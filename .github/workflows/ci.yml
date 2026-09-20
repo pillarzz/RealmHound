@@ -60,6 +60,10 @@ jobs:
         working-directory: realmhound
         run: cargo build --locked
 
+      - name: Build Windows tests
+        working-directory: realmhound
+        run: cargo test --locked --no-run
+
   tests:
     name: Linux tests
     runs-on: ubuntu-latest
@@ -87,6 +91,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run tests
+      - name: Run core tests
         working-directory: realmhound
-        run: cargo test --locked
+        # Some migration tests share process-global state and require serial execution.
+        run: cargo test --locked -p realmhound-core -- --test-threads=1

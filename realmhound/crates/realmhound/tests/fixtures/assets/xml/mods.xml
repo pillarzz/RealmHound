@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DungeonModifiers>
+  <DungeonModifier id="MYSTERYEFFUSION">
+    <DisplayId>Mystery Effusion</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,UNIQUE</Labels>
+    <Mutators>
+      <EntityDropMultiplier amount="1.20" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="EXPERIENCED">
+    <DisplayId>Experienced</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,REWARD</Labels>
+    <Mutators>
+      <EntityStatMultiplier stat="XP" amount="2.00" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="LOOTING">
+    <DisplayId>Looting</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,REWARD</Labels>
+    <Mutators>
+      <EntityDropMultiplier amount="1.50" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="DUSTSTORM">
+    <DisplayId>Dust Storm</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,REWARD</Labels>
+    <Mutators>
+      <EntityDustMultiplier amount="1.50" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="REWARDING">
+    <DisplayId>Rewarding</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,REWARD</Labels>
+    <Mutators>
+      <EntityStatMultiplier stat="XP" amount="1.25" />
+      <EntityDropMultiplier amount="1.25" />
+      <EntityDustMultiplier amount="1.25" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="COLORFUL">
+    <DisplayId>Colorful</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,REWARD</Labels>
+    <Mutators>
+      <EntityDropMultiplier amount="1.10" />
+      <EntityDustMultiplier amount="1.18" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="WEAKBOSS_3">
+    <DisplayId>Weak Boss III</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,ENTITY,BOSS,TIER3</Labels>
+    <Mutators>
+      <EntityStatMultiplier stat="XP" amount="1.15" />
+      <EntityDropMultiplier amount="1.01" />
+      <EntityDustMultiplier amount="1.03" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="CHEF">
+    <DisplayId>Chef</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,REWARD</Labels>
+    <Mutators />
+  </DungeonModifier>
+  <DungeonModifier id="SOUVENIR_1">
+    <DisplayId>Souvenir I (Legacy)</DisplayId>
+    <Weight>0</Weight>
+    <Labels>ANY,REWARD</Labels>
+    <Mutators />
+  </DungeonModifier>
+  <DungeonModifier id="DIMITUS">
+    <DisplayId>Dimitus</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,UNIQUE</Labels>
+    <Mutators>
+      <EntityDustMultiplier amount="1.24" />
+    </Mutators>
+  </DungeonModifier>
+  <DungeonModifier id="EXPOSED_1">
+    <DisplayId>Exposed I</DisplayId>
+    <Weight>1</Weight>
+    <Labels>ANY,PLAYER,TIER1</Labels>
+    <Mutators>
+      <EntityDropMultiplier amount="1.06" />
+      <EntityDustMultiplier amount="1.02" />
+    </Mutators>
+  </DungeonModifier>
+</DungeonModifiers>

@@ -1,0 +1,77 @@
+[package]
+name = "realmhound-core"
+description = "Core packet capture and processing library for RealmHound"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# Packet capture
+pcap = { workspace = true }
+etherparse = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+hex = "0.4"
+dirs = "5.0"
+rand = "0.8"
+png = "0.17"
+uuid = { workspace = true }
+
+# Cross-platform advisory file locking for exclusive migration ownership.
+fs2 = "0.4"
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Version comparison
+semver = { workspace = true }
+
+# URL encoding
+urlencoding = "2.1"
+
+# SQLite database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# XML parsing
+quick-xml = { workspace = true }
+
+# Cryptographic hashing for update verification
+sha2 = "0.10"
+
+# Profiling (opt-in via the `profiling` feature)
+puffin = { version = "0.20", optional = true }
+
+# Windows Credential Manager for per-account access-token storage.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Threading"] }
+
+[features]
+# Enable puffin profiling scopes in the packet pipeline.
+profiling = ["dep:puffin"]
+# Retain capture queue timing metadata for latency diagnostics.
+latency-diagnostics = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+image = "0.25"
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "pipeline"
+harness = false

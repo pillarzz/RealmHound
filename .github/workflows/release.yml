@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          $isPrerelease = $version.Contains("-")
+          "VERSION=$version" >> $env:GITHUB_OUTPUT
+          "PRERELEASE=$($isPrerelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Verify tag matches package version
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ steps.version.outputs.VERSION }}"
+          $match = Select-String `
+            -Path "realmhound/Cargo.toml" `
+            -Pattern '^version = "([^"]+)"$'
+          if (-not $match) {
+            throw "Could not read workspace version from realmhound/Cargo.toml"
+          }
+          $packageVersion = $match.Matches[0].Groups[1].Value
+          if ($tagVersion -ne $packageVersion) {
+            throw "Tag version $tagVersion does not match package version $packageVersion"
+          }
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Npcap SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "npcap-sdk.zip"
+          Expand-Archive -Path "npcap-sdk.zip" -DestinationPath "npcap-sdk"
+          $sdkPath = "${{ github.workspace }}\npcap-sdk\Lib\x64"
+          "LIB=$sdkPath;$env:LIB" >> $env:GITHUB_ENV
+
+      - name: Download official sounds
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_ASSETS_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw "BUILD_ASSETS_TOKEN is required to download official sounds"
+          }
+
+          $archive = "${{ runner.temp }}\realmhound-sounds-v1.zip"
+          gh release download sounds-v1 `
+            --repo pillarzz/realmhound-build-assets `
+            --pattern realmhound-sounds-v1.zip `
+            --output $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download the private official sound bundle"
+          }
+
+          $expectedHash = "1765d31b1c2d79cfef7f274eb480ab6e3fd1b3d0ed73718d2c80fece2dd7dd8e"
+          $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Official sound bundle SHA-256 mismatch"
+          }
+
+          $extracted = "${{ runner.temp }}\realmhound-sounds-v1"
+          Expand-Archive -Path $archive -DestinationPath $extracted
+
+          $expectedPaths = @(
+            "bad_mod_warning.mp3",
+            "dimitus.mp3",
+            "enchants/money.mp3",
+            "events/adept.mp3",
+            "events/alien_wave.mp3",
+            "events/calbrik.mp3",
+            "events/seasonal.mp3",
+            "events/ufo_.mp3",
+            "events/veteran.mp3"
+          ) | Sort-Object
+          $actualPaths = Get-ChildItem -Path $extracted -File -Recurse |
+            ForEach-Object {
+              $_.FullName.Substring($extracted.Length + 1).Replace('\', '/')
+            } |
+            Sort-Object
+          $difference = Compare-Object $expectedPaths $actualPaths
+          if ($difference) {
+            throw "Official sound bundle contains an unexpected file set: $($difference | Out-String)"
+          }
+
+          $destination = "${{ github.workspace }}\realmhound\crates\realmhound\assets\sounds"
+          $installedPaths = "${{ runner.temp }}\realmhound-installed-sounds.txt"
+          $expectedPaths | Set-Content $installedPaths
+          foreach ($relativePath in $expectedPaths) {
+            $target = Join-Path $destination $relativePath
+            New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+            Copy-Item (Join-Path $extracted $relativePath) $target
+          }
+
+      - name: Build release
+        working-directory: realmhound
+        env:
+          REALMHOUND_OFFICIAL_SOUNDS: "1"
+        run: cargo build --release --locked --package RealmHound
+
+      - name: Remove private sound files
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item "${{ runner.temp }}\realmhound-sounds-v1.zip" -Force -ErrorAction SilentlyContinue
+          Remove-Item "${{ runner.temp }}\realmhound-sounds-v1" -Recurse -Force -ErrorAction SilentlyContinue
+          $sounds = "${{ github.workspace }}\realmhound\crates\realmhound\assets\sounds"
+          $installedPaths = "${{ runner.temp }}\realmhound-installed-sounds.txt"
+          if (Test-Path $installedPaths) {
+            Get-Content $installedPaths | ForEach-Object {
+              Remove-Item (Join-Path $sounds $_) -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          $remaining = if (Test-Path $installedPaths) {
+            Get-Content $installedPaths | Where-Object {
+              Test-Path (Join-Path $sounds $_)
+            }
+          }
+          if ($remaining) {
+            throw "Private sound cleanup failed: $($remaining -join ', ')"
+          }
+          Remove-Item $installedPaths -Force -ErrorAction SilentlyContinue
+          $temporaryPaths = @(
+            "${{ runner.temp }}\realmhound-sounds-v1.zip",
+            "${{ runner.temp }}\realmhound-sounds-v1",
+            $installedPaths
+          ) | Where-Object { Test-Path $_ }
+          if ($temporaryPaths) {
+            throw "Temporary sound cleanup failed: $($temporaryPaths -join ', ')"
+          }
+
+      - name: Create checksum
+        id: checksum
+        shell: pwsh
+        run: |
+          $exe = "realmhound/target/release/RealmHound.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  RealmHound.exe" | Set-Content "realmhound/target/release/RealmHound.exe.sha256"
+          "SHA256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        if: github.event_name == 'push' && github.event.repository.private == false
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: RealmHound v${{ steps.version.outputs.VERSION }}
+          body_path: realmhound/RELEASE_NOTES.txt
+          files: |
+            realmhound/target/release/RealmHound.exe
+            realmhound/target/release/RealmHound.exe.sha256
+            LICENSE
+            THIRD-PARTY-LICENSES.md
+          draft: false
+          prerelease: ${{ steps.version.outputs.PRERELEASE }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update version gist
+        if: github.event_name == 'push' && github.event.repository.private == false && steps.version.outputs.PRERELEASE == 'false'
+        uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.VERSION }}
+          RELEASE_SHA256: ${{ steps.checksum.outputs.SHA256 }}
+        with:
+          github-token: ${{ secrets.GIST_PAT }}
+          script: |
+            const fs = require('fs');
+            const gistId = '4f50870a65c14d179eb2c361b5915946';
+            const version = process.env.RELEASE_VERSION;
+            const sha256 = process.env.RELEASE_SHA256;
+            const notes = fs.readFileSync('realmhound/RELEASE_NOTES.txt', 'utf8');
+            const downloadUrl =
+              `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
+              `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound.exe`;
+
+            const gist = await github.rest.gists.get({ gist_id: gistId });
+            const manifest = JSON.parse(gist.data.files['version.json'].content);
+            const changes = notes
+              .split('\n')
+              .map(line => line.trim())
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => line.replace(/^[-*]\s*/, ''));
+
+            const newRelease = {
+              version,
+              date: new Date().toISOString().split('T')[0],
+              changes: changes.length > 0 ? changes : ['Bug fixes and improvements']
+            };
+
+            const compareVersions = (left, right) => {
+              const a = left.split('.').map(Number);
+              const b = right.split('.').map(Number);
+              for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+                const difference = (a[i] || 0) - (b[i] || 0);
+                if (difference !== 0) return difference;
+              }
+              return 0;
+            };
+
+            if (
+              !manifest.latest_version ||
+              compareVersions(version, manifest.latest_version) >= 0
+            ) {
+              manifest.latest_version = version;
+              manifest.download_url = downloadUrl;
+              manifest.sha256 = sha256;
+            }
+
+            const existingIndex = manifest.releases.findIndex(
+              release => release.version === version
+            );
+            if (existingIndex >= 0) {
+              manifest.releases[existingIndex] = newRelease;
+            } else {
+              manifest.releases.unshift(newRelease);
+            }
+            manifest.releases = manifest.releases.slice(0, 20);
+
+            await github.rest.gists.update({
+              gist_id: gistId,
+              files: {
+                'version.json': {
+                  content: JSON.stringify(manifest, null, 2)
+                }
+              }
+            });
+
+      - name: Prepare Discord announcement
+        if: github.event_name == 'push' && github.event.repository.private == false
+        id: discord
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $isPrerelease = "${{ steps.version.outputs.PRERELEASE }}" -eq "true"
+          $notes = (Get-Content "realmhound/RELEASE_NOTES.txt" -Raw).Trim()
+          $title = if ($isPrerelease) { "RealmHound v$version (pre-release)" } else { "RealmHound v$version" }
+
+          $delimiter = "EOF_DISCORD_$(Get-Random)"
+          "TITLE=$title" >> $env:GITHUB_OUTPUT
+          "BODY<<$delimiter" >> $env:GITHUB_OUTPUT
+          $notes >> $env:GITHUB_OUTPUT
+          $delimiter >> $env:GITHUB_OUTPUT
+
+      - name: Announce release on Discord
+        if: github.event_name == 'push' && github.event.repository.private == false
+        uses: SethCohen/github-releases-to-discord@v1
+        with:
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
+          content: "@everyone"
+          color: "5814783"
+          username: "RealmHound Releases"
+          release_name: ${{ steps.discord.outputs.TITLE }}
+          release_body: ${{ steps.discord.outputs.BODY }}
+          release_html_url: "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          reduce_headings: true

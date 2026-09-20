@@ -1,0 +1,47 @@
+# Rust
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Java reference projects (untracked, kept locally)
+RealmShark-realmshark/
+RealmShark-tomato/
+*.class
+*.jar
+
+# Developer identity (per-developer)
+.developer
+
+# Logs
+*.log
+logs/
+
+# Npcap/pcap captures
+*.pcap
+*.pcapng
+
+# Distribution folder (build output)
+realmhound/dist/
+
+# Private official release sounds
+realmhound/crates/realmhound/assets/sounds/bad_mod_warning.mp3
+realmhound/crates/realmhound/assets/sounds/dimitus.mp3
+realmhound/crates/realmhound/assets/sounds/enchants/money.mp3
+realmhound/crates/realmhound/assets/sounds/events/adept.mp3
+realmhound/crates/realmhound/assets/sounds/events/alien_wave.mp3
+realmhound/crates/realmhound/assets/sounds/events/calbrik.mp3
+realmhound/crates/realmhound/assets/sounds/events/seasonal.mp3
+realmhound/crates/realmhound/assets/sounds/events/ufo_.mp3
+realmhound/crates/realmhound/assets/sounds/events/veteran.mp3
+
+# Scraper cache (large, regeneratable)
+tools/realmeye-scraper/.cache/
+__pycache__/

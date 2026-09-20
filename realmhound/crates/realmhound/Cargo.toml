@@ -1,0 +1,77 @@
+[package]
+name = "RealmHound"
+description = "A packet sniffer for Realm of the Mad God"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "RealmHound"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+realmhound-core = { path = "../realmhound-core" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# GUI
+eframe = { workspace = true }
+egui = { workspace = true }
+
+# shadcn-style themed widgets (pinned: API is unstable)
+egui-shadcn = "=0.5.0"
+
+# Image loading for sprites
+image = "0.25"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# File system utilities
+dirs = "5.0"
+
+# Utilities
+chrono = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+
+# Windows API for single-instance mutex and title-bar icon
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+raw-window-handle = "0.6"
+
+# Audio playback for sound notifications
+rodio = "0.19"
+
+# Native file dialogs for custom sound selection
+rfd = "0.15"
+
+# Profiling (opt-in via the `profiling` feature)
+puffin = { version = "0.20", optional = true }
+puffin_egui = { version = "0.30", optional = true }
+puffin_http = { version = "0.17", optional = true }
+
+[dev-dependencies]
+# Hermetic temporary directories for path-injection tests.
+tempfile = "3"
+
+[features]
+# Enable the in-app puffin profiler overlay (toggle with F12) and pipeline scopes.
+profiling = ["dep:puffin", "dep:puffin_egui", "dep:puffin_http", "realmhound-core/profiling"]
+# Enable diagnostic-only capture, pipeline, storage, UI, and audio latency logging.
+latency-diagnostics = ["realmhound-core/latency-diagnostics"]
+
+[build-dependencies]
+# Windows-specific: embed icon and manifest
+winres = "0.1"

@@ -1,0 +1,59 @@
+name: ✨ Feature Request
+description: Suggest a new feature or enhancement
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please describe what you'd like to see.
+
+        **Privacy warning:** Do not attach `.rhcap` captures, logs, databases,
+        tokens, account exports, or unredacted player/session data.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the app would this affect?
+      options:
+        - Live Feed
+        - Quests Panel
+        - Missions Panel
+        - Loot History Panel
+        - Combat History Panel
+        - Trophy Hall Panel
+        - Treasury Panel
+        - Vault Panel
+        - Characters Panel
+        - Exaltations Panel
+        - Party Panel
+        - Chat Panel
+        - Settings
+        - Network/Capture
+        - UI/Display
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature Description
+      description: Describe the feature you'd like
+      placeholder: I would like to see...
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: How would you use this feature?
+      placeholder: This would help me...
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any workarounds or alternative solutions?
+      placeholder: Currently I do this instead...

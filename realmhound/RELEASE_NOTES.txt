@@ -1,11 +1,6 @@
-Combat History:
-- Local player damage now correctly accounts for temporary attack buffs (party buffs, consumables, proc enchants) and weapon damage enchants
-- Rogue Lethal Strike now reads accurate: bonus side shots only count when they actually hit the target, and are no longer over-counted on multi-shot weapons
-- Curse, Exposed and Petrified are now detected correctly
-- "Hits landed" no longer includes shots fired at a boss while it was invulnerable
-- Legacy The Shatters now tracks the opening phases of the Forgotten Sentinel and Forgotten King fights (Titanums/Obelisks, Royal Guardians and colored crystals), so leaving before the boss becomes vulnerable still creates a fight card tagged Escaped
-- Legacy Lair of Draconis dragon fights now complete correctly instead of showing Escaped, with their chest loot linked to the card
-- Bilgewater's Galleon no longer tracks the Galleon Admiral
-- Cube Deity and Ravenous Rot add-ons are no longer tracked as separate entries
-- The dungeon's main boss now stays as the card headline instead of optional side bosses or crates
-- Search tags and Export JSON buttons now fold into a second row in the filter bar, making them visible on small screens
+# Open Source
+- RealmHound's source code is now public on GitHub. Versions through v0.20.2 were binary-only releases; v0.20.3 is the first release built from the public source snapshot.
+
+# Improvements
+- Reduced Combat History persistence work that could delay notifications during long sessions.
+- Update downloads are now verified against the published SHA-256 checksum before installation.

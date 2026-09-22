@@ -11,20 +11,23 @@ way. It does not access server-side information unavailable to your client.
 
 ## Features
 
-- **Widget Bar** - Key currencies, seasonal timers, dust, forge materials, and account information available on every page.
-- **Taskbar** - Customizable mission and quest tracking on every page, with merged objectives, suggested choices, and progress tips.
-- **Live Feed** - Rolling log of realm events, dungeon entries, realm and score details, direct messages, alerts, and clipboard callouts.
-- **Quests** - Daily and event Tinkerer quests with progress, categories, Taskbar tracking, filtering, and claimable-reward reminders.
-- **Missions** - Seasonal mission progress with status categories, custom ordering, Taskbar tracking, eligibility checks, and reward reminders.
-- **Loot History** - Searchable loot records by item, enemy, dungeon, character, date, and special item type.
-- **Combat History** - Boss encounter records with player performance, team damage dealt and taken, search, and filters.
-- **Trophy Hall** - Rare item collections by dungeon, with run summaries and discovery history in detailed tooltips.
-- **Treasury** - Search and count items across observed account storage, with categories and aggregate totals.
-- **Vault** - Last-observed replicas of vault and storage containers for browsing and planning without loading them in game.
-- **Characters** - Character overview with equipment, inventories, stats, maxing progress, fame calculations, and milestone tracking.
-- **Exaltations** - Account-wide exaltation progress by class and stat on one page.
-- **Party** - Party overview, watchlists, and copy-ready moderation commands without reopening the in-game Party UI.
-- **Chat** - Searchable message history for browsing conversations and finding previous contacts.
+- **Widget Bar** - Customizable key currencies, seasonal timers, dust, forge materials, and account information available on every page. <img width="1810" height="36" alt="image" src="https://github.com/user-attachments/assets/01e153a9-0aff-4c1a-9d69-de67728eca76" />
+- **Taskbar** - Customizable mission and quest tracking on every page, with merged objectives, suggested choices, and progress tips. <img width="1810" height="36" alt="image" src="https://github.com/user-attachments/assets/b07f7aaa-c67d-417f-8850-cdf3a6185628" />
+- **Live Feed** - Rolling log of realm events, dungeon entries, realm and score details, direct messages, alerts, and clipboard callouts. <img width="1605" height="787" alt="image" src="https://github.com/user-attachments/assets/41bd94dd-e83d-483d-93f8-2cf6d674d673" />
+- **Quests** - Daily and event Tinkerer quests with progress, categories, Taskbar tracking, filtering, and claimable-reward reminders. <img width="1603" height="1279" alt="image" src="https://github.com/user-attachments/assets/3c68f46e-dcba-49c0-9058-e942d21588d9" />
+- **Missions** - Seasonal mission progress with status categories, custom ordering, Taskbar tracking, eligibility checks, and reward reminders.<img width="1608" height="1313" alt="image" src="https://github.com/user-attachments/assets/56c6eb07-e200-42ed-8ed3-fa02d6eb7ff1" />
+- **Loot History** - Searchable loot records by item, enemy, dungeon, character, date, and special item type. <img width="1605" height="257" alt="image" src="https://github.com/user-attachments/assets/1880ef93-8689-462d-bcd7-56082960e09e" />
+- **Combat History** - Boss encounter records with player performance, team damage dealt and taken, search, and filters. <img width="1607" height="625" alt="image" src="https://github.com/user-attachments/assets/4647f3f3-99cb-48fb-b60b-4e2a4de42778" /> <img width="889" height="1116" alt="image" src="https://github.com/user-attachments/assets/e5022670-ddc3-4d5c-b259-1227cab19d77" />
+- **Trophy Hall** - Rare item collections by dungeon, with run summaries and discovery history in detailed tooltips. <img width="1607" height="1185" alt="image" src="https://github.com/user-attachments/assets/4ba98eaa-7868-4bcd-b0eb-32f07dad45e3" /> <img width="1577" height="1224" alt="image" src="https://github.com/user-attachments/assets/9c54eec2-64be-45cd-8096-57b98706f65d" />
+- **Treasury** - Search and count items across observed account storage, with categories and aggregate totals. <img width="1608" height="1231" alt="image" src="https://github.com/user-attachments/assets/2d2c1ec4-e65f-4d18-bebd-4f35467ceccb" />
+ <img width="1023" height="696" alt="image" src="https://github.com/user-attachments/assets/ad698f10-a451-4933-9a55-b970d3e8a336" /> <img width="1608" height="406" alt="image" src="https://github.com/user-attachments/assets/3562cf51-5379-4052-b140-0c439c7ff569" />
+- **Vault** - Last-observed replicas of vault and storage containers for browsing and planning without loading them in game. <img width="452" height="405" alt="image" src="https://github.com/user-attachments/assets/2c372785-1fc6-4ab8-a2d1-489552dfe0c5" /> <img width="575" height="788" alt="image" src="https://github.com/user-attachments/assets/b6e6816a-9c25-414f-8027-3826e8f07c31" />
+- **Characters** - Character overview with equipment, inventories, stats, maxing progress, fame calculations, and milestone tracking. <img width="1598" height="660" alt="image" src="https://github.com/user-attachments/assets/3581f4c9-5e83-4a11-b916-66f4030baea5" />
+ <img width="1455" height="1089" alt="image" src="https://github.com/user-attachments/assets/291acf91-141a-4884-8170-007832e64db4" />
+- **Exaltations** - Account-wide exaltation progress by class and stat on one page. <img width="1607" height="616" alt="image" src="https://github.com/user-attachments/assets/7a105ed3-79ba-440b-a620-ab48658c1673" />
+- **Party** - Party overview, watchlists, and copy-ready moderation commands without reopening the in-game Party UI. <img width="1607" height="781" alt="image" src="https://github.com/user-attachments/assets/94196443-26df-4b09-b2ac-b989aa35286f" />
+- **Chat** - Searchable message history for browsing conversations and finding previous contacts. <img width="911" height="357" alt="image" src="https://github.com/user-attachments/assets/661a22f9-de8f-401e-ba3a-b3d63c3fddcb" />
+
 
 ## Download
 

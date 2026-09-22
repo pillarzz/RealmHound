@@ -11,8 +11,8 @@ way. It does not access server-side information unavailable to your client.
 
 ## Features
 
-- **Widget Bar** - Customizable key currencies, seasonal timers, dust, forge materials, and account information available on every page. <img width="1810" height="36" alt="image" src="https://github.com/user-attachments/assets/01e153a9-0aff-4c1a-9d69-de67728eca76" />
-- **Taskbar** - Customizable mission and quest tracking on every page, with merged objectives, suggested choices, and progress tips. <img width="1810" height="36" alt="image" src="https://github.com/user-attachments/assets/b07f7aaa-c67d-417f-8850-cdf3a6185628" />
+- **Widget Bar** - Customizable key currencies, seasonal timers, dust, forge materials, and account information available on every page. <img width="787" height="35" alt="image" src="https://github.com/user-attachments/assets/fcfebd8e-f2e3-4f94-9376-7aca745ad353" />
+- **Taskbar** - Customizable mission and quest tracking on every page, with merged objectives, suggested choices, and progress tips. <img width="822" height="796" alt="image" src="https://github.com/user-attachments/assets/33b68130-cc97-45bc-a077-8d786369d6d5" /> <img width="825" height="396" alt="image" src="https://github.com/user-attachments/assets/fdebfb70-9498-4052-a7c5-932f48cf00a9" />
 - **Live Feed** - Rolling log of realm events, dungeon entries, realm and score details, direct messages, alerts, and clipboard callouts. <img width="1605" height="787" alt="image" src="https://github.com/user-attachments/assets/41bd94dd-e83d-483d-93f8-2cf6d674d673" />
 - **Quests** - Daily and event Tinkerer quests with progress, categories, Taskbar tracking, filtering, and claimable-reward reminders. <img width="1603" height="1279" alt="image" src="https://github.com/user-attachments/assets/3c68f46e-dcba-49c0-9058-e942d21588d9" />
 - **Missions** - Seasonal mission progress with status categories, custom ordering, Taskbar tracking, eligibility checks, and reward reminders.<img width="1608" height="1313" alt="image" src="https://github.com/user-attachments/assets/56c6eb07-e200-42ed-8ed3-fa02d6eb7ff1" />

@@ -4487,10 +4487,9 @@ impl RealmHoundApp {
         ui.add_space(15.0);
 
         shadcn.card(ui, "trophy_hall_source", "Data Source", |ui| {
-            // RealmShark import, autoload, and selection are only available when
-            // an account is selected (import path bound) and currently verified.
-            let realmshark_gate =
-                self.trophy_hall_panel.has_realmshark_path() && self.view_state.account_verified;
+            // The bound path belongs to the selected profile, so importing does
+            // not require a live game connection.
+            let realmshark_gate = self.trophy_hall_panel.has_realmshark_path();
             shadcn.field_row(ui, |ui| {
                 ui.label("Source:").hover_tip("Controls which tracked-loot sources feed drop counts and the Unlocked status, alongside account data (which always counts).");
                 let prev_source = self.trophy_hall_panel.data_source();
@@ -4522,7 +4521,7 @@ impl RealmHoundApp {
             let import = ui.add_enabled(realmshark_gate, egui::Button::new("📂 Import RealmShark"));
             if !realmshark_gate {
                 import.clone().on_hover_text(
-                    "Select and verify an account (launch the game) to import RealmShark stats.",
+                    "Select an account profile to import RealmShark stats.",
                 );
             }
             if import.clicked() {

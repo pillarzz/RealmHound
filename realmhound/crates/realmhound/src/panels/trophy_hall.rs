@@ -239,7 +239,7 @@ impl TrophyHallPanel {
     /// Switches the data source to `Both` on success, same as the old inline button.
     pub fn import_realmshark(&mut self) {
         let Some(dest) = self.realmshark_import_path.clone() else {
-            tracing::warn!("[TROPHY] RealmShark import requires a selected, verified account");
+            tracing::warn!("[TROPHY] RealmShark import requires a selected account");
             return;
         };
         if let Some(path) = rfd::FileDialog::new()
@@ -267,17 +267,13 @@ impl TrophyHallPanel {
         loot_db: Option<&LootDatabase>,
         account_data: &AccountData,
         combat_db: Option<&realmhound_core::combat::CombatDatabase>,
-        account_verified: bool,
     ) {
-        // Auto-load RealmShark data from the selected account's import path, only
-        // once the account is selected and currently verified.
+        // Auto-load RealmShark data from the selected account's import path.
         if !self.realmshark_load_attempted {
             if let Some(path) = self.realmshark_import_path.clone() {
-                if account_verified {
-                    self.realmshark_load_attempted = true;
-                    if path.exists() {
-                        self.realmshark_data = realmshark_import::parse_dungeon_stats(&path).ok();
-                    }
+                self.realmshark_load_attempted = true;
+                if path.exists() {
+                    self.realmshark_data = realmshark_import::parse_dungeon_stats(&path).ok();
                 }
             }
         }
@@ -2193,12 +2189,7 @@ impl TrophyHallPanel {
 
 impl Panel for TrophyHallPanel {
     fn show(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) -> Vec<AppAction> {
-        self.refresh_if_stale(
-            ctx.loot_database,
-            ctx.account_data,
-            ctx.combat_database,
-            ctx.account_verified,
-        );
+        self.refresh_if_stale(ctx.loot_database, ctx.account_data, ctx.combat_database);
 
         match self.page.clone() {
             Page::Index => self.render_index(ui, ctx),
@@ -2322,5 +2313,18 @@ mod gating_tests {
         // Clearing it disables RealmShark again.
         panel.set_realmshark_import_path(None);
         assert!(!panel.has_realmshark_path());
+    }
+
+    #[test]
+    fn realmshark_auto_loads_when_import_path_is_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let import_path = temp.path().join("dungeon.stats");
+        std::fs::write(&import_path, br#"{"data":{}}"#).unwrap();
+        let mut panel = TrophyHallPanel::new();
+        panel.set_realmshark_import_path(Some(import_path));
+
+        panel.refresh_if_stale(None, &AccountData::new(), None);
+
+        assert!(panel.realmshark_loaded());
     }
 }

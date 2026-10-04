@@ -422,23 +422,21 @@ fn quest_dungeon(q: &QuestTask) -> Option<String> {
     dungeon
 }
 
-/// Reduce a dungeon name to the base form the mark table uses, so a mission's
-/// dungeon objective matches a mark quest's resolved dungeon. Mark quests resolve
-/// to the *base* dungeon (e.g. the Advanced Control Core mark maps to "Kogbold
-/// Steamworks"), while missions target the specific variant ("Advanced Kogbold
-/// Steamworks", "Plagued Nest"). Case-insensitive; returns a lowercase key.
+/// Reduce a dungeon name to its comparison key, so a mission's dungeon objective
+/// matches a mark quest's resolved dungeon.
+///
+/// Variant dungeons are *not* folded into their base form: the Advanced Nest
+/// ("Plagued Nest") and Advanced Kogbold Steamworks are separate portals whose
+/// marks differ from The Nest / Kogbold Steamworks, so a quest for one must never
+/// pair with a mission for the other (issue #44). Each variant's mark resolves to
+/// that variant in `MARK_TO_DUNGEON`, so an exact comparison is enough. Case
+/// insensitive; returns a lowercase key.
 pub(crate) fn canonical_match_dungeon(name: &str) -> String {
-    let base = name.trim().strip_prefix("Advanced ").unwrap_or(name.trim());
-    let base = if base.eq_ignore_ascii_case("Plagued Nest") {
-        "The Nest"
-    } else {
-        base
-    };
-    base.to_ascii_lowercase()
+    name.trim().to_ascii_lowercase()
 }
 
 /// True when a mission's dungeon objective and a mark quest's resolved dungeon
-/// refer to the same dungeon (handling Advanced/Plagued variants).
+/// refer to the same dungeon.
 fn dungeon_names_match(mission_dungeon: &str, quest_dungeon: &str) -> bool {
     canonical_match_dungeon(mission_dungeon) == canonical_match_dungeon(quest_dungeon)
 }
@@ -1324,22 +1322,89 @@ mod tests {
     // --- Smart combining ---------------------------------------------------
 
     #[test]
-    fn dungeon_names_match_handles_advanced_and_plagued_variants() {
-        // Missions target the specific variant; mark quests resolve to the base
-        // dungeon the mark table uses. They must still match.
-        assert!(dungeon_names_match(
+    fn dungeon_names_match_keeps_variants_apart() {
+        // A variant dungeon is its own dungeon: the Advanced Nest (Plagued Nest)
+        // and Advanced Kogbold Steamworks drop their own marks and need their own
+        // portal, so a mission for one must never pair with the base dungeon's
+        // mark quest (issue #44).
+        assert!(!dungeon_names_match("Plagued Nest", "The Nest"));
+        assert!(!dungeon_names_match(
             "Advanced Kogbold Steamworks",
             "Kogbold Steamworks"
         ));
-        assert!(dungeon_names_match("Plagued Nest", "The Nest"));
         // Same-name and case-insensitive still match.
         assert!(dungeon_names_match("Ocean Trench", "ocean trench"));
+        assert!(dungeon_names_match("Plagued Nest", " plagued nest "));
+        assert!(dungeon_names_match(
+            "Advanced Kogbold Steamworks",
+            "Advanced Kogbold Steamworks"
+        ));
         // Genuinely different dungeons do not.
         assert!(!dungeon_names_match("The Void", "The Shatters"));
         assert!(!dungeon_names_match(
             "Advanced Kogbold Steamworks",
             "The Nest"
         ));
+    }
+
+    /// Load the real game assets so mark ids resolve to their item names (the
+    /// quest pairing reads them). Returns `None` when assets aren't available, so
+    /// the test skips.
+    fn assets_ready() -> Option<std::sync::MutexGuard<'static, ()>> {
+        let guard = crate::test_support::asset_manager_guard();
+        let mgr = realmhound_core::assets::get_asset_manager();
+        if let Some(dir) = realmhound_core::assets::find_assets_dir() {
+            mgr.set_assets_dir(&dir);
+        }
+        if !mgr.try_load() || mgr.object_id_for_name("Beer God").is_none() {
+            eprintln!("skipping: game assets not available");
+            return None;
+        }
+        Some(guard)
+    }
+
+    #[test]
+    fn advanced_nest_quest_does_not_merge_with_a_the_nest_mission() {
+        let Some(_assets) = assets_ready() else {
+            return;
+        };
+        // The "Plagued Nest" daily quest requires 4 Advanced Killer Bee Queen
+        // marks (item 17571), which only the Advanced Nest drops.
+        let advanced_nest_quest = || {
+            build_quest_task(
+                &quest("q-advanced-nest", vec![17571, 17571, 17571, 17571]),
+                |_| (0, 0),
+                false,
+            )
+            .unwrap()
+        };
+
+        // A mission for The Nest must stay a separate pill: running it does not
+        // advance the Advanced Nest quest (issue #44).
+        let the_nest = build_taskbar_items(
+            &view_of(vec![mission(1, vec![dungeon_obj("The Nest", 0, 4)])]),
+            |_| true,
+            vec![advanced_nest_quest()],
+            None,
+            true,
+        );
+        assert!(
+            matches!(the_nest[0], TaskbarItem::Single(_)),
+            "a The Nest mission must not fuse with the Advanced Nest quest"
+        );
+
+        // The Advanced Nest mission itself still fuses with it.
+        let plagued_nest = build_taskbar_items(
+            &view_of(vec![mission(2, vec![dungeon_obj("Plagued Nest", 0, 4)])]),
+            |_| true,
+            vec![advanced_nest_quest()],
+            None,
+            true,
+        );
+        match &plagued_nest[0] {
+            TaskbarItem::Combined(c) => assert_eq!(c.variants[0].dungeon_name, "Plagued Nest"),
+            _ => panic!("expected a combined pill for the Advanced Nest"),
+        }
     }
 
     fn dungeon_obj(dungeon: &str, have: i32, need: i32) -> ObjectiveView {

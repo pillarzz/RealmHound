@@ -934,7 +934,11 @@ fn difficulty_band(difficulty: f32) -> BossGroup {
 /// Puppet Master") are intentionally omitted so no misleading drop tooltip is
 /// shown. Dungeon names match the canonical portal names used elsewhere.
 static MARK_TO_DUNGEON: &[(&str, &str)] = &[
-    ("Advanced Mark of the Killer Bee Queen", "The Nest"),
+    // The Advanced Nest is its own dungeon ("Plagued Nest"), and the Advanced
+    // Control Core mark comes from Advanced Kogbold Steamworks: a quest for one
+    // variant must never pair with a mission for the other, so each variant mark
+    // resolves to the variant dungeon the mission defs name (issue #44).
+    ("Advanced Mark of the Killer Bee Queen", "Plagued Nest"),
     ("Mark of Arachna", "Spider Den"),
     ("Mark of Belladonna", "Belladonna's Garden"),
     ("Mark of Bilgewater", "Deadwater Docks"),
@@ -959,7 +963,10 @@ static MARK_TO_DUNGEON: &[(&str, &str)] = &[
     ("Mark of Shaitan", "Lair of Shaitan"),
     ("Mark of Skuld", "Haunted Cemetery"),
     ("Mark of Stheno", "Snake Pit"),
-    ("Mark of the Advanced Control Core", "Kogbold Steamworks"),
+    (
+        "Mark of the Advanced Control Core",
+        "Advanced Kogbold Steamworks",
+    ),
     ("Mark of the Archivist", "Cursed Library"),
     ("Mark of the Barkeep", "The Tavern"),
     ("Mark of the Control Core", "Kogbold Steamworks"),
@@ -1330,6 +1337,24 @@ mod tests {
         assert_eq!(
             dungeon_for_mark_name("Mark of the Puppet Master"),
             Some("Puppet Master's Theatre")
+        );
+        // Variant marks resolve to their own dungeon, never the base one: a
+        // quest for the Advanced Nest must not pair with a "The Nest" mission.
+        assert_eq!(
+            dungeon_for_mark_name("Advanced Mark of the Killer Bee Queen"),
+            Some("Plagued Nest")
+        );
+        assert_eq!(
+            dungeon_for_mark_name("Mark of the Killer Bee Queen"),
+            Some("The Nest")
+        );
+        assert_eq!(
+            dungeon_for_mark_name("Mark of the Advanced Control Core"),
+            Some("Advanced Kogbold Steamworks")
+        );
+        assert_eq!(
+            dungeon_for_mark_name("Mark of the Control Core"),
+            Some("Kogbold Steamworks")
         );
         assert_eq!(
             dungeon_for_mark_name("Mark of Janus"),

@@ -1526,30 +1526,31 @@ impl LiveFeedPanel {
         join: realmhound_core::settings::JoinPosition,
     ) -> String {
         use realmhound_core::settings::JoinPosition;
-        let mut out = String::new();
+        // Assembled from parts so an empty body (a name-less call with no tag to
+        // name) still reads as `/p j` rather than carrying a stray double space.
+        let mut parts: Vec<String> = Vec::new();
         if self.call_for_party {
-            out.push_str("/p ");
+            parts.push("/p".to_string());
         }
         if join == JoinPosition::Beginning {
-            out.push_str("j ");
+            parts.push("j".to_string());
         }
         if self.include_server_name {
             if let Some(server) = server {
-                out.push_str(realmhound_core::protocol::short_server_name(server));
-                out.push(' ');
+                parts.push(realmhound_core::protocol::short_server_name(server).to_string());
             }
         }
         if self.include_realm_name {
             if let Some(realm) = realm {
-                out.push_str(realm);
-                out.push(' ');
+                parts.push(realm.to_string());
             }
         }
-        out.push_str(body);
+        parts.push(body.to_string());
         if join == JoinPosition::End {
-            out.push_str(" j");
+            parts.push("j".to_string());
         }
-        out
+        parts.retain(|part| !part.is_empty());
+        parts.join(" ")
     }
 
     /// Initialize dust state from cached account data.
@@ -7761,6 +7762,25 @@ mod tests {
         // The copy is handed over once; afterwards the panel only tracks the
         // entry so it can release the clipboard later.
         assert_eq!(panel.poll_clipboard(), None);
+    }
+
+    // With names off, a dungeon whose modifiers clear no threshold still has a
+    // callout -- the join marker alone -- so the auto-clipboard must copy it.
+    #[test]
+    fn auto_clipboard_copies_name_less_callout_with_no_tags() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
+            auto_clipboard_dungeon_calls: true,
+            dungeon_name_style: realmhound_core::settings::DungeonNameStyle::None,
+            ..Default::default()
+        });
+        // Snake Pit with no modifiers: no name, and no tag above its threshold.
+        panel.push_dungeon(7, "Snake Pit", &[], None);
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::Copy("/p j".to_string()))
+        );
     }
 
     #[test]

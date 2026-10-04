@@ -282,8 +282,8 @@ fn resolve_dungeon_name(
 /// (and to nothing at all in [`DungeonNameStyle::None`] mode, which calls only
 /// the reward/mod tags). Every dungeon is callable except those in
 /// [`NON_CALLABLE_DUNGEONS`]. Returns `None` when the dungeon should have no
-/// callout: a non-callable dungeon, a Dimitus dungeon whose reward-mod entry is
-/// disabled, or a callout that would be empty.
+/// callout at all: a non-callable dungeon, or a Dimitus dungeon whose reward-mod
+/// entry is disabled.
 pub fn dungeon_callout_for(
     display_name: &str,
     modifier_tokens: &[String],
@@ -300,10 +300,14 @@ pub fn dungeon_callout_for(
 /// Build the clipboard callout body for a dungeon from a resolved name plus its
 /// modifier-derived tags, in this order: the name (when the style keeps one),
 /// loot, dust, xp, the enabled reward-mod tags (list order), Alexander's Legacy,
-/// Dimitus, then the realm status. Returns `None` for a Dimitus dungeon whose
-/// reward-mod entry is disabled (the whole callout is suppressed, matching the
-/// legacy toggle) or for a callout that would be empty (name-less calls with no
-/// tags to name).
+/// Dimitus, then the realm status. Returns `None` only for a Dimitus dungeon
+/// whose reward-mod entry is disabled (the whole callout is suppressed, matching
+/// the legacy toggle).
+///
+/// A name-less call with no tag to name returns an *empty* body rather than
+/// `None`: the dungeon is still callable, and the join marker, server and realm
+/// the caller assembles around the body make the call -- so the auto-clipboard
+/// must not go silent on an empty body.
 pub fn build_dungeon_callout(
     nickname: &str,
     modifier_tokens: &[String],
@@ -391,7 +395,7 @@ pub fn build_dungeon_callout(
         }
         call.push_str(tag);
     }
-    (!call.is_empty()).then_some(call)
+    Some(call)
 }
 
 /// The short call for a reward-mod entry when the dungeon carries it and the
@@ -966,10 +970,12 @@ mod tests {
             dungeon_callout_for("The Shatters", &tokens(&["LOOTING"]), &p).as_deref(),
             Some("50% lb")
         );
-        // A name-less dungeon with nothing else to say produces no callout.
+        // A name-less dungeon with nothing else to say still has a callout: the
+        // join marker, server and realm make the call, so the auto-clipboard
+        // copies it instead of going silent on an empty body.
         assert_eq!(
-            dungeon_callout_for("The Shatters", &tokens(&["WEAKBOSS_3"]), &p),
-            None
+            dungeon_callout_for("The Shatters", &tokens(&["WEAKBOSS_3"]), &p).as_deref(),
+            Some("")
         );
     }
 

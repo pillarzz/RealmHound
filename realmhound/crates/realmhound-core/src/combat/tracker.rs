@@ -1260,7 +1260,12 @@ impl CombatTracker {
                 && max_hp > 0
                 && fight.min_hp_seen <= max_hp * 15 / 100
                 && new_hp >= max_hp * 30 / 100;
-            if !hb && new_hp <= 0 {
+            // Moonlight Village dancers/Umi floor invulnerable and leave view at
+            // the end of a phase, so a zero HP reading is not a kill: their run is
+            // scored only by its completion (the concluding line or the clear
+            // loot). Letting the generic rule fire here would mark every dancer
+            // killed and complete a run that was never cleared.
+            if !hb && new_hp <= 0 && !crate::assets::is_mv_boss(fight.boss_object_type) {
                 fight.killed = true;
             }
             hb
@@ -1623,7 +1628,14 @@ impl CombatTracker {
         let wandering = get_asset_manager().is_wandering_boss(fight.boss_object_type);
         let reached_zero = fight.min_hp_seen <= 0;
         let dipped_lethal = max_hp > 0 && fight.min_hp_seen <= max_hp / 10;
-        if reached_zero || (!wandering && dipped_lethal) {
+        // Moonlight Village dancers/Umi are exempt: they floor invulnerable and
+        // leave view at the end of each phase, so a low or zero HP reading is not
+        // a kill. `suspend_or_finalize` holds them for the whole run and only the
+        // completion path (`complete_mv_bosses`) may score them; marking them here
+        // would complete a run that was never cleared.
+        if !crate::assets::is_mv_boss(fight.boss_object_type)
+            && (reached_zero || (!wandering && dipped_lethal))
+        {
             fight.killed = true;
         }
         // Self-destructing bosses (e.g. the Kogbold Expedition train) explode on
@@ -8280,6 +8292,48 @@ mod tests {
         assert!(
             !done[0].killed,
             "a dancer cleared with no loot recorded is Escaped"
+        );
+    }
+
+    // A real phase end: the dancer's HP reaches 0 and its object leaves view, but
+    // the run was never cleared (no concluding line, no loot). The generic HP
+    // heuristic must not score the dancer, or every run whose dancer phase ends
+    // would be recorded as Completed.
+    #[test]
+    fn mv_dancer_phase_end_without_completion_stays_escaped() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            100,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 200);
+        // The phase ends: HP hits 0 and the dancer leaves view unscored.
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 300);
+        assert!(
+            t.on_object_removed(500, 400).is_none(),
+            "a dancer is suspended, never finalized on removal"
+        );
+        // The map changes with no completion signal: the run is Escaped.
+        let done = t.on_map_change("Nexus", 0, 500);
+        assert_eq!(done.len(), 1);
+        assert!(
+            !done[0].killed,
+            "an uncleared dancer phase must not complete the run"
         );
     }
 

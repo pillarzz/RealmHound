@@ -674,10 +674,14 @@ pub(crate) fn render_mission_tooltip(
         rewards_line(ui, sr, &e.reward_groups, false);
     }
 
-    // Join the mission-card objective tooltips: each still-incomplete relevant
-    // objective with spawn/drop or qualifying-dungeon detail gets its own
-    // column, split by vertical separators. Completed objectives drop out so
-    // stale drop locations disappear once that step is done.
+    // Join the mission-card objective tooltips below the card. Dungeon
+    // objectives are planned together first, so dungeons that drop in the same
+    // biome fold into "Most efficient areas to farm" (the Quests tooltip's
+    // layout) instead of one full column each -- a choice mission listing five
+    // dungeons no longer needs a wall of near-identical "Drops from" columns.
+    // Every other objective (encounters, grave ranges, named bosses) keeps its
+    // own column. Completed objectives drop out so stale drop locations
+    // disappear once that step is done.
     let info_objs: Vec<usize> = tooltip_objs
         .iter()
         .copied()
@@ -688,6 +692,10 @@ pub(crate) fn render_mission_tooltip(
         })
         .collect();
     if !info_objs.is_empty() {
+        let split = split_drop_objectives(&e.objectives, &info_objs);
+        let plan = plan_drop_tip(&split.dungeons);
+        let has_plan = !plan.efficient.is_empty() || !plan.individual.is_empty();
+
         // Paint the horizontal rule and any inter-column dividers manually so
         // they span only the objective block. A bare `ui.separator()` here
         // grows to the tooltip's available width (and vertical ones to its
@@ -698,10 +706,21 @@ pub(crate) fn render_mission_tooltip(
         ui.add_space(5.0);
         let block = ui.horizontal_top(|ui| {
             let mut rects: Vec<egui::Rect> = Vec::new();
-            for &oi in info_objs.iter() {
-                if !rects.is_empty() {
+            let columns = has_plan as usize + split.others.len();
+            let mut drawn = 0;
+            if has_plan {
+                drawn += 1;
+                let r = ui
+                    .vertical(|ui| render_drop_plan(ui, sr, &plan, &split, &e.objectives))
+                    .response
+                    .rect;
+                rects.push(r);
+            }
+            for &oi in split.others.iter() {
+                if drawn > 0 {
                     ui.add_space(13.0);
                 }
+                drawn += 1;
                 let r = ui
                     .vertical(|ui| {
                         let obj = &e.objectives[oi];
@@ -719,6 +738,7 @@ pub(crate) fn render_mission_tooltip(
                     .rect;
                 rects.push(r);
             }
+            debug_assert_eq!(drawn, columns);
             let top = rects.iter().map(|r| r.top()).fold(f32::INFINITY, f32::min);
             let bottom = rects
                 .iter()
@@ -733,6 +753,107 @@ pub(crate) fn render_mission_tooltip(
         ui.painter()
             .hline(rect.left()..=rect.right(), rule_y, divider);
     }
+}
+
+/// Render the planned "where to farm" column of a mission tooltip: the shared
+/// biomes first ("Most efficient areas to farm", one source row per dungeon so
+/// the block stays compact), then the dungeons with no shared biome as their own
+/// measured columns -- the same shape the Quests tooltip uses.
+/// How a mission tooltip's incomplete objectives are laid out: the dungeons the
+/// planned "where to farm" block covers (deduplicated, in objective order) and
+/// the objectives that keep a column of their own.
+pub(crate) struct DropObjectiveSplit {
+    /// Dungeon names for [`plan_drop_tip`], deduplicated in objective order.
+    pub dungeons: Vec<String>,
+    /// Dungeon name -> the first objective index that names it, so the planned
+    /// column can still use that objective's measured width.
+    pub dungeon_obj: std::collections::HashMap<String, usize>,
+    /// Dungeon name -> that objective's header (`label` plus its `have/need`).
+    pub dungeon_header: std::collections::HashMap<String, String>,
+    /// Objectives that keep their own column (encounters, grave ranges, named
+    /// bosses, and dungeon objectives with no resolvable dungeon name).
+    pub others: Vec<usize>,
+}
+
+/// Split a mission tooltip's incomplete objectives so the dungeon ones can be
+/// planned together: dungeons that drop in the same biome then fold into "Most
+/// efficient areas to farm" instead of one full column each.
+pub(crate) fn split_drop_objectives(
+    objectives: &[ObjectiveView],
+    info_objs: &[usize],
+) -> DropObjectiveSplit {
+    let mut split = DropObjectiveSplit {
+        dungeons: Vec::new(),
+        dungeon_obj: std::collections::HashMap::new(),
+        dungeon_header: std::collections::HashMap::new(),
+        others: Vec::new(),
+    };
+    for &oi in info_objs {
+        let Some(obj) = objectives.get(oi) else {
+            continue;
+        };
+        let counter = if obj.need > 0 {
+            format!("  {}/{}", obj.have.min(obj.need), obj.need)
+        } else {
+            String::new()
+        };
+        let header = format!("{}{}", obj.label, counter);
+        let dungeon = matches!(obj.kind, ObjectiveKind::Dungeon)
+            .then(|| obj.dungeon_name.clone())
+            .flatten()
+            .filter(|name| !name.trim().is_empty());
+        match dungeon {
+            Some(name) => {
+                split.dungeon_obj.entry(name.clone()).or_insert(oi);
+                split.dungeon_header.entry(name.clone()).or_insert(header);
+                if !split.dungeons.contains(&name) {
+                    split.dungeons.push(name);
+                }
+            }
+            None => split.others.push(oi),
+        }
+    }
+    split
+}
+
+fn render_drop_plan(
+    ui: &mut egui::Ui,
+    sr: &mut SpriteRenderer,
+    plan: &DropTipPlan,
+    split: &DropObjectiveSplit,
+    objectives: &[ObjectiveView],
+) {
+    if !plan.efficient.is_empty() {
+        render_efficient_areas_limited(ui, sr, &plan.efficient, 1);
+    }
+    if plan.individual.is_empty() {
+        return;
+    }
+    if !plan.efficient.is_empty() {
+        ui.add_space(4.0);
+    }
+    ui.horizontal_top(|ui| {
+        for (k, dungeon) in plan.individual.iter().enumerate() {
+            if k > 0 {
+                ui.add_space(13.0);
+            }
+            ui.vertical(|ui| {
+                let header = split
+                    .dungeon_header
+                    .get(dungeon)
+                    .map(String::as_str)
+                    .unwrap_or(dungeon.as_str());
+                let width = split
+                    .dungeon_obj
+                    .get(dungeon)
+                    .and_then(|&oi| objectives.get(oi))
+                    .and_then(|obj| dungeon_body_width(ui, obj, header))
+                    .unwrap_or(240.0);
+                ui.set_max_width(width);
+                render_dungeon_tip_body(ui, sr, dungeon, header);
+            });
+        }
+    });
 }
 
 /// Resolve an objective's portal id (0 if not a mapped dungeon).
@@ -2320,6 +2441,19 @@ pub(crate) fn render_efficient_areas(
     sr: &mut SpriteRenderer,
     groups: &[AreaGroup],
 ) {
+    render_efficient_areas_limited(ui, sr, groups, usize::MAX);
+}
+
+/// [`render_efficient_areas`] with a cap on how many source rows each dungeon
+/// shows. The Taskbar mission tooltip passes 1: its drop block shares the row
+/// with the mission's other objective columns, and one source per dungeon is
+/// enough to say where to farm (the Quests tooltip keeps every source).
+pub(crate) fn render_efficient_areas_limited(
+    ui: &mut egui::Ui,
+    sr: &mut SpriteRenderer,
+    groups: &[AreaGroup],
+    max_sources_per_dungeon: usize,
+) {
     ui.label(RichText::new("Most efficient areas to farm:").strong());
     for (i, g) in groups.iter().enumerate() {
         if i > 0 {
@@ -2328,7 +2462,7 @@ pub(crate) fn render_efficient_areas(
         biome_header_row(ui, sr, &g.biome);
         for e in &g.entries {
             let portal = portal_sprite_id(&e.dungeon);
-            for (mid, mname) in &e.monsters {
+            for (mid, mname) in e.monsters.iter().take(max_sources_per_dungeon) {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
                     ui.label(RichText::new("\u{2022}").weak());
@@ -4003,6 +4137,131 @@ impl Panel for MissionsPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn obj_of(
+        label: &str,
+        kind: ObjectiveKind,
+        dungeon: Option<&str>,
+        have: i32,
+        need: i32,
+    ) -> ObjectiveView {
+        ObjectiveView {
+            label: label.to_string(),
+            have,
+            need,
+            kind,
+            dungeon_name: dungeon.map(str::to_string),
+            boss_id: None,
+            target: label.to_string(),
+        }
+    }
+
+    /// Load the real game assets so the drop-tooltip plan can resolve enemy
+    /// sprites (a source with no resolvable sprite is not foldable). Returns
+    /// `None` when assets aren't available, so the test skips.
+    fn assets_ready() -> Option<std::sync::MutexGuard<'static, ()>> {
+        let guard = crate::test_support::asset_manager_guard();
+        let mgr = realmhound_core::assets::get_asset_manager();
+        if let Some(dir) = realmhound_core::assets::find_assets_dir() {
+            mgr.set_assets_dir(&dir);
+        }
+        if !mgr.try_load() || mgr.object_id_for_name("Beer God").is_none() {
+            eprintln!("skipping: game assets not available");
+            return None;
+        }
+        Some(guard)
+    }
+
+    #[test]
+    fn split_drop_objectives_plans_dungeons_and_keeps_others_as_columns() {
+        // A combined mission: two dungeons (one listed twice, as its two
+        // objectives would be) plus an encounter objective that keeps its own
+        // column.
+        let objectives = vec![
+            obj_of(
+                "Ocean Trench",
+                ObjectiveKind::Dungeon,
+                Some("Ocean Trench"),
+                1,
+                2,
+            ),
+            obj_of(
+                "Davy Jones' Locker",
+                ObjectiveKind::Dungeon,
+                Some("Davy Jones' Locker"),
+                0,
+                2,
+            ),
+            obj_of(
+                "Ocean Trench",
+                ObjectiveKind::Dungeon,
+                Some("Ocean Trench"),
+                1,
+                2,
+            ),
+            obj_of("Veteran encounters", ObjectiveKind::KillNamed, None, 0, 5),
+        ];
+        let info: Vec<usize> = (0..objectives.len()).collect();
+        let split = split_drop_objectives(&objectives, &info);
+
+        assert_eq!(
+            split.dungeons,
+            vec!["Ocean Trench", "Davy Jones' Locker"],
+            "dungeons are deduplicated in objective order"
+        );
+        assert_eq!(split.others, vec![3], "the encounter keeps its own column");
+        // The header keeps the objective's progress counter.
+        assert_eq!(
+            split.dungeon_header.get("Ocean Trench").map(String::as_str),
+            Some("Ocean Trench  1/2")
+        );
+        assert_eq!(split.dungeon_obj.get("Ocean Trench"), Some(&0));
+    }
+
+    #[test]
+    fn split_drop_objectives_leaves_nameless_dungeon_objectives_alone() {
+        // A dungeon objective the drop model can't name stays a plain column
+        // rather than entering the plan as an empty dungeon.
+        let objectives = vec![
+            obj_of("Somewhere", ObjectiveKind::Dungeon, None, 0, 1),
+            obj_of("Ocean Trench", ObjectiveKind::Dungeon, Some("  "), 0, 1),
+        ];
+        let split = split_drop_objectives(&objectives, &[0, 1]);
+        assert!(split.dungeons.is_empty());
+        assert_eq!(split.others, vec![0, 1]);
+    }
+
+    #[test]
+    fn plan_drop_tip_folds_dungeons_sharing_a_biome() {
+        // The issue's combined objective: both dungeons drop in Deep Sea Abyss,
+        // so they fold into one "efficient areas" biome instead of two full
+        // per-dungeon columns.
+        let Some(_assets) = assets_ready() else {
+            return;
+        };
+        let plan = plan_drop_tip(&["Ocean Trench".to_string(), "Davy Jones' Locker".to_string()]);
+        assert!(
+            plan.efficient
+                .iter()
+                .any(|g| g.entries.len() >= 2 && g.biome.contains("Deep Sea")),
+            "both dungeons fold into their shared biome: {:?}",
+            plan.efficient
+                .iter()
+                .map(|g| (&g.biome, g.entries.len()))
+                .collect::<Vec<_>>()
+        );
+        assert!(plan.individual.is_empty());
+    }
+
+    #[test]
+    fn plan_drop_tip_keeps_unrelated_dungeons_individual() {
+        let Some(_assets) = assets_ready() else {
+            return;
+        };
+        let plan = plan_drop_tip(&["Ocean Trench".to_string(), "{s.rotmg}".to_string()]);
+        assert!(plan.efficient.is_empty(), "no shared biome, no folding");
+        assert_eq!(plan.individual.len(), 2);
+    }
 
     fn ch(seasonal: bool, crucible_active: bool) -> CurrentChar {
         CurrentChar {

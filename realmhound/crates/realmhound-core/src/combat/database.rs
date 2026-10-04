@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 56;
+pub const SCHEMA_VERSION: i32 = 57;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -531,6 +531,11 @@ impl CombatDatabase {
         // mark such dragons complete from the chest bags they dropped. Idempotent
         // and best-effort, so it runs every open until the loot DB is available.
         self.complete_legacy_lod_dragons_from_loot(loot_path)?;
+        // A main boss's guaranteed Mark proves it died this instance even when its
+        // kill was never observed (party-scaled HP + burst death, or the local
+        // player joining late), so repair fights stored as Escaped from their Mark
+        // bags. Idempotent and best-effort, like the LoD pass above.
+        self.complete_bosses_from_mark_loot(loot_path)?;
         // Legacy Lair of Draconis' Ivory Wyvern portal only drops once all four
         // dragons are defeated, so an Ivory Wyvern fight proves the preceding
         // Lair run was a full clear. Complete such runs from that evidence.
@@ -1358,6 +1363,13 @@ impl CombatDatabase {
             }
             self.conn.execute_batch("PRAGMA user_version = 56")?;
         }
+        if from_version < 57 {
+            // v56 -> v57: no schema change. The bump re-runs the open-time repair
+            // passes on databases written before Mark bags were trusted as proof a
+            // main boss died, so runs already stored as Escaped get repaired on
+            // the next open (see `complete_bosses_from_mark_loot`).
+            self.conn.execute_batch("PRAGMA user_version = 57")?;
+        }
         Ok(())
     }
 
@@ -2045,10 +2057,98 @@ impl CombatDatabase {
         Ok(())
     }
 
-    /// Complete every Legacy Lair of Draconis run that a recorded Ivory Wyvern
-    /// fight proves was fully cleared. Idempotent and evidence-only, so it runs on
-    /// every open to repair legacy history and pick up runs finalized after their
-    /// Ivory fight was inserted.
+    /// Complete every main-boss fight a recorded Mark bag proves was killed.
+    ///
+    /// Mirrors [`Self::complete_legacy_lod_dragons_from_loot`]: it reads the paired
+    /// loot DB (best-effort, a no-op when it is absent or unreadable) for bags
+    /// holding a boss Mark and latches the closest still-escaped fight of the bag's
+    /// attributed boss type in the same instance. Idempotent, so it runs on every
+    /// open; the schema-version bump is what forces one pass over existing history.
+    fn complete_bosses_from_mark_loot(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
+        let Some(path) = loot_path else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        let marks: Vec<i32> = crate::assets::get_asset_manager()
+            .boss_mark_item_ids()
+            .into_iter()
+            .collect();
+        if marks.is_empty() {
+            return Ok(());
+        }
+        let loot = match Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("[COMBAT] Skipping Mark completion; loot DB unreadable: {e}");
+                return Ok(());
+            }
+        };
+        let _ = loot.busy_timeout(std::time::Duration::from_secs(5));
+
+        let placeholders: Vec<String> = (0..marks.len()).map(|i| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT map_seed, mob_type, timestamp FROM loot_drops
+             WHERE map_seed != 0 AND mob_type > 0
+               AND id IN (SELECT drop_id FROM loot_items WHERE item_id IN ({}))",
+            placeholders.join(", ")
+        );
+        let drops: Vec<(i32, i32, i64)> = {
+            let mut stmt = match loot.prepare(&sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("[COMBAT] Skipping Mark completion; loot query failed: {e}");
+                    return Ok(());
+                }
+            };
+            let rows = match stmt.query_map(rusqlite::params_from_iter(marks.iter()), |r| {
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    r.get::<_, i32>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            }) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!("[COMBAT] Skipping Mark completion; loot read failed: {e}");
+                    return Ok(());
+                }
+            };
+            // Bind the collected rows before the statement drops: `rows` borrows it.
+            let collected: Vec<(i32, i32, i64)> = rows.filter_map(Result::ok).collect();
+            collected
+        };
+        if drops.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        for (map_seed, boss_type, ts) in drops {
+            tx.execute(
+                "UPDATE fights SET killed = 1 WHERE id = (
+                     SELECT id FROM fights
+                     WHERE killed = 0 AND map_seed = ?1 AND boss_object_type = ?2
+                       AND started_at <= ?3 AND ended_at >= ?4
+                     ORDER BY ABS(ended_at - ?5) LIMIT 1
+                 )",
+                params![
+                    map_seed,
+                    boss_type,
+                    ts + LOOT_LINK_PRE_MS,
+                    ts - LOOT_LINK_POST_MS,
+                    ts
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     fn backfill_legacy_lod_from_ivory(&mut self) -> SqlResult<()> {
         let ivories: Vec<(i64, i32)> = {
             let mut stmt = self.conn.prepare(
@@ -3928,6 +4028,42 @@ impl CombatDatabase {
             params![encounter_id, map_seed],
         )?;
         Ok(())
+    }
+
+    /// Latch `killed = 1` on the single still-escaped fight of `boss_type` in
+    /// `map_seed` closest to a loot bag that held that boss's Mark. A Mark is a
+    /// guaranteed, exclusive main-boss drop, so the bag proves the boss died this
+    /// instance even when its kill was never observed (party-scaled HP + burst
+    /// death, or the local player joining late).
+    ///
+    /// Only the closest fight is completed, so a reconnect fragment of the same
+    /// instance cannot turn one Mark into several kills. Idempotent: it ignores
+    /// fights already scored as kills, and returns how many rows it changed so a
+    /// caller can tell whether the fight existed yet.
+    pub fn mark_boss_killed_by_mark(
+        &mut self,
+        map_seed: i32,
+        boss_type: i32,
+        timestamp: i64,
+    ) -> SqlResult<usize> {
+        if map_seed == 0 || boss_type <= 0 {
+            return Ok(0);
+        }
+        self.conn.execute(
+            "UPDATE fights SET killed = 1 WHERE id = (
+                 SELECT id FROM fights
+                 WHERE killed = 0 AND map_seed = ?1 AND boss_object_type = ?2
+                   AND started_at <= ?3 AND ended_at >= ?4
+                 ORDER BY ABS(ended_at - ?5) LIMIT 1
+             )",
+            params![
+                map_seed,
+                boss_type,
+                timestamp + LOOT_LINK_PRE_MS,
+                timestamp - LOOT_LINK_POST_MS,
+                timestamp
+            ],
+        )
     }
 
     /// Delete every recorded fight, participant, and encounter run, then reclaim
@@ -6316,6 +6452,219 @@ mod tests {
             "the fragment nearest the chest drop completes"
         );
         assert_eq!(killed_far, 0, "one chest drop completes only one fragment");
+    }
+
+    /// A boss completion Mark item id, or `None` when the game assets are not
+    /// available in this environment (the Mark tests skip then, like the
+    /// legacy-consensus migration test does).
+    fn a_boss_mark_id() -> Option<i32> {
+        let mgr = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            mgr.set_assets_dir(&dir);
+        }
+        let _ = mgr.try_load();
+        mgr.boss_mark_item_ids().into_iter().min()
+    }
+
+    /// A loot DB holding one drop in `map_seed`, attributed to `mob_type` and
+    /// carrying `item_ids`.
+    fn write_loot_db_with_drop(
+        path: &Path,
+        map_seed: i32,
+        mob_type: i32,
+        timestamp: i64,
+        item_ids: &[i32],
+    ) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE loot_drops (
+                 id INTEGER PRIMARY KEY, map_seed INTEGER, mob_type INTEGER, timestamp INTEGER);
+             CREATE TABLE loot_items (drop_id INTEGER, item_id INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO loot_drops (id, map_seed, mob_type, timestamp) VALUES (1, ?1, ?2, ?3)",
+            params![map_seed, mob_type, timestamp],
+        )
+        .unwrap();
+        for item in item_ids {
+            conn.execute(
+                "INSERT INTO loot_items (drop_id, item_id) VALUES (1, ?1)",
+                params![item],
+            )
+            .unwrap();
+        }
+    }
+
+    fn killed_flag(db: &CombatDatabase, id: i64) -> i64 {
+        db.conn
+            .query_row("SELECT killed FROM fights WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn escaped_fight(dungeon: &str, boss_type: i32, map_seed: i32) -> CompletedFight {
+        let mut fight = flawless_fight(dungeon, boss_type, vec![]);
+        fight.map_seed = map_seed;
+        fight.killed = false;
+        fight.reached_zero = false;
+        fight
+    }
+
+    #[test]
+    fn mark_boss_killed_by_mark_completes_only_the_closest_escaped_fight() {
+        let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut far = escaped_fight("The Ivory Wyvern", boss, 7);
+        far.started_at = 1_000;
+        far.ended_at = 61_000;
+        let far_id = db.insert_fight(&far).unwrap();
+        let mut near = escaped_fight("The Ivory Wyvern", boss, 7);
+        near.started_at = 350_000;
+        near.ended_at = 395_000;
+        let near_id = db.insert_fight(&near).unwrap();
+
+        // The Mark proves the kill, and only the fragment nearest the bag is
+        // completed so one Mark cannot become several kills.
+        assert_eq!(db.mark_boss_killed_by_mark(7, boss, 400_000).unwrap(), 1);
+        assert_eq!(killed_flag(&db, near_id), 1, "the closest fight completes");
+        assert_eq!(
+            killed_flag(&db, far_id),
+            0,
+            "the other fragment stays escaped"
+        );
+
+        // A different instance, a different boss, and a bag outside the window
+        // all match nothing once the closest fight is scored.
+        assert_eq!(db.mark_boss_killed_by_mark(8, boss, 400_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_mark(7, 12_345, 400_000).unwrap(), 0);
+        assert_eq!(
+            db.mark_boss_killed_by_mark(7, boss, 395_000 + LOOT_LINK_POST_MS + 1)
+                .unwrap(),
+            0
+        );
+        // An unknown instance or boss type is rejected outright.
+        assert_eq!(db.mark_boss_killed_by_mark(0, boss, 400_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_mark(7, 0, 400_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn mark_boss_killed_by_mark_leaves_scored_fights_alone() {
+        let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // `flawless_fight` is already killed (seed 1, 1000..61000).
+        let id = db
+            .insert_fight(&flawless_fight("The Ivory Wyvern", boss, vec![]))
+            .unwrap();
+        assert_eq!(db.mark_boss_killed_by_mark(1, boss, 61_000).unwrap(), 0);
+        assert_eq!(killed_flag(&db, id), 1);
+    }
+
+    #[test]
+    fn mark_loot_completes_the_escaped_boss_on_open() {
+        let Some(mark) = a_boss_mark_id() else {
+            eprintln!("skipping: game assets not available");
+            return;
+        };
+        let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
+        let temp = tempfile::tempdir().unwrap();
+        let combat_path = temp.path().join("combat_history.db");
+        let loot_path = temp.path().join("loot_history.db");
+        write_loot_db_with_drop(&loot_path, 7, boss, 65_000, &[mark]);
+
+        let hit_id;
+        {
+            let mut db = CombatDatabase::open_writer(&combat_path).unwrap();
+            hit_id = db
+                .insert_fight(&escaped_fight("The Ivory Wyvern", boss, 7))
+                .unwrap();
+            // A same-type escaped fight in another instance must stay escaped.
+            db.insert_fight(&escaped_fight("The Ivory Wyvern", boss, 99))
+                .unwrap();
+            assert_eq!(killed_flag(&db, hit_id), 0);
+        }
+
+        // Re-opening paired with the loot DB repairs the run the Mark proves was
+        // killed, and only that run.
+        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(killed_flag(&db, hit_id), 1, "the Mark completes its boss");
+        let killed_in_other_instance: i64 = db
+            .conn
+            .query_row("SELECT killed FROM fights WHERE map_seed = 99", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(killed_in_other_instance, 0, "another instance is untouched");
+        let completed: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM fights WHERE killed = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(db);
+
+        // Idempotent: re-opening changes nothing further.
+        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        let still_completed: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM fights WHERE killed = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(still_completed, completed);
+    }
+
+    #[test]
+    fn mark_loot_is_ignored_without_a_mark_or_a_usable_loot_db() {
+        let Some(mark) = a_boss_mark_id() else {
+            eprintln!("skipping: game assets not available");
+            return;
+        };
+        let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
+        let temp = tempfile::tempdir().unwrap();
+        let combat_path = temp.path().join("combat_history.db");
+
+        let escaped_id;
+        {
+            let mut db = CombatDatabase::open_writer(&combat_path).unwrap();
+            escaped_id = db
+                .insert_fight(&escaped_fight("The Ivory Wyvern", boss, 7))
+                .unwrap();
+        }
+
+        // No loot DB at all: nothing to correlate against.
+        let db = CombatDatabase::open_writer_with_loot(&combat_path, None).unwrap();
+        assert_eq!(killed_flag(&db, escaped_id), 0);
+        drop(db);
+
+        // A bag that holds no Mark proves nothing.
+        let no_mark_path = temp.path().join("no_mark.db");
+        write_loot_db_with_drop(
+            &no_mark_path,
+            7,
+            boss,
+            65_000,
+            &[mark.saturating_add(1_000_000)],
+        );
+        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&no_mark_path)).unwrap();
+        assert_eq!(killed_flag(&db, escaped_id), 0);
+        drop(db);
+
+        // A loot DB with no `loot_items` table is a best-effort no-op, not a
+        // failure: the open succeeds and the fight stays escaped.
+        let unreadable_path = temp.path().join("no_items_table.db");
+        {
+            let conn = Connection::open(&unreadable_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE loot_drops (
+                     id INTEGER PRIMARY KEY, map_seed INTEGER, mob_type INTEGER, timestamp INTEGER);",
+            )
+            .unwrap();
+        }
+        let db =
+            CombatDatabase::open_writer_with_loot(&combat_path, Some(&unreadable_path)).unwrap();
+        assert_eq!(killed_flag(&db, escaped_id), 0);
     }
 
     #[test]

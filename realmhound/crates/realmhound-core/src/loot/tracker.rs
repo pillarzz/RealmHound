@@ -299,6 +299,10 @@ pub struct LootTracker {
     tracking_settings: LootTrackingSettings,
     /// Recently killed bosses (from the combat tracker) for fight-correlation.
     recent_boss_kills: Vec<RecentBossKill>,
+    /// Every boss fight seen this tick, killed or not. Consulted only by the Mark
+    /// rule: a Mark bag proves its boss died even when the fight was recorded
+    /// Escaped, so it must be able to reach one.
+    recent_boss_fights: Vec<RecentBossKill>,
     /// Live-boss state for Tomb of the Ancients offscreen-death attribution.
     tomb: TombState,
     /// Attribution state for Ice Tomb soul drops.
@@ -326,6 +330,7 @@ impl LootTracker {
             total_bags_seen: 0,
             tracking_settings: LootTrackingSettings::default(),
             recent_boss_kills: Vec::new(),
+            recent_boss_fights: Vec::new(),
             tomb: TombState::default(),
             ice_tomb: IceTombState::default(),
         }
@@ -371,6 +376,14 @@ impl LootTracker {
     /// so Unknown bags can fall back to fight-correlation attribution.
     pub fn set_recent_boss_kills(&mut self, kills: Vec<RecentBossKill>) {
         self.recent_boss_kills = kills;
+    }
+
+    /// Provide every boss fight seen in the current tick, killed or not. The
+    /// difference from [`Self::set_recent_boss_kills`] is the escaped fights:
+    /// only the Mark rule reads them, because a boss's guaranteed Mark proves it
+    /// died even when its kill was never observed.
+    pub fn set_recent_boss_fights(&mut self, fights: Vec<RecentBossKill>) {
+        self.recent_boss_fights = fights;
     }
 
     /// Set callback for new drops.
@@ -911,8 +924,9 @@ impl LootTracker {
         ) {
             return Some(hit);
         }
-        Self::resolve_boss_override_with(
+        Self::resolve_boss_override_with_fights(
             &self.recent_boss_kills,
+            &self.recent_boss_fights,
             bag_type,
             dungeon,
             prior_mob_type,
@@ -985,8 +999,40 @@ impl LootTracker {
         now_ms: i64,
         mv_umi_latched: bool,
     ) -> Option<(i32, String)> {
+        Self::resolve_boss_override_with_fights(
+            recent_boss_kills,
+            &[],
+            bag_type,
+            dungeon,
+            prior_mob_type,
+            item_ids,
+            map_seed,
+            now_ms,
+            mv_umi_latched,
+        )
+    }
+
+    /// [`Self::resolve_boss_override_with`] plus the instance's *escaped* boss
+    /// fights, which only the Mark rule may consult: a Mark bag proves its boss
+    /// died this instance, so it must be able to reach a fight the combat tracker
+    /// recorded as Escaped (killed offscreen, party-scaled HP plus a burst death,
+    /// or a late join that never saw the killing ticks). Every other rule keeps
+    /// seeing recorded kills only, so the live attribution is unchanged for them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_boss_override_with_fights(
+        recent_boss_kills: &[RecentBossKill],
+        escaped_boss_fights: &[RecentBossKill],
+        bag_type: LootBagType,
+        dungeon: &str,
+        prior_mob_type: i32,
+        item_ids: &[i32],
+        map_seed: i32,
+        now_ms: i64,
+        mv_umi_latched: bool,
+    ) -> Option<(i32, String)> {
         let (object_type, name) = Self::attribute_bag_to_boss(
             recent_boss_kills,
+            escaped_boss_fights,
             bag_type,
             dungeon,
             prior_mob_type,
@@ -1003,6 +1049,7 @@ impl LootTracker {
     #[allow(clippy::too_many_arguments)]
     fn attribute_bag_to_boss(
         recent_boss_kills: &[RecentBossKill],
+        escaped_boss_fights: &[RecentBossKill],
         bag_type: LootBagType,
         dungeon: &str,
         prior_mob_type: i32,
@@ -1036,12 +1083,16 @@ impl LootTracker {
         // drop even if proximity left it Unknown or pinned it to a nearby
         // minion. The Mark itself proves the main boss died this instance;
         // attribute the bag to the boss the combat tracker recorded killed here
-        // (variant-safe: e.g. Archdemon Malphas vs Malphas, Gilded Forgemaster).
+        // (variant-safe: e.g. Archdemon Malphas vs Malphas, Gilded Forgemaster),
+        // or -- since the Mark proves the kill -- to the escaped fight the tracker
+        // could not score as killed.
         // Curated dungeons run their own Mark logic (Geb, Soulwarden) below, so
         // skip them here. Legacy bags with no recorded kill are handled by the
         // per-dungeon consensus migration instead.
         if !super::has_curated_boss_attribution(dungeon) && super::bag_has_boss_mark(item_ids) {
-            if let Some(hit) = Self::select_last_boss_in_instance(recent_boss_kills, map_seed) {
+            if let Some(hit) = Self::select_last_boss_in_instance(recent_boss_kills, map_seed)
+                .or_else(|| Self::select_last_boss_in_instance(escaped_boss_fights, map_seed))
+            {
                 return Some(hit);
             }
         }
@@ -2973,6 +3024,43 @@ mod tests {
         let mut tracker = LootTracker::new();
         let hit = tracker.resolve_ice_tomb_attribution(LootBagType::Brown, 0, &[5139]);
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn mark_bag_attributes_to_an_escaped_boss_fight() {
+        // The Mark proves the boss died even though the tracker could not score
+        // the kill, so an Unknown bag resolves to the instance's escaped fight.
+        let assets = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        let _ = assets.try_load();
+        let Some(mark) = assets.boss_mark_item_ids().into_iter().min() else {
+            eprintln!("skipping: game assets not available");
+            return;
+        };
+        let escaped = vec![RecentBossKill {
+            map_seed: 42,
+            object_type: 30_026,
+            name: "Ivory Wyvern".to_string(),
+            started_at_ms: 1_000,
+            ended_at_ms: 61_000,
+        }];
+        let hit = LootTracker::resolve_boss_override_with_fights(
+            &[],
+            &escaped,
+            LootBagType::White,
+            "Legacy Lair of Draconis",
+            0,
+            &[mark],
+            42,
+            61_000,
+            false,
+        );
+        assert_eq!(
+            hit.as_ref().map(|(object_type, _)| *object_type),
+            Some(30_026)
+        );
     }
 
     #[test]

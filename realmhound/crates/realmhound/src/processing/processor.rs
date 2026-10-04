@@ -1038,6 +1038,34 @@ impl PacketProcessor {
         }
     }
 
+    /// The combat tracker's recent fights, split for loot attribution: the bosses
+    /// it scored as killed, and every *other* boss fight seen in the instance
+    /// (recorded as Escaped). Only the Mark rule reads the escaped ones, since a
+    /// guaranteed Mark proves its boss died even when the kill itself was never
+    /// observed (party-scaled HP plus a burst death, or a late join).
+    fn recent_boss_fights_for_loot(&self) -> (Vec<RecentBossKill>, Vec<RecentBossKill>) {
+        let mut kills = Vec::new();
+        let mut escaped = Vec::new();
+        for fight in self.combat.tracker().recent_fights() {
+            if fight.boss_object_type <= 0 {
+                continue;
+            }
+            let record = RecentBossKill {
+                map_seed: fight.map_seed,
+                object_type: fight.boss_object_type,
+                name: fight.boss_name.clone(),
+                started_at_ms: fight.started_at,
+                ended_at_ms: fight.ended_at,
+            };
+            if fight.killed {
+                kills.push(record);
+            } else {
+                escaped.push(record);
+            }
+        }
+        (kills, escaped)
+    }
+
     /// Terminal drain before shutdown: finalize in-flight fights, fold their
     /// tallies, and flush loot buffers. Finalize runs before the fold (reverse of
     /// the live-tick order) so a fight ending at shutdown still contributes.
@@ -1046,21 +1074,9 @@ impl PacketProcessor {
         self.combat.on_tick(now);
         self.fold_deferred_combat();
 
-        let recent_kills: Vec<RecentBossKill> = self
-            .combat
-            .tracker()
-            .recent_fights()
-            .iter()
-            .filter(|f| f.killed && f.boss_object_type > 0)
-            .map(|f| RecentBossKill {
-                map_seed: f.map_seed,
-                object_type: f.boss_object_type,
-                name: f.boss_name.clone(),
-                started_at_ms: f.started_at,
-                ended_at_ms: f.ended_at,
-            })
-            .collect();
+        let (recent_kills, recent_fights) = self.recent_boss_fights_for_loot();
         self.loot_tracker.set_recent_boss_kills(recent_kills);
+        self.loot_tracker.set_recent_boss_fights(recent_fights);
         self.loot_tracker.flush_pending(now as u64);
     }
 
@@ -2771,21 +2787,9 @@ impl PacketProcessor {
                 // Process pending bags and write to database. Feed the loot
                 // tracker the combat tracker's recently killed bosses first so
                 // Unknown bags can fall back to fight-correlation.
-                let recent_kills: Vec<RecentBossKill> = self
-                    .combat
-                    .tracker()
-                    .recent_fights()
-                    .iter()
-                    .filter(|f| f.killed && f.boss_object_type > 0)
-                    .map(|f| RecentBossKill {
-                        map_seed: f.map_seed,
-                        object_type: f.boss_object_type,
-                        name: f.boss_name.clone(),
-                        started_at_ms: f.started_at,
-                        ended_at_ms: f.ended_at,
-                    })
-                    .collect();
+                let (recent_kills, recent_fights) = self.recent_boss_fights_for_loot();
                 self.loot_tracker.set_recent_boss_kills(recent_kills);
+                self.loot_tracker.set_recent_boss_fights(recent_fights);
                 #[cfg(feature = "latency-diagnostics")]
                 let loot_started = std::time::Instant::now();
                 let new_drops = self.loot_tracker.on_tick(time_ms);
@@ -2812,9 +2816,19 @@ impl PacketProcessor {
                     // A core-boss bag latches its realm-event card to Completed
                     // even when the core (e.g. Towering Perfection) was never seen
                     // dying and only its segments were damaged; a Moonlight
-                    // Village bag is what clears the (invulnerable) dancers/Umi.
-                    self.combat
-                        .on_boss_loot(drop.mob_type, drop.player.map_seed, time_ms as i64);
+                    // Village bag is what clears the (invulnerable) dancers/Umi;
+                    // a bag holding the boss's Mark proves the main boss died even
+                    // when its kill was never observed.
+                    self.combat.on_boss_loot(
+                        drop.mob_type,
+                        drop.player.map_seed,
+                        time_ms as i64,
+                        &drop
+                            .items
+                            .iter()
+                            .map(|item| item.item_id)
+                            .collect::<Vec<i32>>(),
+                    );
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
                     if let Some((ref settings, ref catalog)) = enchant_ctx {

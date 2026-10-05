@@ -151,6 +151,19 @@ pub enum AtlasLoadState {
     Ready,
 }
 
+/// What an item unlocks, when it unlocks anything. Drives the tooltip's `OWNED`
+/// tag: forge blueprints and pet stones unlock a *different* object than
+/// themselves, so ownership is tested against the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unlocks {
+    /// The item unlocks nothing: ownership keys on the item id itself.
+    Nothing,
+    /// A forge blueprint; the value is the item id it unlocks.
+    ForgeItem(i32),
+    /// A pet stone; the value is the pet-skin type id it unlocks.
+    PetSkin(i32),
+}
+
 /// Account unlock state backing the item tooltip's `OWNED` tag.
 ///
 /// Built from account data: the wardrobe ids char/list lists (skins, emotes)
@@ -167,32 +180,47 @@ pub struct OwnedUnlocks {
 
 impl OwnedUnlocks {
     /// The tooltip tag state for an item, or `None` when the account does not
-    /// own it. `is_blueprint` says whether `item_id` is a forge blueprint and
-    /// `unlocked_item` the item that blueprint unlocks (the forge lists unlocked
-    /// items, not blueprints).
+    /// own it. `unlocks` says what the item unlocks, when it unlocks anything.
     ///
     /// `Some(false)` is the gold pill: a blueprint unlocked in the regular forge
     /// only, or an owned skin / emote / pet skin (the wardrobe families make no
     /// seasonal distinction). `Some(true)` is the green pill: a blueprint that is
     /// also unlocked in the seasonal forge, i.e. owned in both.
-    fn tag(&self, item_id: i32, is_blueprint: bool, unlocked_item: Option<i32>) -> Option<bool> {
-        if is_blueprint {
-            let unlocked = unlocked_item?;
-            if self.blueprints_seasonal.contains(&unlocked) {
-                return Some(true);
+    fn tag(&self, item_id: i32, unlocks: Unlocks) -> Option<bool> {
+        match unlocks {
+            // The forge lists unlocked items, so a blueprint is matched through
+            // its target.
+            Unlocks::ForgeItem(unlocked) => {
+                if self.blueprints_seasonal.contains(&unlocked) {
+                    return Some(true);
+                }
+                self.blueprints_regular.contains(&unlocked).then_some(false)
             }
-            if self.blueprints_regular.contains(&unlocked) {
-                return Some(false);
-            }
-            return None;
+            // A pet stone and the pet skin it unlocks key on the skin id; the
+            // wardrobe set holds skins, emotes and pet skins alike.
+            Unlocks::PetSkin(skin) => self.wardrobe.contains(&skin).then_some(false),
+            Unlocks::Nothing => self.wardrobe.contains(&item_id).then_some(false),
         }
-        self.wardrobe.contains(&item_id).then_some(false)
     }
 
     /// Rebuild from account data.
     fn from_account_data(account_data: &realmhound_core::vault::AccountData) -> Self {
+        let mut wardrobe: HashSet<i32> = account_data.owned_wardrobe_ids.iter().copied().collect();
+        // A pet wearing a pet skin proves the account owns it, and char/list
+        // carries no pet-skin unlock list (unlike skins and emotes), so the pets'
+        // worn skins are the only bulk evidence.
+        for pet in account_data
+            .characters
+            .regular_pets
+            .values()
+            .chain(account_data.characters.seasonal_pets.values())
+        {
+            if pet.skin > 0 {
+                wardrobe.insert(pet.skin);
+            }
+        }
         Self {
-            wardrobe: account_data.owned_wardrobe_ids.iter().copied().collect(),
+            wardrobe,
             blueprints_regular: account_data
                 .unlocked_blueprints_regular
                 .iter()
@@ -647,13 +675,23 @@ impl SpriteRenderer {
             return None;
         }
         let asset_mgr = get_asset_manager();
-        let obj = asset_mgr.get_object(item_id);
-        let is_blueprint = obj.as_ref().is_some_and(|o| o.is_blueprint());
-        let unlocked_item = is_blueprint
-            .then(|| asset_mgr.blueprint_unlocked_item(item_id))
-            .flatten()
-            .map(|(id, _)| id);
-        self.owned_unlocks.tag(item_id, is_blueprint, unlocked_item)
+        // A pet stone is owned when the pet skin it unlocks is; the stone itself
+        // is consumed on use, so the item's own id proves nothing.
+        if let Some(skin) = asset_mgr.pet_skin_unlocked_id(item_id) {
+            return self.owned_unlocks.tag(item_id, Unlocks::PetSkin(skin));
+        }
+        // A blueprint is owned when the item it unlocks is in a forge list; a
+        // blueprint with no known target cannot be matched.
+        if asset_mgr
+            .get_object(item_id)
+            .is_some_and(|o| o.is_blueprint())
+        {
+            let (unlocked, _) = asset_mgr.blueprint_unlocked_item(item_id)?;
+            return self
+                .owned_unlocks
+                .tag(item_id, Unlocks::ForgeItem(unlocked));
+        }
+        self.owned_unlocks.tag(item_id, Unlocks::Nothing)
     }
 
     /// Refresh the owned-item rarity breakdown from account data. Counts every
@@ -5369,10 +5407,28 @@ mod tests {
     fn owned_tag_marks_wardrobe_items_gold() {
         let owned = unlocks(&[64979, 65040], &[], &[]);
         // A skin or emote the account owns: gold, whatever forge state exists.
-        assert_eq!(owned.tag(64979, false, None), Some(false));
-        assert_eq!(owned.tag(65040, false, None), Some(false));
+        assert_eq!(owned.tag(64979, Unlocks::Nothing), Some(false));
+        assert_eq!(owned.tag(65040, Unlocks::Nothing), Some(false));
         // An item the account does not own gets no tag.
-        assert_eq!(owned.tag(12345, false, None), None);
+        assert_eq!(owned.tag(12345, Unlocks::Nothing), None);
+    }
+
+    #[test]
+    fn owned_tag_marks_pet_stones_by_their_skin() {
+        // A pet stone is keyed on the skin it unlocks, not on the stone's id.
+        const STONE: i32 = 19141;
+        const PET_SKIN: i32 = 19140;
+        let owns_skin = unlocks(&[PET_SKIN], &[], &[]);
+        assert_eq!(
+            owns_skin.tag(STONE, Unlocks::PetSkin(PET_SKIN)),
+            Some(false)
+        );
+        // The unlocked pet skin itself is owned too.
+        assert_eq!(owns_skin.tag(PET_SKIN, Unlocks::Nothing), Some(false));
+        // A stone whose skin is not unlocked carries no tag.
+        let unknown = unlocks(&[], &[], &[]);
+        assert_eq!(unknown.tag(STONE, Unlocks::PetSkin(PET_SKIN)), None);
+        assert_eq!(unknown.tag(PET_SKIN, Unlocks::Nothing), None);
     }
 
     #[test]
@@ -5383,23 +5439,41 @@ mod tests {
         const UNLOCKED_ITEM: i32 = 8386;
         let regular_only = unlocks(&[], &[UNLOCKED_ITEM], &[]);
         assert_eq!(
-            regular_only.tag(BLUEPRINT, true, Some(UNLOCKED_ITEM)),
+            regular_only.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
             Some(false)
         );
         let both = unlocks(&[], &[UNLOCKED_ITEM], &[UNLOCKED_ITEM]);
-        assert_eq!(both.tag(BLUEPRINT, true, Some(UNLOCKED_ITEM)), Some(true));
+        assert_eq!(
+            both.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
+            Some(true)
+        );
         // Unlocked in neither forge: no tag, even though the item is forge gear.
         let neither = unlocks(&[], &[], &[]);
-        assert_eq!(neither.tag(BLUEPRINT, true, Some(UNLOCKED_ITEM)), None);
-        // A blueprint whose unlock target is unknown cannot be matched.
-        assert_eq!(regular_only.tag(BLUEPRINT, true, None), None);
+        assert_eq!(
+            neither.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
+            None
+        );
         // A seasonal entry alone still counts as owned: seasonal unlocks are
         // account-wide.
         let seasonal_only = unlocks(&[], &[], &[UNLOCKED_ITEM]);
         assert_eq!(
-            seasonal_only.tag(BLUEPRINT, true, Some(UNLOCKED_ITEM)),
+            seasonal_only.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
             Some(true)
         );
+    }
+
+    #[test]
+    fn owned_unlocks_include_pet_skins_worn_by_pets() {
+        // char/list has no pet-skin unlock list, so a pet wearing a skin is the
+        // bulk evidence that the account owns it.
+        let mut account_data = realmhound_core::vault::AccountData::default();
+        let mut pet = realmhound_core::vault::CachedPet::default();
+        pet.skin = 19140;
+        account_data.characters.regular_pets.insert(7, pet);
+
+        let mut renderer = SpriteRenderer::new();
+        renderer.update_owned_unlocks(&account_data);
+        assert!(renderer.owned_unlocks.wardrobe.contains(&19140));
     }
 
     #[test]

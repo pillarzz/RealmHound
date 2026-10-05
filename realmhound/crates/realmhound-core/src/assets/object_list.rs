@@ -1103,6 +1103,12 @@ pub struct ObjectList {
     /// in equip.xml. Authoritative (the blueprint's display name doesn't always
     /// match the unlocked item's name).
     blueprint_unlock: HashMap<i32, String>,
+    /// Map from a pet-stone item's object ID to the pet-skin type id it unlocks,
+    /// parsed from `<Activate skinType="N">UnlockPetSkin</Activate>`. Pet stones
+    /// are the "Mini Sphinx Pet Stone" shape: a consumable Equipment item whose
+    /// use adds that skin to the Pet Wardrobe. Lives in `pets.xml` (and a few in
+    /// `equip.xml`).
+    pet_skin_unlock: HashMap<i32, i32>,
     /// Map from ability-item object ID to its locally-computable damaging
     /// effects (DetonateHex / PoisonGrenade), parsed from equip.xml. Only items
     /// that apply hex or deal ability damage are present.
@@ -1121,6 +1127,7 @@ impl ObjectList {
             name_to_id: HashMap::new(),
             display_to_id: HashMap::new(),
             blueprint_unlock: HashMap::new(),
+            pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
         }
@@ -1265,6 +1272,7 @@ impl ObjectList {
             name_to_id,
             display_to_id,
             blueprint_unlock: HashMap::new(),
+            pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
         })
@@ -1522,6 +1530,79 @@ impl ObjectList {
     pub fn blueprint_unlocked_id(&self, id: i32) -> Option<i32> {
         let target = self.blueprint_unlock.get(&id)?;
         self.id_for_name(target)
+    }
+
+    /// The pet-skin type id a pet stone unlocks, from the authoritative
+    /// `<Activate skinType="N">UnlockPetSkin</Activate>` parsed out of `pets.xml`
+    /// and `equip.xml`. Returns `None` when `id` is not a pet stone.
+    pub fn pet_skin_unlocked_id(&self, id: i32) -> Option<i32> {
+        self.pet_skin_unlock.get(&id).copied()
+    }
+
+    /// Merge pet-skin unlock targets from an object XML, accumulating into the
+    /// existing map so it can be called per file.
+    ///
+    /// Only pet stones live in `pets.xml` and `permapets.xml`, which
+    /// [`Self::merge_equipment_xml`] does not read, so this walk is deliberately
+    /// narrow: it records the `item -> pet skin` mapping and nothing else.
+    pub fn merge_pet_skin_unlocks(&mut self, path: &Path) -> Result<usize, String> {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let mut reader = Reader::from_str(&content);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+        let mut current_type_id: Option<i32> = None;
+        let mut in_activate = false;
+        let mut pending_skin: Option<i32> = None;
+        let mut added = 0usize;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => match e.name().as_ref() {
+                    b"Object" => {
+                        current_type_id = e
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"type")
+                            .and_then(|a| parse_hex_type(&String::from_utf8_lossy(&a.value)));
+                    }
+                    b"Activate" => {
+                        in_activate = true;
+                        pending_skin = e
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"skinType")
+                            .and_then(|a| String::from_utf8_lossy(&a.value).parse::<i32>().ok());
+                    }
+                    _ => {}
+                },
+                Ok(Event::Text(ref text)) => {
+                    if in_activate && text.as_ref() == b"UnlockPetSkin" {
+                        if let (Some(item), Some(skin)) = (current_type_id, pending_skin) {
+                            if self.pet_skin_unlock.insert(item, skin).is_none() {
+                                added += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(Event::End(ref e)) => match e.name().as_ref() {
+                    b"Activate" => {
+                        in_activate = false;
+                        pending_skin = None;
+                    }
+                    b"Object" => current_type_id = None,
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(format!("XML parse error: {}", e)),
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(added)
     }
 
     /// Get an object ID for a (case-insensitive) display name, or None.
@@ -1807,6 +1888,8 @@ impl ObjectList {
         let mut pending_activate_id: Option<String> = None;
         let mut current_unlock_target: Option<String> = None;
         let mut unlock_map: HashMap<i32, String> = HashMap::new();
+        let mut current_pet_skin_unlock: Option<i32> = None;
+        let mut pet_skin_map: HashMap<i32, i32> = HashMap::new();
 
         // Damaging ability effects (DetonateHex / PoisonGrenade / Hex) for the
         // current object, and the attributes of the effect element currently
@@ -1866,6 +1949,7 @@ impl ObjectList {
                             current_lethal_strike = None;
                             current_collection_icon = None;
                             current_unlock_target = None;
+                            current_pet_skin_unlock = None;
                             current_ability = AbilityEffects::default();
                             current_rate_of_fire = 1.0;
                             current_num_projectiles = 1;
@@ -2103,6 +2187,10 @@ impl ObjectList {
                         current_lethal_strike = pending_lethal_strike;
                     } else if in_activate && text.as_ref() == "UnlockForgeBlueprint" {
                         current_unlock_target = pending_activate_id.take();
+                    } else if in_activate && text.as_ref() == "UnlockPetSkin" {
+                        current_pet_skin_unlock = pending_attrs
+                            .get("skinType")
+                            .and_then(|v| v.parse::<i32>().ok());
                     } else if in_activate && text.as_ref() == "DetonateHex" {
                         current_ability.detonate_hex = Some(parse_detonate_hex(&pending_attrs));
                     } else if in_activate && text.as_ref() == "PoisonGrenade" {
@@ -2401,6 +2489,9 @@ impl ObjectList {
                                 if let Some(target) = current_unlock_target.take() {
                                     unlock_map.insert(type_id, target);
                                 }
+                                if let Some(skin) = current_pet_skin_unlock.take() {
+                                    pet_skin_map.insert(type_id, skin);
+                                }
                                 if current_ability.has_readout() || current_ability.applies_hex {
                                     ability_map
                                         .insert(type_id, std::mem::take(&mut current_ability));
@@ -2452,6 +2543,9 @@ impl ObjectList {
         }
 
         self.blueprint_unlock = unlock_map;
+        // Extend rather than replace: pet stones are split across equip.xml and
+        // pets.xml, and the latter is merged by `merge_pet_skin_unlocks`.
+        self.pet_skin_unlock.extend(pet_skin_map);
 
         // Resolve deferred BulletCreate entries that reference external
         // projectile objects (type="0xNNNN"). Now that every object is loaded we
@@ -3497,6 +3591,45 @@ mod tests {
         assert_eq!(list.blueprint_unlocked_id(200), Some(100));
         // A non-blueprint item's Shoot activate must not create a mapping.
         assert_eq!(list.blueprint_unlocked_id(100), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_parses_pet_skin_unlock_targets() {
+        // Pet stones are consumables whose `<Activate skinType="N">` names the
+        // pet-skin object they add to the Pet Wardrobe. They live in pets.xml,
+        // which the equipment merge does not read.
+        let mut list = ObjectList::new();
+        let xml = r#"<Objects>
+  <Object type="0x4ac5" id="Mini Sphinx Pet Stone">
+    <DisplayId>Mini Sphinx Pet Skin</DisplayId>
+    <Class>Equipment</Class>
+    <Activate skinType="19140">UnlockPetSkin</Activate>
+  </Object>
+  <Object type="0x4ac4" id="Mini Sphinx Skin">
+    <PetSkin />
+    <Class>PetSkin</Class>
+    <Activate>UnlockPetSkin</Activate>
+  </Object>
+</Objects>"#;
+
+        let dir = std::env::temp_dir().join(format!("rh_petskin_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pets.xml");
+        std::fs::write(&path, xml).unwrap();
+
+        assert_eq!(list.merge_pet_skin_unlocks(&path).unwrap(), 1);
+
+        // 0x4ac5 == 19141 (stone) -> skin 0x4ac4 == 19140.
+        assert_eq!(list.pet_skin_unlocked_id(19141), Some(19140));
+        // The PetSkin object itself unlocks nothing (no skinType attribute), and
+        // an unrelated item has no mapping.
+        assert_eq!(list.pet_skin_unlocked_id(19140), None);
+        assert_eq!(list.pet_skin_unlocked_id(1234), None);
+
+        // Re-merging the same file is idempotent.
+        assert_eq!(list.merge_pet_skin_unlocks(&path).unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

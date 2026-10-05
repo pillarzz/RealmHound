@@ -2510,6 +2510,24 @@ impl AssetManager {
                     }
                 }
 
+                // Merge pet-skin unlock targets. Most pet stones live in
+                // pets.xml, which the equipment merge does not read.
+                let pets_xml_path = assets_dir.join("xml").join("pets.xml");
+                if pets_xml_path.exists() {
+                    match list.merge_pet_skin_unlocks(&pets_xml_path) {
+                        Ok(count) => {
+                            tracing::info!(
+                                "Merged {} pet-skin unlock targets from {:?}",
+                                count,
+                                pets_xml_path
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to merge pet-skin unlocks: {}", e);
+                        }
+                    }
+                }
+
                 *self.objects.write().unwrap() = Some(list);
             }
             Err(e) => {
@@ -2785,6 +2803,15 @@ impl AssetManager {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("Item 0x{item_id:04X}"));
         Some((item_id, name))
+    }
+
+    /// The pet-skin type id a pet stone unlocks, from the authoritative
+    /// `<Activate skinType="N">UnlockPetSkin</Activate>` in `pets.xml` /
+    /// `equip.xml`. Returns `None` when `id` is not a pet stone.
+    pub fn pet_skin_unlocked_id(&self, id: i32) -> Option<i32> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard.as_ref()?.pet_skin_unlocked_id(id)
     }
 
     /// Human-readable dungeon/collection name for a `collectionIcon` frame

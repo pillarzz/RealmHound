@@ -851,6 +851,25 @@ impl PacketProcessor {
                 self.account_data.max_num_chars = data.max_num_chars;
                 self.account_data.next_char_slot_price = data.next_char_slot_price;
                 self.account_data.owned_skins_count = data.owned_skins_count;
+                // char/list is authoritative for the wardrobe (skins + emotes) and
+                // the regular forge unlocks; anything learned live (pet skins via
+                // ReskinUnlock, the seasonal forge list via packet 120) is kept.
+                if !data.owned_skin_ids.is_empty() || !data.owned_emote_ids.is_empty() {
+                    let mut ids: Vec<i32> = data
+                        .owned_skin_ids
+                        .iter()
+                        .chain(data.owned_emote_ids.iter())
+                        .copied()
+                        .collect();
+                    ids.extend(self.account_data.owned_wardrobe_ids.iter().copied());
+                    ids.sort_unstable();
+                    ids.dedup();
+                    self.account_data.owned_wardrobe_ids = ids;
+                }
+                if !data.regular_forge_blueprints.is_empty() {
+                    self.account_data.unlocked_blueprints_regular =
+                        data.regular_forge_blueprints.clone();
+                }
                 if data.account_credits.is_some()
                     || data.account_fame.is_some()
                     || data.account_star.is_some()
@@ -2184,6 +2203,28 @@ impl PacketProcessor {
                 // Drives vault + Treasury live-vault resync.
                 self.vault_view_gen += 1;
             }
+            GameEvent::ForgeUnlockedBlueprints {
+                seasonal_forge,
+                ref item_ids,
+            } => {
+                // The list is authoritative for its forge: entering the Nexus
+                // re-sends it, including entries earned since the last one.
+                if seasonal_forge == 0 {
+                    self.account_data.unlocked_blueprints_regular = item_ids.clone();
+                } else {
+                    self.account_data.unlocked_blueprints_seasonal = item_ids.clone();
+                }
+                self.account_data.bump_generation();
+            }
+            GameEvent::ObjectUnlocked { unlock_id, .. } => {
+                // Live unlock notifications only add ids (unlocks are permanent);
+                // this is what gives pet skins an OWNED tag, since char/list has
+                // no pet-skin list.
+                if unlock_id > 0 && !self.account_data.owned_wardrobe_ids.contains(&unlock_id) {
+                    self.account_data.owned_wardrobe_ids.push(unlock_id);
+                    self.account_data.bump_generation();
+                }
+            }
             GameEvent::TextReceived(ref text) => {
                 // Detect realm-close / lag-warning before from_text_packet filters them out.
                 if text.name.contains("Oryx the Mad God") {
@@ -3220,6 +3261,81 @@ mod dungeon_alert_tests {
         assert_eq!(outline_kind(&modifiers(&["DIMITUS"])), OutlineKind::Golden);
         assert_eq!(outline_kind(&modifiers(&["EXPOSED_1"])), OutlineKind::Red);
         assert_eq!(outline_kind(&modifiers(&["WEAKBOSS_3"])), OutlineKind::Blue);
+    }
+}
+
+#[cfg(test)]
+mod owned_unlock_tests {
+    use super::PacketProcessor;
+    use realmhound_core::vault::AccountData;
+    use realmhound_core::GameEvent;
+
+    /// Packet 120 sends one list per forge; the latest list wins for its forge
+    /// and the other forge's list is untouched.
+    #[test]
+    fn forge_blueprint_lists_are_stored_per_forge() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+
+        processor.dispatch_event(GameEvent::ForgeUnlockedBlueprints {
+            seasonal_forge: 0,
+            item_ids: vec![8386, 4333],
+        });
+        processor.dispatch_event(GameEvent::ForgeUnlockedBlueprints {
+            seasonal_forge: 1,
+            item_ids: vec![306, 8386],
+        });
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_regular,
+            vec![8386, 4333]
+        );
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_seasonal,
+            vec![306, 8386]
+        );
+
+        // Re-entering the Nexus re-sends the regular list; it replaces the old
+        // one (a removed unlock must not linger) without touching the seasonal.
+        processor.dispatch_event(GameEvent::ForgeUnlockedBlueprints {
+            seasonal_forge: 0,
+            item_ids: vec![8386],
+        });
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_regular,
+            vec![8386]
+        );
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_seasonal,
+            vec![306, 8386]
+        );
+    }
+
+    /// Live unlock notifications accumulate once each; they are what gives pet
+    /// skins an OWNED tag, since char/list lists no pet skins.
+    #[test]
+    fn observed_unlocks_accumulate_once() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 1,
+            unlock_id: 64979,
+        });
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 2,
+            unlock_id: 606,
+        });
+        // The same id again (another character, or a re-sent notification).
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 1,
+            unlock_id: 64979,
+        });
+        assert_eq!(processor.account_data.owned_wardrobe_ids, vec![64979, 606]);
+
+        // A nonsense id is ignored.
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 1,
+            unlock_id: 0,
+        });
+        assert_eq!(processor.account_data.owned_wardrobe_ids.len(), 2);
     }
 }
 
@@ -4381,6 +4497,42 @@ mod isolation_gate_tests {
             scope: scope(key, &other_id, 5),
         });
         assert_eq!(p.last_mission_gen, 0, "foreign server id rejected");
+    }
+
+    /// char/list is authoritative for the wardrobe (skins + emotes) and the
+    /// regular forge list, while unlocks learned live (pet skins, the seasonal
+    /// forge list, which char/list does not carry) survive the refresh.
+    #[test]
+    fn api_account_data_merges_the_unlock_lists() {
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        // Learned live before the API refresh: a pet skin unlock and the
+        // seasonal forge list.
+        p.account_data.owned_wardrobe_ids = vec![606];
+        p.account_data.unlocked_blueprints_seasonal = vec![8386];
+
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            owned_skin_ids: vec![872, 9012],
+            owned_emote_ids: vec![49678],
+            regular_forge_blueprints: vec![8386, 4333],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert_eq!(
+            p.account_data.owned_wardrobe_ids,
+            vec![606, 872, 9012, 49678],
+            "char/list ids merge with the live pet-skin unlock"
+        );
+        assert_eq!(p.account_data.unlocked_blueprints_regular, vec![8386, 4333]);
+        assert_eq!(
+            p.account_data.unlocked_blueprints_seasonal,
+            vec![8386],
+            "char/list has no seasonal list, so it must not clear one"
+        );
     }
 
     /// A stale API account-data completion (older generation) is rejected.

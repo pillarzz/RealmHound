@@ -214,6 +214,14 @@ pub struct AccountData {
     pub next_char_slot_price: i32,
     /// Number of skins owned (`OwnedSkins`, comma-separated id list).
     pub owned_skins_count: i32,
+    /// Skin object ids the account owns (`OwnedSkins`), for the tooltip's
+    /// account-owned tag. Empty when the response carried no list.
+    pub owned_skin_ids: Vec<i32>,
+    /// Emote object ids the account owns (`OwnedEmotes`).
+    pub owned_emote_ids: Vec<i32>,
+    /// Item ids whose forge blueprint is unlocked in the regular forge
+    /// (`RegularForgeFireBlueprints`, the same set packet 120 sends).
+    pub regular_forge_blueprints: Vec<i32>,
     /// Account gold (`Credits`), when present in the char/list response.
     pub account_credits: Option<i32>,
     /// Account fame (`Fame`), when present in the char/list response.

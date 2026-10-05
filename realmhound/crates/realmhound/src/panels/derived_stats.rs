@@ -762,38 +762,7 @@ fn object_icon(ui: &mut egui::Ui, sr: &mut SpriteRenderer, id: i32, size: f32) -
 /// rect, CAPS white text centered vertically + horizontally with a 1px black
 /// outline (e.g. SEASONAL / CRUCIBLE).
 fn status_pill(ui: &mut egui::Ui, text: &str, r: u8, g: u8, b: u8) {
-    let font = egui::FontId::proportional(11.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE);
-    let size = galley.size() + egui::vec2(10.0, 4.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
-
-    let center = rect.center();
-    let outline = Color32::from_black_alpha(220);
-    for dx in [-1.0f32, 0.0, 1.0] {
-        for dy in [-1.0f32, 0.0, 1.0] {
-            if dx == 0.0 && dy == 0.0 {
-                continue;
-            }
-            ui.painter().text(
-                center + egui::vec2(dx, dy),
-                egui::Align2::CENTER_CENTER,
-                text,
-                font.clone(),
-                outline,
-            );
-        }
-    }
-    ui.painter().text(
-        center,
-        egui::Align2::CENTER_CENTER,
-        text,
-        font,
-        Color32::WHITE,
-    );
+    crate::ui_ext::status_pill(ui, text, Color32::from_rgb(r, g, b));
 }
 
 /// Seasonal / Crucible marker pills. Drawn just below the ATTRIBUTES header.

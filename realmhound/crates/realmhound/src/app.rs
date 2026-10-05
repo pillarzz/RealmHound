@@ -9118,6 +9118,8 @@ impl RealmHoundApp {
 
         self.sprite_renderer
             .update_owned_rarities(&self.account_data);
+        self.sprite_renderer
+            .update_owned_unlocks(&self.account_data);
 
         let api_refresh_allowed = self.client_relaunched_today();
         let mut ctx = PanelContext {

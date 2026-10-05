@@ -3232,10 +3232,11 @@ impl CombatHistoryPanel {
                     }
 
                     // Bare gear icons (no slot frame) with rarity gems +
-                    // item/enchant hover. Suppress the "Owned rarity" tooltip
-                    // section: this is another player's gear, not the app-user's.
+                    // item/enchant hover. Suppress account-owned tooltip info
+                    // ("Owned rarity" + the OWNED tag): this is another player's
+                    // gear, not the app-user's.
                     let gear_resp = ui.horizontal(|ui| {
-                        ctx.sprite_renderer.set_hide_owned_rarity(true);
+                        ctx.sprite_renderer.set_hide_owned_info(true);
                         for (slot, &eq) in p.equipment.iter().enumerate() {
                             if eq > 0 {
                                 let ench: Vec<i32> = p
@@ -3252,7 +3253,7 @@ impl CombatHistoryPanel {
                                 );
                             }
                         }
-                        ctx.sprite_renderer.set_hide_owned_rarity(false);
+                        ctx.sprite_renderer.set_hide_owned_info(false);
                     });
                     track(gear_resp.response.rect, &mut row_rect);
 

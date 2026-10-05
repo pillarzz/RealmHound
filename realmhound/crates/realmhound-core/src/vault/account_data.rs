@@ -102,6 +102,23 @@ pub struct AccountData {
     #[serde(default)]
     pub owned_skins_count: i32,
 
+    /// Wardrobe object ids the account owns, used for the tooltip's `OWNED`
+    /// tag: skins (`OwnedSkins`) and emotes (`OwnedEmotes`) from char/list, plus
+    /// unlock packets observed live (`ReskinUnlock`), which is the only source
+    /// for pet skins (no bulk list exists).
+    #[serde(default)]
+    pub owned_wardrobe_ids: Vec<i32>,
+
+    /// Item ids whose forge blueprint is unlocked in the regular forge. Sourced
+    /// from char/list (`RegularForgeFireBlueprints`) and packet 120.
+    #[serde(default)]
+    pub unlocked_blueprints_regular: Vec<i32>,
+
+    /// Item ids whose forge blueprint is unlocked in the seasonal forge, from
+    /// packet 120 (the char/list response has no seasonal counterpart).
+    #[serde(default)]
+    pub unlocked_blueprints_seasonal: Vec<i32>,
+
     /// Dirty flag - true if data changed since last save.
     /// Not serialized - always starts false on load.
     #[serde(skip)]
@@ -123,6 +140,9 @@ impl Default for AccountData {
             max_num_chars: 0,
             next_char_slot_price: 0,
             owned_skins_count: 0,
+            owned_wardrobe_ids: Vec::new(),
+            unlocked_blueprints_regular: Vec::new(),
+            unlocked_blueprints_seasonal: Vec::new(),
             dirty: false,
         }
     }

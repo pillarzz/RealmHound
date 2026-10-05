@@ -201,6 +201,25 @@ pub enum GameEvent {
         vault_type: VaultType,
     },
 
+    /// Forge-unlocked blueprints received when entering the Nexus (packet 120).
+    ForgeUnlockedBlueprints {
+        /// Forge the list belongs to: `1` = seasonal forge, `0` = regular forge.
+        seasonal_forge: u8,
+        /// Item ids whose blueprints the account has unlocked in that forge.
+        item_ids: Vec<i32>,
+    },
+
+    /// An object was unlocked for the account (ReskinUnlock packet). Covers the
+    /// wardrobe families the game notifies live — skins (`unlock_type` 1),
+    /// titles (3) and emotes (5) — and is the only source for pet skins, which
+    /// no bulk list exposes.
+    ObjectUnlocked {
+        /// Server-side family code of the unlocked object.
+        unlock_type: u8,
+        /// Object id of the unlocked item.
+        unlock_id: i32,
+    },
+
     /// Chat/text message received (Text packet).
     TextReceived(TextPacket),
 
@@ -645,6 +664,24 @@ impl PacketRouter {
                     }])
                 }
             }
+
+            // ----- ForgeUnlockedBlueprints -----
+            // Sent on entering the Nexus: the items whose blueprints the account
+            // has unlocked, per forge. Backs the item tooltip's OWNED tag.
+            ParsedPacket::ForgeUnlockedBlueprints(p) => {
+                RouteResult::Routed(vec![GameEvent::ForgeUnlockedBlueprints {
+                    seasonal_forge: p.seasonal_forge,
+                    item_ids: p.unlocked_blueprints.clone(),
+                }])
+            }
+
+            // ----- ReskinUnlock -----
+            // A wardrobe item (skin / title / emote / pet skin) was unlocked for
+            // the account; remember it so its tooltip tags the item as owned.
+            ParsedPacket::ReskinUnlock(p) => RouteResult::Routed(vec![GameEvent::ObjectUnlocked {
+                unlock_type: p.unlock_type,
+                unlock_id: p.unlock_id,
+            }]),
 
             // ----- Text -----
             ParsedPacket::Text(text) => {
@@ -1281,11 +1318,11 @@ mod tests {
     use super::*;
     use crate::protocol::data::{PartyPlayerData, QuestData};
     use crate::protocol::packets::{
-        CreatePacket, CreateSuccessPacket, DamagePacket, DeathPacket, EnemyHitPacket, HelloPacket,
-        IncomingPartyMemberInfoPacket, InvSwapPacket, MapInfoPacket, NewCharacterInfoPacket,
-        PartyMemberAddedPacket, QuestFetchResponsePacket, QuestObjectIdPacket,
-        RealmHeroesLeftPacket, RealmScoreUpdatePacket, SlotObjectData, TextPacket,
-        VaultContentPacket,
+        CreatePacket, CreateSuccessPacket, DamagePacket, DeathPacket, EnemyHitPacket,
+        ForgeUnlockedBlueprintsPacket, HelloPacket, IncomingPartyMemberInfoPacket, InvSwapPacket,
+        MapInfoPacket, NewCharacterInfoPacket, PartyMemberAddedPacket, QuestFetchResponsePacket,
+        QuestObjectIdPacket, RealmHeroesLeftPacket, RealmScoreUpdatePacket, ReskinUnlockPacket,
+        SlotObjectData, TextPacket, VaultContentPacket,
     };
     use crate::session::GameSession;
 
@@ -2067,6 +2104,56 @@ mod tests {
         assert_eq!(session.vault.chest_object_id, Some(10));
         assert_eq!(session.vault.material_chest_object_id, Some(11));
         assert_eq!(session.vault.active_vault_page, Some(0));
+    }
+
+    // -- ForgeUnlockedBlueprints / ReskinUnlock --
+
+    #[test]
+    fn forge_unlocked_blueprints_emit_the_forge_list() {
+        let mut router = PacketRouter::new();
+        let mut session = make_session();
+
+        let packet = ParsedPacket::ForgeUnlockedBlueprints(ForgeUnlockedBlueprintsPacket {
+            seasonal_forge: 1,
+            unlocked_blueprints: vec![8386, 4333],
+        });
+        match router.route(&packet, &mut session) {
+            RouteResult::Routed(events) => match &events[0] {
+                GameEvent::ForgeUnlockedBlueprints {
+                    seasonal_forge,
+                    item_ids,
+                } => {
+                    assert_eq!(*seasonal_forge, 1);
+                    assert_eq!(item_ids, &vec![8386, 4333]);
+                }
+                other => panic!("unexpected event {other:?}"),
+            },
+            RouteResult::Unmapped => panic!("Expected Routed"),
+        }
+    }
+
+    #[test]
+    fn reskin_unlock_emits_an_unlock_event() {
+        let mut router = PacketRouter::new();
+        let mut session = make_session();
+
+        let packet = ParsedPacket::ReskinUnlock(ReskinUnlockPacket {
+            unlock_type: 1,
+            unlock_id: 64979,
+        });
+        match router.route(&packet, &mut session) {
+            RouteResult::Routed(events) => match &events[0] {
+                GameEvent::ObjectUnlocked {
+                    unlock_type,
+                    unlock_id,
+                } => {
+                    assert_eq!(*unlock_type, 1);
+                    assert_eq!(*unlock_id, 64979);
+                }
+                other => panic!("unexpected event {other:?}"),
+            },
+            RouteResult::Unmapped => panic!("Expected Routed"),
+        }
     }
 
     // -- Text --

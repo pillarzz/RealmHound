@@ -106,6 +106,15 @@ fn parse_ability_attributes(e: &quick_xml::events::BytesStart<'_>) -> PetAbility
     ability
 }
 
+/// Parse a comma-separated object-id list (char/list's `OwnedSkins`,
+/// `OwnedEmotes`, `RegularForgeFireBlueprints`, ...). Blank and unparsable
+/// entries are skipped.
+fn parse_id_list(text: &str) -> Vec<i32> {
+    text.split(',')
+        .filter_map(|s| s.trim().parse::<i32>().ok())
+        .collect()
+}
+
 /// Parse the char/list XML response into a list of characters.
 /// This is a simplified parser that only returns character data.
 /// Use `parse_account_data` for full account data including vault/storage.
@@ -527,8 +536,15 @@ pub fn parse_account_data(xml: &str) -> Result<AccountData, ParseError> {
                             account_data.next_char_slot_price = text.parse().unwrap_or(0);
                         }
                         "OwnedSkins" => {
+                            account_data.owned_skin_ids = parse_id_list(&text);
                             account_data.owned_skins_count =
-                                text.split(',').filter(|s| !s.trim().is_empty()).count() as i32;
+                                account_data.owned_skin_ids.len() as i32;
+                        }
+                        "OwnedEmotes" => {
+                            account_data.owned_emote_ids = parse_id_list(&text);
+                        }
+                        "RegularForgeFireBlueprints" => {
+                            account_data.regular_forge_blueprints = parse_id_list(&text);
                         }
                         "Credits" => {
                             account_data.account_credits = text.trim().parse().ok();
@@ -747,6 +763,29 @@ mod tests {
         assert_eq!(data.owned_skins_count, 3);
         assert_eq!(data.account_id.as_deref(), Some("ACC-42"));
         assert_eq!(data.account_name.as_deref(), Some("Tester"));
+    }
+
+    #[test]
+    fn test_parse_owned_unlock_lists() {
+        // Real char/list shape: comma-separated object ids, with the regular
+        // forge's unlocked items listed as item ids (not blueprint ids).
+        let xml = r#"
+            <Chars>
+                <Char id="1"><ObjectType>782</ObjectType></Char>
+                <Account>
+                    <AccountId>ACC-7</AccountId>
+                    <OwnedSkins>872,9012,9029</OwnedSkins>
+                    <OwnedEmotes>49678,49681</OwnedEmotes>
+                    <RegularForgeFireBlueprints>8386,4333,306</RegularForgeFireBlueprints>
+                </Account>
+            </Chars>
+        "#;
+
+        let data = parse_account_data(xml).unwrap();
+        assert_eq!(data.owned_skin_ids, vec![872, 9012, 9029]);
+        assert_eq!(data.owned_skins_count, 3);
+        assert_eq!(data.owned_emote_ids, vec![49678, 49681]);
+        assert_eq!(data.regular_forge_blueprints, vec![8386, 4333, 306]);
     }
 
     #[test]

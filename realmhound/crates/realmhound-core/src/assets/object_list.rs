@@ -1103,6 +1103,12 @@ pub struct ObjectList {
     /// in equip.xml. Authoritative (the blueprint's display name doesn't always
     /// match the unlocked item's name).
     blueprint_unlock: HashMap<i32, String>,
+    /// Map from a cosmetic unlocker item's object ID to the cosmetic object it
+    /// unlocks, parsed from `<Activate skinType="N">UnlockSkin</Activate>` in
+    /// `equipSkins.xml`. Skin *items* ("Royal Sorcerer Skin", Equipment class)
+    /// are a different object from the skin they grant, and char/list's
+    /// `OwnedSkins` lists the latter.
+    skin_unlock: HashMap<i32, i32>,
     /// Map from a pet-stone item's object ID to the pet-skin type id it unlocks,
     /// parsed from `<Activate skinType="N">UnlockPetSkin</Activate>`. Pet stones
     /// are the "Mini Sphinx Pet Stone" shape: a consumable Equipment item whose
@@ -1127,6 +1133,7 @@ impl ObjectList {
             name_to_id: HashMap::new(),
             display_to_id: HashMap::new(),
             blueprint_unlock: HashMap::new(),
+            skin_unlock: HashMap::new(),
             pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
@@ -1272,6 +1279,7 @@ impl ObjectList {
             name_to_id,
             display_to_id,
             blueprint_unlock: HashMap::new(),
+            skin_unlock: HashMap::new(),
             pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
@@ -1539,13 +1547,21 @@ impl ObjectList {
         self.pet_skin_unlock.get(&id).copied()
     }
 
-    /// Merge pet-skin unlock targets from an object XML, accumulating into the
-    /// existing map so it can be called per file.
+    /// The skin object id a skin item unlocks, from the authoritative
+    /// `<Activate skinType="N">UnlockSkin</Activate>` parsed out of
+    /// `equipSkins.xml`. Returns `None` when `id` is not a skin item.
+    pub fn skin_unlocked_id(&self, id: i32) -> Option<i32> {
+        self.skin_unlock.get(&id).copied()
+    }
+
+    /// Merge cosmetic unlock targets from an object XML, accumulating into the
+    /// existing maps so it can be called once per file.
     ///
-    /// Only pet stones live in `pets.xml` and `permapets.xml`, which
-    /// [`Self::merge_equipment_xml`] does not read, so this walk is deliberately
-    /// narrow: it records the `item -> pet skin` mapping and nothing else.
-    pub fn merge_pet_skin_unlocks(&mut self, path: &Path) -> Result<usize, String> {
+    /// Handles both kinds: `UnlockSkin` (skin items, `equipSkins.xml`) and
+    /// `UnlockPetSkin` (pet stones, `pets.xml`). Neither file is read by
+    /// [`Self::merge_equipment_xml`], so this walk is deliberately narrow: it
+    /// records the `unlocker -> unlocked object` mappings and nothing else.
+    pub fn merge_cosmetic_unlocks(&mut self, path: &Path) -> Result<usize, String> {
         use quick_xml::events::Event;
         use quick_xml::Reader;
 
@@ -1555,7 +1571,7 @@ impl ObjectList {
         let mut buf = Vec::new();
         let mut current_type_id: Option<i32> = None;
         let mut in_activate = false;
-        let mut pending_skin: Option<i32> = None;
+        let mut pending_target: Option<i32> = None;
         let mut added = 0usize;
 
         loop {
@@ -1570,7 +1586,8 @@ impl ObjectList {
                     }
                     b"Activate" => {
                         in_activate = true;
-                        pending_skin = e
+                        // Both kinds name their target with `skinType`.
+                        pending_target = e
                             .attributes()
                             .flatten()
                             .find(|a| a.key.as_ref() == b"skinType")
@@ -1579,9 +1596,16 @@ impl ObjectList {
                     _ => {}
                 },
                 Ok(Event::Text(ref text)) => {
-                    if in_activate && text.as_ref() == b"UnlockPetSkin" {
-                        if let (Some(item), Some(skin)) = (current_type_id, pending_skin) {
-                            if self.pet_skin_unlock.insert(item, skin).is_none() {
+                    if in_activate {
+                        let map = match text.as_ref() {
+                            b"UnlockSkin" => Some(&mut self.skin_unlock),
+                            b"UnlockPetSkin" => Some(&mut self.pet_skin_unlock),
+                            _ => None,
+                        };
+                        if let (Some(map), Some(item), Some(target)) =
+                            (map, current_type_id, pending_target)
+                        {
+                            if map.insert(item, target).is_none() {
                                 added += 1;
                             }
                         }
@@ -1590,7 +1614,7 @@ impl ObjectList {
                 Ok(Event::End(ref e)) => match e.name().as_ref() {
                     b"Activate" => {
                         in_activate = false;
-                        pending_skin = None;
+                        pending_target = None;
                     }
                     b"Object" => current_type_id = None,
                     _ => {}
@@ -3596,40 +3620,47 @@ mod tests {
     }
 
     #[test]
-    fn merge_parses_pet_skin_unlock_targets() {
-        // Pet stones are consumables whose `<Activate skinType="N">` names the
-        // pet-skin object they add to the Pet Wardrobe. They live in pets.xml,
-        // which the equipment merge does not read.
+    fn merge_parses_cosmetic_unlock_targets() {
+        // Cosmetic unlockers name the cosmetic they grant: a skin item and a
+        // pet stone both via `<Activate skinType="N">`. Neither equipSkins.xml
+        // nor pets.xml is read by the equipment merge.
         let mut list = ObjectList::new();
         let xml = r#"<Objects>
+  <Object type="0x2418" id="Minotaur Skin">
+    <DisplayId>Minotaur Skin</DisplayId>
+    <Class>Equipment</Class>
+    <Activate skinType="9226">UnlockSkin</Activate>
+  </Object>
   <Object type="0x4ac5" id="Mini Sphinx Pet Stone">
     <DisplayId>Mini Sphinx Pet Skin</DisplayId>
     <Class>Equipment</Class>
     <Activate skinType="19140">UnlockPetSkin</Activate>
   </Object>
-  <Object type="0x4ac4" id="Mini Sphinx Skin">
-    <PetSkin />
-    <Class>PetSkin</Class>
-    <Activate>UnlockPetSkin</Activate>
+  <Object type="0x240a" id="Minotaur">
+    <Class>Skin</Class>
+    <Activate>Shoot</Activate>
   </Object>
 </Objects>"#;
 
-        let dir = std::env::temp_dir().join(format!("rh_petskin_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rh_cosmetic_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pets.xml");
+        let path = dir.join("equipSkins.xml");
         std::fs::write(&path, xml).unwrap();
 
-        assert_eq!(list.merge_pet_skin_unlocks(&path).unwrap(), 1);
+        assert_eq!(list.merge_cosmetic_unlocks(&path).unwrap(), 2);
 
-        // 0x4ac5 == 19141 (stone) -> skin 0x4ac4 == 19140.
+        // 0x2418 == 9240 (skin item) -> skin object 9226.
+        assert_eq!(list.skin_unlocked_id(9240), Some(9226));
+        // 0x4ac5 == 19141 (pet stone) -> pet skin 19140.
         assert_eq!(list.pet_skin_unlocked_id(19141), Some(19140));
-        // The PetSkin object itself unlocks nothing (no skinType attribute), and
-        // an unrelated item has no mapping.
-        assert_eq!(list.pet_skin_unlocked_id(19140), None);
-        assert_eq!(list.pet_skin_unlocked_id(1234), None);
+        // The unlocked skin object itself is not an unlocker, and an unrelated
+        // item has no mapping.
+        assert_eq!(list.skin_unlocked_id(9226), None);
+        assert_eq!(list.pet_skin_unlocked_id(9226), None);
+        assert_eq!(list.skin_unlocked_id(1234), None);
 
         // Re-merging the same file is idempotent.
-        assert_eq!(list.merge_pet_skin_unlocks(&path).unwrap(), 0);
+        assert_eq!(list.merge_cosmetic_unlocks(&path).unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

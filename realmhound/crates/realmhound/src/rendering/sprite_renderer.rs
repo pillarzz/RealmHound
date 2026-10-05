@@ -152,16 +152,17 @@ pub enum AtlasLoadState {
 }
 
 /// What an item unlocks, when it unlocks anything. Drives the tooltip's `OWNED`
-/// tag: forge blueprints and pet stones unlock a *different* object than
-/// themselves, so ownership is tested against the target.
+/// tag: forge blueprints, skin items and pet stones unlock a *different* object
+/// than themselves, so ownership is tested against the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unlocks {
-    /// The item unlocks nothing: ownership keys on the item id itself.
+    /// The item unlocks nothing: ownership keys on the item id itself (emotes).
     Nothing,
     /// A forge blueprint; the value is the item id it unlocks.
     ForgeItem(i32),
-    /// A pet stone; the value is the pet-skin type id it unlocks.
-    PetSkin(i32),
+    /// A skin item or pet stone; the value is the cosmetic object it unlocks,
+    /// which is what the account's unlock data lists.
+    Cosmetic(i32),
 }
 
 /// Account unlock state backing the item tooltip's `OWNED` tag.
@@ -196,9 +197,9 @@ impl OwnedUnlocks {
                 }
                 self.blueprints_regular.contains(&unlocked).then_some(false)
             }
-            // A pet stone and the pet skin it unlocks key on the skin id; the
-            // wardrobe set holds skins, emotes and pet skins alike.
-            Unlocks::PetSkin(skin) => self.wardrobe.contains(&skin).then_some(false),
+            // A pet stone or skin item and the cosmetic it unlocks key on the
+            // unlocked object; the set holds skins, emotes and pet skins alike.
+            Unlocks::Cosmetic(target) => self.wardrobe.contains(&target).then_some(false),
             Unlocks::Nothing => self.wardrobe.contains(&item_id).then_some(false),
         }
     }
@@ -673,10 +674,14 @@ impl SpriteRenderer {
     /// own it. See [`OwnedUnlocks::tag`] for what the returned flag means.
     fn owned_tag(&self, item_id: i32) -> Option<bool> {
         let asset_mgr = get_asset_manager();
-        // A pet stone is owned when the pet skin it unlocks is; the stone itself
-        // is consumed on use, so the item's own id proves nothing.
-        if let Some(skin) = asset_mgr.pet_skin_unlocked_id(item_id) {
-            return self.owned_unlocks.tag(item_id, Unlocks::PetSkin(skin));
+        // A skin item is owned when the skin object it unlocks is, and a pet
+        // stone when the pet skin it unlocks is. The items themselves are
+        // consumed on use, so their own ids prove nothing.
+        if let Some(target) = asset_mgr
+            .skin_unlocked_id(item_id)
+            .or_else(|| asset_mgr.pet_skin_unlocked_id(item_id))
+        {
+            return self.owned_unlocks.tag(item_id, Unlocks::Cosmetic(target));
         }
         // A blueprint is owned when the item it unlocks is in a forge list; a
         // blueprint with no known target cannot be matched.
@@ -5412,21 +5417,31 @@ mod tests {
     }
 
     #[test]
-    fn owned_tag_marks_pet_stones_by_their_skin() {
-        // A pet stone is keyed on the skin it unlocks, not on the stone's id.
+    fn owned_tag_marks_cosmetic_unlockers_by_their_target() {
+        // A skin item or pet stone is keyed on the cosmetic object it unlocks,
+        // not on its own id.
+        const SKIN_ITEM: i32 = 9240;
+        const SKIN_OBJECT: i32 = 9226;
         const STONE: i32 = 19141;
         const PET_SKIN: i32 = 19140;
-        let owns_skin = unlocks(&[PET_SKIN], &[], &[]);
+        let owns_skin = unlocks(&[SKIN_OBJECT, PET_SKIN], &[], &[]);
         assert_eq!(
-            owns_skin.tag(STONE, Unlocks::PetSkin(PET_SKIN)),
+            owns_skin.tag(SKIN_ITEM, Unlocks::Cosmetic(SKIN_OBJECT)),
             Some(false)
         );
-        // The unlocked pet skin itself is owned too.
-        assert_eq!(owns_skin.tag(PET_SKIN, Unlocks::Nothing), Some(false));
-        // A stone whose skin is not unlocked carries no tag.
-        let unknown = unlocks(&[], &[], &[]);
-        assert_eq!(unknown.tag(STONE, Unlocks::PetSkin(PET_SKIN)), None);
-        assert_eq!(unknown.tag(PET_SKIN, Unlocks::Nothing), None);
+        assert_eq!(
+            owns_skin.tag(STONE, Unlocks::Cosmetic(PET_SKIN)),
+            Some(false)
+        );
+        // The unlocked skin itself is owned too.
+        assert_eq!(owns_skin.tag(SKIN_OBJECT, Unlocks::Nothing), Some(false));
+        // An unlocker whose target is not unlocked carries no tag.
+        let not_owned = unlocks(&[], &[], &[]);
+        assert_eq!(
+            not_owned.tag(SKIN_ITEM, Unlocks::Cosmetic(SKIN_OBJECT)),
+            None
+        );
+        assert_eq!(not_owned.tag(STONE, Unlocks::Cosmetic(PET_SKIN)), None);
     }
 
     #[test]

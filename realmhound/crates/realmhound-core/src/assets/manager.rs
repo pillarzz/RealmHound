@@ -2510,20 +2510,25 @@ impl AssetManager {
                     }
                 }
 
-                // Merge pet-skin unlock targets. Most pet stones live in
-                // pets.xml, which the equipment merge does not read.
-                let pets_xml_path = assets_dir.join("xml").join("pets.xml");
-                if pets_xml_path.exists() {
-                    match list.merge_pet_skin_unlocks(&pets_xml_path) {
+                // Merge cosmetic unlock targets: skin items (equipSkins.xml) and
+                // pet stones (pets.xml). Neither file is read above, and both
+                // map an unlocker item to a different cosmetic object, the same
+                // way blueprints map to the item they unlock.
+                for name in ["equipSkins.xml", "pets.xml"] {
+                    let path = assets_dir.join("xml").join(name);
+                    if !path.exists() {
+                        continue;
+                    }
+                    match list.merge_cosmetic_unlocks(&path) {
                         Ok(count) => {
                             tracing::info!(
-                                "Merged {} pet-skin unlock targets from {:?}",
+                                "Merged {} cosmetic unlock targets from {:?}",
                                 count,
-                                pets_xml_path
+                                path
                             );
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to merge pet-skin unlocks: {}", e);
+                            tracing::warn!("Failed to merge cosmetic unlocks: {}", e);
                         }
                     }
                 }
@@ -2812,6 +2817,16 @@ impl AssetManager {
         self.try_load();
         let guard = self.objects.read().unwrap();
         guard.as_ref()?.pet_skin_unlocked_id(id)
+    }
+
+    /// The skin object id a skin item unlocks, from the authoritative
+    /// `<Activate skinType="N">UnlockSkin</Activate>` in `equipSkins.xml`.
+    /// Returns `None` when `id` is not a skin item. Char/list's `OwnedSkins`
+    /// lists these skin objects, not the items that grant them.
+    pub fn skin_unlocked_id(&self, id: i32) -> Option<i32> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard.as_ref()?.skin_unlocked_id(id)
     }
 
     /// Human-readable dungeon/collection name for a `collectionIcon` frame

@@ -433,18 +433,46 @@ impl LiveVaultStorage {
         None
     }
 
-    /// Find which gift page matches.
-    pub fn find_matching_gift_page(&self, inventory: &[i32; 8]) -> Option<usize> {
+    /// Map an in-game gift display coordinate `(page, slot)` to the absolute
+    /// index used by `gift_items`.
+    ///
+    /// Gift items are stored **reversed** relative to the packet/in-game page
+    /// order (see [`Self::update_from_packet`]), so a slot the client reports as
+    /// `page * 8 + slot` in packet order corresponds to the mirrored absolute
+    /// index `len - 1 - (page * 8 + slot)`. Returns `None` when the mapped index
+    /// falls outside the stored array.
+    pub fn gift_display_index(&self, page: usize, slot: usize) -> Option<usize> {
+        self.gift_items
+            .len()
+            .checked_sub(1)?
+            .checked_sub(page * 8 + slot)
+    }
+
+    /// Find the in-game gift display page whose contents match `changes` (the
+    /// `(slot, item_id)` list the client reports for the page it is showing).
+    ///
+    /// Unlike the vault/material/potion finders, gifts are stored reversed, so
+    /// matching goes through [`Self::gift_display_index`] rather than the plain
+    /// `page * 8 + slot` layout. Returns `None` if no page matches.
+    pub fn find_matching_gift_display_page(&self, changes: &[(usize, i32)]) -> Option<usize> {
+        if changes.is_empty() || self.gift_items.is_empty() {
+            return None;
+        }
         let num_pages = (self.gift_items.len() + 7) / 8;
         for page in 0..num_pages {
-            let start = page * 8;
             let mut matches = true;
-            for (slot, &item_id) in inventory.iter().enumerate() {
-                let idx = start + slot;
-                let stored_id = self.gift_items.get(idx).map(|i| i.item_id).unwrap_or(-1);
-                if stored_id != item_id {
-                    matches = false;
-                    break;
+            for &(slot, item_id) in changes {
+                match self.gift_display_index(page, slot) {
+                    Some(idx) => {
+                        if self.gift_items.get(idx).map(|i| i.item_id).unwrap_or(-1) != item_id {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        matches = false;
+                        break;
+                    }
                 }
             }
             if matches {
@@ -674,5 +702,74 @@ mod tests {
         assert_eq!(loaded.regular.vault_items[1].enchant_ids, vec![1, 2, 3]);
         assert!(loaded.regular.last_updated.is_some());
         assert_eq!(loaded.seasonal.gift_items[0].item_id, 300);
+    }
+
+    /// Build a VaultContentPacket carrying `gift_contents` in packet order.
+    fn gift_packet(gift_contents: Vec<i32>) -> VaultContentPacket {
+        VaultContentPacket {
+            last_vault_packet: true,
+            vault_chest_object_id: 10,
+            material_chest_object_id: 11,
+            gift_chest_object_id: 12,
+            potion_storage_object_id: 13,
+            seasonal_spoil_chest_object_id: 14,
+            vault_contents: vec![],
+            material_contents: vec![],
+            gift_contents,
+            potion_contents: vec![],
+            seasonal_spoil_contents: vec![],
+            vault_upgrade_cost: 0,
+            material_upgrade_cost: 0,
+            potion_upgrade_cost: 0,
+            current_potion_max: 0,
+            next_potion_max: 0,
+            unknown_short: 0,
+            vault_chest_enchants: String::new(),
+            gift_chest_enchants: String::new(),
+            spoils_chest_enchants: String::new(),
+        }
+    }
+
+    /// Gift items are stored reversed, so the real-time page report (packet
+    /// order) must resolve through the mirrored index mapping. Previously the
+    /// plain layout was used, no page ever matched, and the fallback clobbered
+    /// page 0 (the top row), duplicating the bottom row.
+    #[test]
+    fn gift_status_page_matches_through_reversed_storage() {
+        let packet = gift_packet((100..124).collect()); // 24 gifts = 3 full pages
+        let mut data = LiveVaultData::new();
+        data.update_from_packet(&packet, VaultType::Seasonal);
+        let storage = &data.seasonal;
+
+        // Storage is the reverse of the packet order.
+        assert_eq!(storage.gift_items[0].item_id, 123);
+        assert_eq!(storage.gift_items[23].item_id, 100);
+        assert_eq!(storage.gift_display_index(0, 0), Some(23));
+        assert_eq!(storage.gift_display_index(2, 7), Some(0));
+
+        for page in 0..3usize {
+            let changes: Vec<(usize, i32)> = (0..8)
+                .map(|slot| (slot, 100 + (page * 8 + slot) as i32))
+                .collect();
+            assert_eq!(
+                storage.find_matching_gift_display_page(&changes),
+                Some(page),
+                "display page {page} must resolve through the reversed storage"
+            );
+        }
+    }
+
+    /// A partial last display page maps only its real slots; the padded slots
+    /// beyond the stored length resolve to `None` rather than wrapping.
+    #[test]
+    fn gift_display_index_handles_partial_last_page() {
+        let packet = gift_packet((200..220).collect()); // 20 gifts: last page has 4
+        let mut data = LiveVaultData::new();
+        data.update_from_packet(&packet, VaultType::Seasonal);
+        let storage = &data.seasonal;
+
+        let changes: Vec<(usize, i32)> = (0..4).map(|slot| (slot, 216 + slot as i32)).collect();
+        assert_eq!(storage.find_matching_gift_display_page(&changes), Some(2));
+        assert_eq!(storage.gift_display_index(2, 4), None);
     }
 }

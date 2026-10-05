@@ -2746,18 +2746,22 @@ impl PacketProcessor {
                         let changes = extract_inventory_changes(status);
                         if !changes.is_empty() {
                             let storage = self.account_data.get_vault(vault_type);
-                            if let Some(page) =
-                                detect_page_from_changes(&storage.gift_items, &changes)
-                            {
+                            // Gift items are stored reversed relative to the packet
+                            // order, so match and update through the mirrored index
+                            // mapping. Using the plain page layout here would never
+                            // match and the fallback would clobber page 0 (the row
+                            // shown at the top of the grid).
+                            if let Some(page) = storage.find_matching_gift_display_page(&changes) {
                                 if self.session.vault.active_gift_page != Some(page) {
                                     self.session.vault.active_gift_page = Some(page);
                                 }
                             } else if let Some(page) = self.session.vault.active_gift_page {
                                 let storage = self.account_data.get_vault_mut(vault_type);
                                 for (slot, item_id) in changes {
-                                    let abs_idx = page * 8 + slot;
-                                    if storage.update_gift_slot(abs_idx, item_id) {
-                                        vault_updated = true;
+                                    if let Some(abs_idx) = storage.gift_display_index(page, slot) {
+                                        if storage.update_gift_slot(abs_idx, item_id) {
+                                            vault_updated = true;
+                                        }
                                     }
                                 }
                             }

@@ -39,13 +39,15 @@ pub struct CombatManager {
     /// fights persist, so the signal is buffered and re-applied on every persist;
     /// cleared on map change. See [`crate::assets::encounter_loot_completes`].
     pending_loot_completions: std::collections::HashSet<(i32, &'static str)>,
-    /// Escaped main-boss fights a Mark bag proves were killed, keyed by
-    /// `(map_seed, boss_type, drop timestamp)`. A guaranteed Mark means the boss
-    /// died even when its kill was never observed. Like the loot completions
+    /// Escaped main-boss fights a bag proves were killed, keyed by
+    /// `(map_seed, boss_type, drop timestamp)`. A guaranteed bag means the boss
+    /// died even when its kill was never observed (the bag holds the boss's Mark,
+    /// or the boss is one whose bag alone is proof — see
+    /// [`crate::assets::bag_proves_boss_killed`]). Like the loot completions
     /// above, the bag can register before the fight persists, so the signal is
     /// buffered and re-applied on every persist; cleared on map change. See
-    /// [`CombatDatabase::mark_boss_killed_by_mark`].
-    pending_mark_completions: std::collections::HashSet<(i32, i32, i64)>,
+    /// [`CombatDatabase::mark_boss_killed_by_loot`].
+    pending_kill_proofs: std::collections::HashSet<(i32, i32, i64)>,
 }
 
 /// Tracks the current dungeon run so its elapsed time can be accumulated into
@@ -80,7 +82,7 @@ impl CombatManager {
             dungeon_timer: None,
             pending_dungeon_freeze: None,
             pending_loot_completions: std::collections::HashSet::new(),
-            pending_mark_completions: std::collections::HashSet::new(),
+            pending_kill_proofs: std::collections::HashSet::new(),
         }
     }
 
@@ -247,8 +249,8 @@ impl CombatManager {
         // the signal is dropped, then clear it for the next instance.
         self.apply_pending_loot_completions();
         self.pending_loot_completions.clear();
-        self.apply_pending_mark_completions();
-        self.pending_mark_completions.clear();
+        self.apply_pending_kill_proofs();
+        self.pending_kill_proofs.clear();
         // Close out the run we just left, then arm a timer if the new map is a
         // groupable dungeon instance (Realm / Nexus / hubs are excluded).
         self.flush_dungeon_timer(time_ms);
@@ -269,19 +271,27 @@ impl CombatManager {
     /// bag recorded in the instance is what clears them (or Kitsune Umi, for her
     /// dropper's loot). The finalized fights are persisted here.
     ///
-    /// A bag holding the boss's Mark proves the boss died even when its kill was
-    /// never observed, so the closest escaped fight of that boss is completed.
+    /// A bag whose contents prove the boss died — its Mark, or the guaranteed bag
+    /// of a boss that drops none (Lair of Shaitan's Head, [`BAG_PROVES_KILL`]) —
+    /// completes the closest still-escaped fight of that boss, so a kill that was
+    /// never observed (the local player left the fight before the killing blow, a
+    /// party-scaled burst kill, or a late join) is not stuck as Escaped.
     /// `item_ids` are the bag's contents.
+    ///
+    /// [`BAG_PROVES_KILL`]: crate::assets::bag_proves_boss_killed
     pub fn on_boss_loot(&mut self, mob_type: i32, map_seed: i32, time_ms: i64, item_ids: &[i32]) {
         if map_seed == 0 {
             return;
         }
-        if mob_type > 0 && crate::loot::bag_has_boss_mark(item_ids) {
-            self.pending_mark_completions
+        let proves_kill = mob_type > 0
+            && (crate::loot::bag_has_boss_mark(item_ids)
+                || crate::assets::bag_proves_boss_killed(mob_type));
+        if proves_kill {
+            self.pending_kill_proofs
                 .insert((map_seed, mob_type, time_ms));
             // The fight is usually already persisted (the bag lands after the
             // boss died); the buffer covers loot that arrives first.
-            self.apply_pending_mark_completions();
+            self.apply_pending_kill_proofs();
         }
         let mv_finished = self.tracker.on_instance_loot(mob_type, map_seed, time_ms);
         if !mv_finished.is_empty() {
@@ -316,20 +326,20 @@ impl CombatManager {
         }
     }
 
-    /// Latch `killed` on the escaped fight each buffered Mark bag proves died.
+    /// Latch `killed` on the escaped fight each buffered bag proves died.
     /// Idempotent: a fight stays killed once set, and a signal is kept until it
     /// completes a fight so loot that lands before its fight is persisted still
     /// applies once it is.
-    fn apply_pending_mark_completions(&mut self) {
+    fn apply_pending_kill_proofs(&mut self) {
         let Some(db) = self.database.as_mut() else {
             return;
         };
-        self.pending_mark_completions
+        self.pending_kill_proofs
             .retain(|&(map_seed, boss_type, timestamp)| {
-                match db.mark_boss_killed_by_mark(map_seed, boss_type, timestamp) {
+                match db.mark_boss_killed_by_loot(map_seed, boss_type, timestamp) {
                     Ok(completed) => completed == 0,
                     Err(e) => {
-                        tracing::warn!("[COMBAT] Mark-completion update failed: {}", e);
+                        tracing::warn!("[COMBAT] loot kill-proof update failed: {}", e);
                         false
                     }
                 }
@@ -577,7 +587,7 @@ impl CombatManager {
             // encounters are currently non-Exaltation; if that changes, include
             // every affected run in `changed_cards`.
             self.apply_pending_loot_completions();
-            self.apply_pending_mark_completions();
+            self.apply_pending_kill_proofs();
             let changed_cards: Vec<FightSelection> = changed_cards.into_iter().collect();
             self.reconcile_awards_for_selections(&changed_cards);
             self.reconcile_close_calls();
@@ -804,6 +814,52 @@ mod tests {
         assert!(
             fights[0].killed,
             "the Mark bag completes the escaped fight it proves was killed"
+        );
+    }
+
+    /// The Head of Shaitan drops no Mark, so its guaranteed bag is what completes
+    /// the fight the local player left before the killing blow.
+    #[test]
+    fn bag_loot_completes_a_markless_boss_fight() {
+        const HEAD: i32 = 28058;
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+        let mut escaped = fight("Lair of Shaitan", "Shaitan the Advisor", false);
+        escaped.map_seed = 42;
+        escaped.boss_object_type = HEAD;
+        escaped.killed = false;
+        escaped.reached_zero = false;
+        escaped.started_at = 1_000;
+        escaped.ended_at = 61_000;
+        m.persist(vec![escaped]);
+
+        // The bag lands 25 s after the fight closed, carrying an ordinary drop.
+        m.on_boss_loot(HEAD, 42, 86_000, &[17]);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(
+            fights[0].killed,
+            "the Head's bag completes the escaped fight it proves was killed"
+        );
+        // A bag with no instance (Nexus) proves nothing.
+        let mut nexus_escaped = fight("Lair of Shaitan", "Shaitan the Advisor", false);
+        nexus_escaped.map_seed = 0;
+        nexus_escaped.boss_object_type = HEAD;
+        nexus_escaped.killed = false;
+        nexus_escaped.reached_zero = false;
+        m.persist(vec![nexus_escaped]);
+        m.on_boss_loot(HEAD, 0, 90_000, &[17]);
+        assert!(
+            m.database
+                .as_ref()
+                .unwrap()
+                .recent_fights(10)
+                .unwrap()
+                .iter()
+                .filter(|f| f.map_seed == 0)
+                .all(|f| !f.killed),
+            "a bag outside an instance completes nothing"
         );
     }
 

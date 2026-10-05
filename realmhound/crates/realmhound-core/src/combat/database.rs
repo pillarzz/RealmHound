@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 57;
+pub const SCHEMA_VERSION: i32 = 58;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -531,11 +531,12 @@ impl CombatDatabase {
         // mark such dragons complete from the chest bags they dropped. Idempotent
         // and best-effort, so it runs every open until the loot DB is available.
         self.complete_legacy_lod_dragons_from_loot(loot_path)?;
-        // A main boss's guaranteed Mark proves it died this instance even when its
-        // kill was never observed (party-scaled HP + burst death, or the local
-        // player joining late), so repair fights stored as Escaped from their Mark
-        // bags. Idempotent and best-effort, like the LoD pass above.
-        self.complete_bosses_from_mark_loot(loot_path)?;
+        // A main boss's guaranteed bag proves it died this instance even when its
+        // kill was never observed (the local player left the fight before the
+        // killing blow, party-scaled HP + burst death, or the local player joining
+        // late), so repair fights stored as Escaped from those bags. Idempotent and
+        // best-effort, like the LoD pass above.
+        self.complete_bosses_from_loot(loot_path)?;
         // Legacy Lair of Draconis' Ivory Wyvern portal only drops once all four
         // dragons are defeated, so an Ivory Wyvern fight proves the preceding
         // Lair run was a full clear. Complete such runs from that evidence.
@@ -1367,8 +1368,14 @@ impl CombatDatabase {
             // v56 -> v57: no schema change. The bump re-runs the open-time repair
             // passes on databases written before Mark bags were trusted as proof a
             // main boss died, so runs already stored as Escaped get repaired on
-            // the next open (see `complete_bosses_from_mark_loot`).
+            // the next open (see `complete_bosses_from_loot`).
             self.conn.execute_batch("PRAGMA user_version = 57")?;
+        }
+        if from_version < 58 {
+            // v57 -> v58: no schema change. The same repair now also trusts the
+            // guaranteed bag of a boss that drops no Mark (the Head of Shaitan), so
+            // bumping re-runs it and fixes fights already stored as Escaped.
+            self.conn.execute_batch("PRAGMA user_version = 58")?;
         }
         Ok(())
     }
@@ -2057,14 +2064,16 @@ impl CombatDatabase {
         Ok(())
     }
 
-    /// Complete every main-boss fight a recorded Mark bag proves was killed.
+    /// Complete every main-boss fight a recorded bag proves was killed.
     ///
     /// Mirrors [`Self::complete_legacy_lod_dragons_from_loot`]: it reads the paired
-    /// loot DB (best-effort, a no-op when it is absent or unreadable) for bags
-    /// holding a boss Mark and latches the closest still-escaped fight of the bag's
-    /// attributed boss type in the same instance. Idempotent, so it runs on every
-    /// open; the schema-version bump is what forces one pass over existing history.
-    fn complete_bosses_from_mark_loot(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
+    /// loot DB (best-effort, a no-op when it is absent or unreadable) for bags that
+    /// prove the kill — those holding a boss Mark, and those of the bosses whose
+    /// guaranteed bag is itself proof (see [`crate::assets::bag_proves_boss_killed`])
+    /// — and latches the closest still-escaped fight of the bag's attributed boss
+    /// type in the same instance. Idempotent, so it runs on every open; the
+    /// schema-version bump is what forces one pass over existing history.
+    fn complete_bosses_from_loot(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
         let Some(path) = loot_path else {
             return Ok(());
         };
@@ -2075,7 +2084,8 @@ impl CombatDatabase {
             .boss_mark_item_ids()
             .into_iter()
             .collect();
-        if marks.is_empty() {
+        let bag_types = crate::assets::bag_proves_kill_boss_types();
+        if marks.is_empty() && bag_types.is_empty() {
             return Ok(());
         }
         let loot = match Connection::open_with_flags(
@@ -2086,28 +2096,46 @@ impl CombatDatabase {
         ) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("[COMBAT] Skipping Mark completion; loot DB unreadable: {e}");
+                tracing::warn!("[COMBAT] Skipping loot kill proofs; loot DB unreadable: {e}");
                 return Ok(());
             }
         };
         let _ = loot.busy_timeout(std::time::Duration::from_secs(5));
 
-        let placeholders: Vec<String> = (0..marks.len()).map(|i| format!("?{}", i + 1)).collect();
+        // Either proof selects the drop; the ids are bound in the order the
+        // clauses are appended.
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<i32> = Vec::new();
+        if !bag_types.is_empty() {
+            let placeholders: Vec<String> =
+                (1..=bag_types.len()).map(|i| format!("?{}", i)).collect();
+            clauses.push(format!("mob_type IN ({})", placeholders.join(", ")));
+            binds.extend_from_slice(bag_types);
+        }
+        if !marks.is_empty() {
+            let placeholders: Vec<String> = (binds.len() + 1..=binds.len() + marks.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            clauses.push(format!(
+                "id IN (SELECT drop_id FROM loot_items WHERE item_id IN ({}))",
+                placeholders.join(", ")
+            ));
+            binds.extend_from_slice(&marks);
+        }
         let sql = format!(
             "SELECT map_seed, mob_type, timestamp FROM loot_drops
-             WHERE map_seed != 0 AND mob_type > 0
-               AND id IN (SELECT drop_id FROM loot_items WHERE item_id IN ({}))",
-            placeholders.join(", ")
+             WHERE map_seed != 0 AND mob_type > 0 AND ({})",
+            clauses.join(" OR ")
         );
         let drops: Vec<(i32, i32, i64)> = {
             let mut stmt = match loot.prepare(&sql) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("[COMBAT] Skipping Mark completion; loot query failed: {e}");
+                    tracing::warn!("[COMBAT] Skipping loot kill proofs; loot query failed: {e}");
                     return Ok(());
                 }
             };
-            let rows = match stmt.query_map(rusqlite::params_from_iter(marks.iter()), |r| {
+            let rows = match stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                 Ok((
                     r.get::<_, i32>(0)?,
                     r.get::<_, i32>(1)?,
@@ -2116,7 +2144,7 @@ impl CombatDatabase {
             }) {
                 Ok(rows) => rows,
                 Err(e) => {
-                    tracing::warn!("[COMBAT] Skipping Mark completion; loot read failed: {e}");
+                    tracing::warn!("[COMBAT] Skipping loot kill proofs; loot read failed: {e}");
                     return Ok(());
                 }
             };
@@ -4031,16 +4059,19 @@ impl CombatDatabase {
     }
 
     /// Latch `killed = 1` on the single still-escaped fight of `boss_type` in
-    /// `map_seed` closest to a loot bag that held that boss's Mark. A Mark is a
-    /// guaranteed, exclusive main-boss drop, so the bag proves the boss died this
-    /// instance even when its kill was never observed (party-scaled HP + burst
-    /// death, or the local player joining late).
+    /// `map_seed` closest to a loot bag that proves that boss died. A Mark is a
+    /// guaranteed, exclusive main-boss drop, and some bosses (the Head of
+    /// Shaitan) always bag without dropping one (see
+    /// [`crate::assets::bag_proves_boss_killed`]), so the bag proves the boss died
+    /// this instance even when its kill was never observed — the local player
+    /// left the fight before the killing blow (nexus / disconnect), the fight was
+    /// closed before the boss died, or a party-scaled burst death was never seen.
     ///
     /// Only the closest fight is completed, so a reconnect fragment of the same
-    /// instance cannot turn one Mark into several kills. Idempotent: it ignores
+    /// instance cannot turn one bag into several kills. Idempotent: it ignores
     /// fights already scored as kills, and returns how many rows it changed so a
     /// caller can tell whether the fight existed yet.
-    pub fn mark_boss_killed_by_mark(
+    pub fn mark_boss_killed_by_loot(
         &mut self,
         map_seed: i32,
         boss_type: i32,
@@ -6513,7 +6544,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_boss_killed_by_mark_completes_only_the_closest_escaped_fight() {
+    fn mark_boss_killed_by_loot_completes_only_the_closest_escaped_fight() {
         let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
         let mut db = CombatDatabase::open_in_memory().unwrap();
         let mut far = escaped_fight("The Ivory Wyvern", boss, 7);
@@ -6527,7 +6558,7 @@ mod tests {
 
         // The Mark proves the kill, and only the fragment nearest the bag is
         // completed so one Mark cannot become several kills.
-        assert_eq!(db.mark_boss_killed_by_mark(7, boss, 400_000).unwrap(), 1);
+        assert_eq!(db.mark_boss_killed_by_loot(7, boss, 400_000).unwrap(), 1);
         assert_eq!(killed_flag(&db, near_id), 1, "the closest fight completes");
         assert_eq!(
             killed_flag(&db, far_id),
@@ -6537,28 +6568,94 @@ mod tests {
 
         // A different instance, a different boss, and a bag outside the window
         // all match nothing once the closest fight is scored.
-        assert_eq!(db.mark_boss_killed_by_mark(8, boss, 400_000).unwrap(), 0);
-        assert_eq!(db.mark_boss_killed_by_mark(7, 12_345, 400_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_loot(8, boss, 400_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_loot(7, 12_345, 400_000).unwrap(), 0);
         assert_eq!(
-            db.mark_boss_killed_by_mark(7, boss, 395_000 + LOOT_LINK_POST_MS + 1)
+            db.mark_boss_killed_by_loot(7, boss, 395_000 + LOOT_LINK_POST_MS + 1)
                 .unwrap(),
             0
         );
         // An unknown instance or boss type is rejected outright.
-        assert_eq!(db.mark_boss_killed_by_mark(0, boss, 400_000).unwrap(), 0);
-        assert_eq!(db.mark_boss_killed_by_mark(7, 0, 400_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_loot(0, boss, 400_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_loot(7, 0, 400_000).unwrap(), 0);
     }
 
     #[test]
-    fn mark_boss_killed_by_mark_leaves_scored_fights_alone() {
+    fn mark_boss_killed_by_loot_leaves_scored_fights_alone() {
         let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
         let mut db = CombatDatabase::open_in_memory().unwrap();
         // `flawless_fight` is already killed (seed 1, 1000..61000).
         let id = db
             .insert_fight(&flawless_fight("The Ivory Wyvern", boss, vec![]))
             .unwrap();
-        assert_eq!(db.mark_boss_killed_by_mark(1, boss, 61_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_loot(1, boss, 61_000).unwrap(), 0);
         assert_eq!(killed_flag(&db, id), 1);
+    }
+
+    /// The Head of Shaitan bags but drops no Mark, and the local player can leave
+    /// the fight (nexus / disconnect) seconds before the party kills it: the fight
+    /// then ends well before the bag, yet the bag proves the kill.
+    #[test]
+    fn bag_proves_kill_completes_a_fight_that_ended_before_the_bag() {
+        const HEAD: i32 = 28058;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut left_early = escaped_fight("Lair of Shaitan", HEAD, 11);
+        left_early.started_at = 1_000;
+        left_early.ended_at = 61_000;
+        let id = db.insert_fight(&left_early).unwrap();
+        // An unrelated still-escaped fight in another instance stays escaped.
+        let other = db
+            .insert_fight(&escaped_fight("Lair of Shaitan", HEAD, 12))
+            .unwrap();
+
+        // The bag lands 25 s after the fight closed (it was still 25 s short of
+        // the kill when the player left), which is well past `ended_at`.
+        assert_eq!(db.mark_boss_killed_by_loot(11, HEAD, 86_000).unwrap(), 1);
+        assert_eq!(killed_flag(&db, id), 1, "the bag proves the kill");
+        assert_eq!(killed_flag(&db, other), 0, "another instance is untouched");
+
+        // Idempotent: a second bag of the same kill completes nothing more.
+        assert_eq!(db.mark_boss_killed_by_loot(11, HEAD, 86_002).unwrap(), 0);
+    }
+
+    /// The open-time repair also trusts a mark-less guaranteed bag: a Shaitan fight
+    /// already stored as Escaped is completed from the Head's bag in the loot DB.
+    /// Needs no game assets, since the boss list is curated in the registry.
+    #[test]
+    fn bag_proves_kill_repairs_the_escaped_boss_on_open() {
+        const HEAD: i32 = 28058;
+        let temp = tempfile::tempdir().unwrap();
+        let combat_path = temp.path().join("combat_history.db");
+        let loot_path = temp.path().join("loot_history.db");
+        // The bag carries an ordinary drop, not a Mark: a Mark is not the proof.
+        write_loot_db_with_drop(&loot_path, 11, HEAD, 86_000, &[17]);
+
+        let hit_id;
+        {
+            let mut db = CombatDatabase::open_writer(&combat_path).unwrap();
+            let mut left_early = escaped_fight("Lair of Shaitan", HEAD, 11);
+            left_early.started_at = 1_000;
+            left_early.ended_at = 61_000;
+            hit_id = db.insert_fight(&left_early).unwrap();
+            // A same-type escaped fight in another instance must stay escaped.
+            db.insert_fight(&escaped_fight("Lair of Shaitan", HEAD, 99))
+                .unwrap();
+            assert_eq!(killed_flag(&db, hit_id), 0);
+        }
+
+        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(
+            killed_flag(&db, hit_id),
+            1,
+            "the Head's bag completes its fight"
+        );
+        let killed_in_other_instance: i64 = db
+            .conn
+            .query_row("SELECT killed FROM fights WHERE map_seed = 99", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(killed_in_other_instance, 0, "another instance is untouched");
     }
 
     #[test]

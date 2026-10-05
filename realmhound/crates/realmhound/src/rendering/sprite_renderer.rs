@@ -299,11 +299,12 @@ pub struct SpriteRenderer {
     /// Owned-item rarity breakdown: item_id -> count owned per enchant-slot
     /// rarity (index 0 = Common .. 4 = Divine). Refreshed from account data.
     owned_rarities: HashMap<i32, [u32; 5]>,
-    /// When true, item tooltips omit account-owned info: the "Owned rarity"
-    /// section and the `OWNED` unlock tag. Set by views that show other
-    /// players' gear (e.g. Combat History), where the app-user's own collection
-    /// is irrelevant.
-    hide_owned_info: bool,
+    /// When true, item tooltips omit the "Owned rarity" section. Set by views
+    /// that show other players' gear (e.g. Combat History), where the app-user's
+    /// own collection counts are irrelevant. This is about *equipment rarity*
+    /// counts only: the `OWNED` cosmetic/blueprint tag is unrelated and always
+    /// shows.
+    hide_owned_rarity: bool,
     /// Account generation the `owned_rarities` map was built from (skip recompute).
     owned_rarities_generation: u64,
     /// Account unlock state behind the tooltip's `OWNED` tag.
@@ -369,7 +370,7 @@ impl SpriteRenderer {
             outlined_full_cache: HashMap::new(),
             outlined_fit_cache: HashMap::new(),
             owned_rarities: HashMap::new(),
-            hide_owned_info: false,
+            hide_owned_rarity: false,
             owned_rarities_generation: u64::MAX,
             owned_unlocks: OwnedUnlocks::default(),
             owned_unlocks_generation: u64::MAX,
@@ -649,11 +650,12 @@ impl SpriteRenderer {
         get_asset_manager().is_shiny(item_id)
     }
 
-    /// Toggle whether item tooltips include account-owned info: the "Owned
-    /// rarity" section and the `OWNED` unlock tag. Views that display other
-    /// players' gear (Combat History) set this true so neither appears.
-    pub fn set_hide_owned_info(&mut self, hide: bool) {
-        self.hide_owned_info = hide;
+    /// Toggle whether item tooltips include the "Owned rarity" section (the
+    /// app-user's own collection counts). Views that display other players' gear
+    /// (Combat History) set this true so those counts don't appear. Cosmetic and
+    /// blueprint `OWNED` tags are unaffected.
+    pub fn set_hide_owned_rarity(&mut self, hide: bool) {
+        self.hide_owned_rarity = hide;
     }
 
     /// Refresh the account unlock state behind the tooltip's `OWNED` tag: the
@@ -668,12 +670,8 @@ impl SpriteRenderer {
     }
 
     /// The `OWNED` tag state for `item_id`, or `None` when the account does not
-    /// own it (or the view hides account-owned info). See
-    /// [`OwnedUnlocks::tag`] for what the returned flag means.
+    /// own it. See [`OwnedUnlocks::tag`] for what the returned flag means.
     fn owned_tag(&self, item_id: i32) -> Option<bool> {
-        if self.hide_owned_info {
-            return None;
-        }
         let asset_mgr = get_asset_manager();
         // A pet stone is owned when the pet skin it unlocks is; the stone itself
         // is consumed on use, so the item's own id proves nothing.
@@ -4988,7 +4986,7 @@ impl SpriteRenderer {
                 .owned_rarities
                 .get(&item_id)
                 .copied()
-                .filter(|_| !self.hide_owned_info)
+                .filter(|_| !self.hide_owned_rarity)
             {
                 // Owned-rarity breakdown for enchantable equipment the account
                 // owns (Treasury / Characters / Vault and generic tooltips).
@@ -5500,13 +5498,16 @@ mod tests {
     }
 
     #[test]
-    fn hide_owned_info_suppresses_the_tag() {
+    fn the_rarity_toggle_does_not_affect_the_owned_tag() {
+        // The "Owned rarity" suppression is about equipment rarity counts in
+        // other players' gear views; cosmetic/blueprint OWNED tags are separate
+        // and always show.
         let mut renderer = SpriteRenderer::new();
         renderer.owned_unlocks = unlocks(&[64979], &[], &[]);
         assert_eq!(renderer.owned_tag(64979), Some(false));
-        renderer.set_hide_owned_info(true);
-        assert_eq!(renderer.owned_tag(64979), None);
-        renderer.set_hide_owned_info(false);
+        renderer.set_hide_owned_rarity(true);
+        assert_eq!(renderer.owned_tag(64979), Some(false));
+        renderer.set_hide_owned_rarity(false);
         assert_eq!(renderer.owned_tag(64979), Some(false));
     }
 

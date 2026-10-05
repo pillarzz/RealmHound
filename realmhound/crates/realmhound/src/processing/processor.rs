@@ -2225,6 +2225,18 @@ impl PacketProcessor {
                     self.account_data.bump_generation();
                 }
             }
+            GameEvent::PetStoneUsed { item_type } => {
+                // The stone that was just applied unlocks its target pet skin; no
+                // list or notification reports that, so record the skin itself.
+                let skin = realmhound_core::assets::get_asset_manager()
+                    .pet_skin_unlocked_id(item_type);
+                if let Some(skin) = skin.filter(|s| *s > 0) {
+                    if !self.account_data.owned_wardrobe_ids.contains(&skin) {
+                        self.account_data.owned_wardrobe_ids.push(skin);
+                        self.account_data.bump_generation();
+                    }
+                }
+            }
             GameEvent::TextReceived(ref text) => {
                 // Detect realm-close / lag-warning before from_text_packet filters them out.
                 if text.name.contains("Oryx the Mad God") {
@@ -3311,6 +3323,51 @@ mod owned_unlock_tests {
             processor.account_data.unlocked_blueprints_seasonal,
             vec![306, 8386]
         );
+    }
+
+    /// Apply a pet stone (as the client does) and the target pet skin becomes
+    /// owned, so the stone itself then tags OWNED.
+    #[test]
+    fn applying_a_pet_stone_marks_its_skin_owned() {
+        let assets = crate::test_support::asset_manager_guard();
+        let manager = realmhound_core::assets::get_asset_manager();
+        if let Some(dir) = realmhound_core::assets::find_assets_dir() {
+            manager.set_assets_dir(&dir);
+        }
+        if !manager.try_load() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        drop(assets);
+        // A real stone from the live assets, whatever this build ships with.
+        let stone = (0..80_000).find(|id| manager.pet_skin_unlocked_id(*id).is_some());
+        let Some(stone) = stone else {
+            eprintln!("skipping: no pet stones in the assets");
+            return;
+        };
+        let skin = manager.pet_skin_unlocked_id(stone).unwrap();
+
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        assert!(!processor.account_data.owned_wardrobe_ids.contains(&skin));
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: stone });
+        assert!(
+            processor.account_data.owned_wardrobe_ids.contains(&skin),
+            "the applied stone's skin is recorded as owned"
+        );
+        // Applying the same stone again does not duplicate the entry.
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: stone });
+        assert_eq!(
+            processor
+                .account_data
+                .owned_wardrobe_ids
+                .iter()
+                .filter(|id| **id == skin)
+                .count(),
+            1
+        );
+        // A stone with no mapping (or an empty slot) records nothing.
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: -1 });
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: 0 });
     }
 
     /// Live unlock notifications accumulate once each; they are what gives pet

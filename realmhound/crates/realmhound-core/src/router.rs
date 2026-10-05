@@ -220,6 +220,14 @@ pub enum GameEvent {
         unlock_id: i32,
     },
 
+    /// The client applied a pet stone (PetChangeForm packet). Using the stone
+    /// unlocks its target pet skin, which no list or notification reports, so
+    /// the unlocked skin is learned from the stone's item id.
+    PetStoneUsed {
+        /// The stone item's object type (`-1` when the change used no item).
+        item_type: i32,
+    },
+
     /// Chat/text message received (Text packet).
     TextReceived(TextPacket),
 
@@ -682,6 +690,16 @@ impl PacketRouter {
                 unlock_type: p.unlock_type,
                 unlock_id: p.unlock_id,
             }]),
+
+            // ----- PetChangeForm -----
+            // Applying a pet stone unlocks its target pet skin, the one cosmetic
+            // family no list or unlock notification reports. Learn it from the
+            // stone the client sent.
+            ParsedPacket::PetChangeFormMsg(p) => {
+                RouteResult::Routed(vec![GameEvent::PetStoneUsed {
+                    item_type: p.item.item_type,
+                }])
+            }
 
             // ----- Text -----
             ParsedPacket::Text(text) => {
@@ -1320,9 +1338,9 @@ mod tests {
     use crate::protocol::packets::{
         CreatePacket, CreateSuccessPacket, DamagePacket, DeathPacket, EnemyHitPacket,
         ForgeUnlockedBlueprintsPacket, HelloPacket, IncomingPartyMemberInfoPacket, InvSwapPacket,
-        MapInfoPacket, NewCharacterInfoPacket, PartyMemberAddedPacket, QuestFetchResponsePacket,
-        QuestObjectIdPacket, RealmHeroesLeftPacket, RealmScoreUpdatePacket, ReskinUnlockPacket,
-        SlotObjectData, TextPacket, VaultContentPacket,
+        MapInfoPacket, NewCharacterInfoPacket, PartyMemberAddedPacket, PetChangeFormPacket,
+        QuestFetchResponsePacket, QuestObjectIdPacket, RealmHeroesLeftPacket, RealmScoreUpdatePacket,
+        ReskinUnlockPacket, SlotObjectData, TextPacket, VaultContentPacket,
     };
     use crate::session::GameSession;
 
@@ -2150,6 +2168,29 @@ mod tests {
                     assert_eq!(*unlock_type, 1);
                     assert_eq!(*unlock_id, 64979);
                 }
+                other => panic!("unexpected event {other:?}"),
+            },
+            RouteResult::Unmapped => panic!("Expected Routed"),
+        }
+    }
+
+    #[test]
+    fn pet_change_form_reports_the_stone_used() {
+        let mut router = PacketRouter::new();
+        let mut session = make_session();
+
+        let packet = ParsedPacket::PetChangeFormMsg(PetChangeFormPacket {
+            instance_id: 12,
+            new_pet_type: 606,
+            item: SlotObjectData {
+                object_id: 0,
+                slot_id: 4,
+                item_type: 30447,
+            },
+        });
+        match router.route(&packet, &mut session) {
+            RouteResult::Routed(events) => match &events[0] {
+                GameEvent::PetStoneUsed { item_type } => assert_eq!(*item_type, 30447),
                 other => panic!("unexpected event {other:?}"),
             },
             RouteResult::Unmapped => panic!("Expected Routed"),

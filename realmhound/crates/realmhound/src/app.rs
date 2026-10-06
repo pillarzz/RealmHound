@@ -4948,21 +4948,18 @@ impl RealmHoundApp {
 
         shadcn.card(ui, "trophy_hall_view", "View Options", |ui| {
             let compact_resp = shadcn
-                .switch(ui, self.trophy_hall_panel.compact_view_mut(), "Compact view")
+                .switch(
+                    ui,
+                    self.trophy_hall_panel.compact_view_mut(),
+                    "Compact view",
+                )
                 .hover_tip("Hide dungeon name column and collection section names.");
             if compact_resp.changed() {
                 self.persist_trophy_hall_view();
             }
-            let resp = shadcn
-                .switch(
-                    ui,
-                    self.trophy_hall_panel.show_no_collection_dungeons_mut(),
-                    "Show dungeons without collections",
-                )
-                .hover_tip("Show dungeons whose collection is intentionally empty because their drops fully duplicate another dungeon's collection.");
-            if resp.changed() {
-                self.persist_trophy_hall_view();
-            }
+            // The "dungeons without collections" and Legacy toggles live in the
+            // Trophy Hall's own navigation bar, next to the item filters they
+            // belong with.
         });
     }
 

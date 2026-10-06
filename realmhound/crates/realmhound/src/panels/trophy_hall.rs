@@ -833,14 +833,67 @@ impl TrophyHallPanel {
 
     // ------ Rendering ------
 
+    /// The item-group and dungeon-list filters, shared by both pages' navigation
+    /// bars so they keep the same place whether or not a dungeon page is open.
+    /// Returns true when a persisted setting changed.
+    fn render_filter_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        shadcn: &crate::shadcn_ui::Shadcn,
+        sprites: &mut SpriteRenderer,
+    ) -> bool {
+        let mut changed = false;
+        ui.label("Show:");
+        shadcn
+            .tgl(ui, &mut self.show_ut, RichText::new("UT").small())
+            .hover_tip("Show Untiered (UT) items");
+        shadcn
+            .tgl(ui, &mut self.show_st, RichText::new("ST").small())
+            .hover_tip("Show Set Tier (ST) items");
+        sprites.shiny_toggle(ui, shadcn, &mut self.show_shiny, "Show Shiny items");
+
+        // Checkboxes, not pills: the pills filter item categories inside a
+        // collection, while these two change which dungeons are listed.
+        if ui
+            .checkbox(&mut self.show_legacy_dungeons, "Legacy Dungeons")
+            .hover_tip("List the Time Chamber's Legacy dungeons and their retro collections")
+            .changed()
+        {
+            changed = true;
+        }
+        // Stored as "show dungeons with no collection", presented the other way
+        // round so ticking the box hides them instead.
+        let mut hide_without_collection = !self.show_no_collection_dungeons;
+        if ui
+            .checkbox(
+                &mut hide_without_collection,
+                "Hide dungeons without collections",
+            )
+            .hover_tip(
+                "Hide dungeons whose collection is intentionally empty because their drops \
+                 fully duplicate another dungeon's collection",
+            )
+            .changed()
+        {
+            self.show_no_collection_dungeons = !hide_without_collection;
+            changed = true;
+        }
+        changed
+    }
+
     fn render_index(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) -> Vec<AppAction> {
         realmhound_core::prof_function!();
         let mut actions = Vec::new();
         let shadcn = ctx.shadcn;
 
-        // Controls row: view mode + sort dropdown + search + data source
+        // Controls row: filters first (shared with the dungeon page, so they keep
+        // the same place in both), then view mode + sort + search.
         shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
             shadcn.band_row(ui, |ui| {
+                if self.render_filter_group(ui, shadcn, &mut ctx.sprite_renderer) {
+                    actions.push(AppAction::SaveTrophyHallView);
+                }
+                ui.separator();
                 ui.label("View:");
                 egui::ComboBox::from_id_salt("dungeon_view_mode")
                     .selected_text(match self.view_mode {
@@ -926,30 +979,6 @@ impl TrophyHallPanel {
                             }
                         }
                     }
-                }
-                ui.separator();
-                ui.label("Show:");
-                shadcn
-                    .tgl(ui, &mut self.show_ut, RichText::new("UT").small())
-                    .hover_tip("Show Untiered (UT) items");
-                shadcn
-                    .tgl(ui, &mut self.show_st, RichText::new("ST").small())
-                    .hover_tip("Show Set Tier (ST) items");
-                ctx.sprite_renderer.shiny_toggle(
-                    ui,
-                    shadcn,
-                    &mut self.show_shiny,
-                    "Show Shiny items",
-                );
-                // A checkbox, not a pill: the pills filter item categories inside
-                // a collection, while this one adds whole dungeons to the list.
-                let legacy_resp = ui
-                    .checkbox(&mut self.show_legacy_dungeons, "Legacy Dungeons")
-                    .hover_tip(
-                        "List the Time Chamber's Legacy dungeons and their retro collections",
-                    );
-                if legacy_resp.changed() {
-                    actions.push(AppAction::SaveTrophyHallView);
                 }
             });
         });
@@ -1667,7 +1696,7 @@ impl TrophyHallPanel {
         ctx: &mut PanelContext,
         dungeon: &str,
     ) -> Vec<AppAction> {
-        let actions = Vec::new();
+        let mut actions = Vec::new();
 
         // Lazily reload detail cache if cleared by refresh
         if self.detail_cache.is_none() {
@@ -1683,10 +1712,15 @@ impl TrophyHallPanel {
         let shadcn = ctx.shadcn;
 
         // Navigation band, matching the other panels' navigation rows (darker
-        // secondary fill). The dungeon's own details belong in the page header
-        // below, not in this bar.
+        // secondary fill). The filters come first here too, so they sit in the
+        // same place as on the dungeon list; the dungeon's own details belong in
+        // the page header below.
         shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
             shadcn.band_row(ui, |ui| {
+                if self.render_filter_group(ui, shadcn, &mut ctx.sprite_renderer) {
+                    actions.push(AppAction::SaveTrophyHallView);
+                }
+                ui.separator();
                 if shadcn.btn(ui, "← Back").clicked() {
                     self.page = Page::Index;
                     self.detail_cache = None;

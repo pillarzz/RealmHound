@@ -234,14 +234,14 @@ const EXTRA_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
         "Legacy Sprite World",
         &[53186, 53187], // Retro Staff of Extreme Prejudice, Cloak of the Planewalker
     ),
-    ("Legacy Undead Lair", &[53185]),         // Retro Doom Bow
-    ("Legacy Abyss of Demons", &[53199]),     // Retro Demon Blade
-    ("Legacy Deadwater Docks", &[53188]),     // Retro Pirate King's Cutlass
-    ("Legacy The Crawling Depths", &[53189]), // Retro Doku No Ken
-    ("Legacy Woodland Labyrinth", &[53190]),  // Retro Leaf Bow
-    ("Legacy Lair of Shaitan", &[53191]),     // Retro Skull of Endless Torment
+    ("Legacy Undead Lair", &[53185]),              // Retro Doom Bow
+    ("Legacy Abyss of Demons", &[53199]),          // Retro Demon Blade
+    ("Legacy Deadwater Docks & Grotto", &[53188]), // Retro Pirate King's Cutlass
+    ("Legacy The Crawling Depths", &[53189]),      // Retro Doku No Ken
+    ("Legacy Woodland Labyrinth", &[53190]),       // Retro Leaf Bow
+    ("Legacy Lair of Shaitan", &[53191]),          // Retro Skull of Endless Torment
     (
-        "Legacy Lair of Draconis",
+        "Legacy Lair of Draconis & Ivory",
         &[
             53192, // Retro Leaf Dragon Hide Armor
             53193, // Retro Water Dragon Silk Robe
@@ -1022,11 +1022,14 @@ mod tests {
             ("Legacy Sprite World", &[53186, 53187][..]),
             ("Legacy Undead Lair", &[53185][..]),
             ("Legacy Abyss of Demons", &[53199][..]),
-            ("Legacy Deadwater Docks", &[53188][..]),
+            ("Legacy Deadwater Docks & Grotto", &[53188][..]),
             ("Legacy The Crawling Depths", &[53189][..]),
             ("Legacy Woodland Labyrinth", &[53190][..]),
             ("Legacy Lair of Shaitan", &[53191][..]),
-            ("Legacy Lair of Draconis", &[53192, 53193, 53194, 53195][..]),
+            (
+                "Legacy Lair of Draconis & Ivory",
+                &[53192, 53193, 53194, 53195][..],
+            ),
             ("Legacy The Shatters", &[53196, 53197, 53198][..]),
         ] {
             let members = extra(dungeon);

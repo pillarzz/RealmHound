@@ -517,13 +517,23 @@ impl TrophyHallPanel {
         // RealmShark imported drop counts
         if include_realmshark {
             if let Some(rs) = &self.realmshark_data {
-                for (canonical, dungeon) in &rs.dungeons {
+                let registry = realmhound_core::stats::dungeon_registry::get_dungeon_registry();
+                for (raw_key, dungeon) in &rs.dungeons {
+                    // RealmShark keeps its own spellings ("The Realm", "Vault"),
+                    // so run them through the same normalization as the drop rows
+                    // above: otherwise "The Realm" would appear beside
+                    // RealmHound's "Realm" as a second, empty-looking row.
+                    let display = portal_map.normalize_dungeon_name(raw_key);
+                    let canonical = registry.normalize(&display);
+                    if is_non_dungeon_location(&display) {
+                        continue;
+                    }
                     let entry = merged.entry(canonical.clone()).or_insert_with(|| IndexRow {
                         name: canonical.clone(),
                         db_names: Vec::new(),
                         total_items: 0,
                         completions: 0,
-                        difficulty: dungeon_difficulty(canonical),
+                        difficulty: dungeon_difficulty(&canonical),
                         time_ms: 0,
                     });
                     let item_total: i64 = dungeon.items.iter().map(|i| i.total_count).sum();
@@ -1724,20 +1734,24 @@ impl TrophyHallPanel {
                 }
             }
 
-            // Runs: total completions across all characters.
+            // Runs: total completions across all characters. Realm and the Vault
+            // are not completed runs, so they never show a counter (it would
+            // always read "0 runs").
             let completions = self
                 .index_rows
                 .iter()
                 .find(|r| r.name == dungeon)
                 .map(|r| r.completions)
                 .unwrap_or(0);
-            ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-            let runs_label = if completions == 1 {
-                "1 run".to_string()
-            } else {
-                format!("{completions} runs")
-            };
-            ui.label(RichText::new(runs_label).color(Color32::LIGHT_GRAY));
+            if runs_apply_to(dungeon) {
+                ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                let runs_label = if completions == 1 {
+                    "1 run".to_string()
+                } else {
+                    format!("{completions} runs")
+                };
+                ui.label(RichText::new(runs_label).color(Color32::LIGHT_GRAY));
+            }
 
             // Time spent: running per-dungeon counter (RealmHound and/or
             // RealmShark, per the Data Source selector). Hidden when unknown.
@@ -2321,6 +2335,13 @@ fn is_non_dungeon_location(name: &str) -> bool {
     EXCLUDED.iter().any(|&e| name.eq_ignore_ascii_case(e))
 }
 
+/// Whether a "runs" counter means anything for a dungeon row. Realm and the
+/// Vault are permanent locations rather than completed runs, so their header
+/// omits the counter instead of printing "0 runs".
+fn runs_apply_to(dungeon: &str) -> bool {
+    !matches!(dungeon, "Realm" | "Vault")
+}
+
 /// Whether a dungeon row belongs to the Legacy family: the Time Chamber's retro
 /// dungeons and the Legacy Heroic reskins. They are listed by default and can be
 /// filtered out with the panel's "Legacy Dungeons" toggle.
@@ -2353,6 +2374,14 @@ mod gating_tests {
             realmhound_core::settings::TrophyHallSettings::default().show_legacy_dungeons,
             "a fresh settings file must list Legacy dungeons"
         );
+    }
+
+    #[test]
+    fn runs_counter_is_hidden_for_realm_and_vault() {
+        assert!(runs_apply_to("The Nest"));
+        assert!(runs_apply_to("Legacy Spider Den"));
+        assert!(!runs_apply_to("Realm"));
+        assert!(!runs_apply_to("Vault"));
     }
 
     #[test]

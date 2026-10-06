@@ -78,9 +78,26 @@ fn main() {
     for name in &names {
         println!("\n=== {name} ===");
         let mut found: Vec<(i32, bool, String, i32)> = Vec::new();
-        for (id, obj) in list.iter_with_ids() {
-            if obj.name() == name {
-                found.push((*id, obj.is_shiny(), obj.labels.clone(), obj.slot_type));
+        // Accept `0x…` object types, internal id_names ("Retro Doom Bow"), and
+        // display names ("Doom Bow").
+        if let Some(hex) = name
+            .strip_prefix("0x")
+            .or_else(|| name.strip_prefix("0X"))
+            .and_then(|h| i32::from_str_radix(h, 16).ok())
+        {
+            if let Some(obj) = list.get(hex) {
+                found.push((hex, obj.is_shiny(), obj.labels.clone(), obj.slot_type));
+            }
+        } else if let Some(id) = mgr.object_id_for_name(name) {
+            if let Some(obj) = list.get(id) {
+                found.push((id, obj.is_shiny(), obj.labels.clone(), obj.slot_type));
+            }
+        }
+        if found.is_empty() {
+            for (id, obj) in list.iter_with_ids() {
+                if obj.name() == name {
+                    found.push((*id, obj.is_shiny(), obj.labels.clone(), obj.slot_type));
+                }
             }
         }
         found.sort_by_key(|(id, _, _, _)| *id);

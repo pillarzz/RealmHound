@@ -226,6 +226,37 @@ const EXTRA_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
         "The Shatters",
         &[9669, 7512], // The Forgotten Ring + Shiny
     ),
+    // Legacy dungeons are absent from RealmEye's scrape entirely, so these
+    // collections are declared here and nowhere else: `build_all_collections`
+    // picks a dungeon up from this list when the scrape has no entry for it.
+    ("Legacy Spider Den", &[53183, 53184]), // Retro Spider's Eye Ring, Poison Fang Dagger
+    (
+        "Legacy Sprite World",
+        &[53186, 53187], // Retro Staff of Extreme Prejudice, Cloak of the Planewalker
+    ),
+    ("Legacy Undead Lair", &[53185]),         // Retro Doom Bow
+    ("Legacy Abyss of Demons", &[53199]),     // Retro Demon Blade
+    ("Legacy Deadwater Docks", &[53188]),     // Retro Pirate King's Cutlass
+    ("Legacy The Crawling Depths", &[53189]), // Retro Doku No Ken
+    ("Legacy Woodland Labyrinth", &[53190]),  // Retro Leaf Bow
+    ("Legacy Lair of Shaitan", &[53191]),     // Retro Skull of Endless Torment
+    (
+        "Legacy Lair of Draconis",
+        &[
+            53192, // Retro Leaf Dragon Hide Armor
+            53193, // Retro Water Dragon Silk Robe
+            53194, // Retro Fire Dragon Battle Armor
+            53195, // Retro Celestial Blade
+        ],
+    ),
+    (
+        "Legacy The Shatters",
+        &[
+            53196, // Retro The Forgotten Crown
+            53197, // Retro The Twilight Gemstone
+            53198, // Retro Bracer of the Guardian
+        ],
+    ),
 ];
 
 /// Per-dungeon item IDs that are FORGE-CRAFTED rather than dropped, used by
@@ -359,7 +390,14 @@ pub fn build_all_collections() -> HashMap<String, DungeonCollectionDef> {
     let realmeye = get_realmeye_drops();
     let mut result = HashMap::new();
 
-    for dungeon_name in realmeye.all_dungeon_names() {
+    // The scrape is the usual source of dungeon names, but a dungeon it does not
+    // list at all can still have a collection: a Legacy dungeon's retro UTs are
+    // declared entirely by EXTRA_ITEMS_OVERRIDE.
+    let names = realmeye
+        .all_dungeon_names()
+        .chain(EXTRA_ITEMS_OVERRIDE.iter().map(|(name, _)| *name));
+
+    for dungeon_name in names {
         let collection = build_collection_for_dungeon(dungeon_name);
         if !collection.items.is_empty() {
             result.insert(dungeon_name.to_string(), collection);
@@ -964,6 +1002,55 @@ mod tests {
                     "{id} would be sectioned as a forge upgrade in {dungeon}"
                 );
             }
+        }
+    }
+
+    /// The Legacy dungeons are absent from RealmEye's scrape, so their retro UTs
+    /// are declared entirely by the overrides; `build_all_collections` picks the
+    /// dungeon up from that list.
+    #[test]
+    fn legacy_dungeons_declare_their_retro_uts() {
+        let extra = |dungeon: &str| {
+            EXTRA_ITEMS_OVERRIDE
+                .iter()
+                .find(|(name, _)| *name == dungeon)
+                .map(|(_, ids)| *ids)
+                .unwrap_or_else(|| panic!("{dungeon} missing from EXTRA_ITEMS_OVERRIDE"))
+        };
+        for (dungeon, ids) in [
+            ("Legacy Spider Den", &[53183, 53184][..]),
+            ("Legacy Sprite World", &[53186, 53187][..]),
+            ("Legacy Undead Lair", &[53185][..]),
+            ("Legacy Abyss of Demons", &[53199][..]),
+            ("Legacy Deadwater Docks", &[53188][..]),
+            ("Legacy The Crawling Depths", &[53189][..]),
+            ("Legacy Woodland Labyrinth", &[53190][..]),
+            ("Legacy Lair of Shaitan", &[53191][..]),
+            ("Legacy Lair of Draconis", &[53192, 53193, 53194, 53195][..]),
+            ("Legacy The Shatters", &[53196, 53197, 53198][..]),
+        ] {
+            let members = extra(dungeon);
+            for id in ids {
+                assert!(members.contains(id), "{id} missing from {dungeon}");
+            }
+            // None of them is a forge upgrade, so no section list may claim one.
+            let forge_ids = FORGE_UPGRADE_ITEMS
+                .iter()
+                .find(|(name, _)| *name == dungeon)
+                .map(|(_, ids)| *ids)
+                .unwrap_or(&[]);
+            for id in ids {
+                assert!(!forge_ids.contains(id), "{id} in {dungeon} is a drop");
+            }
+        }
+        // Every retro item is a UT, which is what the collection builder keeps.
+        for id in 53183..=53199 {
+            assert!(
+                EXTRA_ITEMS_OVERRIDE
+                    .iter()
+                    .any(|(_, ids)| ids.contains(&id)),
+                "retro item {id} is declared by no dungeon"
+            );
         }
     }
 }

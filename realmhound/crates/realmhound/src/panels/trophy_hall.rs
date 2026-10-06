@@ -885,6 +885,55 @@ impl TrophyHallPanel {
         changed
     }
 
+    /// Indices of the rows the active search and filters keep visible, in
+    /// displayed order. The list, the icon grid and the dungeon page's
+    /// Previous/Next buttons all read the ordering from here so they agree on
+    /// what "previous" and "next" mean.
+    fn visible_indices(&self) -> Vec<usize> {
+        let query_lower = self.search_query.to_lowercase();
+        let show_no_collection = self.show_no_collection_dungeons;
+        let show_legacy = self.show_legacy_dungeons;
+        let collections = &self.collections;
+        self.index_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower))
+            .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
+            .filter(|(_, r)| {
+                show_no_collection
+                    || collections
+                        .get(&r.name)
+                        .map(|c| !c.items.is_empty())
+                        .unwrap_or(true)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The dungeons surrounding the open one in the filtered list, as
+    /// `(name, db_names)` pairs ready to hand to `load_detail`. `None` at either
+    /// end disables that navigation button.
+    fn detail_neighbours(
+        &self,
+        dungeon: &str,
+    ) -> (Option<(String, Vec<String>)>, Option<(String, Vec<String>)>) {
+        let visible = self.visible_indices();
+        let Some(pos) = visible
+            .iter()
+            .position(|&i| self.index_rows[i].name == dungeon)
+        else {
+            return (None, None);
+        };
+        let at = |idx: usize| {
+            let row = &self.index_rows[idx];
+            (row.name.clone(), row.db_names.clone())
+        };
+        (
+            pos.checked_sub(1).map(|p| at(visible[p])),
+            visible.get(pos + 1).copied().map(at),
+        )
+    }
+
     fn render_index(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) -> Vec<AppAction> {
         realmhound_core::prof_function!();
         let mut actions = Vec::new();
@@ -1108,28 +1157,9 @@ impl TrophyHallPanel {
 
     fn render_list_view(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) {
         let portal_map = get_dungeon_portal_map();
-        let query_lower = self.search_query.to_lowercase();
-        let show_no_collection = self.show_no_collection_dungeons;
-        let show_legacy = self.show_legacy_dungeons;
-        let collections = &self.collections;
         let filtered_indices: Vec<usize> = {
             realmhound_core::prof_scope!("dstats_filter");
-            self.index_rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| {
-                    query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower)
-                })
-                .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
-                .filter(|(_, r)| {
-                    show_no_collection
-                        || collections
-                            .get(&r.name)
-                            .map(|c| !c.items.is_empty())
-                            .unwrap_or(true)
-                })
-                .map(|(i, _)| i)
-                .collect()
+            self.visible_indices()
         };
 
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -1236,6 +1266,7 @@ impl TrophyHallPanel {
             ui.add_space(12.0);
 
             if let Some((display_name, db_names)) = navigate_to {
+                self.selected_icon = Some(display_name.clone());
                 self.load_detail(&db_names, ctx.loot_database, &display_name);
                 self.page = Page::Detail { name: display_name };
             }
@@ -1509,28 +1540,7 @@ impl TrophyHallPanel {
 
     fn render_icon_view(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) {
         let portal_map = get_dungeon_portal_map();
-        let query_lower = self.search_query.to_lowercase();
-        let show_no_collection = self.show_no_collection_dungeons;
-        let show_legacy = self.show_legacy_dungeons;
-        let filtered_indices: Vec<usize> = {
-            let collections = &self.collections;
-            self.index_rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| {
-                    query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower)
-                })
-                .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
-                .filter(|(_, r)| {
-                    show_no_collection
-                        || collections
-                            .get(&r.name)
-                            .map(|c| !c.items.is_empty())
-                            .unwrap_or(true)
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
+        let filtered_indices = self.visible_indices();
 
         // Keyboard navigation. The first visible tile is selected as soon as the
         // icon view is shown; the arrow keys cycle through the tiles (wrapping at
@@ -1814,6 +1824,7 @@ impl TrophyHallPanel {
                 });
 
             if let Some((display_name, db_names)) = navigate_to {
+                self.selected_icon = Some(display_name.clone());
                 self.load_detail(&db_names, ctx.loot_database, &display_name);
                 self.page = Page::Detail { name: display_name };
             }
@@ -1851,21 +1862,47 @@ impl TrophyHallPanel {
         }
 
         // Navigation band, matching the other panels' navigation rows (darker
-        // secondary fill). The filters come first here too, so they sit in the
-        // same place as on the dungeon list; the dungeon's own details belong in
-        // the page header below.
+        // secondary fill). Back sits first, as it does in those panels, followed
+        // by Previous/Next walking the same filtered list the dungeon was opened
+        // from; the filters trail behind them. The dungeon's own details belong
+        // in the page header below.
+        let (prev, next) = self.detail_neighbours(dungeon);
+        let mut open: Option<(String, Vec<String>)> = None;
         shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
             shadcn.band_row(ui, |ui| {
-                if self.render_filter_group(ui, shadcn, &mut ctx.sprite_renderer) {
-                    actions.push(AppAction::SaveTrophyHallView);
-                }
-                ui.separator();
                 if shadcn.btn(ui, "← Back").clicked() {
                     self.page = Page::Index;
                     self.detail_cache = None;
                 }
+                if ui
+                    .add_enabled(prev.is_some(), egui::Button::new("<< Previous"))
+                    .clicked()
+                {
+                    open = prev.clone();
+                }
+                if ui
+                    .add_enabled(next.is_some(), egui::Button::new("Next >>"))
+                    .clicked()
+                {
+                    open = next.clone();
+                }
+                ui.separator();
+                if self.render_filter_group(ui, shadcn, &mut ctx.sprite_renderer) {
+                    actions.push(AppAction::SaveTrophyHallView);
+                }
             });
         });
+
+        // Swapping to a neighbour needs both its name and its loot-database rows,
+        // so it happens here rather than inside the band closure. Returning
+        // early avoids drawing this frame's header for the old dungeon while the
+        // body already belongs to the new one.
+        if let Some((name, db_names)) = open {
+            self.selected_icon = Some(name.clone());
+            self.load_detail(&db_names, ctx.loot_database, &name);
+            self.page = Page::Detail { name };
+            return actions;
+        }
 
         // Dungeon page header: portal, name, difficulty, completion, runs and
         // time spent. Kept above the Collection section. It uses the page's own
@@ -2240,64 +2277,72 @@ impl TrophyHallPanel {
     /// Tracked-loot breakdown (per-item drop counts + mob-item table), sourced
     /// via the Data Source selector, shown below the collection on the detail page.
     fn render_detail_body(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext, dungeon: &str) {
-        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            self.render_detail_collection(ui, ctx, dungeon);
+        // Salted per dungeon so Previous/Next open the neighbour at the top
+        // instead of inheriting the previous dungeon's scroll position.
+        ScrollArea::vertical()
+            .auto_shrink(false)
+            .id_salt(("dungeon_detail", dungeon))
+            .show(ui, |ui| {
+                self.render_detail_collection(ui, ctx, dungeon);
 
-            let Some(detail) = &self.detail_cache else {
-                ui.label("No tracked loot drops recorded.");
-                return;
-            };
+                let Some(detail) = &self.detail_cache else {
+                    ui.label("No tracked loot drops recorded.");
+                    return;
+                };
 
-            if detail.items.is_empty() {
-                ui.label("No tracked loot drops recorded.");
-                return;
-            }
+                if detail.items.is_empty() {
+                    ui.label("No tracked loot drops recorded.");
+                    return;
+                }
 
-            ui.heading("All Items");
-            ui.add_space(4.0);
+                ui.heading("All Items");
+                ui.add_space(4.0);
 
-            let available_width = ui.available_width();
-            let tile_width = 46.0;
-            let spacing = 4.0;
-            let cols = (available_width / tile_width).floor().max(1.0) as usize;
-            let row_height = 62.0; // tile + count label
-            let total_rows = (detail.items.len() + cols - 1) / cols;
+                let available_width = ui.available_width();
+                let tile_width = 46.0;
+                let spacing = 4.0;
+                let cols = (available_width / tile_width).floor().max(1.0) as usize;
+                let row_height = 62.0; // tile + count label
+                let total_rows = (detail.items.len() + cols - 1) / cols;
 
-            // Virtualized grid: allocate full height, render only visible rows
-            let (total_rect, _) = ui.allocate_exact_size(
-                egui::vec2(available_width, total_rows as f32 * (row_height + spacing)),
-                egui::Sense::hover(),
-            );
+                // Virtualized grid: allocate full height, render only visible rows
+                let (total_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(available_width, total_rows as f32 * (row_height + spacing)),
+                    egui::Sense::hover(),
+                );
 
-            let clip_rect = ui.clip_rect();
-            let first_visible_row = ((clip_rect.top() - total_rect.top()) / (row_height + spacing))
-                .floor()
-                .max(0.0) as usize;
-            let last_visible_row = ((clip_rect.bottom() - total_rect.top())
-                / (row_height + spacing))
-                .ceil()
-                .min(total_rows as f32) as usize;
+                let clip_rect = ui.clip_rect();
+                let first_visible_row = ((clip_rect.top() - total_rect.top())
+                    / (row_height + spacing))
+                    .floor()
+                    .max(0.0) as usize;
+                let last_visible_row = ((clip_rect.bottom() - total_rect.top())
+                    / (row_height + spacing))
+                    .ceil()
+                    .min(total_rows as f32) as usize;
 
-            for row in first_visible_row..last_visible_row {
-                let row_start = row * cols;
-                let row_end = (row_start + cols).min(detail.items.len());
-                let row_y = total_rect.top() + row as f32 * (row_height + spacing);
+                for row in first_visible_row..last_visible_row {
+                    let row_start = row * cols;
+                    let row_end = (row_start + cols).min(detail.items.len());
+                    let row_y = total_rect.top() + row as f32 * (row_height + spacing);
 
-                for (col, item_idx) in (row_start..row_end).enumerate() {
-                    let item = &detail.items[item_idx];
-                    let tile_x = total_rect.left() + col as f32 * tile_width;
-                    let tile_rect = egui::Rect::from_min_size(
-                        egui::pos2(tile_x, row_y),
-                        egui::vec2(tile_width, row_height),
-                    );
+                    for (col, item_idx) in (row_start..row_end).enumerate() {
+                        let item = &detail.items[item_idx];
+                        let tile_x = total_rect.left() + col as f32 * tile_width;
+                        let tile_rect = egui::Rect::from_min_size(
+                            egui::pos2(tile_x, row_y),
+                            egui::vec2(tile_width, row_height),
+                        );
 
-                    let mut child_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(tile_rect)
-                            .layout(egui::Layout::top_down(egui::Align::Center)),
-                    );
-                    let rarity_counts: Vec<(u8, &str, u32)> =
-                        if detail.enchantable.contains(&item.item_id) {
+                        let mut child_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(tile_rect)
+                                .layout(egui::Layout::top_down(egui::Align::Center)),
+                        );
+                        let rarity_counts: Vec<(u8, &str, u32)> = if detail
+                            .enchantable
+                            .contains(&item.item_id)
+                        {
                             detail
                                 .rarity_breakdowns
                                 .get(&item.item_id)
@@ -2313,99 +2358,103 @@ impl TrophyHallPanel {
                         } else {
                             Vec::new()
                         };
-                    ctx.sprite_renderer.render_item_tile_with_rarity_counts(
-                        &mut child_ui,
-                        item.item_id,
-                        Some(&item.item_name),
-                        &rarity_counts,
-                    );
-                    child_ui.label(
-                        RichText::new(format!("×{}", item.total_count))
-                            .size(10.0)
-                            .color(Color32::LIGHT_GRAY),
-                    );
-                }
-            }
-
-            if !detail.mob_items.is_empty() {
-                ui.add_space(12.0);
-                ui.heading("Drops By Monster");
-                ui.add_space(4.0);
-
-                let mut i = 0;
-                while i < detail.mob_items.len() {
-                    let mob_name = detail.mob_items[i].mob_name.clone();
-                    let mob_type = detail.mob_items[i].mob_type;
-
-                    let start = i;
-                    while i < detail.mob_items.len() && detail.mob_items[i].mob_name == mob_name {
-                        i += 1;
+                        ctx.sprite_renderer.render_item_tile_with_rarity_counts(
+                            &mut child_ui,
+                            item.item_id,
+                            Some(&item.item_name),
+                            &rarity_counts,
+                        );
+                        child_ui.label(
+                            RichText::new(format!("×{}", item.total_count))
+                                .size(10.0)
+                                .color(Color32::LIGHT_GRAY),
+                        );
                     }
-
-                    let header_id = egui::Id::new(format!("mob_section_{}_{}", mob_type, start));
-                    egui::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        header_id,
-                        false,
-                    )
-                    .show_header(ui, |ui| {
-                        let sprite_type =
-                            realmhound_core::assets::normalize_train_sprite(mob_type, &mob_name);
-                        render_mob_sprite(ui, sprite_type, ctx.sprite_renderer);
-                        ui.label(RichText::new(&mob_name).strong());
-                    })
-                    .body(|ui| {
-                        egui::Grid::new(format!("mob_items_{}_{}", mob_type, start))
-                            .num_columns(cols)
-                            .spacing(egui::vec2(4.0, 4.0))
-                            .show(ui, |ui| {
-                                for (j, idx) in (start..i).enumerate() {
-                                    if j > 0 && j % cols == 0 {
-                                        ui.end_row();
-                                    }
-                                    let mob_item = &detail.mob_items[idx];
-                                    ui.vertical(|ui| {
-                                        let rarity_counts: Vec<(u8, &str, u32)> =
-                                            if detail.enchantable.contains(&mob_item.item_id) {
-                                                detail
-                                                    .rarity_breakdowns
-                                                    .get(&mob_item.item_id)
-                                                    .map(|breakdown| {
-                                                        breakdown
-                                                            .iter()
-                                                            .map(|&(slots, count)| {
-                                                                (
-                                                                    slots as u8,
-                                                                    rarity_name(slots as u8),
-                                                                    count as u32,
-                                                                )
-                                                            })
-                                                            .collect()
-                                                    })
-                                                    .unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            };
-                                        ctx.sprite_renderer.render_item_tile_with_rarity_counts(
-                                            ui,
-                                            mob_item.item_id,
-                                            Some(&mob_item.item_name),
-                                            &rarity_counts,
-                                        );
-                                        ui.label(
-                                            RichText::new(format!("×{}", mob_item.count))
-                                                .size(10.0)
-                                                .color(Color32::LIGHT_GRAY),
-                                        );
-                                    });
-                                }
-                            });
-                    });
-
-                    ui.add_space(4.0);
                 }
-            }
-        });
+
+                if !detail.mob_items.is_empty() {
+                    ui.add_space(12.0);
+                    ui.heading("Drops By Monster");
+                    ui.add_space(4.0);
+
+                    let mut i = 0;
+                    while i < detail.mob_items.len() {
+                        let mob_name = detail.mob_items[i].mob_name.clone();
+                        let mob_type = detail.mob_items[i].mob_type;
+
+                        let start = i;
+                        while i < detail.mob_items.len() && detail.mob_items[i].mob_name == mob_name
+                        {
+                            i += 1;
+                        }
+
+                        let header_id =
+                            egui::Id::new(format!("mob_section_{}_{}", mob_type, start));
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            header_id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            let sprite_type = realmhound_core::assets::normalize_train_sprite(
+                                mob_type, &mob_name,
+                            );
+                            render_mob_sprite(ui, sprite_type, ctx.sprite_renderer);
+                            ui.label(RichText::new(&mob_name).strong());
+                        })
+                        .body(|ui| {
+                            egui::Grid::new(format!("mob_items_{}_{}", mob_type, start))
+                                .num_columns(cols)
+                                .spacing(egui::vec2(4.0, 4.0))
+                                .show(ui, |ui| {
+                                    for (j, idx) in (start..i).enumerate() {
+                                        if j > 0 && j % cols == 0 {
+                                            ui.end_row();
+                                        }
+                                        let mob_item = &detail.mob_items[idx];
+                                        ui.vertical(|ui| {
+                                            let rarity_counts: Vec<(u8, &str, u32)> =
+                                                if detail.enchantable.contains(&mob_item.item_id) {
+                                                    detail
+                                                        .rarity_breakdowns
+                                                        .get(&mob_item.item_id)
+                                                        .map(|breakdown| {
+                                                            breakdown
+                                                                .iter()
+                                                                .map(|&(slots, count)| {
+                                                                    (
+                                                                        slots as u8,
+                                                                        rarity_name(slots as u8),
+                                                                        count as u32,
+                                                                    )
+                                                                })
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default()
+                                                } else {
+                                                    Vec::new()
+                                                };
+                                            ctx.sprite_renderer
+                                                .render_item_tile_with_rarity_counts(
+                                                    ui,
+                                                    mob_item.item_id,
+                                                    Some(&mob_item.item_name),
+                                                    &rarity_counts,
+                                                );
+                                            ui.label(
+                                                RichText::new(format!("×{}", mob_item.count))
+                                                    .size(10.0)
+                                                    .color(Color32::LIGHT_GRAY),
+                                            );
+                                        });
+                                    }
+                                });
+                        });
+
+                        ui.add_space(4.0);
+                    }
+                }
+            });
     }
 }
 
@@ -2599,6 +2648,68 @@ mod gating_tests {
         assert_eq!(icon_nav_target(0, 0, 3, IconNav::Right), None);
         assert_eq!(icon_nav_target(5, 5, 3, IconNav::Right), None);
         assert_eq!(icon_nav_target(0, 6, 0, IconNav::Down), None);
+    }
+
+    fn index_row(name: &str) -> IndexRow {
+        IndexRow {
+            name: name.to_string(),
+            db_names: vec![name.to_string()],
+            total_items: 0,
+            completions: 0,
+            difficulty: None,
+            time_ms: 0,
+        }
+    }
+
+    #[test]
+    fn dungeon_neighbours_follow_the_filtered_list() {
+        let neighbours = |panel: &TrophyHallPanel, name: &str| {
+            let (prev, next) = panel.detail_neighbours(name);
+            (prev.map(|(n, _)| n), next.map(|(n, _)| n))
+        };
+
+        let mut panel = TrophyHallPanel::new();
+        panel.index_rows = vec![
+            index_row("Better Gardens"),
+            index_row("Spectral Penitentiary"),
+            index_row("The Nest"),
+            index_row("Legacy Spider Den"),
+        ];
+
+        // Legacy dungeons are listed by default, so the Legacy row is the last
+        // stop on the walk and the first dungeon has nothing before it.
+        assert_eq!(panel.visible_indices(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            neighbours(&panel, "Better Gardens"),
+            (None, Some("Spectral Penitentiary".to_string()))
+        );
+        assert_eq!(
+            neighbours(&panel, "Spectral Penitentiary"),
+            (
+                Some("Better Gardens".to_string()),
+                Some("The Nest".to_string())
+            )
+        );
+        assert_eq!(
+            neighbours(&panel, "Legacy Spider Den"),
+            (Some("The Nest".to_string()), None)
+        );
+
+        // Hiding Legacy dungeons drops that row from the walk, so the dungeon
+        // before it becomes the last stop and it loses its neighbours.
+        panel.show_legacy_dungeons = false;
+        assert_eq!(panel.visible_indices(), vec![0, 1, 2]);
+        assert_eq!(
+            neighbours(&panel, "The Nest"),
+            (Some("Spectral Penitentiary".to_string()), None)
+        );
+        assert_eq!(neighbours(&panel, "Legacy Spider Den"), (None, None));
+
+        // The search box narrows the list too.
+        panel.show_legacy_dungeons = true;
+        panel.search_query = "nest".to_string();
+        assert_eq!(panel.visible_indices(), vec![2]);
+        assert_eq!(neighbours(&panel, "The Nest"), (None, None));
     }
 
     #[test]

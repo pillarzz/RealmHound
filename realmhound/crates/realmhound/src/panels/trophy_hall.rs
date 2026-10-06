@@ -935,24 +935,22 @@ impl TrophyHallPanel {
                 shadcn
                     .tgl(ui, &mut self.show_st, RichText::new("ST").small())
                     .hover_tip("Show Set Tier (ST) items");
-                let legacy_resp = shadcn
-                    .tgl(
-                        ui,
-                        &mut self.show_legacy_dungeons,
-                        RichText::new("Legacy Dungeons").small(),
-                    )
-                    .hover_tip(
-                        "Show the Time Chamber's Legacy dungeons and their retro collections",
-                    );
-                if legacy_resp.changed() {
-                    actions.push(AppAction::SaveTrophyHallView);
-                }
                 ctx.sprite_renderer.shiny_toggle(
                     ui,
                     shadcn,
                     &mut self.show_shiny,
                     "Show Shiny items",
                 );
+                // A checkbox, not a pill: the pills filter item categories inside
+                // a collection, while this one adds whole dungeons to the list.
+                let legacy_resp = ui
+                    .checkbox(&mut self.show_legacy_dungeons, "Legacy Dungeons")
+                    .hover_tip(
+                        "List the Time Chamber's Legacy dungeons and their retro collections",
+                    );
+                if legacy_resp.changed() {
+                    actions.push(AppAction::SaveTrophyHallView);
+                }
             });
         });
 

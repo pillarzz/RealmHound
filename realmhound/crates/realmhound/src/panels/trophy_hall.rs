@@ -1694,8 +1694,11 @@ impl TrophyHallPanel {
         });
 
         // Dungeon page header: portal, name, difficulty, completion, runs and
-        // time spent. Kept above the Collection section.
-        shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
+        // time spent. Kept above the Collection section. It uses the page's own
+        // background rather than the darker secondary band - these are page
+        // content, not chrome - and the stacked variant keeps the fill from
+        // bleeding above the divider that closes the navigation row.
+        shadcn.header_band_page(ui, shadcn.colors().background, |ui| {
             shadcn.band_row(ui, |ui| {
                 let portal_map = get_dungeon_portal_map();
                 let portal_id = portal_map.get_portal_id(dungeon);
@@ -1778,8 +1781,6 @@ impl TrophyHallPanel {
                 }
             });
         });
-
-        ui.separator();
 
         self.render_detail_body(ui, ctx, dungeon);
 

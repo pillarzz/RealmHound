@@ -489,7 +489,7 @@ impl Shadcn {
         fill: egui::Color32,
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> R {
-        self.header_band_impl(ui, fill, true, true, add_contents)
+        self.header_band_impl(ui, fill, true, true, true, add_contents)
     }
 
     /// A stacked header band that keeps a visible top divider separating it from
@@ -502,7 +502,21 @@ impl Shadcn {
         fill: egui::Color32,
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> R {
-        self.header_band_impl(ui, fill, false, true, add_contents)
+        self.header_band_impl(ui, fill, false, true, true, add_contents)
+    }
+
+    /// A header band for a page's own header: a divider above, filled with the
+    /// caller's colour (the page background, when the header is page content
+    /// rather than chrome), and no divider underneath, so the content that
+    /// follows reads as the same section. The fill stops at the top divider
+    /// instead of covering the seam above it.
+    pub fn header_band_page<R>(
+        &self,
+        ui: &mut Ui,
+        fill: egui::Color32,
+        add_contents: impl FnOnce(&mut Ui) -> R,
+    ) -> R {
+        self.header_band_impl(ui, fill, false, true, false, add_contents)
     }
 
     fn header_band_impl<R>(
@@ -511,6 +525,7 @@ impl Shadcn {
         fill: egui::Color32,
         top_cover: bool,
         top_divider: bool,
+        bottom_divider: bool,
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> R {
         let gap = ui.spacing().item_spacing.y.round() as i8;
@@ -559,7 +574,9 @@ impl Shadcn {
         if top_cover || top_divider {
             ui.painter().hline(x, fill_top, stroke);
         }
-        ui.painter().hline(x, rect.bottom(), stroke);
+        if bottom_divider {
+            ui.painter().hline(x, rect.bottom(), stroke);
+        }
         band.inner
     }
 

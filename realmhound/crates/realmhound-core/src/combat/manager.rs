@@ -339,29 +339,34 @@ impl CombatManager {
 
     /// Latch `killed` on the escaped fight each buffered bag proves died.
     /// Idempotent: a fight stays killed once set, and a signal is kept until it
-    /// completes a fight so loot that lands before its fight is persisted still
-    /// applies once it is. The completed fights' awards are reconciled and the
-    /// change is queued for the Combat History view, which cannot see it through
-    /// the fight count.
+    /// completes a fight, so loot that lands before its fight is persisted still
+    /// applies once it is. A failed update keeps its signal too: a transient
+    /// write error must not lose the proof, so the next persist or map change
+    /// retries it. The completed fights' awards are reconciled and the change is
+    /// queued for the Combat History view, which cannot see it through the fight
+    /// count.
     fn apply_pending_kill_proofs(&mut self) {
         let Some(db) = self.database.as_mut() else {
             return;
         };
         let mut changed: Vec<FightSelection> = Vec::new();
-        self.pending_kill_proofs
-            .retain(|&(map_seed, boss_type, timestamp)| {
-                match db.mark_boss_killed_by_loot(map_seed, boss_type, timestamp) {
-                    Ok(Some(selection)) => {
-                        changed.push(selection);
-                        false
-                    }
-                    Ok(None) => true,
-                    Err(e) => {
-                        tracing::warn!("[COMBAT] loot kill-proof update failed: {}", e);
-                        false
-                    }
+        let mut remaining = std::collections::HashSet::new();
+        for &(map_seed, boss_type, timestamp) in &self.pending_kill_proofs {
+            match db.mark_boss_killed_by_loot(map_seed, boss_type, timestamp) {
+                // The bag found its fight and completed it.
+                Ok(Some(selection)) => changed.push(selection),
+                // Loot that landed before its fight was persisted: wait for it.
+                Ok(None) => {
+                    remaining.insert((map_seed, boss_type, timestamp));
                 }
-            });
+                // Keep the proof so the next lifecycle retries the write.
+                Err(e) => {
+                    tracing::warn!("[COMBAT] loot kill-proof update failed: {}", e);
+                    remaining.insert((map_seed, boss_type, timestamp));
+                }
+            }
+        }
+        self.pending_kill_proofs = remaining;
         self.note_history_changes(changed);
     }
 
@@ -907,6 +912,76 @@ mod tests {
                 .filter(|f| f.map_seed == 0)
                 .all(|f| !f.killed),
             "a bag outside an instance completes nothing"
+        );
+    }
+
+    /// A transient write failure must not lose a buffered kill proof: it stays
+    /// queued and the next lifecycle retries it.
+    #[test]
+    fn a_failed_kill_proof_stays_buffered_until_it_applies() {
+        const HEAD: i32 = 28058;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat_history.db");
+        // The writer records an escaped Head fight and stays open, so the manager
+        // can then be pointed at a read-only connection whose writes fail.
+        let mut writer = super::super::database::CombatDatabase::open_writer(&path).unwrap();
+        let mut escaped = fight("Lair of Shaitan", "Shaitan the Advisor", false);
+        escaped.map_seed = 42;
+        escaped.boss_object_type = HEAD;
+        escaped.killed = false;
+        escaped.reached_zero = false;
+        escaped.started_at = 1_000;
+        escaped.ended_at = 61_000;
+        writer.insert_fight(&escaped).unwrap();
+
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_reader_at(&path).unwrap());
+
+        // The reader sees the escaped fight, and its write really fails: the kept
+        // proof can only be the failed update, never an unfound row.
+        assert_eq!(
+            m.database
+                .as_ref()
+                .unwrap()
+                .recent_fights(10)
+                .unwrap()
+                .len(),
+            1,
+            "the readonly reader sees the fight it has to fail to complete"
+        );
+        assert!(
+            m.database
+                .as_mut()
+                .unwrap()
+                .mark_boss_killed_by_loot(42, HEAD, 86_000)
+                .is_err(),
+            "the readonly connection cannot record the kill"
+        );
+
+        // The bag proves the kill, but the readonly connection cannot record it.
+        m.on_boss_loot(HEAD, 42, 86_000, &[17]);
+
+        assert_eq!(
+            m.pending_kill_proofs.len(),
+            1,
+            "a failed write keeps its proof for the next attempt"
+        );
+        assert!(
+            m.take_pending_history_changes().is_empty(),
+            "a failed write reports nothing to the UI"
+        );
+
+        // The next map change retries it, and the fight completes.
+        m.database = Some(writer);
+        m.on_map_change("Nexus", 0, 90_000);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(fights[0].killed, "the retry completes the abandoned fight");
+        assert_eq!(
+            m.take_pending_history_changes(),
+            vec![FightSelection::Single(fights[0].id)],
+            "the completion is only reported once it actually applies"
         );
     }
 

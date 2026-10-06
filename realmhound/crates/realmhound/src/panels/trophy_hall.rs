@@ -1682,15 +1682,16 @@ impl TrophyHallPanel {
 
         let shadcn = ctx.shadcn;
 
-        // Navigation bar: only the way back. The dungeon's own details belong in
-        // the page header below, not in this bar.
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            ui.add(egui::Label::new(""));
-            if ui.button("← Back").clicked() {
-                self.page = Page::Index;
-                self.detail_cache = None;
-            }
+        // Navigation band, matching the other panels' navigation rows (darker
+        // secondary fill). The dungeon's own details belong in the page header
+        // below, not in this bar.
+        shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
+            shadcn.band_row(ui, |ui| {
+                if shadcn.btn(ui, "← Back").clicked() {
+                    self.page = Page::Index;
+                    self.detail_cache = None;
+                }
+            });
         });
 
         // Dungeon page header: portal, name, difficulty, completion, runs and

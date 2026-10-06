@@ -111,7 +111,10 @@ const DENIED_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
 /// Per-dungeon extra item IDs to include in a collection beyond what's
 /// scraped from RealmEye's drop tables. Used for forge-crafted items that
 /// aren't dropped directly but are exclusive outputs tied to a dungeon's
-/// crafting material (e.g. Kogbold Enhancement Core upgrades). Precursor
+/// crafting material (e.g. Kogbold Enhancement Core upgrades), for drops the
+/// scrape has dropped or not yet listed (e.g. a shiny of an existing drop), and
+/// for the new shinies of Season 31 Part 1. Membership only: whether an entry is
+/// a forge upgrade is decided by [`FORGE_UPGRADE_ITEMS`]. Precursor
 /// weapons used as crafting ingredients (Doom Bow, Tezcacoatl's Tail,
 /// Ancient Stone Sword, Void Blade) are intentionally excluded.
 const EXTRA_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
@@ -137,6 +140,7 @@ const EXTRA_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
             23623, 5335, // Pandemic Poison + Shiny
             23625, 5336, // Boundless Vessel + Shiny
             23624, 5337, // Amulet of Restoration + Shiny
+            5748, // Overwhelming Axehead Shiny (Season 31 P1)
         ],
     ),
     (
@@ -145,6 +149,9 @@ const EXTRA_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
             20745, // Fortitude (no shiny)
             20766, // Mischief (no shiny)
             20746, // Vigor (no shiny)
+            5751,  // Flowering Kimono Shiny (Season 31 P1)
+            5753,  // Sage's Wakibiki Shiny (Season 31 P1)
+            5752,  // Ethereal Happi Shiny (Season 31 P1)
         ],
     ),
     (
@@ -184,7 +191,16 @@ const EXTRA_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
     // lists them.
     (
         "Crystal Cavern",
-        &[7503], // Crystalline Sigil Shiny
+        &[
+            7503, // Crystalline Sigil Shiny
+            5750, // Irradiance Sheath Shiny (Season 31 P1)
+        ],
+    ),
+    (
+        // Season 31 P1: the Ivory Wyvern's sigil shiny. Pinned to the base's
+        // section below, since a shiny has no scraped drop source of its own.
+        "Lair of Draconis",
+        &[5749], // Draconic Insignia Shiny
     ),
     (
         "Fungal Cavern",
@@ -210,6 +226,25 @@ const EXTRA_ITEMS_OVERRIDE: &[(&str, &[i32])] = &[
         "The Shatters",
         &[9669, 7512], // The Forgotten Ring + Shiny
     ),
+];
+
+/// Per-dungeon item IDs that are FORGE-CRAFTED rather than dropped, used by
+/// [`group_by_forge_upgrade`] to split those dungeons into "Dungeon Drops" and
+/// "Forge Upgrades" sections. Kept separate from [`EXTRA_ITEMS_OVERRIDE`], which
+/// only decides collection membership: an extra that IS a dungeon drop (a shiny
+/// of an existing drop, say) must not be sectioned as a forge upgrade.
+/// Every id listed here must also be a member of the same dungeon in
+/// [`EXTRA_ITEMS_OVERRIDE`] when the scrape does not list it.
+const FORGE_UPGRADE_ITEMS: &[(&str, &[i32])] = &[
+    (
+        "Kogbold Steamworks",
+        &[49468, 3980, 49469, 3981, 49470, 3982, 49471, 3983],
+    ),
+    (
+        "Spectral Penitentiary",
+        &[23627, 5334, 23623, 5335, 23625, 5336, 23624, 5337],
+    ),
+    ("Moonlight Village", &[20745, 20766, 20746]),
 ];
 
 /// Build the collection definition for a single dungeon.
@@ -395,6 +430,9 @@ const SECTION_OVERRIDE: &[(&str, i32, &str)] = &[
     ("The Shatters", 9669, "Armors and rings"), // The Forgotten Ring
     ("The Shatters", 7512, "Armors and rings"), // The Forgotten Ring Shiny
     ("The Machine", 23359, "Armors and Rings"), // Ring of Omni-Impotence
+    // Draconic Insignia Shiny follows its base (31611) into the Ivory Wyvern's
+    // section: the scrape cannot place it because a shiny has no drop entry.
+    ("Lair of Draconis", 5749, "Ivory Wyvern"),
 ];
 
 /// The Machine's boss-section names (scraped as literal enemy/area names)
@@ -679,7 +717,7 @@ fn group_by_slot_type(items: &[CollectionItem]) -> Vec<CollectionSection> {
 /// (forge-crafted items that don't drop directly) and everything else is a
 /// normal dungeon drop.
 fn group_by_forge_upgrade(dungeon_name: &str, items: &[CollectionItem]) -> Vec<CollectionSection> {
-    let forge_ids = EXTRA_ITEMS_OVERRIDE
+    let forge_ids = FORGE_UPGRADE_ITEMS
         .iter()
         .find(|(name, _)| *name == dungeon_name)
         .map(|(_, ids)| *ids)
@@ -862,6 +900,70 @@ mod tests {
                 realm_extra.contains(&id),
                 "shiny biome white {id} missing from Realm members"
             );
+        }
+    }
+
+    /// Season 31 P1 added one shiny per dungeon, each belonging to the
+    /// collection its non-shiny base already sits in.
+    #[test]
+    fn season31_p1_shinies_join_their_base_collections() {
+        let extra = |dungeon: &str| {
+            EXTRA_ITEMS_OVERRIDE
+                .iter()
+                .find(|(name, _)| *name == dungeon)
+                .map(|(_, ids)| *ids)
+                .unwrap_or(&[])
+        };
+        for (shiny, dungeon) in [
+            (5751, "Moonlight Village"),     // Flowering Kimono (base 20706)
+            (5753, "Moonlight Village"),     // Sage's Wakibiki (base 20468)
+            (5752, "Moonlight Village"),     // Ethereal Happi (base 20604)
+            (5748, "Spectral Penitentiary"), // Overwhelming Axehead (base 23915)
+            (5749, "Lair of Draconis"),      // Draconic Insignia (base 31611)
+            (5750, "Crystal Cavern"),        // Irradiance Sheath (base 14816)
+        ] {
+            assert!(
+                extra(dungeon).contains(&shiny),
+                "shiny {shiny} missing from {dungeon}"
+            );
+        }
+        // A shiny has no scraped drop source of its own, so the Ivory Wyvern one
+        // needs its section pinned or it lands in "Other".
+        assert!(SECTION_OVERRIDE.iter().any(|&(dungeon, id, section)| {
+            dungeon == "Lair of Draconis" && id == 5749 && section == "Ivory Wyvern"
+        }));
+
+        // The split between "Dungeon Drops" and "Forge Upgrades" has its own
+        // list: every forge id must still be a member of its dungeon, and none of
+        // the drop shinies may be classified as a forge upgrade.
+        for &(dungeon, forge_ids) in FORGE_UPGRADE_ITEMS {
+            let extra = EXTRA_ITEMS_OVERRIDE
+                .iter()
+                .find(|(name, _)| *name == dungeon)
+                .map(|(_, ids)| *ids)
+                .unwrap_or_else(|| panic!("{dungeon} has forge upgrades but no EXTRA entry"));
+            for id in forge_ids {
+                assert!(
+                    extra.contains(id),
+                    "forge upgrade {id} missing from {dungeon} members"
+                );
+            }
+        }
+        for (dungeon, shinies) in [
+            ("Moonlight Village", &[5751, 5753, 5752][..]),
+            ("Spectral Penitentiary", &[5748][..]),
+        ] {
+            let forge_ids = FORGE_UPGRADE_ITEMS
+                .iter()
+                .find(|(name, _)| *name == dungeon)
+                .map(|(_, ids)| *ids)
+                .unwrap_or(&[]);
+            for id in shinies {
+                assert!(
+                    !forge_ids.contains(id),
+                    "{id} would be sectioned as a forge upgrade in {dungeon}"
+                );
+            }
         }
     }
 }

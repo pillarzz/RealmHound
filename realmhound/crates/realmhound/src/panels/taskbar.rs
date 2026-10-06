@@ -471,7 +471,7 @@ fn resolve_quest_marks(q: &QuestTask) -> Vec<QuestMarkDungeon> {
 /// Variant dungeons are *not* folded into their base form: the Advanced Nest
 /// ("Plagued Nest") and Advanced Kogbold Steamworks are separate portals whose
 /// marks differ from The Nest / Kogbold Steamworks, so a quest for one must never
-/// pair with a mission for the other (issue #44). Each variant's mark resolves to
+/// pair with a mission for the other. Each variant's mark resolves to
 /// that variant in `MARK_TO_DUNGEON`, so an exact comparison is enough. Case
 /// insensitive; returns a lowercase key.
 pub(crate) fn canonical_match_dungeon(name: &str) -> String {
@@ -692,7 +692,7 @@ fn build_locked_cooldown_task(
 }
 
 /// A mission dungeon option together with every quest component that matches
-/// it. Matches are grouped by option (issue #19): one run of the dungeon
+/// it. Matches are grouped by option: one run of the dungeon
 /// advances all of them, so they share a single variant.
 struct VariantMatch {
     /// Index of the mission objective this option came from.
@@ -829,7 +829,7 @@ pub fn build_taskbar_items(
 
         // Match each dungeon objective to the quest marks it drops. Matches are
         // grouped per option, so two quests that both need a mark from this
-        // dungeon (issue #19: "Unsettling Foes" and "Lost And Found" on Parasite
+        // dungeon ("Unsettling Foes" and "Lost And Found" both want Parasite
         // Chambers) share one variant and are both advanced by the same run.
         let mut grouped: Vec<VariantMatch> = Vec::new();
         for &oi in &inc {
@@ -1425,7 +1425,7 @@ mod tests {
         // A variant dungeon is its own dungeon: the Advanced Nest (Plagued Nest)
         // and Advanced Kogbold Steamworks drop their own marks and need their own
         // portal, so a mission for one must never pair with the base dungeon's
-        // mark quest (issue #44).
+        // mark quest.
         assert!(!dungeon_names_match("Plagued Nest", "The Nest"));
         assert!(!dungeon_names_match(
             "Advanced Kogbold Steamworks",
@@ -1479,7 +1479,7 @@ mod tests {
         };
 
         // A mission for The Nest must stay a separate pill: running it does not
-        // advance the Advanced Nest quest (issue #44).
+        // advance the Advanced Nest quest.
         let the_nest = build_taskbar_items(
             &view_of(vec![mission(1, vec![dungeon_obj("The Nest", 0, 4)])]),
             |_| true,
@@ -1639,7 +1639,7 @@ mod tests {
         };
         // "Unsettling Foes" and "Lost And Found" both need Parasite marks (7741
         // -> Parasite Chambers) and both stand at zero progress: the same run
-        // advances both, so one variant has to cover them (issue #19).
+        // advances both, so one variant has to cover them.
         let unsettling = build_quest_task(
             &quest("q-unsettling", vec![7741, 7741, 7739, 7739]),
             |_| (0, 0),

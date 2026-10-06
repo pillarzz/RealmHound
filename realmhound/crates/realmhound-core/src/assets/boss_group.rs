@@ -937,7 +937,7 @@ static MARK_TO_DUNGEON: &[(&str, &str)] = &[
     // The Advanced Nest is its own dungeon ("Plagued Nest"), and the Advanced
     // Control Core mark comes from Advanced Kogbold Steamworks: a quest for one
     // variant must never pair with a mission for the other, so each variant mark
-    // resolves to the variant dungeon the mission defs name (issue #44).
+    // resolves to the variant dungeon the mission defs name.
     ("Advanced Mark of the Killer Bee Queen", "Plagued Nest"),
     ("Mark of Arachna", "Spider Den"),
     ("Mark of Belladonna", "Belladonna's Garden"),

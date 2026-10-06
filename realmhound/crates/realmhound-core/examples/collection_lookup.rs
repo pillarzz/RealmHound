@@ -16,7 +16,8 @@ use realmhound_core::stats::dungeon_collection::build_all_collections;
 fn main() {
     let mut names: Vec<String> = std::env::args().skip(1).collect();
     if names.is_empty() {
-        // Season 31 Part 1 shinies (issue #52).
+        // Defaults to the Season 31 Part 1 shinies. Also accepts display
+        // names, `0x…` types and id_names on the command line.
         names = [
             "Flowering Kimono",
             "Sage's Wakibiki",

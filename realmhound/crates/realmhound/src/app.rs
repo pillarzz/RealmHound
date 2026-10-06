@@ -1044,6 +1044,7 @@ impl RealmHoundApp {
         };
 
         let mut characters_panel = CharactersPanel::with_cache(account_data.characters.clone());
+        characters_panel.set_char_list_cache_path(persistence.char_list_cache().to_path_buf());
         if let Ok(s) = settings.read() {
             characters_panel.apply_settings(&s.characters);
         }

@@ -989,6 +989,9 @@ fn payload_relevant(payload: &UiPayload, active: ActiveTab) -> bool {
         | UiPayload::DungeonTimerFrozen { .. }
         | UiPayload::OryxLagWarning => matches!(active, LiveFeed),
 
+        // Only the Combat History panel shows stored fight cards.
+        UiPayload::CombatHistoryChanged => matches!(active, CombatHistory),
+
         // Handled by the audio thread before this point.
         UiPayload::Audio(_) => false,
     }
@@ -1098,6 +1101,20 @@ mod tests {
             assert!(payload_relevant(&p, ActiveTab::LiveFeed));
             assert!(!payload_relevant(&p, ActiveTab::Treasury));
             assert!(!payload_relevant(&p, ActiveTab::Party));
+        }
+    }
+
+    #[test]
+    fn combat_history_change_scopes_to_combat_history() {
+        let p = UiPayload::CombatHistoryChanged;
+        assert!(payload_relevant(&p, ActiveTab::CombatHistory));
+        for tab in [
+            ActiveTab::LiveFeed,
+            ActiveTab::Party,
+            ActiveTab::Treasury,
+            ActiveTab::TrophyHall,
+        ] {
+            assert!(!payload_relevant(&p, tab), "{tab:?} should sleep");
         }
     }
 

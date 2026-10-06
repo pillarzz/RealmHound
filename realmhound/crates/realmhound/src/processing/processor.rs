@@ -3014,6 +3014,9 @@ impl PacketProcessor {
         // targeted by map seed so it lands on the correct row even though the
         // Broadcast for a new dungeon is emitted before this run's flush.
         self.forward_dungeon_freeze();
+        // Cards completed by a loot bag change no fight count, so the Combat
+        // History panel cannot poll them up: push the change to it.
+        self.forward_combat_history_changes();
     }
 
     /// Drain a pending dungeon-run freeze from the CombatManager and forward it
@@ -3024,6 +3027,16 @@ impl PacketProcessor {
                 map_seed,
                 elapsed_ms,
             });
+        }
+    }
+
+    /// Drain the fight cards the CombatManager changed without recording a new
+    /// fight (loot bags completing escaped fights) and tell the open Combat
+    /// History view to re-read its summaries. Awards for those cards are already
+    /// reconciled by the manager.
+    fn forward_combat_history_changes(&mut self) {
+        if !self.combat.take_pending_history_changes().is_empty() {
+            self.emit(UiPayload::CombatHistoryChanged);
         }
     }
 

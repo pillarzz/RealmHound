@@ -48,6 +48,11 @@ pub struct CombatManager {
     /// buffered and re-applied on every persist; cleared on map change. See
     /// [`CombatDatabase::mark_boss_killed_by_loot`].
     pending_kill_proofs: std::collections::HashSet<(i32, i32, i64)>,
+    /// Stored cards that changed without a new fight being recorded (loot bags
+    /// completing escaped fights and encounter runs). An open Combat History
+    /// view only polls the fight count, so the processor drains these to tell it
+    /// to re-read its summaries.
+    pending_history_changes: Vec<FightSelection>,
 }
 
 /// Tracks the current dungeon run so its elapsed time can be accumulated into
@@ -83,6 +88,7 @@ impl CombatManager {
             pending_dungeon_freeze: None,
             pending_loot_completions: std::collections::HashSet::new(),
             pending_kill_proofs: std::collections::HashSet::new(),
+            pending_history_changes: Vec::new(),
         }
     }
 
@@ -314,36 +320,66 @@ impl CombatManager {
     }
 
     /// Latch `killed` on every persisted encounter run matching a buffered
-    /// loot-completion signal. Idempotent: a run stays killed once set.
+    /// loot-completion signal. Idempotent: a run stays killed once set. The
+    /// completed runs' awards are reconciled and the change is queued for the
+    /// Combat History view, which cannot see it through the fight count.
     fn apply_pending_loot_completions(&mut self) {
         let Some(db) = self.database.as_mut() else {
             return;
         };
+        let mut changed: Vec<FightSelection> = Vec::new();
         for &(map_seed, enc_id) in &self.pending_loot_completions {
-            if let Err(e) = db.mark_encounter_killed_by_loot(map_seed, enc_id) {
-                tracing::warn!("[COMBAT] loot-completion update failed: {}", e);
+            match db.mark_encounter_killed_by_loot(map_seed, enc_id) {
+                Ok(selections) => changed.extend(selections),
+                Err(e) => tracing::warn!("[COMBAT] loot-completion update failed: {}", e),
             }
         }
+        self.note_history_changes(changed);
     }
 
     /// Latch `killed` on the escaped fight each buffered bag proves died.
     /// Idempotent: a fight stays killed once set, and a signal is kept until it
     /// completes a fight so loot that lands before its fight is persisted still
-    /// applies once it is.
+    /// applies once it is. The completed fights' awards are reconciled and the
+    /// change is queued for the Combat History view, which cannot see it through
+    /// the fight count.
     fn apply_pending_kill_proofs(&mut self) {
         let Some(db) = self.database.as_mut() else {
             return;
         };
+        let mut changed: Vec<FightSelection> = Vec::new();
         self.pending_kill_proofs
             .retain(|&(map_seed, boss_type, timestamp)| {
                 match db.mark_boss_killed_by_loot(map_seed, boss_type, timestamp) {
-                    Ok(completed) => completed == 0,
+                    Ok(Some(selection)) => {
+                        changed.push(selection);
+                        false
+                    }
+                    Ok(None) => true,
                     Err(e) => {
                         tracing::warn!("[COMBAT] loot kill-proof update failed: {}", e);
                         false
                     }
                 }
             });
+        self.note_history_changes(changed);
+    }
+
+    /// Reconcile the awards of cards that changed without a new fight, and queue
+    /// them so the processor can refresh an open Combat History view.
+    fn note_history_changes(&mut self, changed: Vec<FightSelection>) {
+        if changed.is_empty() {
+            return;
+        }
+        self.reconcile_awards_for_selections(&changed);
+        self.pending_history_changes.extend(changed);
+    }
+
+    /// Drain the stored cards that changed since the last call, so the UI can
+    /// re-read its summaries (a loot completion adds no fight, so the fight-count
+    /// poll cannot see it).
+    pub fn take_pending_history_changes(&mut self) -> Vec<FightSelection> {
+        std::mem::take(&mut self.pending_history_changes)
     }
 
     /// Disconnected from the server.
@@ -814,6 +850,17 @@ mod tests {
         assert!(
             fights[0].killed,
             "the Mark bag completes the escaped fight it proves was killed"
+        );
+        // A completion records no new fight, so a fight-count poll cannot see it:
+        // the manager queues the changed card for the UI and reports it once.
+        assert_eq!(
+            m.take_pending_history_changes(),
+            vec![FightSelection::Single(fights[0].id)],
+            "the completed card is queued for the Combat History view"
+        );
+        assert!(
+            m.take_pending_history_changes().is_empty(),
+            "the change is only reported once"
         );
     }
 

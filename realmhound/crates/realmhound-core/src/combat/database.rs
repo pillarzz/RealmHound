@@ -4039,15 +4039,37 @@ impl CombatDatabase {
     /// event finished even though the core was never observed dying (see
     /// [`crate::assets::encounter_loot_completes`]). No-op when no matching run
     /// exists yet. The random per-instance `map_seed` scopes it to one realm.
+    ///
+    /// Returns the selections of the runs it completed, so the caller can
+    /// reconcile their awards and invalidate an open Combat History view (a
+    /// completion adds no fight, so a fight-count poll cannot see it).
     pub fn mark_encounter_killed_by_loot(
         &mut self,
         map_seed: i32,
         encounter_id: &str,
-    ) -> SqlResult<()> {
+    ) -> SqlResult<Vec<FightSelection>> {
         if map_seed == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        // Collect the runs first: the update below only reports the row count.
+        let run_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT encounter_run_id FROM fights
+                 WHERE encounter_id = ?1 AND map_seed = ?2
+                   AND encounter_run_id IS NOT NULL
+                   AND encounter_run_id IN (SELECT run_id FROM encounter_runs WHERE killed = 0)",
+            )?;
+            let rows = stmt.query_map(params![encounter_id, map_seed], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<SqlResult<Vec<String>>>()?
+        };
+        if run_ids.is_empty() {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        tx.execute(
             "UPDATE encounter_runs SET killed = 1
              WHERE killed = 0 AND run_id IN (
                  SELECT DISTINCT encounter_run_id FROM fights
@@ -4055,7 +4077,8 @@ impl CombatDatabase {
                    AND encounter_run_id IS NOT NULL)",
             params![encounter_id, map_seed],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(run_ids.into_iter().map(FightSelection::Encounter).collect())
     }
 
     /// Latch `killed = 1` on the single still-escaped fight of `boss_type` in
@@ -4069,32 +4092,46 @@ impl CombatDatabase {
     ///
     /// Only the closest fight is completed, so a reconnect fragment of the same
     /// instance cannot turn one bag into several kills. Idempotent: it ignores
-    /// fights already scored as kills, and returns how many rows it changed so a
-    /// caller can tell whether the fight existed yet.
+    /// fights already scored as kills. Returns the completed fight's selection
+    /// (`None` when no fight matched yet), so the caller can reconcile its awards
+    /// and invalidate an open Combat History view — a completion adds no fight,
+    /// so a fight-count poll cannot see it.
     pub fn mark_boss_killed_by_loot(
         &mut self,
         map_seed: i32,
         boss_type: i32,
         timestamp: i64,
-    ) -> SqlResult<usize> {
+    ) -> SqlResult<Option<FightSelection>> {
         if map_seed == 0 || boss_type <= 0 {
-            return Ok(0);
+            return Ok(None);
         }
-        self.conn.execute(
-            "UPDATE fights SET killed = 1 WHERE id = (
-                 SELECT id FROM fights
+        let tx = self.conn.transaction()?;
+        let target: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT id, encounter_run_id FROM fights
                  WHERE killed = 0 AND map_seed = ?1 AND boss_object_type = ?2
                    AND started_at <= ?3 AND ended_at >= ?4
-                 ORDER BY ABS(ended_at - ?5) LIMIT 1
-             )",
-            params![
-                map_seed,
-                boss_type,
-                timestamp + LOOT_LINK_PRE_MS,
-                timestamp - LOOT_LINK_POST_MS,
-                timestamp
-            ],
-        )
+                 ORDER BY ABS(ended_at - ?5) LIMIT 1",
+                params![
+                    map_seed,
+                    boss_type,
+                    timestamp + LOOT_LINK_PRE_MS,
+                    timestamp - LOOT_LINK_POST_MS,
+                    timestamp
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, encounter_run_id)) = target else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        tx.execute("UPDATE fights SET killed = 1 WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(Some(match encounter_run_id {
+            Some(run_id) => FightSelection::Encounter(run_id),
+            None => FightSelection::Single(id),
+        }))
     }
 
     /// Delete every recorded fight, participant, and encounter run, then reclaim
@@ -6545,20 +6582,26 @@ mod tests {
 
     #[test]
     fn mark_boss_killed_by_loot_completes_only_the_closest_escaped_fight() {
-        let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
+        // An Exaltation boss, so the completed card's awards can be reconciled.
+        const FUNGAL_BOSS: i32 = 45712;
         let mut db = CombatDatabase::open_in_memory().unwrap();
-        let mut far = escaped_fight("The Ivory Wyvern", boss, 7);
+        let mut far = escaped_fight("Fungal Cavern", FUNGAL_BOSS, 7);
         far.started_at = 1_000;
         far.ended_at = 61_000;
         let far_id = db.insert_fight(&far).unwrap();
-        let mut near = escaped_fight("The Ivory Wyvern", boss, 7);
+        let mut near = escaped_fight("Fungal Cavern", FUNGAL_BOSS, 7);
         near.started_at = 350_000;
         near.ended_at = 395_000;
         let near_id = db.insert_fight(&near).unwrap();
 
         // The Mark proves the kill, and only the fragment nearest the bag is
-        // completed so one Mark cannot become several kills.
-        assert_eq!(db.mark_boss_killed_by_loot(7, boss, 400_000).unwrap(), 1);
+        // completed so one Mark cannot become several kills. The completed card's
+        // selection comes back so the caller can reconcile its awards.
+        assert_eq!(
+            db.mark_boss_killed_by_loot(7, FUNGAL_BOSS, 400_000)
+                .unwrap(),
+            Some(FightSelection::Single(near_id))
+        );
         assert_eq!(killed_flag(&db, near_id), 1, "the closest fight completes");
         assert_eq!(
             killed_flag(&db, far_id),
@@ -6568,16 +6611,37 @@ mod tests {
 
         // A different instance, a different boss, and a bag outside the window
         // all match nothing once the closest fight is scored.
-        assert_eq!(db.mark_boss_killed_by_loot(8, boss, 400_000).unwrap(), 0);
-        assert_eq!(db.mark_boss_killed_by_loot(7, 12_345, 400_000).unwrap(), 0);
         assert_eq!(
-            db.mark_boss_killed_by_loot(7, boss, 395_000 + LOOT_LINK_POST_MS + 1)
+            db.mark_boss_killed_by_loot(8, FUNGAL_BOSS, 400_000)
                 .unwrap(),
-            0
+            None
+        );
+        assert_eq!(
+            db.mark_boss_killed_by_loot(7, 12_345, 400_000).unwrap(),
+            None
+        );
+        assert_eq!(
+            db.mark_boss_killed_by_loot(7, FUNGAL_BOSS, 395_000 + LOOT_LINK_POST_MS + 1)
+                .unwrap(),
+            None
         );
         // An unknown instance or boss type is rejected outright.
-        assert_eq!(db.mark_boss_killed_by_loot(0, boss, 400_000).unwrap(), 0);
-        assert_eq!(db.mark_boss_killed_by_loot(7, 0, 400_000).unwrap(), 0);
+        assert_eq!(
+            db.mark_boss_killed_by_loot(0, FUNGAL_BOSS, 400_000)
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.mark_boss_killed_by_loot(7, 0, 400_000).unwrap(), None);
+
+        // The returned selection is what a caller needs to reconcile the
+        // completed card: feeding it back stages the card's awards.
+        let totals = db
+            .reconcile_stat_awards_for_selections(&[FightSelection::Single(near_id)])
+            .unwrap();
+        assert!(
+            totals.contains_key(&1),
+            "the completed card reconciles for its own character"
+        );
     }
 
     #[test]
@@ -6588,7 +6652,7 @@ mod tests {
         let id = db
             .insert_fight(&flawless_fight("The Ivory Wyvern", boss, vec![]))
             .unwrap();
-        assert_eq!(db.mark_boss_killed_by_loot(1, boss, 61_000).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_loot(1, boss, 61_000).unwrap(), None);
         assert_eq!(killed_flag(&db, id), 1);
     }
 
@@ -6610,12 +6674,15 @@ mod tests {
 
         // The bag lands 25 s after the fight closed (it was still 25 s short of
         // the kill when the player left), which is well past `ended_at`.
-        assert_eq!(db.mark_boss_killed_by_loot(11, HEAD, 86_000).unwrap(), 1);
+        assert_eq!(
+            db.mark_boss_killed_by_loot(11, HEAD, 86_000).unwrap(),
+            Some(FightSelection::Single(id))
+        );
         assert_eq!(killed_flag(&db, id), 1, "the bag proves the kill");
         assert_eq!(killed_flag(&db, other), 0, "another instance is untouched");
 
         // Idempotent: a second bag of the same kill completes nothing more.
-        assert_eq!(db.mark_boss_killed_by_loot(11, HEAD, 86_002).unwrap(), 0);
+        assert_eq!(db.mark_boss_killed_by_loot(11, HEAD, 86_002).unwrap(), None);
     }
 
     /// The open-time repair also trusts a mark-less guaranteed bag: a Shaitan fight
@@ -7046,9 +7113,14 @@ mod tests {
         assert_eq!(run_killed(&db), 0, "run starts escaped");
         assert!(!card_killed(&db), "card starts Escaped");
 
-        // A bag from the core (same instance seed) latches the card Completed.
-        db.mark_encounter_killed_by_loot(1, "towering_perfection")
-            .unwrap();
+        // A bag from the core (same instance seed) latches the card Completed,
+        // and reports the run it completed so the caller can reconcile awards
+        // and refresh an open Combat History view.
+        assert_eq!(
+            db.mark_encounter_killed_by_loot(1, "towering_perfection")
+                .unwrap(),
+            vec![FightSelection::Encounter("tp-run".to_string())]
+        );
         assert_eq!(run_killed(&db), 1, "core bag completes the run");
         assert!(card_killed(&db), "card now shows Completed");
         assert!(
@@ -7064,8 +7136,12 @@ mod tests {
         seg.encounter_id = Some("towering_perfection".to_string());
         seg.encounter_run_id = Some("tp-run-2".to_string());
         db2.insert_fight(&seg).unwrap();
-        db2.mark_encounter_killed_by_loot(1, "towering_perfection")
-            .unwrap();
+        assert_eq!(
+            db2.mark_encounter_killed_by_loot(1, "towering_perfection")
+                .unwrap(),
+            Vec::<FightSelection>::new(),
+            "a different instance seed completes nothing"
+        );
         let killed: i64 = db2
             .conn
             .query_row(

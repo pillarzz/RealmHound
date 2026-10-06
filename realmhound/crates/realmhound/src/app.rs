@@ -1671,6 +1671,9 @@ impl RealmHoundApp {
                 self.live_feed_panel
                     .apply_dungeon_freeze(map_seed, elapsed_ms);
             }
+            UiPayload::CombatHistoryChanged => {
+                self.combat_panel.invalidate_cards();
+            }
             UiPayload::PushLoot(drop) => {
                 self.live_feed_panel.push_loot(&drop);
                 // A new drop was recorded by the worker; refresh the history view.

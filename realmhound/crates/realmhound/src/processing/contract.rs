@@ -147,6 +147,11 @@ pub enum UiPayload {
     /// value (fired when the run ends: leave/nexus, death, disconnect). Carries
     /// the map seed of the run so the Live Feed can target the matching row.
     DungeonTimerFrozen { map_seed: i32, elapsed_ms: i64 },
+
+    /// A stored Combat History card changed without a new fight being recorded
+    /// (a loot bag completing an escaped fight or an encounter run), which the
+    /// panel's fight-count poll cannot see. The open view re-reads its summaries.
+    CombatHistoryChanged,
 }
 
 // ---------------------------------------------------------------------------

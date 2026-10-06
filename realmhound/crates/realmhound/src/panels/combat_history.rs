@@ -513,6 +513,18 @@ impl CombatHistoryPanel {
         self.reset_scroll_pending = true;
     }
 
+    /// Re-read the stored fight cards on the next render, keeping the current
+    /// selection in place. Invoked when a card changes without a new fight being
+    /// recorded (a loot bag completing an escaped fight or an encounter run),
+    /// which the fight-count poll cannot see. The open detail/encounter records
+    /// are dropped so they are re-hydrated and the flipped outcome shows
+    /// immediately.
+    pub fn invalidate_cards(&mut self) {
+        self.detail = None;
+        self.encounter = None;
+        self.needs_refresh = true;
+    }
+
     /// Force the list to reload from the database on the next render and drop
     /// any cached view/selection state. Invoked when the Combat History
     /// database is mutated from outside the panel (e.g. the settings-tab

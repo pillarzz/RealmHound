@@ -1680,6 +1680,10 @@ impl TrophyHallPanel {
             self.load_detail(&db_names, ctx.loot_database, dungeon);
         }
 
+        let shadcn = ctx.shadcn;
+
+        // Navigation bar: only the way back. The dungeon's own details belong in
+        // the page header below, not in this bar.
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
             ui.add(egui::Label::new(""));
@@ -1687,85 +1691,92 @@ impl TrophyHallPanel {
                 self.page = Page::Index;
                 self.detail_cache = None;
             }
+        });
 
-            let portal_map = get_dungeon_portal_map();
-            let portal_id = portal_map.get_portal_id(dungeon);
-            let portal_resp = render_portal_sprite_sized(ui, portal_id, ctx.sprite_renderer, 32.0);
-            attach_dungeon_tooltip(portal_resp, ctx.sprite_renderer, dungeon, dungeon);
+        // Dungeon page header: portal, name, difficulty, completion, runs and
+        // time spent. Kept above the Collection section.
+        shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
+            shadcn.band_row(ui, |ui| {
+                let portal_map = get_dungeon_portal_map();
+                let portal_id = portal_map.get_portal_id(dungeon);
+                let portal_resp =
+                    render_portal_sprite_sized(ui, portal_id, ctx.sprite_renderer, 32.0);
+                attach_dungeon_tooltip(portal_resp, ctx.sprite_renderer, dungeon, dungeon);
 
-            let name_resp = ui.heading(dungeon);
-            attach_dungeon_tooltip(name_resp, ctx.sprite_renderer, dungeon, dungeon);
+                let name_resp = ui.heading(dungeon);
+                attach_dungeon_tooltip(name_resp, ctx.sprite_renderer, dungeon, dungeon);
 
-            let sep_color = Color32::from_rgb(150, 150, 150);
+                let sep_color = Color32::from_rgb(150, 150, 150);
 
-            if let Some(diff) = dungeon_difficulty(dungeon) {
-                ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-                ui.label(
-                    RichText::new(format!("Difficulty: {}", format_difficulty(diff)))
-                        .color(Color32::LIGHT_GRAY),
-                );
-                let (grave_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                ctx.sprite_renderer
-                    .draw_sprite_in_rect(ui, GRAVESTONE_ID, grave_rect);
-            }
-
-            // Completion %: obtained/total of the full (unfiltered) collection.
-            if let Some(collection) = self.collections.get(dungeon) {
-                let total = collection.items.len();
-                if total > 0 {
-                    let obtained = collection
-                        .items
-                        .iter()
-                        .filter(|i| self.obtained_items.contains(&i.item_id))
-                        .count();
-                    let pct = (obtained * 100) / total;
-                    let pct_color = if pct == 100 {
-                        Color32::from_rgb(100, 255, 100)
-                    } else if pct > 0 {
-                        Color32::from_rgb(200, 200, 100)
-                    } else {
-                        Color32::from_rgb(80, 80, 80)
-                    };
+                if let Some(diff) = dungeon_difficulty(dungeon) {
                     ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-                    ui.label(RichText::new(format!("{pct}%")).color(pct_color));
+                    ui.label(
+                        RichText::new(format!("Difficulty: {}", format_difficulty(diff)))
+                            .color(Color32::LIGHT_GRAY),
+                    );
+                    let (grave_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    ctx.sprite_renderer
+                        .draw_sprite_in_rect(ui, GRAVESTONE_ID, grave_rect);
                 }
-            }
 
-            // Runs: total completions across all characters. Realm and the Vault
-            // are not completed runs, so they never show a counter (it would
-            // always read "0 runs").
-            let completions = self
-                .index_rows
-                .iter()
-                .find(|r| r.name == dungeon)
-                .map(|r| r.completions)
-                .unwrap_or(0);
-            if runs_apply_to(dungeon) {
-                ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-                let runs_label = if completions == 1 {
-                    "1 run".to_string()
-                } else {
-                    format!("{completions} runs")
-                };
-                ui.label(RichText::new(runs_label).color(Color32::LIGHT_GRAY));
-            }
+                // Completion %: obtained/total of the full (unfiltered) collection.
+                if let Some(collection) = self.collections.get(dungeon) {
+                    let total = collection.items.len();
+                    if total > 0 {
+                        let obtained = collection
+                            .items
+                            .iter()
+                            .filter(|i| self.obtained_items.contains(&i.item_id))
+                            .count();
+                        let pct = (obtained * 100) / total;
+                        let pct_color = if pct == 100 {
+                            Color32::from_rgb(100, 255, 100)
+                        } else if pct > 0 {
+                            Color32::from_rgb(200, 200, 100)
+                        } else {
+                            Color32::from_rgb(80, 80, 80)
+                        };
+                        ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                        ui.label(RichText::new(format!("{pct}%")).color(pct_color));
+                    }
+                }
 
-            // Time spent: running per-dungeon counter (RealmHound and/or
-            // RealmShark, per the Data Source selector). Hidden when unknown.
-            let time_ms = self
-                .index_rows
-                .iter()
-                .find(|r| r.name == dungeon)
-                .map(|r| r.time_ms)
-                .unwrap_or(0);
-            if time_ms > 0 {
-                ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-                ui.label(
-                    RichText::new(format!("Time spent: {}", format_dungeon_time(time_ms)))
-                        .color(Color32::LIGHT_GRAY),
-                );
-            }
+                // Runs: total completions across all characters. Realm and the Vault
+                // are not completed runs, so they never show a counter (it would
+                // always read "0 runs").
+                let completions = self
+                    .index_rows
+                    .iter()
+                    .find(|r| r.name == dungeon)
+                    .map(|r| r.completions)
+                    .unwrap_or(0);
+                if runs_apply_to(dungeon) {
+                    ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                    let runs_label = if completions == 1 {
+                        "1 run".to_string()
+                    } else {
+                        format!("{completions} runs")
+                    };
+                    ui.label(RichText::new(runs_label).color(Color32::LIGHT_GRAY));
+                }
+
+                // Time spent: running per-dungeon counter (RealmHound and/or
+                // RealmShark, per the Data Source selector). Hidden when unknown.
+                let time_ms = self
+                    .index_rows
+                    .iter()
+                    .find(|r| r.name == dungeon)
+                    .map(|r| r.time_ms)
+                    .unwrap_or(0);
+                if time_ms > 0 {
+                    ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                    ui.label(
+                        RichText::new(format!("Time spent: {}", format_dungeon_time(time_ms)))
+                            .color(Color32::LIGHT_GRAY),
+                    );
+                }
+            });
         });
 
         ui.separator();

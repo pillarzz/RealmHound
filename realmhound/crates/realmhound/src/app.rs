@@ -9182,7 +9182,15 @@ impl RealmHoundApp {
         // scroll position) on entry instead of inheriting a stale position.
         if self.active_tab != self.last_active_tab {
             match self.active_tab {
-                ActiveTab::CombatHistory => self.combat_panel.reset_scroll(),
+                ActiveTab::CombatHistory => {
+                    // Cards can change while another tab is open (a loot bag
+                    // completing an escaped fight changes no fight count), so
+                    // re-read the stored summaries on entry as well: the
+                    // delivery of `UiPayload::CombatHistoryChanged` must not be
+                    // the only way an open view is invalidated.
+                    self.combat_panel.invalidate_cards();
+                    self.combat_panel.reset_scroll();
+                }
                 ActiveTab::LootHistory => self.loot_panel.reset_scroll(),
                 ActiveTab::Chat => self.chat_panel.reset_scroll(),
                 _ => {}

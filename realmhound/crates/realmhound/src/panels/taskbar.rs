@@ -277,21 +277,29 @@ pub fn build_quest_task(
 // link missions that progress together.
 // ---------------------------------------------------------------------------
 
+/// One mark a fused dungeon option has to pick up: the sprite, and how many
+/// runs still drop one. A single dungeon can advance several quests, so a
+/// variant lists every mark its matching quests still need.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VariantMark {
+    pub mark_id: i32,
+    pub remaining: i32,
+}
+
 /// One dungeon variety inside a combined mission+quest pill. The Mission side
-/// (`dungeon_runs` dungeon completions) and the Quest side (`mark_count` marks
-/// to pick up) render as two separate columns. A locked pill has a single
-/// variant; a tie shows several.
+/// (`dungeon_runs` dungeon completions) and the Quest side (`marks` pickups)
+/// render as two separate columns. A locked pill has a single variant; a tie
+/// shows several.
 #[derive(Clone)]
 pub struct CombinedVariant {
     pub dungeon_name: String,
     /// Portal artwork for the dungeon (the Mission column icon).
     pub portal_icon: ObjIcon,
-    /// Mark sprite id (the Quest column icon).
-    pub mark_id: i32,
+    /// Mark sprites (the Quest column icons) running this dungeon drops, one
+    /// entry per distinct mark, deduplicated across every matching quest.
+    pub marks: Vec<VariantMark>,
     /// Dungeon completions the mission still needs (Mission column count).
     pub dungeon_runs: i32,
-    /// Marks the quest still needs to pick up (Quest column count).
-    pub mark_count: i32,
 }
 
 /// A mission fused with the mark quest(s) it overlaps. An *exact* overlap fuses
@@ -683,26 +691,49 @@ fn build_locked_cooldown_task(
     })
 }
 
-/// A quest matched to a mission dungeon variety during combining.
-struct QuestMatch {
-    quest_idx: usize,
+/// A mission dungeon option together with every quest component that matches
+/// it. Matches are grouped by option (issue #19): one run of the dungeon
+/// advances all of them, so they share a single variant.
+struct VariantMatch {
+    /// Index of the mission objective this option came from.
+    obj_idx: usize,
     dungeon: String,
     mission_remaining: i32,
-    mark_id: i32,
-    mark_remaining: i32,
-    /// Marks already collected on the tracked side (the headstart used to pick
-    /// a winner among tied choice variants).
+    /// Distinct marks the dungeon drops for the matching quests, deduplicated by
+    /// mark id (two quests needing the same mark still need one run each).
+    marks: Vec<VariantMark>,
+    /// Marks already collected on the tracked side, used to pick a winner among
+    /// tied choice variants: the furthest-along matching quest wins.
     headstart: i32,
+    /// Every quest that contributed a mark here.
+    quest_idxs: Vec<usize>,
+}
+
+impl VariantMatch {
+    fn add(&mut self, quest_idx: usize, mark_id: i32, mark_remaining: i32, headstart: i32) {
+        self.headstart = self.headstart.max(headstart);
+        if !self.quest_idxs.contains(&quest_idx) {
+            self.quest_idxs.push(quest_idx);
+        }
+        match self.marks.iter_mut().find(|m| m.mark_id == mark_id) {
+            // Two quests can need the same mark; the run count is driven by the
+            // larger of the two requirements.
+            Some(existing) => existing.remaining = existing.remaining.max(mark_remaining),
+            None => self.marks.push(VariantMark {
+                mark_id,
+                remaining: mark_remaining,
+            }),
+        }
+    }
 }
 
 /// Build one combined variety from a mission/quest match.
-fn variant_from_match(m: &QuestMatch) -> CombinedVariant {
+fn variant_from_match(m: &VariantMatch) -> CombinedVariant {
     CombinedVariant {
         dungeon_name: m.dungeon.clone(),
         portal_icon: dungeon_portal_icon(&m.dungeon),
-        mark_id: m.mark_id,
+        marks: m.marks.clone(),
         dungeon_runs: m.mission_remaining.max(0),
-        mark_count: m.mark_remaining.max(0),
     }
 }
 
@@ -796,14 +827,18 @@ pub fn build_taskbar_items(
             continue;
         }
 
-        // Match each dungeon variety to an available same-dungeon quest.
-        let mut matches: Vec<QuestMatch> = Vec::new();
+        // Match each dungeon objective to the quest marks it drops. Matches are
+        // grouped per option, so two quests that both need a mark from this
+        // dungeon (issue #19: "Unsettling Foes" and "Lost And Found" on Parasite
+        // Chambers) share one variant and are both advanced by the same run.
+        let mut grouped: Vec<VariantMatch> = Vec::new();
         for &oi in &inc {
             let o = &e.objectives[oi];
             let Some(dn) = o.dungeon_name.as_deref() else {
                 continue;
             };
             let remaining = (o.need - o.have).max(0);
+            let mut option: Option<VariantMatch> = None;
             for (qi, _) in quest_tasks.iter().enumerate() {
                 if consumed_quest[qi] {
                     continue;
@@ -818,17 +853,22 @@ pub fn build_taskbar_items(
                 else {
                     continue;
                 };
-                matches.push(QuestMatch {
-                    quest_idx: qi,
-                    dungeon: dn.to_string(),
-                    mission_remaining: remaining,
-                    mark_id: md.mark_id,
-                    mark_remaining: md.remaining,
-                    headstart: quest_tasks[qi].have,
-                });
+                option
+                    .get_or_insert_with(|| VariantMatch {
+                        obj_idx: oi,
+                        dungeon: dn.to_string(),
+                        mission_remaining: remaining,
+                        marks: Vec::new(),
+                        headstart: 0,
+                        quest_idxs: Vec::new(),
+                    })
+                    .add(qi, md.mark_id, md.remaining, quest_tasks[qi].have);
+            }
+            if let Some(option) = option {
+                grouped.push(option);
             }
         }
-        if matches.is_empty() {
+        if grouped.is_empty() {
             continue;
         }
 
@@ -836,22 +876,24 @@ pub fn build_taskbar_items(
         let (variants, choice, used_quests): (Vec<CombinedVariant>, bool, Vec<usize>) = if is_choice
         {
             // Undecided OR mission: lock onto the biggest headstart, or keep a
-            // choice pill when tied. With "show all choice options" enabled we
-            // never collapse -- every matching variety stays on the pill.
-            let max_head = matches.iter().map(|m| m.headstart).max().unwrap_or(0);
-            let top: Vec<&QuestMatch> =
-                matches.iter().filter(|m| m.headstart == max_head).collect();
+            // choice pill when tied. The winning option keeps every quest that
+            // matches it -- running it advances all of them at once. With "show
+            // all choice options" enabled we never collapse -- every matching
+            // variety stays on the pill.
+            let max_head = grouped.iter().map(|g| g.headstart).max().unwrap_or(0);
+            let top: Vec<&VariantMatch> =
+                grouped.iter().filter(|g| g.headstart == max_head).collect();
             if !show_all_choice_options && top.len() == 1 {
                 let m = top[0];
-                (vec![variant_from_match(m)], false, vec![m.quest_idx])
+                (vec![variant_from_match(m)], false, m.quest_idxs.clone())
             } else {
-                let vs = matches.iter().map(variant_from_match).collect();
-                let used = matches.iter().map(|m| m.quest_idx).collect();
-                (vs, true, used)
+                let vs = grouped.iter().map(variant_from_match).collect();
+                let used = grouped.iter().flat_map(|g| g.quest_idxs.iter().copied());
+                (vs, true, used.collect())
             }
         } else {
-            // AND / decided mission: one variety per dungeon chip, mark-fused
-            // when a quest matches, portal-only otherwise.
+            // AND / decided mission: one variety per dungeon chip, carrying every
+            // quest that drops a mark there, portal-only when none does.
             let mut vs = Vec::new();
             let mut used = Vec::new();
             for &oi in &inc {
@@ -860,17 +902,16 @@ pub fn build_taskbar_items(
                     continue;
                 };
                 let remaining = (o.need - o.have).max(0);
-                match matches.iter().find(|m| m.dungeon.eq_ignore_ascii_case(dn)) {
+                match grouped.iter().find(|g| g.obj_idx == oi) {
                     Some(m) => {
                         vs.push(variant_from_match(m));
-                        used.push(m.quest_idx);
+                        used.extend(m.quest_idxs.iter().copied());
                     }
                     None => vs.push(CombinedVariant {
                         dungeon_name: dn.to_string(),
                         portal_icon: dungeon_portal_icon(dn),
-                        mark_id: 0,
+                        marks: Vec::new(),
                         dungeon_runs: remaining,
-                        mark_count: 0,
                     }),
                 }
             }
@@ -915,7 +956,7 @@ pub fn build_taskbar_items(
 
         // Candidate quests: dungeon lands in the difficulty band, mission needs
         // no more runs than the quest, and quest not already used.
-        let mut candidates: Vec<QuestMatch> = Vec::new();
+        let mut candidates: Vec<VariantMatch> = Vec::new();
         for (qi, qd) in quest_dungeons.iter().enumerate() {
             if consumed_quest[qi] {
                 continue;
@@ -930,13 +971,16 @@ pub fn build_taskbar_items(
             if mission_remaining > quest_tasks[qi].remaining {
                 continue;
             }
-            candidates.push(QuestMatch {
-                quest_idx: qi,
+            candidates.push(VariantMatch {
+                obj_idx: inc[0],
                 dungeon: dn.to_string(),
                 mission_remaining,
-                mark_id: quest_tasks[qi].mark_id,
-                mark_remaining: quest_tasks[qi].remaining,
+                marks: vec![VariantMark {
+                    mark_id: quest_tasks[qi].mark_id,
+                    remaining: quest_tasks[qi].remaining,
+                }],
                 headstart: quest_tasks[qi].have,
+                quest_idxs: vec![qi],
             });
         }
         if candidates.is_empty() {
@@ -959,9 +1003,11 @@ pub fn build_taskbar_items(
         let m = &candidates[0];
         let variant = variant_from_match(m);
         consumed_mission[mi] = true;
-        consumed_quest[m.quest_idx] = true;
+        for &qi in &m.quest_idxs {
+            consumed_quest[qi] = true;
+        }
         let (quests, item_counts) =
-            combine_quest_inputs(&quest_tasks, std::iter::once(m.quest_idx));
+            combine_quest_inputs(&quest_tasks, m.quest_idxs.iter().copied());
         items.push(TaskbarItem::Combined(CombinedTask {
             eligible: mission_tasks[mi].eligible,
             fraction: mission_tasks[mi].fraction,
@@ -1507,8 +1553,14 @@ mod tests {
             .iter()
             .find(|v| v.dungeon_name == "Parasite Chambers")
             .expect("the Parasite Chambers option carries the fused mark");
-        assert_eq!(variant.mark_id, 7741, "the chip shows the matching mark");
-        assert_eq!(variant.mark_count, 2, "only that mark's own count");
+        assert_eq!(
+            variant.marks,
+            vec![VariantMark {
+                mark_id: 7741,
+                remaining: 2,
+            }],
+            "the chip shows only that mark's own count"
+        );
         assert_eq!(variant.dungeon_runs, 3);
         // The quest's other mark stays listed on the merged quest side.
         assert_eq!(combined.quests.len(), 1);
@@ -1554,18 +1606,206 @@ mod tests {
             })
             .expect("both matching options fuse with the quest");
         assert_eq!(combined.quests.len(), 1, "the quest card is listed once");
-        let variants: Vec<(String, i32, i32)> = combined
+        let variants: Vec<(String, Vec<VariantMark>)> = combined
             .variants
             .iter()
-            .map(|v| (v.dungeon_name.clone(), v.mark_id, v.mark_count))
+            .map(|v| (v.dungeon_name.clone(), v.marks.clone()))
             .collect();
         assert_eq!(
             variants,
             vec![
-                ("Parasite Chambers".to_string(), 7741, 2),
-                ("Snake Pit".to_string(), 7739, 2),
+                (
+                    "Parasite Chambers".to_string(),
+                    vec![VariantMark {
+                        mark_id: 7741,
+                        remaining: 2,
+                    }],
+                ),
+                (
+                    "Snake Pit".to_string(),
+                    vec![VariantMark {
+                        mark_id: 7739,
+                        remaining: 2,
+                    }],
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn two_quests_on_one_dungeon_option_share_a_single_variant() {
+        let Some(_assets) = assets_ready() else {
+            return;
+        };
+        // "Unsettling Foes" and "Lost And Found" both need Parasite marks (7741
+        // -> Parasite Chambers) and both stand at zero progress: the same run
+        // advances both, so one variant has to cover them (issue #19).
+        let unsettling = build_quest_task(
+            &quest("q-unsettling", vec![7741, 7741, 7739, 7739]),
+            |_| (0, 0),
+            false,
+        )
+        .unwrap();
+        let lost_and_found =
+            build_quest_task(&quest("q-lost", vec![7741, 7741]), |_| (0, 0), false).unwrap();
+        let mut entry = mission(
+            20,
+            vec![
+                dungeon_obj("Parasite Chambers", 0, 3),
+                dungeon_obj("The Crawling Depths", 0, 3),
+            ],
+        );
+        entry.one_of = true;
+
+        let items = build_taskbar_items(
+            &view_of(vec![entry]),
+            |_| true,
+            vec![unsettling, lost_and_found],
+            None,
+            true,
+        );
+
+        assert_eq!(
+            items.len(),
+            1,
+            "both quests are consumed, neither is left as its own task"
+        );
+        let TaskbarItem::Combined(combined) = &items[0] else {
+            panic!("the mission fuses with both quests");
+        };
+        let chambers: Vec<_> = combined
+            .variants
+            .iter()
+            .filter(|v| v.dungeon_name == "Parasite Chambers")
+            .collect();
+        assert_eq!(
+            chambers.len(),
+            1,
+            "one variant per dungeon option, not one per quest"
+        );
+        assert_eq!(
+            chambers[0].marks,
+            vec![VariantMark {
+                mark_id: 7741,
+                remaining: 2,
+            }],
+            "the shared mark is listed once, at its largest requirement"
+        );
+        assert_eq!(combined.quests.len(), 2, "both quest cards ride along");
+    }
+
+    #[test]
+    fn unequal_progress_keeps_both_quests_on_the_locked_variant() {
+        let Some(_assets) = assets_ready() else {
+            return;
+        };
+        // Same overlap, but one quest is further along. The winner of the
+        // headstart comparison is the dungeon option, not the single furthest
+        // quest: both ride on it and neither is stranded as a separate task.
+        let unsettling = build_quest_task(
+            &quest("q-unsettling", vec![7741, 7741, 7739, 7739]),
+            |id| if id == 7739 { (0, 1) } else { (0, 0) },
+            false,
+        )
+        .unwrap();
+        assert_eq!(unsettling.have, 1, "this quest carries the headstart");
+        let lost_and_found =
+            build_quest_task(&quest("q-lost", vec![7741, 7741]), |_| (0, 0), false).unwrap();
+        let mut entry = mission(
+            21,
+            vec![
+                dungeon_obj("Parasite Chambers", 0, 3),
+                dungeon_obj("The Crawling Depths", 0, 3),
+            ],
+        );
+        entry.one_of = true;
+
+        let items = build_taskbar_items(
+            &view_of(vec![entry]),
+            |_| true,
+            vec![unsettling, lost_and_found],
+            None,
+            false,
+        );
+
+        assert_eq!(items.len(), 1, "no quest is left as a separate task");
+        let TaskbarItem::Combined(combined) = &items[0] else {
+            panic!("the mission fuses with both quests");
+        };
+        assert!(!combined.choice, "a decided mission renders as a lock");
+        assert_eq!(combined.variants.len(), 1, "locked onto a single dungeon");
+        assert_eq!(combined.variants[0].dungeon_name, "Parasite Chambers");
+        assert_eq!(
+            combined.variants[0].marks,
+            vec![VariantMark {
+                mark_id: 7741,
+                remaining: 2,
+            }]
+        );
+        assert_eq!(combined.quests.len(), 2, "both quest cards ride along");
+    }
+
+    #[test]
+    fn two_quests_share_an_and_missions_dungeon_chip() {
+        let Some(_assets) = assets_ready() else {
+            return;
+        };
+        // AND mission running Parasite Chambers and Snake Pit, with two quests
+        // that both need the Parasite mark: the chip has to carry both, and
+        // neither quest may survive as its own separate task.
+        let unsettling = build_quest_task(
+            &quest("q-unsettling", vec![7741, 7741, 7739, 7739]),
+            |_| (0, 0),
+            false,
+        )
+        .unwrap();
+        let lost_and_found =
+            build_quest_task(&quest("q-lost", vec![7741, 7741]), |_| (0, 0), false).unwrap();
+
+        let items = build_taskbar_items(
+            &view_of(vec![mission(
+                22,
+                vec![
+                    dungeon_obj("Parasite Chambers", 0, 2),
+                    dungeon_obj("Snake Pit", 0, 2),
+                ],
+            )]),
+            |_| true,
+            vec![unsettling, lost_and_found],
+            None,
+            true,
+        );
+
+        assert_eq!(items.len(), 1, "both quests fuse, none left over");
+        let TaskbarItem::Combined(combined) = &items[0] else {
+            panic!("the mission fuses with both quests");
+        };
+        let chip = |name: &str| {
+            combined
+                .variants
+                .iter()
+                .find(|v| v.dungeon_name == name)
+                .unwrap_or_else(|| panic!("the {name} chip is missing"))
+                .marks
+                .clone()
+        };
+        assert_eq!(
+            chip("Parasite Chambers"),
+            vec![VariantMark {
+                mark_id: 7741,
+                remaining: 2,
+            }],
+            "both quests' shared mark lands on one chip"
+        );
+        assert_eq!(
+            chip("Snake Pit"),
+            vec![VariantMark {
+                mark_id: 7739,
+                remaining: 2,
+            }],
+            "the other chip keeps its own mark"
+        );
+        assert_eq!(combined.quests.len(), 2, "each quest card is listed once");
     }
 
     #[test]

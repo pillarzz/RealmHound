@@ -5844,24 +5844,32 @@ fn quest_chip_groups(q: &crate::panels::taskbar::QuestTask) -> Vec<Vec<ChipSeg>>
 
 /// Chip segment-groups for a combined mission+quest pill. Per dungeon variety
 /// the pill shows the mark pickups first, then any remaining portal-only runs:
-/// each of the first `mark_count` dungeon runs also drops a mark, so only
-/// `dungeon_runs - mark_count` runs are portal-only. When the marks already
-/// cover every run (`mark_count >= dungeon_runs`) just the marks show; with no
-/// marks left just the portals show. A choice/tie yields one `|`-separated
-/// group per variety.
+/// a run drops one mark for every quest the variety covers, so the marks need
+/// `max(remaining)` runs and only the surplus is portal-only. When the marks
+/// already cover every run (`max(remaining) >= dungeon_runs`) just the marks
+/// show; with no marks left just the portals show. A choice/tie yields one
+/// `|`-separated group per variety.
 fn combined_chip_groups(variants: &[crate::panels::taskbar::CombinedVariant]) -> Vec<Vec<ChipSeg>> {
     use crate::panels::missions::ObjIcon;
     variants
         .iter()
         .filter_map(|v| {
             let mut segs: Vec<ChipSeg> = Vec::new();
-            if v.mark_id > 0 && v.mark_count > 0 {
-                segs.push(ChipSeg {
-                    prefix: None,
-                    icon: ObjIcon::Object(v.mark_id),
-                    text: format!("x {}", v.mark_count),
-                });
-                let extra_portals = v.dungeon_runs - v.mark_count;
+            let marks: Vec<_> = v
+                .marks
+                .iter()
+                .filter(|m| m.mark_id > 0 && m.remaining > 0)
+                .collect();
+            if !marks.is_empty() {
+                for m in &marks {
+                    segs.push(ChipSeg {
+                        prefix: None,
+                        icon: ObjIcon::Object(m.mark_id),
+                        text: format!("x {}", m.remaining),
+                    });
+                }
+                let runs_for_marks = marks.iter().map(|m| m.remaining).max().unwrap_or(0);
+                let extra_portals = v.dungeon_runs - runs_for_marks;
                 if extra_portals > 0 {
                     segs.push(ChipSeg {
                         prefix: None,
@@ -6184,13 +6192,40 @@ mod tests {
         mark_count: i32,
         dungeon_runs: i32,
     ) -> crate::panels::taskbar::CombinedVariant {
+        combined_variant_marks(&[(mark_id, mark_count)], dungeon_runs)
+    }
+
+    fn combined_variant_marks(
+        marks: &[(i32, i32)],
+        dungeon_runs: i32,
+    ) -> crate::panels::taskbar::CombinedVariant {
         crate::panels::taskbar::CombinedVariant {
             dungeon_name: "Ocean Trench".to_string(),
             portal_icon: crate::panels::missions::ObjIcon::None,
-            mark_id,
+            marks: marks
+                .iter()
+                .map(
+                    |&(mark_id, remaining)| crate::panels::taskbar::VariantMark {
+                        mark_id,
+                        remaining,
+                    },
+                )
+                .collect(),
             dungeon_runs,
-            mark_count,
         }
+    }
+
+    #[test]
+    fn combined_split_lists_every_mark_the_dungeon_drops() {
+        // Two quests need a mark from the same dungeon: both marks show, and
+        // because the same runs drop both, only the larger requirement eats
+        // runs (4 runs, 3 marks needed -> one portal-only run left).
+        let groups = combined_chip_groups(&[combined_variant_marks(&[(50, 2), (60, 3)], 4)]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+        assert_eq!(groups[0][0].text, "x 2");
+        assert_eq!(groups[0][1].text, "x 3");
+        assert_eq!(groups[0][2].text, "x 1");
     }
 
     #[test]

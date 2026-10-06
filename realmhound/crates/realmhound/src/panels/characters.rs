@@ -402,12 +402,8 @@ pub struct CharactersPanel {
     cache: CharacterCache,
     /// Current fetch state
     fetch_state: CharactersFetchState,
-    /// Receiver for API results: the parsed account data plus the raw XML, so a
-    /// successful fetch can also refresh the functional `char_list.xml` cache.
-    api_result_rx: Option<mpsc::Receiver<Result<(AccountData, String), String>>>,
-    /// Path of the functional `char_list.xml` cache. Injected by the app (it is
-    /// per-account); `None` in tests and any context without a profile.
-    char_list_cache_path: Option<std::path::PathBuf>,
+    /// Receiver for API results (returns AccountData which includes characters and exaltation stats)
+    api_result_rx: Option<mpsc::Receiver<Result<AccountData, String>>>,
     /// Currently playing character ID (from CREATE_SUCCESS)
     live_char_id: Option<i32>,
     /// Last-known loot-drop-boost seconds per character id. Populated from the
@@ -525,7 +521,6 @@ impl CharactersPanel {
             cache,
             fetch_state: CharactersFetchState::Idle,
             api_result_rx: None,
-            char_list_cache_path: None,
             live_char_id: None,
             loot_boost_by_char: std::collections::HashMap::new(),
             editing_label: None,
@@ -568,26 +563,6 @@ impl CharactersPanel {
             stats_block_order: [0, 1, 2, 3, 4, 5, 6],
             stats_dragging_block: None,
             stats_show_breakdown: false,
-        }
-    }
-
-    /// Inject the per-account `char_list.xml` cache path. Set by the app right
-    /// after construction; without it a successful fetch is not cached.
-    pub fn set_char_list_cache_path(&mut self, path: std::path::PathBuf) {
-        self.char_list_cache_path = Some(path);
-    }
-
-    /// Write a freshly fetched `char_list.xml` to the functional cache, so the
-    /// next startup (and every cache consumer) sees the newest response.
-    fn save_char_list_cache(&self, xml: &str) {
-        let Some(path) = &self.char_list_cache_path else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(path, xml) {
-            tracing::warn!("[CHARACTERS] Failed to save char_list cache: {}", e);
         }
     }
 
@@ -821,17 +796,12 @@ impl CharactersPanel {
     pub fn check_api_result(&mut self) -> Option<AccountData> {
         if let Some(rx) = &self.api_result_rx {
             match rx.try_recv() {
-                Ok(Ok((account_data, xml))) => {
+                Ok(Ok(account_data)) => {
                     tracing::info!(
                         "[CHARACTERS] Loaded {} characters from API, {} exaltation classes",
                         account_data.characters.len(),
                         account_data.exaltation_stats.len()
                     );
-                    // Keep the functional `char_list.xml` cache fresh. Both this
-                    // panel and the Vault panel fetch the same endpoint, and any
-                    // consumer of the cached response (vault/gift contents, owned
-                    // skins/emotes, forge unlocks) benefits from the newest copy.
-                    self.save_char_list_cache(&xml);
                     let applied = self.cache.update_from_api(
                         &account_data.characters,
                         account_data.account_id.as_deref(),
@@ -915,9 +885,7 @@ impl CharactersPanel {
                         let _ = tx.send(Err("Server returned an error".to_string()));
                         return;
                     }
-                    let result = parse_account_data(&xml)
-                        .map(|data| (data, xml.clone()))
-                        .map_err(|e| e.to_string());
+                    let result = parse_account_data(&xml).map_err(|e| e.to_string());
                     let _ = tx.send(result);
                 }
                 Err(e) => {
@@ -4156,32 +4124,5 @@ impl Panel for CharactersPanel {
         } else {
             vec![]
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn api_fetch_writes_the_char_list_cache_to_the_injected_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache = temp.path().join("cache").join("char_list.xml");
-        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
-        panel.set_char_list_cache_path(cache.clone());
-
-        // A successful fetch persists the raw response, so the next startup and
-        // every cache consumer (vault/gift contents, owned skins/emotes, forge
-        // unlocks) see the newest copy.
-        panel.save_char_list_cache("<Chars/>");
-        assert!(cache.exists());
-        assert_eq!(std::fs::read_to_string(&cache).unwrap(), "<Chars/>");
-    }
-
-    #[test]
-    fn api_fetch_without_an_injected_path_writes_nothing() {
-        let panel = CharactersPanel::with_cache(CharacterCache::default());
-        // No path injected (tests / profile-less contexts): must not panic.
-        panel.save_char_list_cache("<Chars/>");
     }
 }

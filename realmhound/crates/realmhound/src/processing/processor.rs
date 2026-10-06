@@ -2228,8 +2228,8 @@ impl PacketProcessor {
             GameEvent::PetStoneUsed { item_type } => {
                 // The stone that was just applied unlocks its target pet skin; no
                 // list or notification reports that, so record the skin itself.
-                let skin =
-                    realmhound_core::assets::get_asset_manager().pet_skin_unlocked_id(item_type);
+                let skin = realmhound_core::assets::get_asset_manager()
+                    .pet_skin_unlocked_id(item_type);
                 if let Some(skin) = skin.filter(|s| *s > 0) {
                     if !self.account_data.owned_wardrobe_ids.contains(&skin) {
                         self.account_data.owned_wardrobe_ids.push(skin);

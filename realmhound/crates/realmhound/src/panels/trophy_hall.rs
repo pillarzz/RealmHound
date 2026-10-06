@@ -87,6 +87,10 @@ struct IndexRow {
     /// Raw dungeon names from loot DB that resolved to this display name.
     /// Used for detail queries (DB stores raw names, not normalized).
     db_names: Vec<String>,
+    /// RealmShark's own keys that resolved to this display name ("The Realm" for
+    /// the "Realm" row). Kept so detail loading can find the imported dungeon
+    /// under the spelling the import used.
+    rs_keys: Vec<String>,
     total_items: u64,
     completions: i32,
     difficulty: Option<f32>,
@@ -507,6 +511,7 @@ impl TrophyHallPanel {
                     let entry = merged.entry(canonical.clone()).or_insert_with(|| IndexRow {
                         name: canonical.clone(),
                         db_names: Vec::new(),
+                        rs_keys: Vec::new(),
                         total_items: 0,
                         completions: 0,
                         difficulty: dungeon_difficulty(&canonical),
@@ -535,6 +540,7 @@ impl TrophyHallPanel {
                     let entry = merged.entry(canonical.clone()).or_insert_with(|| IndexRow {
                         name: canonical.clone(),
                         db_names: Vec::new(),
+                        rs_keys: Vec::new(),
                         total_items: 0,
                         completions: 0,
                         difficulty: dungeon_difficulty(&canonical),
@@ -543,6 +549,7 @@ impl TrophyHallPanel {
                     let item_total: i64 = dungeon.items.iter().map(|i| i.total_count).sum();
                     entry.total_items += item_total as u64;
                     entry.completions += dungeon.completions;
+                    entry.rs_keys.push(raw_key.clone());
                 }
             }
         }
@@ -558,6 +565,7 @@ impl TrophyHallPanel {
                 .or_insert_with(|| IndexRow {
                     name: snap.dungeon_name.clone(),
                     db_names: Vec::new(),
+                    rs_keys: Vec::new(),
                     total_items: 0,
                     completions: 0,
                     difficulty: snap.difficulty,
@@ -589,6 +597,7 @@ impl TrophyHallPanel {
             self.index_rows.push(IndexRow {
                 name: d.name.to_string(),
                 db_names: Vec::new(),
+                rs_keys: Vec::new(),
                 total_items: 0,
                 completions: 0,
                 difficulty: dungeon_difficulty(d.name),
@@ -603,6 +612,7 @@ impl TrophyHallPanel {
             self.index_rows.push(IndexRow {
                 name: "Realm".to_string(),
                 db_names: Vec::new(),
+                rs_keys: Vec::new(),
                 total_items: 0,
                 completions: 0,
                 difficulty: dungeon_difficulty("Realm"),
@@ -631,9 +641,13 @@ impl TrophyHallPanel {
         }
         if include_realmshark {
             if let Some(rs) = &self.realmshark_data {
-                for (canonical, dungeon) in &rs.dungeons {
+                for (raw_key, dungeon) in &rs.dungeons {
                     if dungeon.total_time_ms > 0 {
-                        *time_by_dungeon.entry(canonical.clone()).or_insert(0) +=
+                        // Same normalization as the item totals above: RealmShark
+                        // spells the key its own way ("The Realm").
+                        let display = portal_map.normalize_dungeon_name(raw_key);
+                        let canonical = registry.normalize(&display);
+                        *time_by_dungeon.entry(canonical).or_insert(0) +=
                             dungeon.total_time_ms as u64;
                     }
                 }
@@ -660,6 +674,7 @@ impl TrophyHallPanel {
                 rows[vi].total_items += remnant.total_items;
                 rows[vi].completions += remnant.completions;
                 rows[vi].db_names.extend(remnant.db_names);
+                rows[vi].rs_keys.extend(remnant.rs_keys);
             }
             (Some(ri), None) => {
                 // Rename Remnant to The Void
@@ -699,6 +714,7 @@ impl TrophyHallPanel {
     fn load_detail(
         &mut self,
         db_names: &[String],
+        rs_keys: &[String],
         loot_db: Option<&LootDatabase>,
         dungeon_name: &str,
     ) {
@@ -742,7 +758,18 @@ impl TrophyHallPanel {
         // RealmShark items
         if include_realmshark {
             if let Some(rs) = &self.realmshark_data {
-                if let Some(dungeon) = rs.dungeons.get(dungeon_name) {
+                // The import keys the dungeon its own way ("The Realm" for the
+                // "Realm" row), so use the keys the row was merged from; a row
+                // built without an import falls back to its own name.
+                let keys: Vec<&str> = if rs_keys.is_empty() {
+                    vec![dungeon_name]
+                } else {
+                    rs_keys.iter().map(String::as_str).collect()
+                };
+                for key in keys {
+                    let Some(dungeon) = rs.dungeons.get(key) else {
+                        continue;
+                    };
                     for item in &dungeon.items {
                         if let Some(existing) =
                             all_items.iter_mut().find(|i| i.item_id == item.item_id)
@@ -910,6 +937,17 @@ impl TrophyHallPanel {
             .collect()
     }
 
+    /// The loot-database names and RealmShark keys the merged row for `dungeon`
+    /// was built from, so detail loading can query both sources under their own
+    /// spellings. Both empty for a row that does not exist.
+    fn row_source_keys(&self, dungeon: &str) -> (Vec<String>, Vec<String>) {
+        self.index_rows
+            .iter()
+            .find(|r| r.name == dungeon)
+            .map(|r| (r.db_names.clone(), r.rs_keys.clone()))
+            .unwrap_or_default()
+    }
+
     /// The dungeons surrounding the open one in the filtered list, as
     /// `(name, db_names)` pairs ready to hand to `load_detail`. `None` at either
     /// end disables that navigation button.
@@ -926,11 +964,11 @@ impl TrophyHallPanel {
         };
         let at = |idx: usize| {
             let row = &self.index_rows[idx];
-            (row.name.clone(), row.db_names.clone())
+            Some((row.name.clone(), row.db_names.clone()))
         };
         (
-            pos.checked_sub(1).map(|p| at(visible[p])),
-            visible.get(pos + 1).copied().map(at),
+            pos.checked_sub(1).and_then(at),
+            visible.get(pos + 1).copied().and_then(at),
         )
     }
 
@@ -1164,7 +1202,7 @@ impl TrophyHallPanel {
 
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             realmhound_core::prof_scope!("dstats_index_scroll_body");
-            let mut navigate_to: Option<(String, Vec<String>)> = None;
+            let mut navigate_to: Option<String> = None;
 
             let num_columns = (self.column_count as usize).clamp(1, 3);
 
@@ -1265,9 +1303,10 @@ impl TrophyHallPanel {
             // content edge.
             ui.add_space(12.0);
 
-            if let Some((display_name, db_names)) = navigate_to {
+            if let Some(display_name) = navigate_to {
                 self.selected_icon = Some(display_name.clone());
-                self.load_detail(&db_names, ctx.loot_database, &display_name);
+                let (db_names, rs_keys) = self.row_source_keys(&display_name);
+                self.load_detail(&db_names, &rs_keys, ctx.loot_database, &display_name);
                 self.page = Page::Detail { name: display_name };
             }
         });
@@ -1279,7 +1318,7 @@ impl TrophyHallPanel {
         ctx: &mut PanelContext,
         portal_map: &realmhound_core::assets::DungeonPortalMap,
         indices: &[usize],
-        navigate_to: &mut Option<(String, Vec<String>)>,
+        navigate_to: &mut Option<String>,
         col_width: f32,
     ) {
         const MAX_INLINE: usize = MAX_INLINE_COLLECTION_ITEMS;
@@ -1528,7 +1567,7 @@ impl TrophyHallPanel {
                     );
                 }
                 if resp.clicked() {
-                    *navigate_to = Some((row.name.clone(), row.db_names.clone()));
+                    *navigate_to = Some(row.name.clone());
                 }
                 // The row-wide click rect is drawn on top of the icon and
                 // name, so attach the drop tooltip here too -- otherwise the
@@ -1585,7 +1624,7 @@ impl TrophyHallPanel {
             .collect();
 
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            let mut navigate_to: Option<(String, Vec<String>)> = None;
+            let mut navigate_to: Option<String> = None;
 
             let available_width = ui.available_width();
             let button_width = 150.0;
@@ -1621,7 +1660,7 @@ impl TrophyHallPanel {
                         }
                         if enter {
                             if let Some(row) = self.index_rows.iter().find(|r| r.name == sel) {
-                                navigate_to = Some((row.name.clone(), row.db_names.clone()));
+                                navigate_to = Some(row.name.clone());
                             }
                         }
                     }
@@ -1648,7 +1687,7 @@ impl TrophyHallPanel {
                         );
 
                         if resp.clicked() {
-                            navigate_to = Some((row.name.clone(), row.db_names.clone()));
+                            navigate_to = Some(row.name.clone());
                         }
                         attach_dungeon_tooltip(
                             resp.clone(),
@@ -1823,9 +1862,10 @@ impl TrophyHallPanel {
                     }
                 });
 
-            if let Some((display_name, db_names)) = navigate_to {
+            if let Some(display_name) = navigate_to {
                 self.selected_icon = Some(display_name.clone());
-                self.load_detail(&db_names, ctx.loot_database, &display_name);
+                let (db_names, rs_keys) = self.row_source_keys(&display_name);
+                self.load_detail(&db_names, &rs_keys, ctx.loot_database, &display_name);
                 self.page = Page::Detail { name: display_name };
             }
         });
@@ -1841,13 +1881,8 @@ impl TrophyHallPanel {
 
         // Lazily reload detail cache if cleared by refresh
         if self.detail_cache.is_none() {
-            let db_names: Vec<String> = self
-                .index_rows
-                .iter()
-                .find(|r| r.name == dungeon)
-                .map(|r| r.db_names.clone())
-                .unwrap_or_default();
-            self.load_detail(&db_names, ctx.loot_database, dungeon);
+            let (db_names, rs_keys) = self.row_source_keys(dungeon);
+            self.load_detail(&db_names, &rs_keys, ctx.loot_database, dungeon);
         }
 
         let shadcn = ctx.shadcn;
@@ -1893,13 +1928,14 @@ impl TrophyHallPanel {
             });
         });
 
-        // Swapping to a neighbour needs both its name and its loot-database rows,
-        // so it happens here rather than inside the band closure. Returning
-        // early avoids drawing this frame's header for the old dungeon while the
-        // body already belongs to the new one.
-        if let Some((name, db_names)) = open {
+        // Swapping to a neighbour needs the new row's source keys, so it happens
+        // here rather than inside the band closure. Returning early avoids
+        // drawing this frame's header for the old dungeon while the body already
+        // belongs to the new one.
+        if let Some((name, _)) = open {
             self.selected_icon = Some(name.clone());
-            self.load_detail(&db_names, ctx.loot_database, &name);
+            let (db_names, rs_keys) = self.row_source_keys(&name);
+            self.load_detail(&db_names, &rs_keys, ctx.loot_database, &name);
             self.page = Page::Detail { name };
             return actions;
         }
@@ -2650,10 +2686,60 @@ mod gating_tests {
         assert_eq!(icon_nav_target(0, 6, 0, IconNav::Down), None);
     }
 
+    #[test]
+    fn realmshark_time_and_items_follow_the_normalized_row() {
+        use realmhound_core::realmshark_import::{RealmSharkDungeon, RealmSharkStats};
+
+        // RealmShark keys the realm as "The Realm"; the merged row is "Realm".
+        let mut panel = TrophyHallPanel::new();
+        panel.data_source = DataSource::RealmShark;
+        panel.realmshark_data = Some(RealmSharkStats {
+            dungeons: [(
+                "The Realm".to_string(),
+                RealmSharkDungeon {
+                    name: "The Realm".to_string(),
+                    completions: 12,
+                    total_time_ms: 3_600_000,
+                    items: vec![DungeonItemStat {
+                        item_id: 2608,
+                        item_name: String::new(),
+                        total_count: 4,
+                        bag_type_counts: Vec::new(),
+                    }],
+                    mob_items: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+
+        panel.rebuild_index(None, &AccountData::new(), None);
+
+        let row = panel
+            .index_rows
+            .iter()
+            .find(|r| r.name == "Realm")
+            .expect("the import merges into the Realm row");
+        assert_eq!(row.rs_keys, vec!["The Realm".to_string()]);
+        assert_eq!(row.total_items, 4, "the imported items land on the row");
+        assert_eq!(
+            row.time_ms, 3_600_000,
+            "the imported time lands on the same row"
+        );
+
+        // ...and the detail page finds the import under its own key too.
+        let (db_names, rs_keys) = panel.row_source_keys("Realm");
+        panel.load_detail(&db_names, &rs_keys, None, "Realm");
+        let detail = panel.detail_cache.as_ref().expect("detail loaded");
+        assert_eq!(detail.items.len(), 1);
+        assert_eq!(detail.items[0].item_id, 2608);
+    }
+
     fn index_row(name: &str) -> IndexRow {
         IndexRow {
             name: name.to_string(),
             db_names: vec![name.to_string()],
+            rs_keys: Vec::new(),
             total_items: 0,
             completions: 0,
             difficulty: None,

@@ -383,6 +383,11 @@ mod slot_types {
     pub const LUTE: i32 = 28;
     pub const MACE: i32 = 29;
     pub const SHEATH: i32 = 30;
+    /// Druid sigils. The game's own XML slot enum does not name 31, so assets are
+    /// identified by their `SIGIL` label (see
+    /// [`ItemCategorizer::special_override`]); mission `wornRestriction` entries
+    /// still spell the slot `SIGIL`.
+    pub const SIGIL: i32 = 31;
 
     // -- Accessories --
     pub const RING: i32 = 9;
@@ -393,9 +398,10 @@ mod slot_types {
 }
 
 /// Resolve a game `SlotType` name (as it appears in mission `wornRestriction`
-/// entries, e.g. `"ORB"`, `"SKULL"`, `"KATANA"`) to its numeric slot type.
-/// Case-insensitive. Returns `None` for unknown names so callers can degrade
-/// gracefully rather than guess. Kept in sync with the [`slot_types`] table.
+/// entries, e.g. `"ORB"`, `"SKULL"`, `"SIGIL"`) to its numeric slot type.
+/// Case-insensitive. Returns `None` for unknown names so callers keep the
+/// requirement unresolved instead of guessing. Kept in sync with the
+/// [`slot_types`] table.
 pub fn slot_type_from_name(name: &str) -> Option<i32> {
     use slot_types::*;
     Some(match name.trim().to_ascii_uppercase().as_str() {
@@ -426,6 +432,7 @@ pub fn slot_type_from_name(name: &str) -> Option<i32> {
         "LUTE" => LUTE,
         "MACE" => MACE,
         "SHEATH" => SHEATH,
+        "SIGIL" => SIGIL,
         "RING" => RING,
         _ => return None,
     })
@@ -2551,6 +2558,20 @@ mod tests {
             ItemCategorizer::categorize(&a),
             (ItemCategory::Weapons, ItemSubCategory::MorningStars)
         );
+    }
+
+    #[test]
+    fn test_slot_type_from_name_resolves_sigils() {
+        // Druid sigils carry slot type 31, which the game's XML slot enum does
+        // not name, so mission worn restrictions that spell it "SIGIL" used to
+        // resolve to nothing and dropped the restriction.
+        assert_eq!(slot_type_from_name("SIGIL"), Some(31));
+        assert_eq!(slot_type_from_name(" sigil "), Some(31));
+        assert_eq!(slot_type_from_name("ORB"), Some(21));
+        assert_eq!(slot_type_from_name("SHEATH"), Some(30));
+        // Unknown names stay unresolved for callers to handle.
+        assert_eq!(slot_type_from_name("BANNER"), None);
+        assert_eq!(slot_type_from_name(""), None);
     }
 
     #[test]

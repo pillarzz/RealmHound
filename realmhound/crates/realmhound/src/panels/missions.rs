@@ -393,8 +393,11 @@ pub(crate) struct CurrentChar {
 /// draw no indicator.
 ///
 /// When the mission carries `worn` restrictions the character must additionally
-/// have an item of one of those slot types equipped (e.g. an Orb -> Mystic).
-/// The pill stays dimmed until a matching equipped item is found.
+/// have an item of one of those slot types equipped (e.g. an Orb -> Mystic, a
+/// Sigil -> Druid). The pill stays dimmed until a matching equipped item is
+/// found. A restriction RealmHound could not resolve (`slot_type` `0`) is never
+/// satisfied - matching an empty slot there would make a class-exclusive mission
+/// look open to everyone.
 fn mission_qualifies(participants: i32, worn: &[WornReqView], c: &CurrentChar) -> Option<bool> {
     let base = match participants {
         255 => Some(true),
@@ -405,7 +408,9 @@ fn mission_qualifies(participants: i32, worn: &[WornReqView], c: &CurrentChar) -
     if worn.is_empty() {
         return Some(base);
     }
-    let worn_ok = worn.iter().any(|w| c.equipped_slots.contains(&w.slot_type));
+    let worn_ok = worn
+        .iter()
+        .any(|w| w.slot_type != 0 && c.equipped_slots.contains(&w.slot_type));
     Some(base && worn_ok)
 }
 
@@ -4337,6 +4342,27 @@ mod tests {
             mission_qualifies(2, &[worn(21)], &non_seasonal),
             Some(false)
         );
+    }
+
+    #[test]
+    fn unmapped_worn_requirement_never_qualifies() {
+        // A restriction whose slot RealmHound cannot map carries slot type 0 and
+        // must not match an empty slot: that is how the Druid-only sigil mission
+        // showed every class as eligible in a new season.
+        let mut wizard = ch(true, false);
+        wizard.equipped_slots = [17, 11, 14, 0]; // staff, spell, robe, empty ring
+        assert_eq!(mission_qualifies(2, &[worn(0)], &wizard), Some(false));
+        assert_eq!(
+            mission_qualifies(2, &[worn(0), worn(21)], &wizard),
+            Some(false)
+        );
+
+        // A mapped sigil requirement (31) needs a sigil equipped: the Druid
+        // qualifies, the Wizard does not.
+        let mut druid = ch(true, false);
+        druid.equipped_slots = [17, 31, 14, 9];
+        assert_eq!(mission_qualifies(2, &[worn(31)], &druid), Some(true));
+        assert_eq!(mission_qualifies(2, &[worn(31)], &wizard), Some(false));
     }
 
     #[test]

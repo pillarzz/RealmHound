@@ -438,15 +438,16 @@ impl MissionTracker {
             worn_restriction: def
                 .worn_restriction
                 .iter()
-                .filter_map(|w| {
-                    realmhound_core::assets::slot_type_from_name(&w.kind).map(|st| WornReqView {
-                        slot_type: st,
-                        display: if w.display.is_empty() {
-                            w.kind.clone()
-                        } else {
-                            w.display.clone()
-                        },
-                    })
+                .map(|w| WornReqView {
+                    // `0` when the game names a slot RealmHound cannot map. The
+                    // requirement is kept so it can never silently widen the
+                    // mission to every class (see [`WornReqView::slot_type`]).
+                    slot_type: realmhound_core::assets::slot_type_from_name(&w.kind).unwrap_or(0),
+                    display: if w.display.is_empty() {
+                        w.kind.clone()
+                    } else {
+                        w.display.clone()
+                    },
                 })
                 .collect(),
             repeatable,
@@ -676,7 +677,9 @@ pub struct ObjectiveView {
 
 /// A resolved worn-equipment restriction for display and eligibility: the
 /// character must have an item of `slot_type` equipped (e.g. an Orb). `display`
-/// is the human label shown in the tooltip.
+/// is the human label shown in the tooltip. `slot_type` is `0` when the game
+/// named a slot RealmHound cannot map yet; such a requirement is never
+/// satisfied, so the mission dims instead of reading as open to every class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WornReqView {
     pub slot_type: i32,
@@ -1183,6 +1186,45 @@ mod tests {
         assert_eq!(entry_in(&v, 55, 1).state, MissionState::InProgress);
         assert_eq!(entry_in(&v, 55, 2).state, MissionState::Locked);
         assert_eq!(entry_in(&v, 55, 3).state, MissionState::Locked);
+    }
+
+    /// A worn restriction keeps its resolved slot (`SIGIL` -> 31) and is never
+    /// dropped when the game names a slot RealmHound cannot map, so the
+    /// requirement cannot silently widen the mission to every class.
+    #[test]
+    fn worn_restrictions_resolve_or_fail_closed() {
+        let defs = r#"
+        {
+          "seasons": [
+            {
+              "id": 55, "name": "The Whispers of Skuld", "current": 1, "available": 1,
+              "missions": [
+                { "id": 1, "name": "The Veil Is Breaking", "desc": "Requires a Sigil",
+                  "participants": 2,
+                  "wornRestriction": [{ "type": "SIGIL", "display": "Sigil" }],
+                  "conds": [{ "type": 2, "target": "", "amount": 75 }],
+                  "rewards": [{ "type": 1, "target": "", "amount": 1400000 }] },
+                { "id": 2, "name": "Mystery Slot", "desc": "Unmapped slot",
+                  "wornRestriction": [{ "type": "BANNER", "display": "Banner" }],
+                  "conds": [{ "type": 2, "target": "", "amount": 75 }],
+                  "rewards": [{ "type": 1, "target": "", "amount": 1400000 }] }
+              ]
+            }
+          ]
+        }"#;
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(defs).unwrap());
+        let v = t.build_view();
+
+        let sigil = &entry_in(&v, 55, 1).worn_restriction;
+        assert_eq!(sigil.len(), 1);
+        assert_eq!(sigil[0].slot_type, 31, "SIGIL resolves to the sigil slot");
+        assert_eq!(sigil[0].display, "Sigil");
+
+        let banner = &entry_in(&v, 55, 2).worn_restriction;
+        assert_eq!(banner.len(), 1, "unmapped requirement is kept, not dropped");
+        assert_eq!(banner[0].slot_type, 0);
+        assert_eq!(banner[0].display, "Banner");
     }
 
     #[test]

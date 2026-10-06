@@ -8205,8 +8205,8 @@ impl RealmHoundApp {
                     value_color,
                 )
                 .hover_tip(
-                    "Estimated battlepass end (season midpoint, snapped to Tuesday).\n\
-                     Press Refresh to load or update it.",
+                    "Battlepass end date from live game data, or the season midpoint \
+                     estimate when the server has none.\nPress Refresh to load or update it.",
                 );
             }
             WidgetKind::CurrentCharacter => {
@@ -8414,6 +8414,39 @@ impl RealmHoundApp {
                     progress,
                     scope: mission_scope,
                 });
+            }
+            // Exact season start and battlepass window. The mission payload's pool
+            // timestamp keeps reporting the previous cycle's start after a
+            // rollover, which put the battlepass estimate's midpoint behind now
+            // and collapsed the countdown onto the season end.
+            let season_info = match client.get_season_info() {
+                Ok(body) => realmhound_core::api::parse_season_info(&body),
+                Err(e) => {
+                    tracing::warn!("[SEASON] season/seasonInfo failed: {e}");
+                    None
+                }
+            };
+            let battlepass = match client.get_battlepass_info() {
+                Ok(body) => realmhound_core::api::parse_battlepass_info(&body),
+                Err(e) => {
+                    tracing::warn!("[SEASON] season/bpInfo failed: {e}");
+                    None
+                }
+            };
+            if season_info.is_some() || battlepass.is_some() {
+                if let Ok(mut s) = settings.write() {
+                    let mut changed = false;
+                    if let Some((start, _)) = season_info.as_ref().and_then(|i| i.window()) {
+                        changed |= s.season.apply_live_season_start(start);
+                    }
+                    if let Some((start, end)) = battlepass.as_ref().and_then(|b| b.window()) {
+                        changed |= s.season.apply_live_battlepass_window(start, end);
+                    }
+                    if changed {
+                        s.save();
+                        tracing::info!("[SEASON] season/battlepass window auto-set from live data");
+                    }
+                }
             }
         });
     }

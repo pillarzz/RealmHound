@@ -1139,11 +1139,12 @@ impl UtcResetTime {
 /// `reset` is shared; `battlepass_reset` is an optional override used only when
 /// it `is_set()`.
 ///
-/// The season `reset` can be auto-populated from live `getClientSeasons` data
-/// (see `apply_live_season_end`). The battlepass end date has no live source, so
-/// it is estimated from the season span (two equal battlepasses per season,
-/// boundaries on Tuesdays; see `season::battlepass_target`). A hand-entered
-/// `battlepass_reset` overrides the estimate.
+/// The season `reset` can be auto-populated from live `getClientSeasons` /
+/// `season/seasonInfo` data (see `apply_live_season_end`). The battlepass window
+/// comes from `season/bpInfo` (`apply_live_battlepass_window`); when the server
+/// has none, it is estimated from the season span (two equal battlepasses per
+/// season, boundaries on Tuesdays; see `season::battlepass_target`). A
+/// hand-entered `battlepass_reset` overrides both.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SeasonConfig {
     /// Display name of the current season (e.g. "Alien Invasion").
@@ -1167,10 +1168,18 @@ pub struct SeasonConfig {
     /// used to avoid clobbering manual overrides on every fetch.
     #[serde(default)]
     pub auto_season_end_unix: i64,
-    /// The season start (unix seconds) observed for `auto_season_id`, from the
-    /// `getPlayerMissions` pool timestamp. Anchors the battlepass-end estimate.
+    /// The season start (unix seconds) observed for `auto_season_id`, from
+    /// `season/seasonInfo`, else the `getPlayerMissions` pool timestamp (which
+    /// keeps reporting the previous cycle's start after a rollover). Anchors the
+    /// battlepass-end estimate.
     #[serde(default)]
     pub auto_season_start_unix: i64,
+    /// The running battlepass start (unix seconds) from `season/bpInfo`.
+    #[serde(default)]
+    pub auto_bp_start_unix: i64,
+    /// The running battlepass end (unix seconds) from `season/bpInfo`.
+    #[serde(default)]
+    pub auto_bp_end_unix: i64,
 }
 
 impl SeasonConfig {
@@ -1201,7 +1210,10 @@ impl SeasonConfig {
         self.auto_season_id = season_id;
         self.auto_season_end_unix = end_unix;
         if let Some(start) = start_unix {
-            if start > 0 {
+            // Only ever move the anchor forward: the mission payload's pool
+            // timestamp keeps reporting the previous cycle's start after a
+            // rollover, and must not undo the exact `season/seasonInfo` start.
+            if start > self.auto_season_start_unix {
                 self.auto_season_start_unix = start;
             }
         }
@@ -1213,6 +1225,35 @@ impl SeasonConfig {
         if let Some(reset) = crate::season::unix_to_reset(end_unix) {
             self.reset = reset;
         }
+        true
+    }
+
+    /// Refine the season start anchor from `season/seasonInfo`.
+    ///
+    /// The `getPlayerMissions` pool timestamp keeps reporting the *previous*
+    /// cycle's start after a rollover, which put the battlepass estimate's
+    /// midpoint behind `now` and collapsed it onto the season end. The live
+    /// window is authoritative, so record it whenever it changes.
+    pub fn apply_live_season_start(&mut self, start_unix: i64) -> bool {
+        // Only ever move the anchor forward, for the same reason.
+        if start_unix <= self.auto_season_start_unix {
+            return false;
+        }
+        self.auto_season_start_unix = start_unix;
+        true
+    }
+
+    /// Record the running battlepass window from `season/bpInfo`, the only live
+    /// source of a battlepass boundary.
+    pub fn apply_live_battlepass_window(&mut self, start_unix: i64, end_unix: i64) -> bool {
+        if start_unix <= 0 || end_unix <= start_unix {
+            return false;
+        }
+        if self.auto_bp_start_unix == start_unix && self.auto_bp_end_unix == end_unix {
+            return false;
+        }
+        self.auto_bp_start_unix = start_unix;
+        self.auto_bp_end_unix = end_unix;
         true
     }
 }
@@ -2695,6 +2736,42 @@ mod tests {
         assert!(!c.apply_live_season_end(52, 0, Some(1785761800)));
         assert!(!c.apply_live_season_end(52, -5, None));
         assert_eq!(c.auto_season_id, 0);
+    }
+
+    #[test]
+    fn apply_live_season_start_moves_the_anchor_forward_only() {
+        let mut c = SeasonConfig::default();
+        assert!(c.apply_live_season_start(1791277199));
+        assert!(!c.apply_live_season_start(1791277199), "unchanged start");
+        assert!(!c.apply_live_season_start(0));
+        // The stale pool timestamp of a previous cycle must not move it back.
+        assert!(!c.apply_live_season_start(1785761800));
+        assert_eq!(c.auto_season_start_unix, 1791277199);
+    }
+
+    #[test]
+    fn apply_live_season_end_keeps_the_exact_start_over_the_pool_timestamp() {
+        let mut c = SeasonConfig::default();
+        assert!(c.apply_live_season_start(1791277199));
+        // The rollover reports the new season id but still the old pool start.
+        assert!(c.apply_live_season_end(55, 1796119199, Some(1785761800)));
+        assert_eq!(c.auto_season_id, 55);
+        assert_eq!(c.auto_season_start_unix, 1791277199);
+    }
+
+    #[test]
+    fn apply_live_battlepass_window_records_and_dedups() {
+        let mut c = SeasonConfig::default();
+        assert!(c.apply_live_battlepass_window(1791277201, 1793698800));
+        assert!(!c.apply_live_battlepass_window(1791277201, 1793698800));
+        // A window needs both ends, in order.
+        assert!(!c.apply_live_battlepass_window(0, 1793698800));
+        assert!(!c.apply_live_battlepass_window(1793698800, 1791277201));
+        assert_eq!(c.auto_bp_start_unix, 1791277201);
+        assert_eq!(c.auto_bp_end_unix, 1793698800);
+        // A later battlepass replaces the window.
+        assert!(c.apply_live_battlepass_window(1793698801, 1796119199));
+        assert_eq!(c.auto_bp_end_unix, 1796119199);
     }
 
     #[test]

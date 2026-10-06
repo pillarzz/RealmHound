@@ -66,16 +66,25 @@ pub fn snap_to_tuesday(dt: DateTime<Utc>) -> DateTime<Utc> {
 
 /// Resolve the effective battlepass end instant.
 ///
-/// A hand-entered `battlepass_reset` overrides everything. Otherwise the end is
-/// estimated: each season holds two equal battlepasses, so the first ends at the
-/// season midpoint (snapped to the nearest Tuesday) and the second ends with the
-/// season. Falls back to the shared season `reset` when the span is unknown.
+/// A hand-entered `battlepass_reset` overrides everything. Otherwise the live
+/// battlepass window from `season/bpInfo` is used while it is still running
+/// (`apply_live_battlepass_window`). Failing that it is estimated: each season
+/// holds two equal battlepasses, so the first ends at the season midpoint
+/// (snapped to the nearest Tuesday) and the second ends with the season. Falls
+/// back to the shared season `reset` when the span is unknown.
 pub fn battlepass_target(
     cfg: &crate::settings::SeasonConfig,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     if cfg.battlepass_reset.is_set() {
         return reset_to_datetime(&cfg.battlepass_reset);
+    }
+    if cfg.auto_bp_start_unix > 0 && cfg.auto_bp_end_unix > cfg.auto_bp_start_unix {
+        if let chrono::LocalResult::Single(end_dt) = Utc.timestamp_opt(cfg.auto_bp_end_unix, 0) {
+            if now < end_dt {
+                return Some(end_dt);
+            }
+        }
     }
     if cfg.auto_season_start_unix > 0 && cfg.auto_season_end_unix > cfg.auto_season_start_unix {
         let mid = (cfg.auto_season_start_unix + cfg.auto_season_end_unix) / 2;
@@ -202,6 +211,73 @@ mod tests {
     fn unix_to_reset_rejects_non_positive() {
         assert!(unix_to_reset(0).is_none());
         assert!(unix_to_reset(-1).is_none());
+    }
+
+    /// The rollover case: with the exact season start (season 55 began
+    /// 2026-10-06, when season 52 ended) the estimate lands on 2026-11-03 - the
+    /// battlepass end the game shows - instead of collapsing onto the season end
+    /// the way the stale pool timestamp (2026-08-03) made it.
+    #[test]
+    fn battlepass_estimate_splits_the_season_at_its_midpoint() {
+        let mut cfg = crate::settings::SeasonConfig::default();
+        cfg.auto_season_start_unix = 1791277199;
+        cfg.auto_season_end_unix = 1796119199;
+        let now = dt(2026, 10, 6, 15, 57);
+        // 1793698199 == 2026-11-03 09:29:59 UTC, already a Tuesday.
+        assert_eq!(
+            battlepass_target(&cfg, now),
+            Some(Utc.timestamp_opt(1793698199, 0).unwrap())
+        );
+
+        // The previous cycle's start puts the midpoint behind `now`, so the
+        // estimate falls through to the season end.
+        cfg.auto_season_start_unix = 1785761800;
+        assert_eq!(
+            battlepass_target(&cfg, now),
+            Some(Utc.timestamp_opt(1796119199, 0).unwrap())
+        );
+    }
+
+    /// A live battlepass window (`season/bpInfo`) wins over the estimate while it
+    /// is still running, and the estimate takes over once it has passed.
+    #[test]
+    fn live_battlepass_window_wins_while_running() {
+        let mut cfg = crate::settings::SeasonConfig::default();
+        cfg.auto_season_start_unix = 1791277199;
+        cfg.auto_season_end_unix = 1796119199;
+        cfg.auto_bp_start_unix = 1791277201;
+        cfg.auto_bp_end_unix = 1793698800;
+        let window_end = Utc.timestamp_opt(1793698800, 0).unwrap();
+
+        assert_eq!(
+            battlepass_target(&cfg, dt(2026, 10, 6, 15, 57)),
+            Some(window_end)
+        );
+        // After the battlepass ends, the estimate answers again.
+        assert_eq!(
+            battlepass_target(&cfg, dt(2026, 11, 4, 0, 0)),
+            Some(Utc.timestamp_opt(1796119199, 0).unwrap())
+        );
+    }
+
+    /// A hand-entered battlepass reset overrides both the live window and the
+    /// estimate.
+    #[test]
+    fn manual_battlepass_reset_overrides_live_data() {
+        let mut cfg = crate::settings::SeasonConfig::default();
+        cfg.auto_bp_start_unix = 1791277201;
+        cfg.auto_bp_end_unix = 1793698800;
+        cfg.battlepass_reset = UtcResetTime {
+            year: 2026,
+            month: 11,
+            day: 10,
+            hour: 12,
+            minute: 0,
+        };
+        assert_eq!(
+            battlepass_target(&cfg, dt(2026, 10, 6, 15, 57)),
+            Some(dt(2026, 11, 10, 12, 0))
+        );
     }
 
     #[test]

@@ -249,6 +249,9 @@ pub enum AppAction {
     SaveCharactersSettings(realmhound_core::settings::CharactersSettings),
     /// Missions panel state changed (hidden/order/collapsed/hide-claimed) -- app should persist it.
     SaveMissionsSettings(realmhound_core::settings::MissionsSettings),
+    /// The Trophy Hall's view toggles changed; the app writes them back to
+    /// `TrophyHallSettings`.
+    SaveTrophyHallView,
     /// Quests panel state changed (collapsed/disabled sections) -- app should persist it.
     SaveQuestsSettings(realmhound_core::settings::QuestsSettings),
     /// Live Feed Taskbar tracking changed (per-card compass toggle) -- app

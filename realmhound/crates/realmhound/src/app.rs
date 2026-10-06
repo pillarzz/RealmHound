@@ -1266,6 +1266,7 @@ impl RealmHoundApp {
             *app.trophy_hall_panel.show_no_collection_dungeons_mut() =
                 s.trophy_hall.show_no_collection_dungeons;
             *app.trophy_hall_panel.compact_view_mut() = s.trophy_hall.compact_view;
+            *app.trophy_hall_panel.show_legacy_dungeons_mut() = s.trophy_hall.show_legacy_dungeons;
         }
 
         // Forward cached vault data to treasury panel (vault panel loads its own cache)
@@ -1348,6 +1349,8 @@ impl RealmHoundApp {
             settings.trophy_hall.show_no_collection_dungeons =
                 self.trophy_hall_panel.show_no_collection_dungeons();
             settings.trophy_hall.compact_view = self.trophy_hall_panel.compact_view();
+            settings.trophy_hall.show_legacy_dungeons =
+                self.trophy_hall_panel.show_legacy_dungeons();
             settings.save();
         }
     }
@@ -9272,6 +9275,9 @@ impl RealmHoundApp {
                         s.characters.last_live_char_id = keep;
                         s.save();
                     }
+                }
+                AppAction::SaveTrophyHallView => {
+                    self.persist_trophy_hall_view();
                 }
                 AppAction::SaveMissionsSettings(missions) => {
                     if let Ok(mut s) = self.settings.write() {

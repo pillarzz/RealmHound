@@ -133,6 +133,9 @@ pub struct TrophyHallPanel {
     /// drop tables, e.g. White Snake Invasion I/II). Off by default since
     /// these rows have no items to show, just completions.
     show_no_collection_dungeons: bool,
+    /// List Legacy dungeons (the Time Chamber's retro dungeons, and the Legacy
+    /// Heroic ones). On by default, matching the game's own Time Chamber hub.
+    show_legacy_dungeons: bool,
     show_st: bool,
     show_ut: bool,
     show_shiny: bool,
@@ -174,6 +177,7 @@ impl TrophyHallPanel {
             force_rebuild: false,
             column_count: 2,
             show_no_collection_dungeons: false,
+            show_legacy_dungeons: true,
             show_st: true,
             show_ut: true,
             show_shiny: true,
@@ -232,6 +236,14 @@ impl TrophyHallPanel {
 
     pub fn show_no_collection_dungeons(&self) -> bool {
         self.show_no_collection_dungeons
+    }
+
+    pub fn show_legacy_dungeons_mut(&mut self) -> &mut bool {
+        &mut self.show_legacy_dungeons
+    }
+
+    pub fn show_legacy_dungeons(&self) -> bool {
+        self.show_legacy_dungeons
     }
 
     /// Open a file picker for a RealmShark `dungeon.stats` file and import it to
@@ -813,7 +825,7 @@ impl TrophyHallPanel {
 
     fn render_index(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) -> Vec<AppAction> {
         realmhound_core::prof_function!();
-        let actions = Vec::new();
+        let mut actions = Vec::new();
         let shadcn = ctx.shadcn;
 
         // Controls row: view mode + sort dropdown + search + data source
@@ -913,6 +925,18 @@ impl TrophyHallPanel {
                 shadcn
                     .tgl(ui, &mut self.show_st, RichText::new("ST").small())
                     .hover_tip("Show Set Tier (ST) items");
+                let legacy_resp = shadcn
+                    .tgl(
+                        ui,
+                        &mut self.show_legacy_dungeons,
+                        RichText::new("Legacy Dungeons").small(),
+                    )
+                    .hover_tip(
+                        "Show the Time Chamber's Legacy dungeons and their retro collections",
+                    );
+                if legacy_resp.changed() {
+                    actions.push(AppAction::SaveTrophyHallView);
+                }
                 ctx.sprite_renderer.shiny_toggle(
                     ui,
                     shadcn,
@@ -1045,6 +1069,7 @@ impl TrophyHallPanel {
         let portal_map = get_dungeon_portal_map();
         let query_lower = self.search_query.to_lowercase();
         let show_no_collection = self.show_no_collection_dungeons;
+        let show_legacy = self.show_legacy_dungeons;
         let collections = &self.collections;
         let filtered_indices: Vec<usize> = {
             realmhound_core::prof_scope!("dstats_filter");
@@ -1054,6 +1079,7 @@ impl TrophyHallPanel {
                 .filter(|(_, r)| {
                     query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower)
                 })
+                .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
                 .filter(|(_, r)| {
                     show_no_collection
                         || collections
@@ -1444,12 +1470,14 @@ impl TrophyHallPanel {
         let portal_map = get_dungeon_portal_map();
         let query_lower = self.search_query.to_lowercase();
         let show_no_collection = self.show_no_collection_dungeons;
+        let show_legacy = self.show_legacy_dungeons;
         let collections = &self.collections;
         let filtered_indices: Vec<usize> = self
             .index_rows
             .iter()
             .enumerate()
             .filter(|(_, r)| query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower))
+            .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
             .filter(|(_, r)| {
                 show_no_collection
                     || collections
@@ -2293,9 +2321,39 @@ fn is_non_dungeon_location(name: &str) -> bool {
     EXCLUDED.iter().any(|&e| name.eq_ignore_ascii_case(e))
 }
 
+/// Whether a dungeon row belongs to the Legacy family: the Time Chamber's retro
+/// dungeons and the Legacy Heroic reskins. They are listed by default and can be
+/// filtered out with the panel's "Legacy Dungeons" toggle.
+fn is_legacy_dungeon(name: &str) -> bool {
+    name.strip_prefix("Legacy ")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 #[cfg(test)]
 mod gating_tests {
     use super::*;
+
+    #[test]
+    fn is_legacy_dungeon_matches_the_legacy_family_only() {
+        assert!(is_legacy_dungeon("Legacy Spider Den"));
+        assert!(is_legacy_dungeon("Legacy The Shatters"));
+        assert!(is_legacy_dungeon("Legacy Heroic Undead Lair"));
+        assert!(!is_legacy_dungeon("Spider Den"));
+        assert!(!is_legacy_dungeon("The Nest"));
+        assert!(!is_legacy_dungeon("Legacy"));
+        assert!(!is_legacy_dungeon("legacy spider den"));
+        assert!(!is_legacy_dungeon(""));
+    }
+
+    #[test]
+    fn legacy_toggle_defaults_on() {
+        let panel = TrophyHallPanel::new();
+        assert!(panel.show_legacy_dungeons());
+        assert!(
+            realmhound_core::settings::TrophyHallSettings::default().show_legacy_dungeons,
+            "a fresh settings file must list Legacy dungeons"
+        );
+    }
 
     #[test]
     fn realmshark_gating_requires_a_bound_import_path() {

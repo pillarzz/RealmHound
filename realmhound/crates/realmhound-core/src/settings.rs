@@ -1838,7 +1838,7 @@ impl AccountSettings {
 ///
 /// Persists the tracked-loot data source so a RealmShark/Both selection
 /// survives restarts instead of resetting to RealmHound.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrophyHallSettings {
     /// Data source key: "realmhound" (default), "realmshark", or "both".
     /// `None` uses the default (RealmHound).
@@ -1851,6 +1851,21 @@ pub struct TrophyHallSettings {
     /// Whether the compact list view (hide name/section columns) is enabled.
     #[serde(default)]
     pub compact_view: bool,
+    /// Whether Legacy dungeons (the Time Chamber's retro dungeons and the
+    /// Legacy Heroic ones) are listed. On by default.
+    #[serde(default = "default_true")]
+    pub show_legacy_dungeons: bool,
+}
+
+impl Default for TrophyHallSettings {
+    fn default() -> Self {
+        Self {
+            data_source: None,
+            show_no_collection_dungeons: false,
+            compact_view: false,
+            show_legacy_dungeons: true,
+        }
+    }
 }
 
 /// Treasury tab settings.

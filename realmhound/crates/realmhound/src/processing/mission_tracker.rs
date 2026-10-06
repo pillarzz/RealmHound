@@ -46,19 +46,10 @@ pub struct MissionTracker {
     /// Per-mission runtime, keyed by `(tree/season id, mission id)` so missions
     /// from different trees never collide.
     runtime: HashMap<(i32, i32), MissionRuntime>,
-    /// Fully-unlocked tree ids (`<TreesUnlocked>`): every mission in these trees
-    /// is available. From the last `getPlayerMissions`.
-    trees_unlocked: HashSet<i32>,
     /// Individually locked `(tree, mission)` from `<LockedMissions>`.
     locked: HashSet<(i32, i32)>,
     /// Individually unlocked `(tree, mission)` from `<UnlockedMissions>`.
     unlocked: HashSet<(i32, i32)>,
-    /// Trees the last `getPlayerMissions` actually reported a `<Season>` block
-    /// for. Within a seen tree, a mission with no progress entry is locked.
-    seen_trees: HashSet<i32>,
-    /// `(tree, mission)` the server surfaced as unlocked: it either carried a
-    /// progress entry in its `<Season>` block or appeared in `<UnlockedMissions>`.
-    server_unlocked: HashSet<(i32, i32)>,
     /// Account name this state belongs to; used to discard stale/mule data.
     account: Option<String>,
     /// Outstanding claims keyed by request id (from packet 163).
@@ -104,11 +95,8 @@ impl MissionTracker {
         self.account = Some(new);
         self.runtime.clear();
         self.pending_claims.clear();
-        self.trees_unlocked.clear();
         self.locked.clear();
         self.unlocked.clear();
-        self.seen_trees.clear();
-        self.server_unlocked.clear();
         self.season_id = None;
         self.defs = None;
         self.touch();
@@ -136,18 +124,8 @@ impl MissionTracker {
         if let Some(id) = pm.season_id {
             self.season_id = Some(id);
         }
-        self.trees_unlocked = pm.trees_unlocked.iter().copied().collect();
         self.locked = pm.locked_missions.iter().copied().collect();
         self.unlocked = pm.unlocked_missions.iter().copied().collect();
-        // Presence in a tree's <Season> block is the server's unlock signal: a
-        // reported mission is unlocked, an omitted one (in a seen tree) is locked.
-        self.seen_trees = pm.missions.iter().map(|m| m.tree_id).collect();
-        self.server_unlocked = pm
-            .missions
-            .iter()
-            .map(|m| (m.tree_id, m.mission_id))
-            .chain(pm.unlocked_missions.iter().copied())
-            .collect();
         for m in pm.missions {
             let rt = self.runtime.entry((m.tree_id, m.mission_id)).or_default();
             rt.progress = m.progress;
@@ -393,22 +371,28 @@ impl MissionTracker {
             .trim()
             .to_string();
         let complete = def.is_complete(&progress);
-        // Lock state combines the server's explicit signals with the mission
-        // tree's unlock graph. A mission is unlocked if the last
-        // getPlayerMissions carried a progress entry for it (rt.is_some()), if it
-        // appears in <UnlockedMissions>, via a later live delta, OR if all of its
-        // `parentsStr` prerequisites are satisfied (claimed/complete). Graph
-        // unlock is essential for a past tree, which omits unlocked-but-unstarted
-        // missions from its <Season> block (they'd otherwise false-lock). Within a
-        // tree the server reported, a mission with none of these is locked.
+        // Lock state follows the client: a mission is available on a POSITIVE
+        // signal only -
+        //   - it appears in <UnlockedMissions>,
+        //   - every `parentsStr` prerequisite is satisfied (the unlock graph),
+        //   - the server already reports it as started or finished, i.e. progress
+        //     that is not zero or a claimable/claimed state (a locked mission can
+        //     have neither).
+        // Being listed in a <Season> block is NOT an unlock signal: that block is
+        // the tree's whole mission list, and on a season's first day the server
+        // sends no block at all. Treating it as one showed every mission of a
+        // fresh season as in progress.
         let parents = def.parents();
         let graph_unlocked = parents.iter().all(|&p| self.mission_satisfied(season, p));
-        let unlocked = rt.is_some()
-            || self.server_unlocked.contains(&key)
-            || self.unlocked.contains(&key)
-            || graph_unlocked;
-        let is_locked =
-            self.locked.contains(&key) || (self.seen_trees.contains(&season.id) && !unlocked);
+        let started = rt.is_some_and(|r| {
+            r.progress.iter().any(|&v| v != 0)
+                || matches!(
+                    r.state,
+                    Some(MissionState::Claimable | MissionState::Claimed)
+                )
+        });
+        let unlocked = graph_unlocked || self.unlocked.contains(&key) || started;
+        let is_locked = self.locked.contains(&key) || !unlocked;
         let state = if is_locked {
             MissionState::Locked
         } else {
@@ -1124,6 +1108,81 @@ mod tests {
         assert_eq!(entry_in(&v, 53, 3).state, MissionState::Locked);
         // The colliding-id tree-52 missions stay unlocked (never Locked).
         assert_ne!(entry_in(&v, 52, 2).state, MissionState::Locked);
+    }
+
+    // Season rollover (2026-10-06, season 55 "The Whispers of Skuld"): a chain of
+    // missions where only the root has no `parentsStr`, as the live definitions do.
+    const ROLLOVER_DEFS: &str = r#"
+    {
+      "seasons": [
+        {
+          "name": "The Whispers of Skuld", "current": 1, "available": 1, "id": 55,
+          "missions": [
+            { "id": 1, "name": "Whispers in the Dark", "desc": "Defeat Enemies in Realm or Dungeons",
+              "conds": [{ "type": 2, "target": "", "amount": 75 }],
+              "rewards": [{ "type": 1, "target": "", "amount": 1400000 }] },
+            { "id": 2, "name": "Gods in the Dark", "desc": "Defeat Gods in Realm",
+              "parentsStr": "1",
+              "conds": [{ "type": 3, "target": "", "amount": 75 }],
+              "rewards": [{ "type": 1, "target": "", "amount": 1500000 }] },
+            { "id": 3, "name": "Things That Crawl", "desc": "Complete any one of the listed Dungeons",
+              "parentsStr": "2",
+              "conds": [{ "type": 1, "target": "", "amount": 2 }],
+              "rewards": [{ "type": 1, "target": "", "amount": 1750000 }] }
+          ]
+        }
+      ]
+    }"#;
+
+    /// A season's first day sends no `<Season>` block at all (trimmed real
+    /// capture), so nothing may be treated as available just for being known: the
+    /// tree's root is the single mission the game offers, and everything behind an
+    /// unfinished parent is locked rather than in progress.
+    #[test]
+    fn season_rollover_locks_missions_behind_their_parents() {
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(ROLLOVER_DEFS).unwrap());
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions>\
+             <ActivePoolMissions>50:55:103:1785761800|50:56:201:1785761800|</ActivePoolMissions>\
+             <LockedMissions>;31,5560;31,5555;31,5556;31,5557;31,5558;31,5559</LockedMissions>\
+             <UnlockedMissions>;31,5561</UnlockedMissions>\
+             <TreesUnlocked>55</TreesUnlocked></Missions>",
+        ));
+
+        let v = t.build_view();
+        assert_eq!(entry_in(&v, 55, 1).state, MissionState::InProgress);
+        assert_eq!(entry_in(&v, 55, 2).state, MissionState::Locked);
+        assert_eq!(entry_in(&v, 55, 3).state, MissionState::Locked);
+
+        // Progress arrives from packet 165 once the root is worked on, and
+        // completing it unlocks the mission behind it.
+        t.apply_prog(&ProgEntry {
+            season_id: 55,
+            mission_id: 1,
+            values: vec![75],
+        });
+        let v = t.build_view();
+        assert_ne!(entry_in(&v, 55, 2).state, MissionState::Locked);
+        assert_eq!(entry_in(&v, 55, 3).state, MissionState::Locked);
+    }
+
+    /// A `<Season>` block is the tree's whole mission list, so listing a mission
+    /// there is not an unlock: an undecoded state code with zero progress stays
+    /// locked rather than reading as in progress.
+    #[test]
+    fn listed_mission_without_progress_is_locked() {
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(ROLLOVER_DEFS).unwrap());
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><TreesUnlocked>55</TreesUnlocked>\
+             <Season id=\"55\">1,0,0|2,0,0|3,0,0</Season></Missions>",
+        ));
+        let v = t.build_view();
+        // The root has no parents, so it is the one that stays available.
+        assert_eq!(entry_in(&v, 55, 1).state, MissionState::InProgress);
+        assert_eq!(entry_in(&v, 55, 2).state, MissionState::Locked);
+        assert_eq!(entry_in(&v, 55, 3).state, MissionState::Locked);
     }
 
     #[test]

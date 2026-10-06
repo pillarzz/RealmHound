@@ -2283,6 +2283,8 @@ const GRAVESTONE_ID: i32 = 1282;
 /// collapsible toggle in the index list (matches render_list_column).
 const MAX_INLINE_COLLECTION_ITEMS: usize = 24;
 
+/// Portal sprite for the dungeon page header, drawn with the same outline the
+/// index view's tiles use so the two read alike.
 fn render_portal_sprite_sized(
     ui: &mut egui::Ui,
     portal_id: Option<i32>,
@@ -2294,7 +2296,7 @@ fn render_portal_sprite_sized(
         return response;
     }
     let drawn = if let Some(id) = portal_id {
-        sprite_renderer.draw_sprite_in_rect(ui, id, rect)
+        sprite_renderer.draw_outlined_sprite_in_rect(ui, id, rect)
     } else {
         false
     };

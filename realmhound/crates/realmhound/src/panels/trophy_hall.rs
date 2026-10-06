@@ -136,6 +136,9 @@ pub struct TrophyHallPanel {
     /// List Legacy dungeons (the Time Chamber's retro dungeons, and the Legacy
     /// Heroic ones). On by default, matching the game's own Time Chamber hub.
     show_legacy_dungeons: bool,
+    /// Dungeon name selected in the icon view, for keyboard navigation. The first
+    /// visible tile is selected as soon as the view is shown.
+    selected_icon: Option<String>,
     show_st: bool,
     show_ut: bool,
     show_shiny: bool,
@@ -178,6 +181,7 @@ impl TrophyHallPanel {
             column_count: 2,
             show_no_collection_dungeons: false,
             show_legacy_dungeons: true,
+            selected_icon: None,
             show_st: true,
             show_ut: true,
             show_shiny: true,
@@ -1508,21 +1512,66 @@ impl TrophyHallPanel {
         let query_lower = self.search_query.to_lowercase();
         let show_no_collection = self.show_no_collection_dungeons;
         let show_legacy = self.show_legacy_dungeons;
-        let collections = &self.collections;
-        let filtered_indices: Vec<usize> = self
-            .index_rows
+        let filtered_indices: Vec<usize> = {
+            let collections = &self.collections;
+            self.index_rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower)
+                })
+                .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
+                .filter(|(_, r)| {
+                    show_no_collection
+                        || collections
+                            .get(&r.name)
+                            .map(|c| !c.items.is_empty())
+                            .unwrap_or(true)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+
+        // Keyboard navigation. The first visible tile is selected as soon as the
+        // icon view is shown; the arrow keys cycle through the tiles (wrapping at
+        // both ends) and Enter opens the selected one. The handling itself lives
+        // inside the scroll area because Up/Down need the resolved column count.
+        // Anything that owns the keyboard - the search box - suspends this.
+        let visible_names: Vec<String> = filtered_indices
             .iter()
-            .enumerate()
-            .filter(|(_, r)| query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower))
-            .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
-            .filter(|(_, r)| {
-                show_no_collection
-                    || collections
-                        .get(&r.name)
-                        .map(|c| !c.items.is_empty())
-                        .unwrap_or(true)
+            .map(|&i| self.index_rows[i].name.clone())
+            .collect();
+        let selection_missing = !self
+            .selected_icon
+            .as_ref()
+            .is_some_and(|sel| visible_names.contains(sel));
+        if visible_names.is_empty() {
+            self.selected_icon = None;
+        } else if selection_missing {
+            self.selected_icon = Some(visible_names[0].clone());
+        }
+        // Completion per visible row, computed here so the grid closure below
+        // doesn't have to reach into the collections map (which would clash with
+        // the mutation that follows a click).
+        let completion_by_row: HashMap<String, u32> = filtered_indices
+            .iter()
+            .filter_map(|&i| {
+                let name = self.index_rows[i].name.clone();
+                self.collections
+                    .get(&name)
+                    .and_then(|c| {
+                        let total = c.items.len();
+                        (total > 0).then(|| {
+                            let obtained = c
+                                .items
+                                .iter()
+                                .filter(|it| self.obtained_items.contains(&it.item_id))
+                                .count();
+                            ((obtained * 100) / total) as u32
+                        })
+                    })
+                    .map(|pct| (name, pct))
             })
-            .map(|(i, _)| i)
             .collect();
 
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -1531,6 +1580,43 @@ impl TrophyHallPanel {
             let available_width = ui.available_width();
             let button_width = 150.0;
             let cols = (available_width / button_width).floor().max(1.0) as usize;
+
+            if !visible_names.is_empty() && ui.memory(|m| m.focused().is_none()) {
+                let (left, right, up, down, enter) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::ArrowLeft),
+                        i.key_pressed(egui::Key::ArrowRight),
+                        i.key_pressed(egui::Key::ArrowUp),
+                        i.key_pressed(egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::Enter),
+                    )
+                });
+                if let Some(sel) = self.selected_icon.clone() {
+                    if let Some(pos) = visible_names.iter().position(|n| *n == sel) {
+                        let dir = if left {
+                            Some(IconNav::Left)
+                        } else if right {
+                            Some(IconNav::Right)
+                        } else if up {
+                            Some(IconNav::Up)
+                        } else if down {
+                            Some(IconNav::Down)
+                        } else {
+                            None
+                        };
+                        if let Some(next) =
+                            dir.and_then(|dir| icon_nav_target(pos, visible_names.len(), cols, dir))
+                        {
+                            self.selected_icon = Some(visible_names[next].clone());
+                        }
+                        if enter {
+                            if let Some(row) = self.index_rows.iter().find(|r| r.name == sel) {
+                                navigate_to = Some((row.name.clone(), row.db_names.clone()));
+                            }
+                        }
+                    }
+                }
+            }
 
             egui::Grid::new("dungeon_icon_grid")
                 .num_columns(cols)
@@ -1563,13 +1649,57 @@ impl TrophyHallPanel {
 
                         if ui.is_rect_visible(rect) {
                             let painter = ui.painter();
+                            let is_selected =
+                                self.selected_icon.as_deref() == Some(row.name.as_str());
 
-                            let bg_color = if resp.hovered() {
+                            let bg_color = if is_selected {
+                                // Selected tile: tinted with the navigation blue.
+                                Color32::from_rgba_unmultiplied(0x04, 0x97, 0xff, 70)
+                            } else if resp.hovered() {
                                 Color32::from_white_alpha(25)
                             } else {
                                 Color32::from_white_alpha(10)
                             };
                             painter.rect_filled(rect, 4.0, bg_color);
+
+                            if is_selected {
+                                painter.rect_stroke(
+                                    rect,
+                                    4.0,
+                                    egui::Stroke::new(1.5_f32, Color32::from_rgb(0x04, 0x97, 0xff)),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+
+                            // Collection completion in the top-left corner, and a
+                            // golden frame once nothing is missing from it.
+                            if let Some(pct) = completion_by_row.get(&row.name).copied() {
+                                let pct_color = if pct == 100 {
+                                    Color32::from_rgb(100, 255, 100)
+                                } else if pct > 0 {
+                                    Color32::from_rgb(200, 200, 100)
+                                } else {
+                                    Color32::from_rgb(120, 120, 120)
+                                };
+                                painter.text(
+                                    egui::pos2(rect.left() + 4.0, rect.top() + 4.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{pct}%"),
+                                    egui::FontId::proportional(10.0),
+                                    pct_color,
+                                );
+                                if pct == 100 {
+                                    painter.rect_stroke(
+                                        rect,
+                                        4.0,
+                                        egui::Stroke::new(
+                                            2.0_f32,
+                                            Color32::from_rgb(0xff, 0xbf, 0x00),
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                            }
 
                             // Portal sprite (centered vertically in upper portion)
                             let sprite_size = 40.0;
@@ -1710,6 +1840,15 @@ impl TrophyHallPanel {
         }
 
         let shadcn = ctx.shadcn;
+
+        // Backspace is the keyboard twin of "← Back", taking the dungeon page
+        // back to the list (whichever view mode it was opened from).
+        if ui.memory(|m| m.focused().is_none()) && ui.input(|i| i.key_pressed(egui::Key::Backspace))
+        {
+            self.page = Page::Index;
+            self.detail_cache = None;
+            return actions;
+        }
 
         // Navigation band, matching the other panels' navigation rows (darker
         // secondary fill). The filters come first here too, so they sit in the
@@ -2397,6 +2536,31 @@ fn is_legacy_dungeon(name: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty())
 }
 
+/// The directions the icon view's keyboard navigation understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconNav {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Where an arrow key moves the icon view's selection to, wrapping at both ends
+/// of the tile list. `cols` is how many tiles a row holds, so Up/Down move by a
+/// whole row (the list is not rectangular, hence the wrapped jump).
+fn icon_nav_target(pos: usize, count: usize, cols: usize, dir: IconNav) -> Option<usize> {
+    if count == 0 || cols == 0 || pos >= count {
+        return None;
+    }
+    let jump = cols % count;
+    Some(match dir {
+        IconNav::Left => (pos + count - 1) % count,
+        IconNav::Right => (pos + 1) % count,
+        IconNav::Up => (pos + count - jump) % count,
+        IconNav::Down => (pos + jump) % count,
+    })
+}
+
 #[cfg(test)]
 mod gating_tests {
     use super::*;
@@ -2411,6 +2575,30 @@ mod gating_tests {
         assert!(!is_legacy_dungeon("Legacy"));
         assert!(!is_legacy_dungeon("legacy spider den"));
         assert!(!is_legacy_dungeon(""));
+    }
+
+    #[test]
+    fn icon_arrows_cycle_with_wrapping() {
+        // Six tiles in rows of three.
+        assert_eq!(icon_nav_target(0, 6, 3, IconNav::Right), Some(1));
+        assert_eq!(icon_nav_target(2, 6, 3, IconNav::Right), Some(3));
+        assert_eq!(icon_nav_target(5, 6, 3, IconNav::Right), Some(0));
+        assert_eq!(icon_nav_target(0, 6, 3, IconNav::Left), Some(5));
+        // Vertical moves are a whole row, wrapping past the ends.
+        assert_eq!(icon_nav_target(1, 6, 3, IconNav::Down), Some(4));
+        assert_eq!(icon_nav_target(3, 6, 3, IconNav::Down), Some(0));
+        assert_eq!(icon_nav_target(4, 6, 3, IconNav::Up), Some(1));
+        assert_eq!(icon_nav_target(1, 6, 3, IconNav::Up), Some(4));
+        // A ragged last row still wraps around the end of the list.
+        assert_eq!(icon_nav_target(4, 5, 3, IconNav::Down), Some(2));
+        assert_eq!(icon_nav_target(1, 5, 3, IconNav::Up), Some(3));
+        // No tile below or above (a single row): the selection stays put.
+        assert_eq!(icon_nav_target(1, 2, 4, IconNav::Down), Some(1));
+        assert_eq!(icon_nav_target(1, 2, 4, IconNav::Up), Some(1));
+        // Empty lists, unknown positions and unknown column counts have no target.
+        assert_eq!(icon_nav_target(0, 0, 3, IconNav::Right), None);
+        assert_eq!(icon_nav_target(5, 5, 3, IconNav::Right), None);
+        assert_eq!(icon_nav_target(0, 6, 0, IconNav::Down), None);
     }
 
     #[test]

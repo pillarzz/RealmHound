@@ -7,6 +7,7 @@ pub mod character;
 mod client;
 pub mod crucible;
 pub mod missions;
+pub mod pet_skins;
 pub mod token;
 
 pub use character::{
@@ -23,4 +24,5 @@ pub use missions::{
     ClientSeasons, Cond, CondKind, MissionDef, MissionState, PlayerMission, PlayerMissions,
     ProgEntry, Reward, Season, WornRestriction,
 };
+pub use pet_skins::parse_owned_pet_skins;
 pub use token::{is_token_expired, token_age, token_expiry_message, TOKEN_VALIDITY_HOURS};

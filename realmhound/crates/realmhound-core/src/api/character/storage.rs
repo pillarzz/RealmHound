@@ -219,6 +219,9 @@ pub struct AccountData {
     pub owned_skin_ids: Vec<i32>,
     /// Emote object ids the account owns (`OwnedEmotes`).
     pub owned_emote_ids: Vec<i32>,
+    /// Pet-skin object ids the account owns (`account/getOwnedPetSkins`, a
+    /// separate request: char/list carries no pet-skin list).
+    pub owned_pet_skin_ids: Vec<i32>,
     /// Item ids whose forge blueprint is unlocked in the regular forge
     /// (`RegularForgeFireBlueprints`, the same set packet 120 sends).
     pub regular_forge_blueprints: Vec<i32>,

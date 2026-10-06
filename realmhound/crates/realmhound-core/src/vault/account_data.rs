@@ -103,9 +103,9 @@ pub struct AccountData {
     pub owned_skins_count: i32,
 
     /// Wardrobe object ids the account owns, used for the tooltip's `OWNED`
-    /// tag: skins (`OwnedSkins`) and emotes (`OwnedEmotes`) from char/list, plus
-    /// unlock packets observed live (`ReskinUnlock`), which is the only source
-    /// for pet skins (no bulk list exists).
+    /// tag: skins (`OwnedSkins`) and emotes (`OwnedEmotes`) from char/list, pet
+    /// skins (`account/getOwnedPetSkins`, fetched with the account refresh) and
+    /// unlocks observed live (`ReskinUnlock`, a pet wearing a skin).
     #[serde(default)]
     pub owned_wardrobe_ids: Vec<i32>,
 

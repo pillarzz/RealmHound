@@ -9,8 +9,8 @@ use crate::ui_ext::HoverTooltipExt;
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
     api::{
-        debug_order_alignment, decode_pcstats, parse_account_data, parse_char_list, AccountData,
-        CharacterStats, ClassExaltation, RotmgApiClient,
+        debug_order_alignment, decode_pcstats, parse_account_data, parse_char_list,
+        parse_owned_pet_skins, AccountData, CharacterStats, ClassExaltation, RotmgApiClient,
     },
     assets::get_dungeon_portal_map,
     stats::{
@@ -886,6 +886,18 @@ impl CharactersPanel {
                         return;
                     }
                     let result = parse_account_data(&xml).map_err(|e| e.to_string());
+                    let result = result.map(|mut data| {
+                        // char/list carries no pet-skin list, so ask the endpoint
+                        // that has it. Best-effort: without it the pet skins the
+                        // account never applied simply get no OWNED tag.
+                        match client.get_owned_pet_skins() {
+                            Ok(body) => data.owned_pet_skin_ids = parse_owned_pet_skins(&body),
+                            Err(e) => {
+                                tracing::warn!("[CHARACTERS] getOwnedPetSkins failed: {e}")
+                            }
+                        }
+                        data
+                    });
                     let _ = tx.send(result);
                 }
                 Err(e) => {

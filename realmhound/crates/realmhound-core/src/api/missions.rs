@@ -866,7 +866,7 @@ fn parse_tree_mission_pairs(section: Option<&str>) -> Vec<(i32, i32)> {
 }
 
 /// Return the text between `<tag>` and `</tag>` (first occurrence).
-fn extract_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn extract_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}");
     let start_tag = body.find(&open)?;
     // Skip to the end of the opening tag (handles attributes like id="52").

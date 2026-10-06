@@ -207,9 +207,9 @@ impl OwnedUnlocks {
     /// Rebuild from account data.
     fn from_account_data(account_data: &realmhound_core::vault::AccountData) -> Self {
         let mut wardrobe: HashSet<i32> = account_data.owned_wardrobe_ids.iter().copied().collect();
-        // A pet wearing a pet skin proves the account owns it, and char/list
-        // carries no pet-skin unlock list (unlike skins and emotes), so the pets'
-        // worn skins are the only bulk evidence.
+        // A pet wearing a pet skin proves the account owns it. The pet-skin list
+        // itself comes from `account/getOwnedPetSkins` (char/list carries none),
+        // so this catches skins worn before that list was fetched.
         for pet in account_data
             .characters
             .regular_pets
@@ -660,8 +660,8 @@ impl SpriteRenderer {
     }
 
     /// Refresh the account unlock state behind the tooltip's `OWNED` tag: the
-    /// wardrobe ids (skins, emotes, observed pet skins) and both forge blueprint
-    /// lists. Skips the rebuild when the account generation is unchanged.
+    /// wardrobe ids (skins, emotes, pet skins) and both forge blueprint lists.
+    /// Skips the rebuild when the account generation is unchanged.
     pub fn update_owned_unlocks(&mut self, account_data: &realmhound_core::vault::AccountData) {
         if self.owned_unlocks_generation == account_data.generation {
             return;

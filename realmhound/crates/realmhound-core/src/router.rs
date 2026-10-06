@@ -1339,8 +1339,8 @@ mod tests {
         CreatePacket, CreateSuccessPacket, DamagePacket, DeathPacket, EnemyHitPacket,
         ForgeUnlockedBlueprintsPacket, HelloPacket, IncomingPartyMemberInfoPacket, InvSwapPacket,
         MapInfoPacket, NewCharacterInfoPacket, PartyMemberAddedPacket, PetChangeFormPacket,
-        QuestFetchResponsePacket, QuestObjectIdPacket, RealmHeroesLeftPacket, RealmScoreUpdatePacket,
-        ReskinUnlockPacket, SlotObjectData, TextPacket, VaultContentPacket,
+        QuestFetchResponsePacket, QuestObjectIdPacket, RealmHeroesLeftPacket,
+        RealmScoreUpdatePacket, ReskinUnlockPacket, SlotObjectData, TextPacket, VaultContentPacket,
     };
     use crate::session::GameSession;
 

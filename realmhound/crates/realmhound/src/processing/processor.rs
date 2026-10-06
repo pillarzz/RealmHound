@@ -851,14 +851,19 @@ impl PacketProcessor {
                 self.account_data.max_num_chars = data.max_num_chars;
                 self.account_data.next_char_slot_price = data.next_char_slot_price;
                 self.account_data.owned_skins_count = data.owned_skins_count;
-                // char/list is authoritative for the wardrobe (skins + emotes) and
-                // the regular forge unlocks; anything learned live (pet skins via
+                // char/list is authoritative for the wardrobe (skins + emotes)
+                // and the regular forge unlocks; the pet-skin list comes from its
+                // own endpoint, and anything learned live (pet skins via
                 // ReskinUnlock, the seasonal forge list via packet 120) is kept.
-                if !data.owned_skin_ids.is_empty() || !data.owned_emote_ids.is_empty() {
+                if !data.owned_skin_ids.is_empty()
+                    || !data.owned_emote_ids.is_empty()
+                    || !data.owned_pet_skin_ids.is_empty()
+                {
                     let mut ids: Vec<i32> = data
                         .owned_skin_ids
                         .iter()
                         .chain(data.owned_emote_ids.iter())
+                        .chain(data.owned_pet_skin_ids.iter())
                         .copied()
                         .collect();
                     ids.extend(self.account_data.owned_wardrobe_ids.iter().copied());
@@ -2228,8 +2233,8 @@ impl PacketProcessor {
             GameEvent::PetStoneUsed { item_type } => {
                 // The stone that was just applied unlocks its target pet skin; no
                 // list or notification reports that, so record the skin itself.
-                let skin = realmhound_core::assets::get_asset_manager()
-                    .pet_skin_unlocked_id(item_type);
+                let skin =
+                    realmhound_core::assets::get_asset_manager().pet_skin_unlocked_id(item_type);
                 if let Some(skin) = skin.filter(|s| *s > 0) {
                     if !self.account_data.owned_wardrobe_ids.contains(&skin) {
                         self.account_data.owned_wardrobe_ids.push(skin);
@@ -4562,7 +4567,8 @@ mod isolation_gate_tests {
 
     /// char/list is authoritative for the wardrobe (skins + emotes) and the
     /// regular forge list, while unlocks learned live (pet skins, the seasonal
-    /// forge list, which char/list does not carry) survive the refresh.
+    /// forge list, which char/list does not carry) and the pet-skin endpoint's
+    /// list survive the refresh.
     #[test]
     fn api_account_data_merges_the_unlock_lists() {
         let key = AccountKey::generate();
@@ -4578,6 +4584,7 @@ mod isolation_gate_tests {
             account_id: Some("MAIN123".into()),
             owned_skin_ids: vec![872, 9012],
             owned_emote_ids: vec![49678],
+            owned_pet_skin_ids: vec![30445, 24724],
             regular_forge_blueprints: vec![8386, 4333],
             ..Default::default()
         };
@@ -4585,8 +4592,8 @@ mod isolation_gate_tests {
 
         assert_eq!(
             p.account_data.owned_wardrobe_ids,
-            vec![606, 872, 9012, 49678],
-            "char/list ids merge with the live pet-skin unlock"
+            vec![606, 872, 9012, 24724, 30445, 49678],
+            "char/list ids and the pet-skin list merge with the live pet-skin unlock"
         );
         assert_eq!(p.account_data.unlocked_blueprints_regular, vec![8386, 4333]);
         assert_eq!(
@@ -4594,6 +4601,26 @@ mod isolation_gate_tests {
             vec![8386],
             "char/list has no seasonal list, so it must not clear one"
         );
+    }
+
+    /// The pet-skin list arrives from its own endpoint, so a refresh whose
+    /// char/list carried neither `OwnedSkins` nor `OwnedEmotes` (a mule response
+    /// or a partial one) must still learn the pet skins.
+    #[test]
+    fn api_account_data_merges_pet_skins_without_a_wardrobe_list() {
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            owned_pet_skin_ids: vec![30445],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert_eq!(p.account_data.owned_wardrobe_ids, vec![30445]);
     }
 
     /// A stale API account-data completion (older generation) is rejected.

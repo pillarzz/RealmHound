@@ -8439,8 +8439,11 @@ impl RealmHoundApp {
             if season_info.is_some() || battlepass.is_some() {
                 if let Ok(mut s) = settings.write() {
                     let mut changed = false;
-                    if let Some((start, _)) = season_info.as_ref().and_then(|i| i.window()) {
-                        changed |= s.season.apply_live_season_start(start);
+                    if let Some((start, end)) = season_info.as_ref().and_then(|i| i.window()) {
+                        // Season and end together: this endpoint is authoritative,
+                        // so it can also repair a date `getClientSeasons` never
+                        // delivered or reported stale.
+                        changed |= s.season.apply_live_season_window(start, end);
                     }
                     if let Some((start, end)) = battlepass.as_ref().and_then(|b| b.window()) {
                         changed |= s.season.apply_live_battlepass_window(start, end);

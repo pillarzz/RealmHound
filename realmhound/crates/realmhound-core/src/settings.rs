@@ -1243,6 +1243,40 @@ impl SeasonConfig {
         true
     }
 
+    /// Record the authoritative season window from `season/seasonInfo`.
+    ///
+    /// Unlike [`Self::apply_live_season_end`], whose season id and date come from
+    /// `getClientSeasons` and may be stale or missing entirely, this endpoint is
+    /// allowed to *correct* the end date already on record for the current
+    /// season, so a failed or outdated seasons request cannot leave the countdown
+    /// wrong. A date the user entered by hand is still preserved on the first
+    /// observation, exactly as `apply_live_season_end` does. The start anchor only
+    /// ever moves forward. Returns `true` when the settings should be saved.
+    pub fn apply_live_season_window(&mut self, start_unix: i64, end_unix: i64) -> bool {
+        if end_unix <= 0 || (start_unix > 0 && end_unix <= start_unix) {
+            return false;
+        }
+        let changed = if start_unix > 0 {
+            self.apply_live_season_start(start_unix)
+        } else {
+            false
+        };
+        if end_unix == self.auto_season_end_unix {
+            return changed;
+        }
+        if self.auto_season_id == 0 && self.auto_season_end_unix == 0 && self.reset.is_set() {
+            // First observation after upgrade: keep the hand-entered date and
+            // only record provenance, so a later rollover can take over.
+            self.auto_season_end_unix = end_unix;
+            return true;
+        }
+        self.auto_season_end_unix = end_unix;
+        if let Some(reset) = crate::season::unix_to_reset(end_unix) {
+            self.reset = reset;
+        }
+        true
+    }
+
     /// Record the running battlepass window from `season/bpInfo`, the only live
     /// source of a battlepass boundary.
     pub fn apply_live_battlepass_window(&mut self, start_unix: i64, end_unix: i64) -> bool {
@@ -2762,6 +2796,52 @@ mod tests {
         // The stale pool timestamp of a previous cycle must not move it back.
         assert!(!c.apply_live_season_start(1785761800));
         assert_eq!(c.auto_season_start_unix, 1791277199);
+    }
+
+    #[test]
+    fn apply_live_season_window_corrects_a_stale_auto_end() {
+        let mut c = SeasonConfig::default();
+        // `getClientSeasons` landed first, with an out-of-date end date.
+        assert!(c.apply_live_season_end(55, 1796119199, Some(1785761800)));
+        // The authoritative endpoint corrects it and fixes the start anchor.
+        assert!(c.apply_live_season_window(1791277199, 1793000000));
+        assert_eq!(c.auto_season_end_unix, 1793000000);
+        assert_eq!(c.auto_season_start_unix, 1791277199);
+        assert!(
+            !c.apply_live_season_window(1791277199, 1793000000),
+            "unchanged"
+        );
+        // A later correction of the same season is accepted here, unlike the
+        // mission payload's id-keyed date.
+        assert!(c.apply_live_season_window(1791277199, 1794804000));
+        assert_eq!(c.auto_season_end_unix, 1794804000);
+        assert_eq!(c.auto_season_id, 55, "the season id stays as recorded");
+        // Both ends are required, and the order has to make sense.
+        assert!(!c.apply_live_season_window(1791277199, 0));
+        assert!(!c.apply_live_season_window(1794804000, 1791277199));
+        assert_eq!(c.auto_season_end_unix, 1794804000);
+    }
+
+    #[test]
+    fn apply_live_season_window_keeps_a_hand_entered_date_on_first_sight() {
+        let mut c = SeasonConfig::default();
+        c.reset = UtcResetTime {
+            year: 2025,
+            month: 1,
+            day: 1,
+            hour: 9,
+            minute: 0,
+        };
+        assert!(c.apply_live_season_window(1791277199, 1794804000));
+        assert_eq!(
+            c.auto_season_end_unix, 1794804000,
+            "the window is recorded as provenance"
+        );
+        assert_eq!(
+            (c.reset.year, c.reset.month, c.reset.day),
+            (2025, 1, 1),
+            "the date the user entered by hand is kept"
+        );
     }
 
     #[test]

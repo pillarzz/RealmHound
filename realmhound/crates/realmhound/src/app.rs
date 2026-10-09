@@ -5350,13 +5350,14 @@ impl RealmHoundApp {
 
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.shiny_goldbag, "")
-                        .hover_tip("Plays when a loot bag holds a shiny pet stone.")
+                        .hover_tip(
+                            "Plays when a loot bag holds a shiny pet stone (which \
+                             unlocks a shiny pet skin).",
+                        )
                         .changed();
-                    self.render_loot_sound_row_icon(
-                        ui,
-                        Some(realmhound_core::loot::LootBagType::Gold.id()),
-                    );
-                    ui.label("Shiny gold bag");
+                    // Gold Primal Snake Pet Skin (0xA145) represents a shiny pet skin.
+                    self.render_loot_sound_row_icon(ui, Some(41285));
+                    ui.label("Shiny pet skins");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,

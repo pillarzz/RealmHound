@@ -763,10 +763,27 @@ impl PacketProcessor {
                 realmhound_core::capture::captures_dir().join(p)
             }
         };
+        self.start_recorder_at(path);
+    }
+
+    /// Start a raw-packet recorder writing a timestamped file to the captures
+    /// directory. Returns the file path when the writer opened successfully.
+    pub fn start_recorder(&mut self) -> Option<PathBuf> {
+        let name = format!(
+            "capture_{}.rhcap",
+            chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S")
+        );
+        self.start_recorder_at(realmhound_core::capture::captures_dir().join(name))
+    }
+
+    /// Start a raw-packet recorder at an explicit path, replacing any current
+    /// recorder.
+    fn start_recorder_at(&mut self, path: PathBuf) -> Option<PathBuf> {
         match CaptureWriter::create(&path) {
             Ok(w) => {
                 tracing::info!("[RECORD] Recording raw packets to {}", path.display());
                 self.recorder = Some(w);
+                Some(path)
             }
             Err(e) => {
                 tracing::warn!(
@@ -774,7 +791,15 @@ impl PacketProcessor {
                     path.display(),
                     e
                 );
+                None
             }
+        }
+    }
+
+    /// Stop the raw-packet recorder, flushing any buffered frames.
+    pub fn stop_recorder(&mut self) {
+        if self.recorder.take().is_some() {
+            tracing::info!("[RECORD] Stopped raw-packet recording");
         }
     }
 
@@ -792,6 +817,15 @@ impl PacketProcessor {
         match msg {
             ControlMsg::ClearIgnored => {
                 self.reassembler.clear_ignored();
+            }
+            ControlMsg::SetCaptureRecording(on) => {
+                if on {
+                    if self.recorder.is_none() {
+                        self.start_recorder();
+                    }
+                } else {
+                    self.stop_recorder();
+                }
             }
             ControlMsg::SetLootTrackingSettings(settings) => {
                 self.loot_tracker.set_tracking_settings(&settings);

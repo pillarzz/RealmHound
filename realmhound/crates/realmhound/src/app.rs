@@ -617,6 +617,8 @@ mod ui_health_tests {
 pub struct RealmHoundApp {
     /// Packet capture lifecycle manager
     capture: CaptureManager,
+    /// Whether raw packets are being written to a `.rhcap` file (Debug settings).
+    record_raw_packets: bool,
     /// Active tab
     active_tab: ActiveTab,
     /// Active tab on the previous frame, used to detect tab activation so a
@@ -1140,6 +1142,11 @@ impl RealmHoundApp {
 
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
+            // Honour the REALMHOUND_RECORD env var so the Debug toggle reflects
+            // any recording already started at capture start.
+            record_raw_packets: std::env::var("REALMHOUND_RECORD")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false),
             active_tab: ActiveTab::LiveFeed, // Default to Live Feed tab
             last_active_tab: ActiveTab::LiveFeed,
             chat_panel,
@@ -2260,6 +2267,7 @@ impl RealmHoundApp {
                             ("appearance", "🎨 Appearance"),
                             ("sound", "🔊 Sound"),
                             ("account", "👤 Account"),
+                            ("debug", "🔧 Debug"),
                         ];
                         ui.horizontal_top(|ui| {
                             // Left: vertical tab sidebar (Discord-style).
@@ -2391,6 +2399,9 @@ impl RealmHoundApp {
                                                             ),
                                                         SettingsCategory::Taskbar => self
                                                             .render_taskbar_settings(ui, &shadcn),
+                                                        SettingsCategory::Debug => {
+                                                            self.render_debug_settings(ui, &shadcn)
+                                                        }
                                                     }
                                                 });
                                         });
@@ -4963,6 +4974,46 @@ impl RealmHoundApp {
             // The "dungeons without collections" and Legacy toggles live in the
             // Trophy Hall's own navigation bar, next to the item filters they
             // belong with.
+        });
+    }
+
+    /// Debug settings tab: developer / diagnostic tools.
+    fn render_debug_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
+        ui.heading("Debug");
+        ui.add_space(8.0);
+
+        shadcn.card(ui, "dbg_packet_capture", "Packet capture", |ui| {
+            ui.label(
+                RichText::new(
+                    "Record every captured packet to a .rhcap file for offline analysis. \
+                     Recording starts as soon as you enable this and stops when you turn \
+                     it off (or close the app). Recording continues into any dungeon you \
+                     enter, so start it before the fight you want to capture.",
+                )
+                .weak(),
+            );
+            ui.add_space(6.0);
+
+            let mut record = self.record_raw_packets;
+            if shadcn
+                .switch(ui, &mut record, "Record raw packets (.rhcap)")
+                .hover_tip(
+                    "Writes raw packets to the captures folder. Useful for reproducing \
+                     combat-tracking bugs.",
+                )
+                .changed()
+            {
+                self.record_raw_packets = record;
+                self.worker
+                    .send_control(ControlMsg::SetCaptureRecording(record));
+            }
+
+            ui.add_space(6.0);
+            let dir = realmhound_core::capture::captures_dir();
+            ui.label(RichText::new(format!("Output folder: {}", dir.display())).weak());
+            if !self.record_raw_packets {
+                ui.label(RichText::new("Not recording.").weak());
+            }
         });
     }
 

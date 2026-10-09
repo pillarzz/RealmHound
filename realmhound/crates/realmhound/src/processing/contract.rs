@@ -212,6 +212,8 @@ pub enum ControlMsg {
     Shutdown,
     /// Clear the reassembler's ignored-connection set.
     ClearIgnored,
+    /// Start/stop recording raw packets to a `.rhcap` file (Debug settings).
+    SetCaptureRecording(bool),
     /// Update loot-tracking capture settings.
     SetLootTrackingSettings(LootTrackingSettings),
     /// Update Combat History tracking settings (which boss groups are recorded).

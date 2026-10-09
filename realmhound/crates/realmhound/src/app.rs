@@ -5244,6 +5244,36 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.shiny_whitebag, "Shiny white bag")
+                        .hover_tip(
+                            "Plays when a loot bag holds a shiny item whose own bag tier \
+                             is white (the bag the shiny item normally drops in).",
+                        )
+                        .changed();
+                    settings_changed |= self.render_sound_row_controls(
+                        ui,
+                        shadcn,
+                        SoundType::ShinyWhiteBag,
+                        current_settings,
+                    );
+                    ui.end_row();
+
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.shiny_tealbag, "Shiny teal bag")
+                        .hover_tip(
+                            "Plays when a loot bag holds a shiny item whose own bag tier \
+                             is teal (the bag the shiny item normally drops in).",
+                        )
+                        .changed();
+                    settings_changed |= self.render_sound_row_controls(
+                        ui,
+                        shadcn,
+                        SoundType::ShinyTealBag,
+                        current_settings,
+                    );
+                    ui.end_row();
+
+                    settings_changed |= shadcn
                         .switch(ui, &mut current_settings.redbag, "Red bag")
                         .changed();
                     settings_changed |= self.render_sound_row_controls(
@@ -5283,6 +5313,18 @@ impl RealmHoundApp {
                         ui,
                         shadcn,
                         SoundType::GoldBag,
+                        current_settings,
+                    );
+                    ui.end_row();
+
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.shiny_goldbag, "Shiny gold bag")
+                        .hover_tip("Plays when a loot bag holds a shiny pet stone.")
+                        .changed();
+                    settings_changed |= self.render_sound_row_controls(
+                        ui,
+                        shadcn,
+                        SoundType::ShinyGoldBag,
                         current_settings,
                     );
                     ui.end_row();

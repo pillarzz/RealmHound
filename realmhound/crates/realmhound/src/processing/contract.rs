@@ -167,6 +167,9 @@ pub enum AudioCommand {
     Play(SoundType),
     /// Play the configured notification sound for a loot bag tier.
     PlayForBag(LootBagType),
+    /// Play the shiny-loot notification sound for the shiny item's own bag tier
+    /// (see [`realmhound_core::loot::shiny_bag_tier`]).
+    PlayForBagShiny(LootBagType),
     /// Play a realm-event notification sound at a specific volume (already the
     /// per-event level; the audio thread scales it by master). `custom_key`
     /// selects a per-boss custom override from `SoundSettings::custom_sounds`.

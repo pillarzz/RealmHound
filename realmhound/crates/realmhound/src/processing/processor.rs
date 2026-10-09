@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use realmhound_core::{
     capture::{CaptureWriter, RawPacket},
     combat::CombatManager,
-    loot::{LootTracker, RecentBossKill},
+    loot::{shiny_bag_tier, LootTracker, RecentBossKill},
     protocol::{ip_to_server_name, parse_packet_with_status, Packet, ParsedPacket},
     session::{AccountVerifyResult, HelloAction},
     stats::{
@@ -2893,6 +2893,12 @@ impl PacketProcessor {
                     );
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
+                    // Shiny-loot notification keyed off the shiny item's own bag
+                    // tier (or the shiny pet-stone list).
+                    if let Some(tier) = shiny_bag_tier(drop.items.iter().map(|item| item.item_id))
+                    {
+                        self.emit(UiPayload::Audio(AudioCommand::PlayForBagShiny(tier)));
+                    }
                     if let Some((ref settings, ref catalog)) = enchant_ctx {
                         self.play_enchant_sounds(drop, settings, catalog);
                     }

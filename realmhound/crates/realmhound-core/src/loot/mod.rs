@@ -23,6 +23,56 @@ pub use player_state::{
 };
 pub use tracker::{LootTracker, ProcessedLootDrop, ProcessedLootItem, RecentBossKill};
 
+// --- Shiny bag notifications ---
+
+/// Object ids of the shiny pet stones.
+///
+/// Pet stones carry no shiny indicator in the game data (they are structurally
+/// identical to their base variants), so the shiny pet stones are hardcoded.
+/// Each id is the *stone* (the consumable that unlocks the pet skin), which is
+/// what appears in a loot bag.
+pub const SHINY_PET_STONE_IDS: &[i32] = &[
+    21642, // Enlightened Bookwyrm Pet Stone (The Cursed Library)
+    22581, // Bogged Panda Pet Stone (Sulfurous Wetlands)
+    41286, // Gold Primal Snake Pet Stone (White Snake Invasion I-III)
+];
+
+/// The shiny-notification bag tier for a set of loot-bag item ids.
+///
+/// Shiny items are matched by the game's `SHINY` label, and the tier comes from
+/// the item's own `<BagType>` (the bag it normally drops in) rather than the
+/// physical bag colour, so a shiny that lands in a mixed bag still maps to its
+/// own tier. Shiny pet stones have no shiny label, so they are matched by
+/// [`SHINY_PET_STONE_IDS`] and always map to [`LootBagType::Gold`].
+///
+/// Returns `None` when no shiny item with a notification tier is present.
+pub fn shiny_bag_tier<I>(item_ids: I) -> Option<LootBagType>
+where
+    I: IntoIterator<Item = i32>,
+{
+    let manager = crate::assets::get_asset_manager();
+    for id in item_ids {
+        if id <= 0 {
+            continue;
+        }
+        if SHINY_PET_STONE_IDS.contains(&id) {
+            return Some(LootBagType::Gold);
+        }
+        if !manager.is_shiny(id) {
+            continue;
+        }
+        // `<BagType>` 4 = teal, 6 = white. Other tiers have no shiny
+        // notification. Equipment is enriched with `bag_type` from equip.xml at
+        // load time; items outside that merge report 0 and are ignored.
+        match manager.get_object(id).map(|asset| asset.bag_type) {
+            Some(4) => return Some(LootBagType::Teal),
+            Some(6) => return Some(LootBagType::White),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Object type of Janus the Doorwarden (the Enemy the player fights).
 pub const JANUS_OBJECT_TYPE: i32 = 8200;
 
@@ -960,5 +1010,20 @@ mod beisa_tests {
         assert!(!beisa_engaged(&kills, 99));
         assert!(!beisa_engaged(&kills, 0));
         assert!(!beisa_engaged(&[], 42));
+    }
+
+    #[test]
+    fn shiny_pet_stones_map_to_gold_tier() {
+        // Pet stones have no shiny label, so they are matched by the hardcoded
+        // id list without consulting the (unloaded) asset manager.
+        for id in SHINY_PET_STONE_IDS {
+            assert_eq!(shiny_bag_tier([*id]), Some(LootBagType::Gold));
+        }
+    }
+
+    #[test]
+    fn drops_without_shiny_items_have_no_tier() {
+        assert_eq!(shiny_bag_tier([0, -1]), None);
+        assert_eq!(shiny_bag_tier(std::iter::empty()), None);
     }
 }

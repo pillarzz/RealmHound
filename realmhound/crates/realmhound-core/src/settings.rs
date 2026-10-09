@@ -2158,6 +2158,21 @@ pub struct SoundSettings {
     #[serde(default)]
     pub eggbag: bool,
 
+    /// Enable sound when a loot bag holds a shiny item whose own bag tier is
+    /// white (`<BagType>6</BagType>`). Off by default.
+    #[serde(default)]
+    pub shiny_whitebag: bool,
+
+    /// Enable sound when a loot bag holds a shiny item whose own bag tier is
+    /// teal (`<BagType>4</BagType>`). Off by default.
+    #[serde(default)]
+    pub shiny_tealbag: bool,
+
+    /// Enable sound when a loot bag holds one of the shiny pet stones listed in
+    /// [`crate::loot::SHINY_PET_STONE_IDS`]. Off by default.
+    #[serde(default)]
+    pub shiny_goldbag: bool,
+
     /// Enable sound for key pops (not yet implemented).
     #[serde(default)]
     pub keypop: bool,
@@ -2481,6 +2496,10 @@ impl Default for SoundSettings {
             bluebag: false,
             goldbag: false,
             eggbag: false,
+            // Shiny loot bag notifications are opt-in
+            shiny_whitebag: false,
+            shiny_tealbag: false,
+            shiny_goldbag: false,
             // Social sounds disabled by default (not yet implemented)
             keypop: false,
             // All key-pop difficulty tiers notify by default
@@ -2939,6 +2958,28 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(back.ign_mention && back.custom_chat);
         assert_eq!(back.custom_chat_text, "abyss");
+    }
+
+    #[test]
+    fn shiny_bag_sounds_default_off_and_survive_missing_json() {
+        // All three shiny loot notifications are opt-in.
+        let d = SoundSettings::default();
+        assert!(!d.shiny_whitebag && !d.shiny_tealbag && !d.shiny_goldbag);
+
+        // Back-compat: configs saved before these options existed still load.
+        let legacy = r#"{ "volume": 0.5, "whitebag": true }"#;
+        let parsed: SoundSettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.whitebag);
+        assert!(!parsed.shiny_whitebag && !parsed.shiny_tealbag && !parsed.shiny_goldbag);
+
+        // Round-trip preserves the toggles.
+        let mut s = SoundSettings::default();
+        s.shiny_whitebag = true;
+        s.shiny_tealbag = true;
+        s.shiny_goldbag = true;
+        let back: SoundSettings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.shiny_whitebag && back.shiny_tealbag && back.shiny_goldbag);
     }
 
     #[test]

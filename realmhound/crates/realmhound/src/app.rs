@@ -619,6 +619,12 @@ pub struct RealmHoundApp {
     capture: CaptureManager,
     /// Whether raw packets are being written to a `.rhcap` file (Debug settings).
     record_raw_packets: bool,
+    /// Debug "App resolution" width input (pixels, as typed).
+    debug_window_width: String,
+    /// Debug "App resolution" height input (pixels, as typed).
+    debug_window_height: String,
+    /// Validation message for the Debug "App resolution" apply action.
+    debug_window_error: Option<String>,
     /// Active tab
     active_tab: ActiveTab,
     /// Active tab on the previous frame, used to detect tab activation so a
@@ -1147,6 +1153,9 @@ impl RealmHoundApp {
             record_raw_packets: std::env::var("REALMHOUND_RECORD")
                 .map(|v| !v.is_empty() && v != "0")
                 .unwrap_or(false),
+            debug_window_width: String::new(),
+            debug_window_height: String::new(),
+            debug_window_error: None,
             active_tab: ActiveTab::LiveFeed, // Default to Live Feed tab
             last_active_tab: ActiveTab::LiveFeed,
             chat_panel,
@@ -5013,6 +5022,74 @@ impl RealmHoundApp {
             ui.label(RichText::new(format!("Output folder: {}", dir.display())).weak());
             if !self.record_raw_packets {
                 ui.label(RichText::new("Not recording.").weak());
+            }
+        });
+
+        ui.add_space(12.0);
+
+        shadcn.card(ui, "dbg_app_resolution", "App resolution", |ui| {
+            ui.label(
+                RichText::new(
+                    "Type a window size in pixels and press Apply to resize the app \
+                     (useful for reproducing layout issues at specific resolutions).",
+                )
+                .weak(),
+            );
+            ui.add_space(6.0);
+
+            // Prefill the inputs from the live window size the first time the
+            // card is shown, then leave the user's typed values alone.
+            if self.debug_window_width.is_empty() || self.debug_window_height.is_empty() {
+                if let Ok(s) = self.settings.read() {
+                    self.debug_window_width = format!("{}", s.window.width.round() as i32);
+                    self.debug_window_height = format!("{}", s.window.height.round() as i32);
+                }
+            }
+
+            shadcn.field_row(ui, |ui| {
+                ui.label("Width:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_window_width)
+                        .char_limit(5)
+                        .desired_width(70.0)
+                        .hint_text("1920"),
+                );
+                ui.label("Height:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_window_height)
+                        .char_limit(5)
+                        .desired_width(70.0)
+                        .hint_text("1080"),
+                );
+                if shadcn.btn(ui, "Apply").clicked() {
+                    match (
+                        self.debug_window_width.trim().parse::<i32>(),
+                        self.debug_window_height.trim().parse::<i32>(),
+                    ) {
+                        (Ok(w), Ok(h))
+                            if (320..=7680).contains(&w) && (240..=4320).contains(&h) =>
+                        {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                                egui::vec2(w as f32, h as f32),
+                            ));
+                            if let Ok(mut s) = self.settings.write() {
+                                s.window.width = w as f32;
+                                s.window.height = h as f32;
+                                s.window.maximized = false;
+                                s.save();
+                            }
+                            self.debug_window_error = None;
+                        }
+                        _ => {
+                            self.debug_window_error = Some(
+                                "Enter width 320-7680 and height 240-4320 (pixels).".to_string(),
+                            );
+                        }
+                    }
+                }
+            });
+            if let Some(err) = &self.debug_window_error {
+                ui.label(RichText::new(err).color(egui::Color32::from_rgb(220, 120, 120)));
             }
         });
     }

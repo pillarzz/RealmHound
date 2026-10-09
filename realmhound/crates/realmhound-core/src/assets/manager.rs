@@ -3326,21 +3326,24 @@ impl AssetManager {
         projectile_id: usize,
     ) -> Option<(i32, i32, bool, i32)> {
         self.try_load();
-        self.objects
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|list| list.get(id))
-            .and_then(|asset| {
-                asset.projectiles.get(projectile_id).map(|p| {
-                    (
-                        p.min_damage,
-                        p.max_damage,
-                        p.armor_piercing,
-                        asset.slot_type,
-                    )
-                })
-            })
+        let guard = self.objects.read().unwrap();
+        let list = guard.as_ref()?;
+        let asset = list.get(id)?;
+        // Most weapons index their `<Projectile>` list directly, but the client's
+        // `PlayerShoot.projectileId` is the *subattack* index. Longbows fire 3
+        // spread arrows (patterns 0/1/2) that all use projectile 0, so fall back
+        // to the subattack's projectile when the direct index is missing rather
+        // than reporting no data (which disables self-compute for the map).
+        let resolved = asset.projectiles.get(projectile_id).or_else(|| {
+            list.subattack_projectile_index(id, projectile_id)
+                .and_then(|i| asset.projectiles.get(i))
+        })?;
+        Some((
+            resolved.min_damage,
+            resolved.max_damage,
+            resolved.armor_piercing,
+            asset.slot_type,
+        ))
     }
 
     /// Whether the object `id`'s projectile at `projectile_id` is armor-piercing

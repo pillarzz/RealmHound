@@ -2895,8 +2895,7 @@ impl PacketProcessor {
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
                     // Shiny-loot notification keyed off the shiny item's own bag
                     // tier (or the shiny pet-stone list).
-                    if let Some(tier) = shiny_bag_tier(drop.items.iter().map(|item| item.item_id))
-                    {
+                    if let Some(tier) = shiny_bag_tier(drop.items.iter().map(|item| item.item_id)) {
                         self.emit(UiPayload::Audio(AudioCommand::PlayForBagShiny(tier)));
                     }
                     if let Some((ref settings, ref catalog)) = enchant_ctx {

@@ -5229,9 +5229,13 @@ impl RealmHoundApp {
         let mut settings_changed = false;
         shadcn.card(ui, "snd_loot_sounds", "Loot Sounds", |ui| {
             egui::Grid::new("loot_sounds_grid")
-                .num_columns(5)
+                .num_columns(6)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::White.id()),
+                    );
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.whitebag, "White bag")
                         .changed();
@@ -5243,8 +5247,14 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    // Dirk of Cronus Shiny (0x4BA) represents the shiny white tier.
+                    self.render_loot_sound_row_icon(ui, Some(1210));
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.shiny_whitebag, "Shiny white bag")
+                        .switch(
+                            ui,
+                            &mut current_settings.shiny_whitebag,
+                            "Shiny white bag items",
+                        )
                         .hover_tip(
                             "Plays when a loot bag holds a shiny item whose own bag tier \
                              is white (the bag the shiny item normally drops in).",
@@ -5258,8 +5268,14 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    // Sprite Wand Shiny (0x14BE) represents the shiny teal tier.
+                    self.render_loot_sound_row_icon(ui, Some(5310));
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.shiny_tealbag, "Shiny teal bag")
+                        .switch(
+                            ui,
+                            &mut current_settings.shiny_tealbag,
+                            "Shiny teal bag items",
+                        )
                         .hover_tip(
                             "Plays when a loot bag holds a shiny item whose own bag tier \
                              is teal (the bag the shiny item normally drops in).",
@@ -5273,6 +5289,10 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Red.id()),
+                    );
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.redbag, "Red bag")
                         .changed();
@@ -5284,6 +5304,10 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Orange.id()),
+                    );
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.orangebag, "Orange bag")
                         .changed();
@@ -5295,6 +5319,10 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Blue.id()),
+                    );
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.bluebag, "Blue bag")
                         .changed();
@@ -5306,6 +5334,10 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Gold.id()),
+                    );
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.goldbag, "Gold bag")
                         .changed();
@@ -5317,6 +5349,10 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Gold.id()),
+                    );
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.shiny_goldbag, "Shiny gold bag")
                         .hover_tip("Plays when a loot bag holds a shiny pet stone.")
@@ -5329,6 +5365,10 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Egg.id()),
+                    );
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.eggbag, "Egg bag")
                         .changed();
@@ -5343,6 +5383,19 @@ impl RealmHoundApp {
         });
 
         settings_changed
+    }
+
+    /// Draw the leading icon for a Loot Sounds grid row into an inline 20x20
+    /// slot. Draws nothing (leaving the reserved space blank) when `item_id` is
+    /// `None`, so rows without an icon stay aligned.
+    fn render_loot_sound_row_icon(&mut self, ui: &mut egui::Ui, item_id: Option<i32>) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        if let Some(id) = item_id {
+            self.sprite_renderer.draw_sprite_in_rect(ui, id, rect);
+        }
     }
 
     /// Enchantments sound sub-tab: play a notification when a matching enchant

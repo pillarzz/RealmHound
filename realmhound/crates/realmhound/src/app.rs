@@ -5229,16 +5229,17 @@ impl RealmHoundApp {
         let mut settings_changed = false;
         shadcn.card(ui, "snd_loot_sounds", "Loot Sounds", |ui| {
             egui::Grid::new("loot_sounds_grid")
-                .num_columns(6)
+                .num_columns(7)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.whitebag, "")
+                        .changed();
                     self.render_loot_sound_row_icon(
                         ui,
                         Some(realmhound_core::loot::LootBagType::White.id()),
                     );
-                    settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.whitebag, "White bag")
-                        .changed();
+                    ui.label("White bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5247,19 +5248,16 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
-                    // Dirk of Cronus Shiny (0x4BA) represents the shiny white tier.
-                    self.render_loot_sound_row_icon(ui, Some(1210));
                     settings_changed |= shadcn
-                        .switch(
-                            ui,
-                            &mut current_settings.shiny_whitebag,
-                            "Shiny white bag items",
-                        )
+                        .switch(ui, &mut current_settings.shiny_whitebag, "")
                         .hover_tip(
                             "Plays when a loot bag holds a shiny item whose own bag tier \
                              is white (the bag the shiny item normally drops in).",
                         )
                         .changed();
+                    // Dirk of Cronus Shiny (0x4BA) represents the shiny white tier.
+                    self.render_loot_sound_row_icon(ui, Some(1210));
+                    ui.label("Shiny white bag items");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5268,19 +5266,16 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
-                    // Sprite Wand Shiny (0x14BE) represents the shiny teal tier.
-                    self.render_loot_sound_row_icon(ui, Some(5310));
                     settings_changed |= shadcn
-                        .switch(
-                            ui,
-                            &mut current_settings.shiny_tealbag,
-                            "Shiny teal bag items",
-                        )
+                        .switch(ui, &mut current_settings.shiny_tealbag, "")
                         .hover_tip(
                             "Plays when a loot bag holds a shiny item whose own bag tier \
                              is teal (the bag the shiny item normally drops in).",
                         )
                         .changed();
+                    // Sprite Wand Shiny (0x14BE) represents the shiny teal tier.
+                    self.render_loot_sound_row_icon(ui, Some(5310));
+                    ui.label("Shiny teal bag items");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5289,13 +5284,14 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.redbag, "")
+                        .changed();
                     self.render_loot_sound_row_icon(
                         ui,
                         Some(realmhound_core::loot::LootBagType::Red.id()),
                     );
-                    settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.redbag, "Red bag")
-                        .changed();
+                    ui.label("Red bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5304,13 +5300,14 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.orangebag, "")
+                        .changed();
                     self.render_loot_sound_row_icon(
                         ui,
                         Some(realmhound_core::loot::LootBagType::Orange.id()),
                     );
-                    settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.orangebag, "Orange bag")
-                        .changed();
+                    ui.label("Orange bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5319,13 +5316,14 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.bluebag, "")
+                        .changed();
                     self.render_loot_sound_row_icon(
                         ui,
                         Some(realmhound_core::loot::LootBagType::Blue.id()),
                     );
-                    settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.bluebag, "Blue bag")
-                        .changed();
+                    ui.label("Blue bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5334,13 +5332,14 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.goldbag, "")
+                        .changed();
                     self.render_loot_sound_row_icon(
                         ui,
                         Some(realmhound_core::loot::LootBagType::Gold.id()),
                     );
-                    settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.goldbag, "Gold bag")
-                        .changed();
+                    ui.label("Gold bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5349,14 +5348,15 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.shiny_goldbag, "")
+                        .hover_tip("Plays when a loot bag holds a shiny pet stone.")
+                        .changed();
                     self.render_loot_sound_row_icon(
                         ui,
                         Some(realmhound_core::loot::LootBagType::Gold.id()),
                     );
-                    settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.shiny_goldbag, "Shiny gold bag")
-                        .hover_tip("Plays when a loot bag holds a shiny pet stone.")
-                        .changed();
+                    ui.label("Shiny gold bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5365,13 +5365,14 @@ impl RealmHoundApp {
                     );
                     ui.end_row();
 
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.eggbag, "")
+                        .changed();
                     self.render_loot_sound_row_icon(
                         ui,
                         Some(realmhound_core::loot::LootBagType::Egg.id()),
                     );
-                    settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.eggbag, "Egg bag")
-                        .changed();
+                    ui.label("Egg bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,

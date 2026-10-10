@@ -25,8 +25,8 @@ use super::{PacketFormat, RawPacket};
 
 const MAGIC: &[u8; 6] = b"RHCAP\x02";
 
-/// Directory where session captures are written:
-/// `%LOCALAPPDATA%\RealmHound\captures\`.
+/// Directory where session captures are written: `captures/` under the
+/// per-user local data directory (see [`crate::storage::StorageRoot`]).
 pub fn captures_dir() -> PathBuf {
     let base = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))

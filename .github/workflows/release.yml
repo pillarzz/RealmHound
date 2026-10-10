@@ -14,9 +14,126 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build-macos:
+    name: Build macOS binary
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Download official sounds
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_ASSETS_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw "BUILD_ASSETS_TOKEN is required to download official sounds"
+          }
+
+          $archive = Join-Path "${{ runner.temp }}" "realmhound-sounds-v1.zip"
+          gh release download sounds-v1 `
+            --repo pillarzz/realmhound-build-assets `
+            --pattern realmhound-sounds-v1.zip `
+            --output $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download the private official sound bundle"
+          }
+
+          $expectedHash = "1765d31b1c2d79cfef7f274eb480ab6e3fd1b3d0ed73718d2c80fece2dd7dd8e"
+          $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Official sound bundle SHA-256 mismatch"
+          }
+
+          $extracted = Join-Path "${{ runner.temp }}" "realmhound-sounds-v1"
+          Expand-Archive -Path $archive -DestinationPath $extracted
+
+          $destination = Join-Path "${{ github.workspace }}" "realmhound/crates/realmhound/assets/sounds"
+          $installedPaths = Join-Path "${{ runner.temp }}" "realmhound-installed-sounds.txt"
+          $relativePaths = Get-ChildItem -Path $extracted -File -Recurse |
+            ForEach-Object { $_.FullName.Substring($extracted.Length + 1) }
+          $relativePaths | Set-Content $installedPaths
+          foreach ($relativePath in $relativePaths) {
+            $target = Join-Path $destination $relativePath
+            New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+            Copy-Item (Join-Path $extracted $relativePath) $target
+          }
+
+      - name: Build universal binary
+        working-directory: realmhound
+        env:
+          REALMHOUND_OFFICIAL_SOUNDS: "1"
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --package RealmHound --target aarch64-apple-darwin
+          cargo build --release --locked --package RealmHound --target x86_64-apple-darwin
+          lipo -create -output target/release/RealmHound-macos \
+            target/aarch64-apple-darwin/release/RealmHound \
+            target/x86_64-apple-darwin/release/RealmHound
+          # The release profile strips, which drops the ad-hoc signature the
+          # linker applies. arm64 refuses to execute an unsigned binary, so
+          # re-sign; this is ad-hoc only and is not notarization.
+          codesign --sign - --force --timestamp=none target/release/RealmHound-macos
+          codesign --verify --verbose target/release/RealmHound-macos
+          lipo -info target/release/RealmHound-macos
+
+      - name: Package app bundle
+        run: |
+          set -euo pipefail
+          # A bare Mach-O cannot carry an icon, so Finder shows the generic
+          # executable icon and a double-click opens Terminal. Ship the same
+          # universal binary inside a bundle as well, for the icon and a plain
+          # double-click launch. ditto (not zip) keeps the bundle's permissions
+          # and ad-hoc signature intact.
+          bash tools/macos/make-app-bundle.sh \
+            realmhound/target/release/RealmHound-macos \
+            realmhound/target/release
+          ditto -c -k --sequesterRsrc --keepParent \
+            realmhound/target/release/RealmHound.app \
+            realmhound/target/release/RealmHound-macos-app.zip
+
+      - name: Remove private sound files
+        if: always()
+        shell: pwsh
+        run: |
+          $sounds = Join-Path "${{ github.workspace }}" "realmhound/crates/realmhound/assets/sounds"
+          $installedPaths = Join-Path "${{ runner.temp }}" "realmhound-installed-sounds.txt"
+          if (Test-Path $installedPaths) {
+            Get-Content $installedPaths | ForEach-Object {
+              Remove-Item (Join-Path $sounds $_) -Force -ErrorAction SilentlyContinue
+            }
+            $remaining = Get-Content $installedPaths | Where-Object {
+              Test-Path (Join-Path $sounds $_)
+            }
+            if ($remaining) {
+              throw "Private sound cleanup failed: $($remaining -join ', ')"
+            }
+          }
+          Remove-Item (Join-Path "${{ runner.temp }}" "realmhound-sounds-v1.zip") -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path "${{ runner.temp }}" "realmhound-sounds-v1") -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $installedPaths -Force -ErrorAction SilentlyContinue
+
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-binary
+          path: |
+            realmhound/target/release/RealmHound-macos
+            realmhound/target/release/RealmHound-macos-app.zip
+          if-no-files-found: error
+          retention-days: 1
+
   build-and-release:
     name: Build and Release
     runs-on: windows-latest
+    # A release must not advertise a macOS build that failed to produce one.
+    needs: build-macos
     permissions:
       contents: write
 
@@ -156,6 +273,12 @@ jobs:
             throw "Temporary sound cleanup failed: $($temporaryPaths -join ', ')"
           }
 
+      - name: Download macOS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-binary
+          path: realmhound/target/release
+
       - name: Create checksum
         id: checksum
         shell: pwsh
@@ -164,6 +287,16 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
           "$hash  RealmHound.exe" | Set-Content "realmhound/target/release/RealmHound.exe.sha256"
           "SHA256=$hash" >> $env:GITHUB_OUTPUT
+
+          $macos = "realmhound/target/release/RealmHound-macos"
+          $macosHash = (Get-FileHash -Algorithm SHA256 $macos).Hash.ToLowerInvariant()
+          "$macosHash  RealmHound-macos" | Set-Content "realmhound/target/release/RealmHound-macos.sha256"
+          "MACOS_SHA256=$macosHash" >> $env:GITHUB_OUTPUT
+
+          $macosApp = "realmhound/target/release/RealmHound-macos-app.zip"
+          $macosAppHash = (Get-FileHash -Algorithm SHA256 $macosApp).Hash.ToLowerInvariant()
+          "$macosAppHash  RealmHound-macos-app.zip" |
+            Set-Content "realmhound/target/release/RealmHound-macos-app.zip.sha256"
 
       - name: Create GitHub release
         if: github.event_name == 'push' && github.event.repository.private == false
@@ -175,6 +308,10 @@ jobs:
           files: |
             realmhound/target/release/RealmHound.exe
             realmhound/target/release/RealmHound.exe.sha256
+            realmhound/target/release/RealmHound-macos
+            realmhound/target/release/RealmHound-macos.sha256
+            realmhound/target/release/RealmHound-macos-app.zip
+            realmhound/target/release/RealmHound-macos-app.zip.sha256
             LICENSE
             THIRD-PARTY-LICENSES.md
           draft: false
@@ -188,6 +325,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.VERSION }}
           RELEASE_SHA256: ${{ steps.checksum.outputs.SHA256 }}
+          RELEASE_MACOS_SHA256: ${{ steps.checksum.outputs.MACOS_SHA256 }}
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
@@ -195,10 +333,14 @@ jobs:
             const gistId = '4f50870a65c14d179eb2c361b5915946';
             const version = process.env.RELEASE_VERSION;
             const sha256 = process.env.RELEASE_SHA256;
+            const macosSha256 = process.env.RELEASE_MACOS_SHA256;
             const notes = fs.readFileSync('realmhound/RELEASE_NOTES.txt', 'utf8');
             const downloadUrl =
               `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
               `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound.exe`;
+            const macosDownloadUrl =
+              `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
+              `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound-macos`;
 
             const gist = await github.rest.gists.get({ gist_id: gistId });
             const manifest = JSON.parse(gist.data.files['version.json'].content);
@@ -231,6 +373,8 @@ jobs:
               manifest.latest_version = version;
               manifest.download_url = downloadUrl;
               manifest.sha256 = sha256;
+              manifest.macos_download_url = macosDownloadUrl;
+              manifest.macos_sha256 = macosSha256;
             }
 
             const existingIndex = manifest.releases.findIndex(

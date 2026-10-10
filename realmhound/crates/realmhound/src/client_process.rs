@@ -6,13 +6,34 @@
 //! daily grant) nor the packet/connection lifecycle (an area change opens a new
 //! socket whose Hello is indistinguishable from a cold launch) can detect a
 //! relaunch. The only reliable signal is the owning process's creation time,
-//! read from the current OS state via `GetExtendedTcpTable` + `GetProcessTimes`
-//! -- which works regardless of when RealmHound itself was started.
+//! read from the current OS state -- which works regardless of when RealmHound
+//! itself was started.
+//!
+//! Each supported platform answers the same two questions, "which process owns
+//! this socket" and "when did that process start", from whatever the kernel
+//! exposes: `GetExtendedTcpTable` + `GetProcessTimes` on Windows, and `libproc`
+//! on macOS. Anywhere else the safeguard stays conservative and never unlocks.
 
 use realmhound_core::stream::ConnectionKey;
 
+/// The RotMG game-server TCP port. Every game client -- Steam, standalone, any
+/// install -- talks to the world server on this port, and effectively nothing
+/// else on the machine connects out to it, so it reliably marks a socket as
+/// belonging to a RotMG client without matching any file name.
+const GAME_SERVER_PORT: u16 = 2050;
+
+#[cfg(windows)]
+use windows_impl as platform;
+
+#[cfg(target_os = "macos")]
+use macos_impl as platform;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+use unsupported as platform;
+
 /// Convert a Windows `FILETIME` (100-ns intervals since 1601-01-01 UTC, split
 /// into low/high 32-bit halves) to a Unix timestamp in seconds.
+#[cfg(windows)]
 pub(crate) fn filetime_to_unix_secs(low: u32, high: u32) -> i64 {
     const HUNDRED_NS_PER_SEC: u64 = 10_000_000;
     // Whole seconds between 1601-01-01 and 1970-01-01 (Unix epoch).
@@ -23,16 +44,11 @@ pub(crate) fn filetime_to_unix_secs(low: u32, high: u32) -> i64 {
 
 /// Unix timestamp (seconds) of the creation time of the process that owns the
 /// given main game-client connection, or `None` if it can't be determined
-/// (connection not found in the OS TCP table, access denied, or non-Windows).
-#[cfg(windows)]
+/// (connection not found in the OS tables, access denied, or the process exited
+/// between the two lookups).
 pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
-    let pid = windows_impl::owning_pid(conn)?;
-    windows_impl::process_creation_unix(pid)
-}
-
-#[cfg(not(windows))]
-pub fn connection_process_start_unix(_conn: &ConnectionKey) -> Option<i64> {
-    None
+    let pid = platform::owning_pid(conn)?;
+    platform::process_creation_unix(pid)
 }
 
 /// Unix timestamp (seconds) of the *earliest* creation time among all running
@@ -48,21 +64,45 @@ pub fn connection_process_start_unix(_conn: &ConnectionKey) -> Option<i64> {
 /// the guard stays locked. It only reports a post-reset time when *every*
 /// running client started after the reset -- in which case the tracked main
 /// account, whichever client it is, must also have relaunched.
-#[cfg(windows)]
 pub fn earliest_rotmg_client_start_unix() -> Option<i64> {
-    windows_impl::earliest_client_start_unix()
+    platform::earliest_client_start_unix()
 }
 
-#[cfg(not(windows))]
-pub fn earliest_rotmg_client_start_unix() -> Option<i64> {
-    None
+/// The MIB and `libproc` port fields both store the port in network byte order
+/// in the low 16 bits; decode to a host-order `u16`.
+#[cfg(any(windows, target_os = "macos"))]
+fn decode_port(raw: u32) -> u16 {
+    u16::from_be((raw & 0xFFFF) as u16)
+}
+
+/// The kernel address fields store the IPv4 address as network-order octets in
+/// a `u32`; the native-endian bytes are already those octets in order.
+#[cfg(any(windows, target_os = "macos"))]
+fn decode_addr(raw: u32) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(raw.to_ne_bytes())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod unsupported {
+    use realmhound_core::stream::ConnectionKey;
+
+    pub(super) fn owning_pid(_conn: &ConnectionKey) -> Option<u32> {
+        None
+    }
+
+    pub(super) fn process_creation_unix(_pid: u32) -> Option<i64> {
+        None
+    }
+
+    pub(super) fn earliest_client_start_unix() -> Option<i64> {
+        None
+    }
 }
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::filetime_to_unix_secs;
+    use super::{decode_addr, decode_port, filetime_to_unix_secs, GAME_SERVER_PORT};
     use realmhound_core::stream::ConnectionKey;
-    use std::net::Ipv4Addr;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
@@ -71,24 +111,6 @@ mod windows_impl {
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
-
-    /// The RotMG game-server TCP port. Every game client -- Steam, standalone,
-    /// any install -- talks to the world server on this port, and effectively
-    /// nothing else on the machine connects out to it, so it reliably marks a
-    /// socket as belonging to a RotMG client without matching any file name.
-    const GAME_SERVER_PORT: u16 = 2050;
-
-    /// The MIB port fields store the port in network byte order in the low 16
-    /// bits; decode to a host-order `u16`.
-    fn decode_port(raw: u32) -> u16 {
-        u16::from_be((raw & 0xFFFF) as u16)
-    }
-
-    /// The MIB address fields store the IPv4 address as network-order octets in
-    /// a `u32`; the native-endian bytes are already those octets in order.
-    fn decode_addr(raw: u32) -> Ipv4Addr {
-        Ipv4Addr::from(raw.to_ne_bytes())
-    }
 
     /// Fetch the IPv4 TCP table (with owning PIDs) from the OS and hand the row
     /// slice to `f`. Returns `None` on any failure. Centralizes the sized-query
@@ -215,10 +237,118 @@ mod windows_impl {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::{decode_addr, decode_port, GAME_SERVER_PORT};
+    use libproc::bsd_info::BSDInfo;
+    use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
+    use libproc::net_info::{SocketFDInfo, SocketInfoKind};
+    use libproc::proc_pid::{listpidinfo, pidinfo};
+    use libproc::processes::{pids_by_type, ProcFilter};
+    use realmhound_core::stream::ConnectionKey;
+
+    /// `INI_IPV4` from `sys/proc_info.h`: `insi_vflag` marks which of the v4/v6
+    /// address members of the union actually carries the endpoint.
+    const INI_IPV4: u8 = 0x1;
+
+    /// The IPv4 TCP endpoints of a process's sockets, as (local, remote) pairs
+    /// of `(address, port)`.
+    ///
+    /// macOS has no global socket table, so each process is asked for its own
+    /// descriptors. Processes owned by another user are not inspectable and are
+    /// skipped, which is fine: the game client runs as the same user we do.
+    fn tcp_endpoints(pid: u32) -> Vec<(std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)> {
+        let Ok(info) = pidinfo::<BSDInfo>(pid as i32, 0) else {
+            return Vec::new();
+        };
+        let Ok(fds) = listpidinfo::<ListFDs>(pid as i32, info.pbi_nfiles as usize) else {
+            return Vec::new();
+        };
+
+        fds.iter()
+            .filter(|fd| matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::Socket))
+            .filter_map(|fd| pidfdinfo::<SocketFDInfo>(pid as i32, fd.proc_fd).ok())
+            .filter(|socket| {
+                matches!(
+                    SocketInfoKind::from(socket.psi.soi_kind),
+                    SocketInfoKind::Tcp
+                )
+            })
+            .filter_map(|socket| {
+                // SAFETY: the union member is selected by `soi_kind`, which the
+                // filter above has already confirmed to be TCP.
+                let tcp = unsafe { socket.psi.soi_proto.pri_tcp };
+                let endpoint = tcp.tcpsi_ini;
+                if endpoint.insi_vflag & INI_IPV4 == 0 {
+                    return None;
+                }
+                // SAFETY: `insi_vflag` selects the v4 member of both unions,
+                // checked immediately above.
+                let (local, remote) = unsafe {
+                    (
+                        endpoint.insi_laddr.ina_46.i46a_addr4.s_addr,
+                        endpoint.insi_faddr.ina_46.i46a_addr4.s_addr,
+                    )
+                };
+                Some((
+                    decode_addr(local),
+                    decode_port(endpoint.insi_lport as u32),
+                    decode_addr(remote),
+                    decode_port(endpoint.insi_fport as u32),
+                ))
+            })
+            .collect()
+    }
+
+    /// Find the PID owning the TCP connection matching `conn`.
+    pub(super) fn owning_pid(conn: &ConnectionKey) -> Option<u32> {
+        pids_by_type(ProcFilter::All)
+            .ok()?
+            .into_iter()
+            .find(|&pid| {
+                // Match the full 4-tuple for the same reason Windows does: on a
+                // multihomed or VPN host a different process may share the local
+                // port to the same remote via a different local address.
+                tcp_endpoints(pid).iter().any(
+                    |&(local_addr, local_port, remote_addr, remote_port)| {
+                        local_port == conn.client_port
+                            && local_addr == conn.client_ip
+                            && remote_port == conn.server_port
+                            && remote_addr == conn.server_ip
+                    },
+                )
+            })
+    }
+
+    /// Read the creation time (Unix seconds) of the process with `pid`.
+    pub(super) fn process_creation_unix(pid: u32) -> Option<i64> {
+        pidinfo::<BSDInfo>(pid as i32, 0)
+            .ok()
+            .map(|info| info.pbi_start_tvsec as i64)
+    }
+
+    /// Earliest process creation time (Unix seconds) among all processes that
+    /// currently own a TCP connection to a RotMG game server.
+    pub(super) fn earliest_client_start_unix() -> Option<i64> {
+        pids_by_type(ProcFilter::All)
+            .ok()?
+            .into_iter()
+            .filter(|&pid| {
+                tcp_endpoints(pid)
+                    .iter()
+                    .any(|&(_, _, _, remote_port)| remote_port == GAME_SERVER_PORT)
+            })
+            .filter_map(process_creation_unix)
+            .filter(|&t| t > 0)
+            .min()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn filetime_epoch_is_unix_zero() {
         // 11644473600 seconds after 1601-01-01, in 100-ns ticks, is 1970-01-01.
@@ -228,6 +358,7 @@ mod tests {
         assert_eq!(filetime_to_unix_secs(low, high), 0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn filetime_known_value() {
         // 2021-01-01T00:00:00Z == Unix 1609459200.
@@ -238,14 +369,15 @@ mod tests {
         assert_eq!(filetime_to_unix_secs(low, high), 1_609_459_200);
     }
 
-    // The following exercise the real Windows FFI (table parse, port/address
-    // decoding, OpenProcess/GetProcessTimes) against a live loopback socket and
-    // this test process, so struct-layout or byte-order bugs surface at runtime.
-    #[cfg(windows)]
+    /// The remaining tests exercise the real platform lookups (table/descriptor
+    /// parse, port and address decoding, process start time) against a live
+    /// loopback socket and this test process, so struct-layout, byte-order and
+    /// field-offset bugs surface at runtime rather than in the field.
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn resolves_own_process_creation_time() {
-        let start = super::windows_impl::process_creation_unix(std::process::id())
-            .expect("own process creation time");
+        let start =
+            platform::process_creation_unix(std::process::id()).expect("own process start time");
         // Plausible: after 2020-01-01 and not in the future.
         assert!(start > 1_577_836_800, "start too old: {start}");
         assert!(
@@ -254,7 +386,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn resolves_own_loopback_connection_to_this_pid() {
         use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
@@ -277,22 +409,22 @@ mod tests {
         );
 
         assert_eq!(
-            super::windows_impl::owning_pid(&conn),
+            platform::owning_pid(&conn),
             Some(std::process::id()),
             "loopback connection should be owned by this test process"
         );
-        let start = super::connection_process_start_unix(&conn).expect("start via connection");
+        let start = connection_process_start_unix(&conn).expect("start via connection");
         assert!(start > 1_577_836_800, "start too old: {start}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn earliest_client_scan_does_not_panic() {
         // No RotMG client is expected in the test environment, so this is
         // normally None; if some process happens to hold a :2050 connection the
         // time must at least be plausible. Either way it must not panic or
-        // return a bogus value -- this exercises the shared table read + scan.
-        if let Some(t) = super::earliest_rotmg_client_start_unix() {
+        // return a bogus value -- this exercises the shared scan on every
+        // platform, including the stub.
+        if let Some(t) = earliest_rotmg_client_start_unix() {
             assert!(t > 1_577_836_800, "scan returned implausible time: {t}");
         }
     }

@@ -5,7 +5,8 @@ use super::error::CaptureError;
 /// Represents a network interface available for packet capture.
 #[derive(Debug, Clone)]
 pub struct NetworkInterface {
-    /// System name of the interface (e.g., "\\Device\\NPF_{GUID}")
+    /// System name of the interface, as libpcap reports it
+    /// (`\Device\NPF_{GUID}` on Windows, `en0`/`utun3`/`eth0` elsewhere).
     pub name: String,
     /// Human-readable description
     pub description: Option<String>,

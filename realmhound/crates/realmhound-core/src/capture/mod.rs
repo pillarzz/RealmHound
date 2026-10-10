@@ -1,6 +1,7 @@
 //! Network packet capture module.
 //!
-//! This module provides functionality to capture network packets using Npcap/pcap.
+//! Captures packets through libpcap: Npcap on Windows, the system libpcap on
+//! macOS and Linux.
 
 pub mod error;
 pub mod interface;

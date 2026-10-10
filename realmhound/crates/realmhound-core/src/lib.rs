@@ -9,7 +9,7 @@
 //!
 //! - `api` - RotMG web API client for fetching character data
 //! - `assets` - Game asset management (object definitions, sprites)
-//! - `capture` - Network packet capture using Npcap/pcap
+//! - `capture` - Network packet capture using libpcap (Npcap on Windows)
 //! - `crypto` - RC4 encryption/decryption
 //! - `loot` - Loot detection, tracking, and history database
 //! - `party_cache` - In-memory player class/skin/guild sightings for the Party panel

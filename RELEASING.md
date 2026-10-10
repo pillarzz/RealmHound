@@ -51,8 +51,14 @@ The release workflow:
 
 - Downloads and verifies the pinned official sound bundle from the private
   `pillarzz/realmhound-build-assets` repository
+- Builds `RealmHound-macos`, a universal binary, and blocks the release if that
+  build fails: a manifest must never advertise a macOS build that does not exist
+- Wraps that same binary in `RealmHound.app` and publishes it as
+  `RealmHound-macos-app.zip`, so macOS users get the RealmHound icon and a
+  double-click launch; the updater keeps targeting the bare binary
 - Builds `RealmHound.exe` with the locked dependency graph
-- Generates and publishes `RealmHound.exe.sha256`
+- Generates and publishes `RealmHound.exe.sha256`, `RealmHound-macos.sha256`,
+  and `RealmHound-macos-app.zip.sha256`
 - Creates a GitHub Release in this repository
 - Updates the production updater manifest for stable releases only
 - Announces public releases on Discord
@@ -88,9 +94,13 @@ For every release:
 - Confirm the workflow completed successfully.
 - Confirm the GitHub Release is attached to the intended tag.
 - Confirm `RealmHound.exe` and `RealmHound.exe.sha256` are present.
-- Download the executable and verify its SHA-256 against the checksum file.
+- Confirm `RealmHound-macos` and `RealmHound-macos.sha256` are present.
+- Confirm `RealmHound-macos-app.zip` and its `.sha256` are present, and that
+  unzipping it yields a `RealmHound.app` showing the RealmHound icon in Finder.
+- Download each binary and verify its SHA-256 against the checksum file.
 
 For a stable version at or above the manifest's current latest version, also
-confirm the production updater manifest contains the new version,
-same-repository download URL, and matching SHA-256. For a prerelease, confirm
+confirm the production updater manifest contains the new version, the
+same-repository download URLs and matching SHA-256 for both `download_url` and
+`macos_download_url`. For a prerelease, confirm
 the production updater manifest remains unchanged.

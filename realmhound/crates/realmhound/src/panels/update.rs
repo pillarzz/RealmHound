@@ -159,10 +159,8 @@ impl UpdatePanel {
                                     .btn(ui, format!("⬇ Update to v{}", manifest.latest_version))
                                     .clicked()
                                 {
-                                    self_updater.start_download(
-                                        manifest.download_url.clone(),
-                                        manifest.sha256.clone(),
-                                    );
+                                    self_updater
+                                        .start_download(manifest.artifact_for_this_platform());
                                 }
                             }
                             SelfUpdateState::Downloading(progress) => {

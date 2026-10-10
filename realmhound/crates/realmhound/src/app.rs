@@ -138,7 +138,23 @@ fn open_in_file_explorer(path: &std::path::Path) {
 }
 
 #[cfg(not(windows))]
-fn open_in_file_explorer(_path: &std::path::Path) {}
+fn open_in_file_explorer(path: &std::path::Path) {
+    // `open` on macOS and `xdg-open` on every other Unix desktop are the
+    // standard "hand this to the user's file manager" entry points, and both
+    // return immediately rather than blocking on the spawned browser.
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
+    if let Err(error) = std::process::Command::new(opener).arg(path).spawn() {
+        tracing::warn!(
+            "[UI] Could not open {} with {opener}: {error}",
+            path.display()
+        );
+    }
+}
 
 /// Roman-numeral label (I-IV) for an enchantment tier number 1-4.
 fn roman_tier(tier: u8) -> &'static str {
@@ -1466,17 +1482,24 @@ impl RealmHoundApp {
     /// Surface a fatal relaunch failure and quit; the worker is already stopped.
     fn abort_relaunch(&self, reason: &str) {
         tracing::error!("[RELAUNCH] aborted: {reason}");
+        let message = format!("Restart failed and RealmHound must close:\n\n{reason}");
         #[cfg(windows)]
         {
             use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
             let title: Vec<u16> = "RealmHound\0".encode_utf16().collect();
-            let msg: Vec<u16> = format!("Restart failed and RealmHound must close:\n\n{reason}\0")
-                .encode_utf16()
-                .collect();
+            let msg: Vec<u16> = format!("{message}\0").encode_utf16().collect();
             unsafe {
                 MessageBoxW(0, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
             }
         }
+        // The window is already gone by this point, so without a dialog the exit
+        // would look like a silent crash.
+        #[cfg(not(windows))]
+        rfd::MessageDialog::new()
+            .set_title("RealmHound")
+            .set_description(&message)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
         std::process::exit(1);
     }
 
@@ -2108,8 +2131,7 @@ impl RealmHoundApp {
                                             .clicked()
                                         {
                                             self.self_updater.start_download(
-                                                manifest.download_url.clone(),
-                                                manifest.sha256.clone(),
+                                                manifest.artifact_for_this_platform(),
                                             );
                                         }
                                     }

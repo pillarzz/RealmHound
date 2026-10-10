@@ -229,6 +229,9 @@ impl Default for UnityExtractor {
 /// 1. `%LOCALAPPDATA%\RealmOfTheMadGod\Production\` (current game location since ~2025)
 /// 2. `%USERPROFILE%\Documents\RealmOfTheMadGod\Production\` (legacy location)
 ///
+/// On macOS the Deca launcher installs under `~/.local/share/RealmOfTheMadGod/`,
+/// with `~/Documents/RealmOfTheMadGod/` as the legacy location.
+///
 /// When both exist, the most recently modified file wins, since the legacy
 /// Documents location may still contain a stale copy.
 pub fn find_resources_assets() -> Option<PathBuf> {
@@ -256,6 +259,17 @@ pub fn find_resources_assets() -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
+        // The Deca launcher installs the client under an XDG-style path rather
+        // than anywhere Mac-conventional, keeping the layout it uses elsewhere.
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(
+                ".local/share/RealmOfTheMadGod/Production/RotMGExalt.app/Contents/Resources/Data/resources.assets",
+            );
+            if path.exists() {
+                candidates.push(path);
+            }
+        }
+
         if let Some(docs) = dirs::document_dir() {
             let path = docs.join("RealmOfTheMadGod/Production/RotMGExalt.app/Contents/Resources/Data/resources.assets");
             if path.exists() {

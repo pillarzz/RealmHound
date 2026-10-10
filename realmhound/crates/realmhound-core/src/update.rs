@@ -29,7 +29,51 @@ pub struct VersionManifest {
     /// SHA-256 hex digest of the exe at download_url
     #[serde(default)]
     pub sha256: Option<String>,
+    /// macOS universal binary for this release.
+    ///
+    /// Absent from manifests published before macOS builds existed, which is
+    /// what lets an older client keep reading this document unchanged.
+    #[serde(default)]
+    pub macos_download_url: Option<String>,
+    /// SHA-256 hex digest of the binary at `macos_download_url`.
+    #[serde(default)]
+    pub macos_sha256: Option<String>,
     pub releases: Vec<Release>,
+}
+
+/// A release binary this platform can actually execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformArtifact {
+    pub download_url: String,
+    pub sha256: Option<String>,
+}
+
+impl VersionManifest {
+    /// The artifact for the platform this build runs on, or `None` when the
+    /// release published nothing this platform can run.
+    ///
+    /// `download_url` is the Windows executable: it predates any other target
+    /// and is left unqualified so older clients keep resolving it.
+    pub fn artifact_for_this_platform(&self) -> Option<PlatformArtifact> {
+        #[cfg(windows)]
+        {
+            Some(PlatformArtifact {
+                download_url: self.download_url.clone(),
+                sha256: self.sha256.clone(),
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Some(PlatformArtifact {
+                download_url: self.macos_download_url.clone()?,
+                sha256: self.macos_sha256.clone(),
+            })
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            None
+        }
+    }
 }
 
 /// A single release entry in the manifest
@@ -391,8 +435,23 @@ impl SelfUpdater {
     }
 
     /// Start downloading the update in a background thread.
-    pub fn start_download(&self, download_url: String, expected_sha256: Option<String>) {
-        let expected_sha256 = match expected_sha256 {
+    ///
+    /// The manifest is vetted on every platform so a malformed or unsigned
+    /// entry is reported the same way everywhere. A platform the release
+    /// published no binary for is told so rather than being handed one the
+    /// kernel cannot run; the update *check* is separate and still reports that
+    /// a newer version exists.
+    pub fn start_download(&self, artifact: Option<PlatformArtifact>) {
+        let Some(artifact) = artifact else {
+            *self.state.lock().unwrap() = SelfUpdateState::Failed(format!(
+                "This release does not publish a {} build. Pull the latest \
+                 source and rebuild to update.",
+                std::env::consts::OS
+            ));
+            return;
+        };
+        let download_url = artifact.download_url;
+        let expected_sha256 = match artifact.sha256 {
             Some(value)
                 if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
             {
@@ -460,7 +519,17 @@ impl Default for SelfUpdater {
 /// Maximum allowed download size (100 MB) to prevent unbounded memory usage.
 const MAX_DOWNLOAD_SIZE: u64 = 100 * 1024 * 1024;
 
-/// Download the update exe to a temp file next to the current exe.
+/// A sibling of `path` with `suffix` appended to the whole file name.
+///
+/// Appending rather than replacing the extension keeps `RealmHound.exe.old` on
+/// Windows while giving the extensionless macOS binary `RealmHound.old` instead
+/// of a misleading `.exe.old`.
+fn sibling_with_suffix(path: &std::path::Path, suffix: &str) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    Some(path.with_file_name(format!("{name}{suffix}")))
+}
+
+/// Download the update binary to a temp file next to the current one.
 fn download_update(
     url: &str,
     expected_sha256: &str,
@@ -471,11 +540,9 @@ fn download_update(
 
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Cannot determine current exe path: {}", e))?;
-    let exe_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Cannot determine exe directory".to_string())?;
 
-    let new_path = exe_dir.join("RealmHound.exe.new");
+    let new_path = sibling_with_suffix(&current_exe, ".new")
+        .ok_or_else(|| "Cannot determine download path".to_string())?;
 
     info!("Downloading update from {} to {:?}", url, new_path);
 
@@ -552,6 +619,14 @@ fn download_update(
     }
     info!("SHA-256 verified: {}", actual);
 
+    // A downloaded file is not executable on Unix until it is marked so.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&new_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Failed to mark update executable: {}", e))?;
+    }
+
     info!("Download complete: {} bytes", downloaded);
     Ok(new_path)
 }
@@ -574,13 +649,15 @@ impl StagedSwap {
     }
 }
 
-/// Swap the running exe with the new one, leaving the process running.
-/// On Windows: rename current -> .old, rename .new -> current. On the second
-/// rename failing, the first is rolled back before returning the error.
+/// Swap the running binary with the new one, leaving the process running.
+/// Rename current -> .old, rename .new -> current. On the second rename
+/// failing, the first is rolled back before returning the error. Both Windows
+/// and Unix allow renaming the image of a running process.
 pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwap, String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Cannot determine current exe path: {}", e))?;
-    let old_path = current_exe.with_extension("exe.old");
+    let old_path = sibling_with_suffix(&current_exe, ".old")
+        .ok_or_else(|| "Cannot determine backup path".to_string())?;
 
     info!("Applying update: swapping {:?}", current_exe);
 
@@ -590,7 +667,7 @@ pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwa
             .map_err(|e| format!("Cannot remove old backup ({}): {}", old_path.display(), e))?;
     }
 
-    // Rename running exe to .old (Windows allows renaming a running exe)
+    // Rename the running binary aside
     std::fs::rename(&current_exe, &old_path)
         .map_err(|e| format!("Failed to rename current exe to .old: {}", e))?;
 
@@ -619,7 +696,9 @@ pub fn rollback_executable_swap(staged: &StagedSwap) {
 /// Call this on app startup.
 pub fn cleanup_old_exe() {
     if let Ok(current_exe) = std::env::current_exe() {
-        let old_path = current_exe.with_extension("exe.old");
+        let Some(old_path) = sibling_with_suffix(&current_exe, ".old") else {
+            return;
+        };
         if old_path.exists() {
             match std::fs::remove_file(&old_path) {
                 Ok(()) => info!("Cleaned up old exe: {:?}", old_path),
@@ -632,6 +711,80 @@ pub fn cleanup_old_exe() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manifest in the shape published before macOS builds existed.
+    const LEGACY_MANIFEST: &str = r#"{
+        "latest_version": "0.21.1",
+        "download_url": "https://example.invalid/RealmHound.exe",
+        "sha256": "aa",
+        "releases": []
+    }"#;
+
+    #[test]
+    fn a_manifest_without_macos_fields_still_parses() {
+        // Every published manifest predates those fields, so dropping this
+        // compatibility would break the update check for every client.
+        let manifest: VersionManifest =
+            serde_json::from_str(LEGACY_MANIFEST).expect("legacy manifest parses");
+        assert_eq!(manifest.latest_version, "0.21.1");
+        assert_eq!(manifest.macos_download_url, None);
+        assert_eq!(manifest.macos_sha256, None);
+    }
+
+    #[test]
+    fn each_platform_resolves_only_a_binary_it_can_run() {
+        let manifest: VersionManifest = serde_json::from_str(
+            r#"{
+                "latest_version": "0.21.1",
+                "download_url": "https://example.invalid/RealmHound.exe",
+                "sha256": "ab",
+                "macos_download_url": "https://example.invalid/RealmHound-macos",
+                "macos_sha256": "cd",
+                "releases": []
+            }"#,
+        )
+        .expect("manifest parses");
+
+        let artifact = manifest.artifact_for_this_platform();
+        if cfg!(windows) {
+            let artifact = artifact.expect("windows publishes an executable");
+            assert!(artifact.download_url.ends_with(".exe"));
+            assert_eq!(artifact.sha256.as_deref(), Some("ab"));
+        } else if cfg!(target_os = "macos") {
+            let artifact = artifact.expect("macOS publishes a binary");
+            assert!(artifact.download_url.ends_with("-macos"));
+            assert_eq!(artifact.sha256.as_deref(), Some("cd"));
+        } else {
+            assert_eq!(artifact, None, "no binary is published for this platform");
+        }
+    }
+
+    #[test]
+    fn macos_resolves_nothing_when_the_release_published_no_macos_binary() {
+        let manifest: VersionManifest =
+            serde_json::from_str(LEGACY_MANIFEST).expect("legacy manifest parses");
+        // The Windows executable must never be offered to another platform.
+        #[cfg(not(windows))]
+        assert_eq!(manifest.artifact_for_this_platform(), None);
+        #[cfg(windows)]
+        assert!(manifest.artifact_for_this_platform().is_some());
+    }
+
+    #[test]
+    fn backup_and_download_names_append_rather_than_replace_the_extension() {
+        // `with_extension` would turn the extensionless macOS binary into
+        // "RealmHound.exe.old", and must leave the Windows name untouched.
+        let windows = std::path::Path::new("/opt/RealmHound.exe");
+        assert_eq!(
+            sibling_with_suffix(windows, ".old").unwrap(),
+            std::path::Path::new("/opt/RealmHound.exe.old")
+        );
+        let unix = std::path::Path::new("/opt/RealmHound");
+        assert_eq!(
+            sibling_with_suffix(unix, ".new").unwrap(),
+            std::path::Path::new("/opt/RealmHound.new")
+        );
+    }
 
     #[test]
     fn test_compare_versions() {
@@ -648,6 +801,8 @@ mod tests {
             latest_version: "0.5.0".to_string(),
             download_url: "http://example.com".to_string(),
             sha256: None,
+            macos_download_url: None,
+            macos_sha256: None,
             releases: vec![
                 Release {
                     version: "0.5.0".to_string(),
@@ -699,7 +854,10 @@ mod tests {
     fn test_missing_checksum_blocks_download() {
         let updater = SelfUpdater::new();
 
-        updater.start_download("http://example.com".to_string(), None);
+        updater.start_download(Some(PlatformArtifact {
+            download_url: "http://example.com".to_string(),
+            sha256: None,
+        }));
 
         assert!(matches!(
             updater.state(),
@@ -711,11 +869,26 @@ mod tests {
     fn test_invalid_checksum_blocks_download() {
         let updater = SelfUpdater::new();
 
-        updater.start_download("http://example.com".to_string(), Some("g".repeat(64)));
+        updater.start_download(Some(PlatformArtifact {
+            download_url: "http://example.com".to_string(),
+            sha256: Some("g".repeat(64)),
+        }));
 
         assert!(matches!(
             updater.state(),
             SelfUpdateState::Failed(message) if message == "Update manifest has an invalid SHA-256"
+        ));
+    }
+
+    #[test]
+    fn a_platform_without_a_published_binary_is_told_so() {
+        let updater = SelfUpdater::new();
+
+        updater.start_download(None);
+
+        assert!(matches!(
+            updater.state(),
+            SelfUpdateState::Failed(message) if message.contains("does not publish")
         ));
     }
 }

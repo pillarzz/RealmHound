@@ -23,6 +23,7 @@ pub fn still_holds(copied: &str) -> bool {
 /// Upper bound on the units RealmHound will look at. Only a short callout is
 /// ever written here, so an implausibly large clipboard block is not worth
 /// copying into a `String` even though its size is known.
+#[cfg(windows)]
 const MAX_UNITS: usize = 1 << 20;
 
 /// Decode a UTF-16 clipboard block, given the units the block actually holds.
@@ -30,6 +31,7 @@ const MAX_UNITS: usize = 1 << 20;
 /// Returns `None` when the block carries no null terminator, rather than reading
 /// past the memory its owner allocated: a malformed payload must never be
 /// scanned out of bounds.
+#[cfg(windows)]
 fn decode_utf16_block(units: &[u16]) -> Option<String> {
     let len = units.iter().position(|&unit| unit == 0)?;
     Some(String::from_utf16_lossy(&units[..len]))
@@ -90,12 +92,20 @@ fn text() -> Option<String> {
 
 #[cfg(not(windows))]
 fn text() -> Option<String> {
-    None
+    // A fresh context per read: the callout cleanup runs at most once per join
+    // window, and holding an X11/Wayland connection open for the life of the
+    // process just to poll it occasionally is the worse trade. A clipboard that
+    // is busy, empty, or holding an image reports `Err` here, which keeps the
+    // callout rather than risk clobbering anything -- the same outcome the
+    // Windows path reaches by returning `None`.
+    arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_utf16_block, should_clear, still_holds};
+    #[cfg(windows)]
+    use super::decode_utf16_block;
+    use super::{should_clear, still_holds};
 
     #[test]
     fn clears_only_the_callout_we_copied() {
@@ -124,6 +134,7 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
     #[test]
     fn decodes_text_up_to_the_terminator() {
         assert_eq!(decode_utf16_block(&[104, 105, 0]), Some("hi".to_string()));
@@ -133,6 +144,7 @@ mod tests {
         assert_eq!(decode_utf16_block(&[0]), Some(String::new()));
     }
 
+    #[cfg(windows)]
     #[test]
     fn rejects_a_block_without_a_terminator() {
         // What a malformed payload looks like: the allocated block ends without

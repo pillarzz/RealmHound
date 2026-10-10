@@ -2418,8 +2418,18 @@ impl AssetManager {
     /// - assets/sprites/*.png
     /// - assets/xml/enchantments.xml
     pub fn set_assets_dir<P: AsRef<Path>>(&self, path: P) {
+        let path = path.as_ref();
         let mut dir = self.assets_dir.write().unwrap();
-        *dir = Some(path.as_ref().to_path_buf());
+
+        // Re-pointing at the directory already in use must not discard what is
+        // loaded. Call sites "ensure" the directory before every use, so wiping
+        // the cache here makes a concurrent lookup elsewhere miss. Re-extraction
+        // invalidates explicitly and does not rely on this.
+        if dir.as_deref() == Some(path) {
+            return;
+        }
+
+        *dir = Some(path.to_path_buf());
 
         // Reset loaded state
         *self.initialized.write().unwrap() = false;
@@ -4364,6 +4374,16 @@ pub fn default_asset_dirs() -> Vec<PathBuf> {
         }
     }
 
+    // Application Support on macOS. Must mirror `default_assets_dir`, which is
+    // where extraction writes: without this the extracted assets are never
+    // found again and every sprite/name lookup silently fails.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(support) = dirs::data_local_dir() {
+            dirs.push(support.join("RealmHound").join("assets"));
+        }
+    }
+
     dirs
 }
 
@@ -4402,6 +4422,19 @@ mod tests {
         let manager = AssetManager::new();
         assert!(!manager.is_loaded());
         assert!(manager.assets_dir().is_none());
+    }
+
+    #[test]
+    fn extraction_target_is_searched_on_load() {
+        // `extract_assets` writes to `default_assets_dir` and `find_assets_dir`
+        // only looks in `default_asset_dirs`. If the two ever disagree the
+        // assets extract successfully and are then never found again, which
+        // looks like a silent asset failure rather than a path bug.
+        let target = default_assets_dir();
+        assert!(
+            default_asset_dirs().contains(&target),
+            "{target:?} is written by extraction but never searched on load"
+        );
     }
 
     #[test]

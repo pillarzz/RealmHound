@@ -20,7 +20,6 @@ use tracing_subscriber::{filter::Targets, fmt, layer::SubscriberExt, util::Subsc
 
 #[cfg(windows)]
 mod power_throttling;
-#[cfg(windows)]
 mod single_instance;
 
 mod app;
@@ -29,6 +28,8 @@ mod capture_manager;
 mod client_process;
 mod clipboard;
 mod discovery;
+#[cfg(target_os = "macos")]
+mod dock_icon;
 mod enchant_sound;
 mod event_log;
 mod memo;
@@ -72,15 +73,13 @@ use app::{RealmHoundApp, PKG_NAME, VERSION};
 
 fn main() -> Result<()> {
     // A relaunch replacement waits (bounded) for the previous instance to exit
-    // before contending for the mutex or profile lock.
-    #[cfg(windows)]
+    // before contending for the single-instance claim or the profile lock.
     if let Some(pid) = relaunch_wait_pid() {
         realmhound_core::relaunch::wait_for_process_exit(pid, std::time::Duration::from_secs(10));
     }
 
     // Ensure only one instance of RealmHound runs at a time.
     // The guard must live for the entire program duration.
-    #[cfg(windows)]
     let _single_instance = single_instance::acquire_or_exit();
 
     // Initialize logging
@@ -162,6 +161,8 @@ fn main() -> Result<()> {
                 "RealmHound",
                 options,
                 Box::new(move |cc| {
+                    #[cfg(target_os = "macos")]
+                    dock_icon::install();
                     Ok(Box::new(RootApp::build(
                         &cc.egui_ctx,
                         outcome.settings,
@@ -178,6 +179,8 @@ fn main() -> Result<()> {
                 "RealmHound",
                 options,
                 Box::new(|cc| {
+                    #[cfg(target_os = "macos")]
+                    dock_icon::install();
                     let egui_ctx = cc.egui_ctx.clone();
                     let (tx, rx) = mpsc::channel();
                     std::thread::Builder::new()
@@ -766,7 +769,6 @@ enum StartupLaunch {
 }
 
 /// Parse the `--wait-pid <pid>` argument a relaunch replacement carries, if any.
-#[cfg(windows)]
 fn relaunch_wait_pid() -> Option<u32> {
     let mut args = std::env::args();
     while let Some(arg) = args.next() {

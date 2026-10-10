@@ -60,8 +60,32 @@ pub fn wait_for_process_exit(pid: u32, timeout: Duration) {
     }
 }
 
-/// Off Windows the profile lock wait is the correctness guard; no process wait.
-#[cfg(not(windows))]
+/// Off Windows there is no waitable handle for a process that is not our child,
+/// so liveness is polled with the null signal until `pid` is gone. The profile
+/// lock remains the correctness guard; this only shortens the wait for it.
+#[cfg(unix)]
+pub fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    /// Short enough that the replacement starts promptly once the old process
+    /// is gone, long enough not to spin for the whole timeout.
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // Signal 0 performs the permission and existence checks without
+        // delivering anything; ESRCH (-1) means the process is gone.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("[RELAUNCH] timed out waiting for pid {pid} to exit");
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Neither Windows nor Unix: the profile lock wait is the only guard.
+#[cfg(not(any(windows, unix)))]
 pub fn wait_for_process_exit(_pid: u32, _timeout: Duration) {}
 
 #[cfg(test)]
@@ -79,6 +103,25 @@ mod tests {
     fn wait_for_process_exit_returns_immediately_for_dead_pid() {
         let start = std::time::Instant::now();
         wait_for_process_exit(0xFFFF_FFFC, Duration::from_secs(30));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_process_exit_returns_immediately_for_dead_pid() {
+        // Above the default pid_max on both macOS and Linux, so no live process
+        // can own it and the first poll must already observe ESRCH.
+        let start = std::time::Instant::now();
+        wait_for_process_exit(0x7FFF_FFFE, Duration::from_secs(30));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_process_exit_gives_up_at_the_timeout_for_a_live_process() {
+        let start = std::time::Instant::now();
+        wait_for_process_exit(std::process::id(), Duration::from_millis(200));
+        assert!(start.elapsed() >= Duration::from_millis(200));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

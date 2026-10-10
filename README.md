@@ -17,7 +17,7 @@ Join our Discord!
 
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg)
 
 ## Features
@@ -46,39 +46,110 @@ Join our Discord!
 
 Get the latest release from the [Releases](../../releases) page.
 
-Just download `RealmHound.exe` and run it!
+Releases ship a build for each platform:
+
+| Platform | Download | Notes |
+| --- | --- | --- |
+| Windows | `RealmHound.exe` | Download and run it. |
+| macOS | `RealmHound-macos-app.zip` | Universal (Apple Silicon and Intel). Unzip and drag `RealmHound.app` to Applications. Recommended: it carries the RealmHound icon and opens on a double-click. |
+| macOS | `RealmHound-macos` | The same universal binary, unwrapped, for running from a terminal. Run `chmod +x RealmHound-macos` before the first launch. |
+
+macOS quarantines anything downloaded through a browser, so the first launch is
+blocked with "cannot be opened because the developer cannot be verified". Clear
+it once with `xattr -dr com.apple.quarantine RealmHound.app` (or
+`RealmHound-macos`), or right-click in Finder and choose **Open**. Updates
+applied from inside the app are not quarantined and need neither step.
+
+The in-app updater works with either download: it replaces the executable in
+place, which inside the bundle is `RealmHound.app/Contents/MacOS/RealmHound`, so
+the icon survives an update.
 
 ## Requirements
 
+### Windows
+
 - **Windows 10/11** (64-bit)
 - **[Npcap](https://npcap.com/#download)** - Required for packet capture (install with WinPcap compatibility mode)
+
+### macOS
+
+- **macOS 11 or newer**, Apple Silicon or Intel
+- `libpcap` ships with macOS, so there is nothing extra to install - but
+  capturing packets needs read access to `/dev/bpf*`, which is root-only by
+  default. Grant it once by installing
+  [Wireshark](https://www.wireshark.org/download.html) and allowing its
+  **ChmodBPF** helper during setup, then log out and back in.
+
+  Running `sudo RealmHound` also works, but ChmodBPF is safer: it grants capture
+  access to your user instead of running the whole app as root.
 
 ## Usage
 
 Many features work best fullscreen. If you use two monitors, consider running
 RealmHound on the second.
 
-1. Install [Npcap](https://npcap.com/#download) if you haven't already
-2. Download and run `RealmHound.exe`
+1. Install the packet-capture prerequisite for your platform (see [Requirements](#requirements))
+2. Download and run RealmHound
 3. The app will automatically detect your network interface and start capturing
 4. Launch Realm of the Mad God and play normally
 5. RealmHound will display game data in real-time
+
+If RealmHound reports that it may not open a capture device, the capture
+permission above has not been granted yet - the message names the fix for your
+platform.
 
 ## Building from Source
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable toolchain)
-- [Npcap SDK](https://npcap.com/#download) (for development)
+All platforms need the stable [Rust](https://rustup.rs/) toolchain, plus:
+
+| Platform | Additional prerequisites |
+| --- | --- |
+| Windows | [Npcap SDK](https://npcap.com/#download), with its `Lib\x64` directory on `LIB` |
+| macOS | Xcode Command Line Tools (`xcode-select --install`) - these supply `libpcap` |
 
 ### Build
 
-```powershell
+```sh
 cd realmhound
 cargo build --release
 ```
 
-The executable will be at `realmhound/target/release/RealmHound.exe`
+The executable will be at `realmhound/target/release/RealmHound`
+(`RealmHound.exe` on Windows).
+
+On macOS, wrap that binary in the icon-carrying bundle the release ships with:
+
+```sh
+tools/macos/make-app-bundle.sh realmhound/target/release/RealmHound realmhound/target/release
+```
+
+### Platform notes
+
+- **Automatic updates** fetch the build for the platform they are running on and
+  verify its SHA-256 before swapping it in. A release that publishes no binary
+  for a platform reports that instead of offering one it cannot run.
+- **Game assets** are read from the RotMG install: `%LOCALAPPDATA%` on Windows
+  and `~/.local/share/RealmOfTheMadGod` on macOS. See
+  [Game assets](#game-assets).
+- **RealmHound's own data** lives under `%LOCALAPPDATA%\RealmHound` on Windows
+  and `~/Library/Application Support/RealmHound` on macOS.
+
+## Game assets
+
+RealmHound ships no game art. On first launch it finds your RotMG install and
+extracts sprites and the object-name table from the client's own
+`resources.assets`. This is automatic and needs no configuration - the Deca
+launcher's install location is known for each platform:
+
+| Platform | Install location |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\RealmOfTheMadGod\Production\` |
+| macOS | `~/.local/share/RealmOfTheMadGod/Production/` |
+
+Without a local install the app still captures and records everything, but
+items and enemies show as numeric IDs and icons render empty.
 
 ## Project Structure
 

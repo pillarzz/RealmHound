@@ -46,21 +46,39 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
 
-# Windows API for single-instance mutex and title-bar icon
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
-raw-window-handle = "0.6"
-
 # Audio playback for sound notifications
 rodio = "0.19"
 
-# Native file dialogs for custom sound selection
+# Native file dialogs for custom sound selection, and message boxes off Windows
 rfd = "0.15"
 
 # Profiling (opt-in via the `profiling` feature)
 puffin = { version = "0.20", optional = true }
 puffin_egui = { version = "0.30", optional = true }
 puffin_http = { version = "0.17", optional = true }
+
+# Windows API for single-instance mutex and title-bar icon
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(not(windows))'.dependencies]
+# Clipboard reads for the dungeon-callout cleanup (Windows uses the Win32 API).
+arboard = "3"
+
+[target.'cfg(unix)'.dependencies]
+# Advisory lock file standing in for the Windows named single-instance mutex.
+fs2 = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Socket -> owning process lookup for the forge-fire relaunch safeguard,
+# replacing GetExtendedTcpTable/GetProcessTimes.
+libproc = "0.14"
+# A bundle-less Mach-O has nowhere to carry an icon, so AppKit's Dock tile is the
+# only place the plain binary can show one; NSBundle tells a bundled build apart.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", features = ["NSBundle", "NSData"] }
 
 [dev-dependencies]
 # Hermetic temporary directories for path-injection tests.
@@ -72,6 +90,6 @@ profiling = ["dep:puffin", "dep:puffin_egui", "dep:puffin_http", "realmhound-cor
 # Enable diagnostic-only capture, pipeline, storage, UI, and audio latency logging.
 latency-diagnostics = ["realmhound-core/latency-diagnostics"]
 
-[build-dependencies]
 # Windows-specific: embed icon and manifest
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

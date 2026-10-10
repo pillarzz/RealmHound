@@ -5087,6 +5087,33 @@ impl RealmHoundApp {
                         }
                     }
                 }
+                if shadcn
+                    .btn(ui, "Reset to full screen")
+                    .hover_tip("Set the window to this monitor's native resolution and maximize.")
+                    .clicked()
+                {
+                    match ui.ctx().input(|i| i.viewport().monitor_size) {
+                        Some(size) => {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                            self.debug_window_width = format!("{}", size.x.round() as i32);
+                            self.debug_window_height = format!("{}", size.y.round() as i32);
+                            if let Ok(mut s) = self.settings.write() {
+                                s.window.width = size.x;
+                                s.window.height = size.y;
+                                s.window.maximized = true;
+                                s.save();
+                            }
+                            self.debug_window_error = None;
+                        }
+                        None => {
+                            self.debug_window_error =
+                                Some("Could not read the monitor resolution.".to_string());
+                        }
+                    }
+                }
             });
             if let Some(err) = &self.debug_window_error {
                 ui.label(RichText::new(err).color(egui::Color32::from_rgb(220, 120, 120)));

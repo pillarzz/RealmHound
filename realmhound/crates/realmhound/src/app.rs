@@ -617,6 +617,14 @@ mod ui_health_tests {
 pub struct RealmHoundApp {
     /// Packet capture lifecycle manager
     capture: CaptureManager,
+    /// Whether raw packets are being written to a `.rhcap` file (Debug settings).
+    record_raw_packets: bool,
+    /// Debug "App resolution" width input (pixels, as typed).
+    debug_window_width: String,
+    /// Debug "App resolution" height input (pixels, as typed).
+    debug_window_height: String,
+    /// Validation message for the Debug "App resolution" apply action.
+    debug_window_error: Option<String>,
     /// Active tab
     active_tab: ActiveTab,
     /// Active tab on the previous frame, used to detect tab activation so a
@@ -1140,6 +1148,14 @@ impl RealmHoundApp {
 
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
+            // Honour the REALMHOUND_RECORD env var so the Debug toggle reflects
+            // any recording already started at capture start.
+            record_raw_packets: std::env::var("REALMHOUND_RECORD")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false),
+            debug_window_width: String::new(),
+            debug_window_height: String::new(),
+            debug_window_error: None,
             active_tab: ActiveTab::LiveFeed, // Default to Live Feed tab
             last_active_tab: ActiveTab::LiveFeed,
             chat_panel,
@@ -2260,6 +2276,7 @@ impl RealmHoundApp {
                             ("appearance", "🎨 Appearance"),
                             ("sound", "🔊 Sound"),
                             ("account", "👤 Account"),
+                            ("debug", "🔧 Debug"),
                         ];
                         ui.horizontal_top(|ui| {
                             // Left: vertical tab sidebar (Discord-style).
@@ -2391,6 +2408,9 @@ impl RealmHoundApp {
                                                             ),
                                                         SettingsCategory::Taskbar => self
                                                             .render_taskbar_settings(ui, &shadcn),
+                                                        SettingsCategory::Debug => {
+                                                            self.render_debug_settings(ui, &shadcn)
+                                                        }
                                                     }
                                                 });
                                         });
@@ -4966,6 +4986,141 @@ impl RealmHoundApp {
         });
     }
 
+    /// Debug settings tab: developer / diagnostic tools.
+    fn render_debug_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
+        ui.heading("Debug");
+        ui.add_space(8.0);
+
+        shadcn.card(ui, "dbg_packet_capture", "Packet capture", |ui| {
+            ui.label(
+                RichText::new(
+                    "Record every captured packet to a .rhcap file for offline analysis. \
+                     Recording starts as soon as you enable this and stops when you turn \
+                     it off (or close the app). Recording continues into any dungeon you \
+                     enter, so start it before the fight you want to capture.",
+                )
+                .weak(),
+            );
+            ui.add_space(6.0);
+
+            let mut record = self.record_raw_packets;
+            if shadcn
+                .switch(ui, &mut record, "Record raw packets (.rhcap)")
+                .hover_tip(
+                    "Writes raw packets to the captures folder. Useful for reproducing \
+                     combat-tracking bugs.",
+                )
+                .changed()
+            {
+                self.record_raw_packets = record;
+                self.worker
+                    .send_control(ControlMsg::SetCaptureRecording(record));
+            }
+
+            ui.add_space(6.0);
+            let dir = realmhound_core::capture::captures_dir();
+            ui.label(RichText::new(format!("Output folder: {}", dir.display())).weak());
+            if !self.record_raw_packets {
+                ui.label(RichText::new("Not recording.").weak());
+            }
+        });
+
+        ui.add_space(12.0);
+
+        shadcn.card(ui, "dbg_app_resolution", "App resolution", |ui| {
+            ui.label(
+                RichText::new(
+                    "Type a window size in pixels and press Apply to resize the app \
+                     (useful for reproducing layout issues at specific resolutions).",
+                )
+                .weak(),
+            );
+            ui.add_space(6.0);
+
+            // Prefill the inputs from the live window size the first time the
+            // card is shown, then leave the user's typed values alone.
+            if self.debug_window_width.is_empty() || self.debug_window_height.is_empty() {
+                if let Ok(s) = self.settings.read() {
+                    self.debug_window_width = format!("{}", s.window.width.round() as i32);
+                    self.debug_window_height = format!("{}", s.window.height.round() as i32);
+                }
+            }
+
+            shadcn.field_row(ui, |ui| {
+                ui.label("Width:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_window_width)
+                        .char_limit(5)
+                        .desired_width(70.0)
+                        .hint_text("1920"),
+                );
+                ui.label("Height:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.debug_window_height)
+                        .char_limit(5)
+                        .desired_width(70.0)
+                        .hint_text("1080"),
+                );
+                if shadcn.btn(ui, "Apply").clicked() {
+                    match (
+                        self.debug_window_width.trim().parse::<i32>(),
+                        self.debug_window_height.trim().parse::<i32>(),
+                    ) {
+                        (Ok(w), Ok(h))
+                            if (320..=7680).contains(&w) && (240..=4320).contains(&h) =>
+                        {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                                egui::vec2(w as f32, h as f32),
+                            ));
+                            if let Ok(mut s) = self.settings.write() {
+                                s.window.width = w as f32;
+                                s.window.height = h as f32;
+                                s.window.maximized = false;
+                                s.save();
+                            }
+                            self.debug_window_error = None;
+                        }
+                        _ => {
+                            self.debug_window_error = Some(
+                                "Enter width 320-7680 and height 240-4320 (pixels).".to_string(),
+                            );
+                        }
+                    }
+                }
+                if shadcn
+                    .btn(ui, "Reset to full screen")
+                    .hover_tip("Set the window to this monitor's native resolution and maximize.")
+                    .clicked()
+                {
+                    match ui.ctx().input(|i| i.viewport().monitor_size) {
+                        Some(size) => {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                            self.debug_window_width = format!("{}", size.x.round() as i32);
+                            self.debug_window_height = format!("{}", size.y.round() as i32);
+                            if let Ok(mut s) = self.settings.write() {
+                                s.window.width = size.x;
+                                s.window.height = size.y;
+                                s.window.maximized = true;
+                                s.save();
+                            }
+                            self.debug_window_error = None;
+                        }
+                        None => {
+                            self.debug_window_error =
+                                Some("Could not read the monitor resolution.".to_string());
+                        }
+                    }
+                }
+            });
+            if let Some(err) = &self.debug_window_error {
+                ui.label(RichText::new(err).color(egui::Color32::from_rgb(220, 120, 120)));
+            }
+        });
+    }
+
     /// Render the Sound settings panel.
     fn render_sound_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
         ui.add_space(10.0);
@@ -5229,12 +5384,17 @@ impl RealmHoundApp {
         let mut settings_changed = false;
         shadcn.card(ui, "snd_loot_sounds", "Loot Sounds", |ui| {
             egui::Grid::new("loot_sounds_grid")
-                .num_columns(5)
+                .num_columns(7)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.whitebag, "White bag")
+                        .switch(ui, &mut current_settings.whitebag, "")
                         .changed();
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::White.id()),
+                    );
+                    ui.label("White bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5244,8 +5404,49 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.redbag, "Red bag")
+                        .switch(ui, &mut current_settings.shiny_whitebag, "")
+                        .hover_tip(
+                            "Plays when a loot bag holds a shiny item whose own bag tier \
+                             is white (the bag the shiny item normally drops in).",
+                        )
                         .changed();
+                    // Dirk of Cronus Shiny (0x4BA) represents the shiny white tier.
+                    self.render_loot_sound_row_icon(ui, Some(1210));
+                    ui.label("Shiny white bag items");
+                    settings_changed |= self.render_sound_row_controls(
+                        ui,
+                        shadcn,
+                        SoundType::ShinyWhiteBag,
+                        current_settings,
+                    );
+                    ui.end_row();
+
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.shiny_tealbag, "")
+                        .hover_tip(
+                            "Plays when a loot bag holds a shiny item whose own bag tier \
+                             is teal (the bag the shiny item normally drops in).",
+                        )
+                        .changed();
+                    // Sprite Wand Shiny (0x14BE) represents the shiny teal tier.
+                    self.render_loot_sound_row_icon(ui, Some(5310));
+                    ui.label("Shiny teal bag items");
+                    settings_changed |= self.render_sound_row_controls(
+                        ui,
+                        shadcn,
+                        SoundType::ShinyTealBag,
+                        current_settings,
+                    );
+                    ui.end_row();
+
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.redbag, "")
+                        .changed();
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Red.id()),
+                    );
+                    ui.label("Red bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5255,8 +5456,13 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.orangebag, "Orange bag")
+                        .switch(ui, &mut current_settings.orangebag, "")
                         .changed();
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Orange.id()),
+                    );
+                    ui.label("Orange bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5266,8 +5472,13 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.bluebag, "Blue bag")
+                        .switch(ui, &mut current_settings.bluebag, "")
                         .changed();
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Blue.id()),
+                    );
+                    ui.label("Blue bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5277,8 +5488,13 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.goldbag, "Gold bag")
+                        .switch(ui, &mut current_settings.goldbag, "")
                         .changed();
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Gold.id()),
+                    );
+                    ui.label("Gold bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5288,8 +5504,31 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.eggbag, "Egg bag")
+                        .switch(ui, &mut current_settings.shiny_goldbag, "")
+                        .hover_tip(
+                            "Plays when a loot bag holds a shiny pet stone (which \
+                             unlocks a shiny pet skin).",
+                        )
                         .changed();
+                    // Gold Primal Snake Pet Skin (0xA145) represents a shiny pet skin.
+                    self.render_loot_sound_row_icon(ui, Some(41285));
+                    ui.label("Shiny pet skins");
+                    settings_changed |= self.render_sound_row_controls(
+                        ui,
+                        shadcn,
+                        SoundType::ShinyGoldBag,
+                        current_settings,
+                    );
+                    ui.end_row();
+
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.eggbag, "")
+                        .changed();
+                    self.render_loot_sound_row_icon(
+                        ui,
+                        Some(realmhound_core::loot::LootBagType::Egg.id()),
+                    );
+                    ui.label("Egg bag");
                     settings_changed |= self.render_sound_row_controls(
                         ui,
                         shadcn,
@@ -5301,6 +5540,19 @@ impl RealmHoundApp {
         });
 
         settings_changed
+    }
+
+    /// Draw the leading icon for a Loot Sounds grid row into an inline 20x20
+    /// slot. Draws nothing (leaving the reserved space blank) when `item_id` is
+    /// `None`, so rows without an icon stay aligned.
+    fn render_loot_sound_row_icon(&mut self, ui: &mut egui::Ui, item_id: Option<i32>) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        if let Some(id) = item_id {
+            self.sprite_renderer.draw_sprite_in_rect(ui, id, rect);
+        }
     }
 
     /// Enchantments sound sub-tab: play a notification when a matching enchant

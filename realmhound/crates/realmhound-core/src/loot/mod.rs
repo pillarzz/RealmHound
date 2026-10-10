@@ -23,11 +23,83 @@ pub use player_state::{
 };
 pub use tracker::{LootTracker, ProcessedLootDrop, ProcessedLootItem, RecentBossKill};
 
+// --- Shiny bag notifications ---
+
+/// Object ids of the shiny pet stones.
+///
+/// Pet stones carry no shiny indicator in the game data (they are structurally
+/// identical to their base variants), so the shiny pet stones are hardcoded.
+/// Each id is the *stone* (the consumable that unlocks the pet skin), which is
+/// what appears in a loot bag.
+pub const SHINY_PET_STONE_IDS: &[i32] = &[
+    21642, // Enlightened Bookwyrm Pet Stone (The Cursed Library)
+    22581, // Bogged Panda Pet Stone (Sulfurous Wetlands)
+    41286, // Gold Primal Snake Pet Stone (White Snake Invasion I-III)
+];
+
+/// The shiny-notification bag tier for a set of loot-bag item ids.
+///
+/// Shiny items are matched by the game's `SHINY` label, and the tier comes from
+/// the item's own `<BagType>` (the bag it normally drops in) rather than the
+/// physical bag colour, so a shiny that lands in a mixed bag still maps to its
+/// own tier. Shiny pet stones have no shiny label, so they are matched by
+/// [`SHINY_PET_STONE_IDS`] and always map to [`LootBagType::Gold`].
+///
+/// Returns `None` when no shiny item with a notification tier is present.
+pub fn shiny_bag_tier<I>(item_ids: I) -> Option<LootBagType>
+where
+    I: IntoIterator<Item = i32>,
+{
+    let manager = crate::assets::get_asset_manager();
+    for id in item_ids {
+        if id <= 0 {
+            continue;
+        }
+        if SHINY_PET_STONE_IDS.contains(&id) {
+            return Some(LootBagType::Gold);
+        }
+        if !manager.is_shiny(id) {
+            continue;
+        }
+        // `<BagType>` 4 = teal, 6 = white. Other tiers have no shiny
+        // notification. Equipment is enriched with `bag_type` from equip.xml at
+        // load time; items outside that merge report 0 and are ignored.
+        match manager.get_object(id).map(|asset| asset.bag_type) {
+            Some(4) => return Some(LootBagType::Teal),
+            Some(6) => return Some(LootBagType::White),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Object type of Janus the Doorwarden (the Enemy the player fights).
 pub const JANUS_OBJECT_TYPE: i32 = 8200;
 
 /// Display name for Janus the Doorwarden, matching Combat History's boss name.
 pub const JANUS_NAME: &str = "Janus the Doorwarden";
+
+/// Every known Janus the Doorwarden object type: the classic boss plus the
+/// seasonal reskins (e.g. the Season 31 "Infested" variant, 46385). All of them
+/// keep the [`JANUS_NAME`] display name, which is what the attribution matches
+/// on so new reskins need no code change; the ids are only a backstop for a
+/// reskin that would also rename the boss.
+pub const JANUS_VARIANT_TYPES: &[i32] = &[JANUS_OBJECT_TYPE, 46385];
+
+/// The Janus the Doorwarden killed in `kills` for `map_seed`, if any.
+///
+/// Janus emits loot anonymously, so a Mark-of-Janus bag is attributed from the
+/// recorded kills rather than by proximity. Matching on the display name (shared
+/// by every reskin) keeps the bag linked to the right Combat History card for
+/// future seasonal reskins, whose object ids are unknown ahead of time.
+pub fn janus_kill_in_instance(kills: &[RecentBossKill], map_seed: i32) -> Option<(i32, String)> {
+    kills
+        .iter()
+        .filter(|k| k.map_seed == map_seed)
+        .filter(|k| k.name == JANUS_NAME || JANUS_VARIANT_TYPES.contains(&k.object_type))
+        .max_by_key(|k| k.ended_at_ms)
+        .map(|k| (k.object_type, k.name.clone()))
+}
 
 /// Item id of Mark of Janus, a guaranteed soulbound drop from Janus. Its
 /// presence in a bag is a 100% reliable signal the bag came from Janus (whose
@@ -960,5 +1032,62 @@ mod beisa_tests {
         assert!(!beisa_engaged(&kills, 99));
         assert!(!beisa_engaged(&kills, 0));
         assert!(!beisa_engaged(&[], 42));
+    }
+
+    #[test]
+    fn shiny_pet_stones_map_to_gold_tier() {
+        // Pet stones have no shiny label, so they are matched by the hardcoded
+        // id list without consulting the (unloaded) asset manager.
+        for id in SHINY_PET_STONE_IDS {
+            assert_eq!(shiny_bag_tier([*id]), Some(LootBagType::Gold));
+        }
+    }
+
+    #[test]
+    fn janus_attribution_resolves_reskin_by_name() {
+        // A reskin is a different object type with the same display name; the
+        // Mark-of-Janus bag must attach to the variant that actually died.
+        let reskin = RecentBossKill {
+            map_seed: 7,
+            object_type: 46385,
+            name: JANUS_NAME.to_string(),
+            started_at_ms: 0,
+            ended_at_ms: 10,
+        };
+        assert_eq!(
+            janus_kill_in_instance(std::slice::from_ref(&reskin), 7),
+            Some((46385, JANUS_NAME.to_string()))
+        );
+        // Same instance only: a Janus in another instance is not this bag's boss.
+        assert_eq!(
+            janus_kill_in_instance(std::slice::from_ref(&reskin), 8),
+            None
+        );
+
+        // The most recent Janus kill wins when the instance recorded several.
+        let classic = RecentBossKill {
+            object_type: JANUS_OBJECT_TYPE,
+            ended_at_ms: 5,
+            ..reskin.clone()
+        };
+        assert_eq!(
+            janus_kill_in_instance(&[classic, reskin.clone()], 7),
+            Some((46385, JANUS_NAME.to_string()))
+        );
+
+        // An unrelated boss in the same instance is not Janus.
+        let other = RecentBossKill {
+            object_type: 1234,
+            name: "Some Other Boss".to_string(),
+            ..reskin.clone()
+        };
+        assert_eq!(janus_kill_in_instance(&[other], 7), None);
+        assert_eq!(janus_kill_in_instance(&[], 7), None);
+    }
+
+    #[test]
+    fn drops_without_shiny_items_have_no_tier() {
+        assert_eq!(shiny_bag_tier([0, -1]), None);
+        assert_eq!(shiny_bag_tier(std::iter::empty()), None);
     }
 }

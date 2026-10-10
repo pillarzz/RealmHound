@@ -1064,7 +1064,16 @@ impl LootTracker {
 
         // Mark of Janus is a guaranteed, exclusive Janus drop, so a bag holding
         // it is always a genuine Janus drop even if proximity misattributed it.
+        // Attribute it to the Janus that actually died in this instance so the bag
+        // links to its fight: seasonal reskins are separate object types that
+        // share the display name, so matching the recorded kill (by name) keeps
+        // this correct for future reskins instead of pinning the canonical id.
         if item_ids.contains(&super::MARK_OF_JANUS_ITEM_ID) {
+            if let Some(hit) = super::janus_kill_in_instance(recent_boss_kills, map_seed)
+                .or_else(|| super::janus_kill_in_instance(escaped_boss_fights, map_seed))
+            {
+                return Some(hit);
+            }
             return Some((super::JANUS_OBJECT_TYPE, super::JANUS_NAME.to_string()));
         }
 

@@ -550,6 +550,14 @@ impl LootPanel {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
+        // A seasonally-reskinned source shows its current asset name for every
+        // record, so old entries read uniformly with the active season.
+        let live_name = (valid_source
+            && realmhound_core::assets::encounter_variant_types(mob_type).len() > 1)
+            .then(|| realmhound_core::assets::get_asset_manager().object_name(mob_type))
+            .flatten();
+        let mob_name = live_name.as_deref().unwrap_or(mob_name);
+
         // Show mob name in tooltip with click hint
         let name = if !valid_source || mob_name.is_empty() {
             "Unknown"
@@ -922,6 +930,13 @@ impl LootPanel {
                         self.source_filters.mob_type,
                         &self.source_filters.mob_name.clone(),
                     ) {
+                        // Show the current seasonal name for reskinned sources.
+                        let live = (realmhound_core::assets::encounter_variant_types(mob_type)
+                            .len()
+                            > 1)
+                        .then(|| realmhound_core::assets::get_asset_manager().object_name(mob_type))
+                        .flatten();
+                        let mob_name = live.as_deref().unwrap_or(mob_name);
                         if sprite_renderer.render_filter_pill(
                             ui,
                             mob_type,
@@ -1794,12 +1809,20 @@ impl LootPanel {
                 });
             }
 
+            // Names of reskinned sources matching the query under *either* their
+            // base or seasonal name, so searching "Grand Sphinx" surfaces the
+            // "Withered Sphinx" tag and vice versa.
+            let alias_matches: Vec<String> =
+                realmhound_core::assets::encounter_alias_names_matching(&self.search_text);
             // Collect enemy matches
             for (mob_type, mob_name) in self
                 .autocomplete_cache
                 .mobs
                 .iter()
-                .filter(|(_, name)| name.to_lowercase().contains(&search_lower))
+                .filter(|(_, name)| {
+                    name.to_lowercase().contains(&search_lower)
+                        || alias_matches.iter().any(|a| a.eq_ignore_ascii_case(name))
+                })
                 .take(5)
             {
                 results.push(SearchResult::Enemy {

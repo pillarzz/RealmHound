@@ -1123,6 +1123,13 @@ pub struct ObjectList {
     /// each `(stat, percent, stat_relative_to)`: adds `percent`% of the wearer's
     /// `stat_relative_to` value to `stat`. Only items with such effects appear.
     stat_relatives: HashMap<i32, Vec<(StatKind, f32, StatKind)>>,
+    /// Map from a weapon's object ID to the ordered `<Projectile>` index each of
+    /// its `<Subattack>` patterns fires (equip.xml `projectileId` attribute). The
+    /// client's `PlayerShoot.projectileId` is the *subattack* index, so weapons
+    /// with more subattacks than projectiles (longbows: 3 patterns, all firing
+    /// projectile 0) need this mapping to resolve their damage. Only weapons
+    /// whose subattack list is present and non-trivial appear.
+    subattack_projectiles: HashMap<i32, Vec<i32>>,
 }
 
 impl ObjectList {
@@ -1137,6 +1144,7 @@ impl ObjectList {
             pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
+            subattack_projectiles: HashMap::new(),
         }
     }
 
@@ -1283,6 +1291,7 @@ impl ObjectList {
             pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
+            subattack_projectiles: HashMap::new(),
         })
     }
 
@@ -1684,6 +1693,20 @@ impl ObjectList {
             .unwrap_or(&[])
     }
 
+    /// Resolve a weapon's `PlayerShoot.projectileId` to a `<Projectile>` index.
+    ///
+    /// The client reports the *subattack* index, which for most weapons equals
+    /// the projectile index, but not for longbows (3 subattack patterns that all
+    /// fire projectile 0). Returns the projectile index the given subattack
+    /// fires, or `None` when the weapon has no subattack table or the index is
+    /// out of range.
+    pub fn subattack_projectile_index(&self, id: i32, subattack_index: usize) -> Option<usize> {
+        self.subattack_projectiles
+            .get(&id)
+            .and_then(|subs| subs.get(subattack_index))
+            .and_then(|&proj| usize::try_from(proj).ok())
+    }
+
     /// Every object ID whose display name matches `display_name`
     /// (case-insensitive). Used to group biome / re-skinned variants of the
     /// same encounter (e.g. the old and "New" Skull Shrine both display as
@@ -1889,6 +1912,7 @@ impl ObjectList {
         let mut np_seen = false;
         let mut current_stat_bonuses = StatBonuses::default();
         let mut current_stat_relatives: Vec<(StatKind, f32, StatKind)> = Vec::new();
+        let mut current_subattacks: Vec<i32> = Vec::new();
 
         // Element tracking
         let mut in_tier = false;
@@ -1981,6 +2005,7 @@ impl ObjectList {
                             np_seen = false;
                             current_stat_bonuses = StatBonuses::default();
                             current_stat_relatives = Vec::new();
+                            current_subattacks = Vec::new();
                             pending_proj = None;
                             in_projectile = false;
                             in_proj_min = false;
@@ -2020,6 +2045,18 @@ impl ObjectList {
                         b"Projectile" => {
                             in_projectile = true;
                             proj_ap = false;
+                        }
+                        // A firing pattern; records which `<Projectile>` it fires.
+                        // The client's PlayerShoot.projectileId indexes these.
+                        b"Subattack" => {
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == b"projectileId" {
+                                    let v = String::from_utf8_lossy(&attr.value);
+                                    if let Ok(id) = v.trim().parse::<i32>() {
+                                        current_subattacks.push(id);
+                                    }
+                                }
+                            }
                         }
                         b"MinDamage" if in_projectile => in_proj_min = true,
                         b"MaxDamage" if in_projectile => in_proj_max = true,
@@ -2509,6 +2546,10 @@ impl ObjectList {
                                         type_id,
                                         std::mem::take(&mut current_stat_relatives),
                                     );
+                                }
+                                if !current_subattacks.is_empty() {
+                                    self.subattack_projectiles
+                                        .insert(type_id, std::mem::take(&mut current_subattacks));
                                 }
                                 if let Some(target) = current_unlock_target.take() {
                                     unlock_map.insert(type_id, target);
@@ -3615,6 +3656,43 @@ mod tests {
         assert_eq!(list.blueprint_unlocked_id(200), Some(100));
         // A non-blueprint item's Shoot activate must not create a mapping.
         assert_eq!(list.blueprint_unlocked_id(100), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_records_subattack_projectile_index() {
+        // The client's PlayerShoot.projectileId is the *subattack* index. A
+        // longbow has 3 firing patterns (center/left/right) that all fire its
+        // single projectile, so indices 1 and 2 must resolve to projectile 0
+        // instead of reporting "no data" (which kills self-compute for the map).
+        let mut list = ObjectList::new();
+        let xml = r#"<Objects>
+  <Object type="0x7010" id="Longbow of the Endless Sky">
+    <Class>Equipment</Class>
+    <Item />
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Projectile id="0">
+      <MinDamage>100</MinDamage>
+      <MaxDamage>125</MaxDamage>
+    </Projectile>
+  </Object>
+</Objects>"#;
+
+        let dir = std::env::temp_dir().join(format!("rh_subattack_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("equip.xml");
+        std::fs::write(&path, xml).unwrap();
+        list.merge_equipment_xml(&path).unwrap();
+
+        // 0x7010 == 28688 (Longbow of the Endless Sky).
+        assert_eq!(list.subattack_projectile_index(28688, 0), Some(0));
+        assert_eq!(list.subattack_projectile_index(28688, 1), Some(0));
+        assert_eq!(list.subattack_projectile_index(28688, 2), Some(0));
+        assert_eq!(list.subattack_projectile_index(28688, 3), None);
+        assert_eq!(list.subattack_projectile_index(1234, 0), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

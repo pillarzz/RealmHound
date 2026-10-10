@@ -628,7 +628,13 @@ impl CombatHistoryPanel {
         let mut fights: Vec<(FightSelection, i64, i64)> = Vec::new();
         let mut candidates: Vec<(usize, LootDropRecord)> = Vec::new();
         for summary in &self.summaries {
-            if !summary.killed || summary.map_seed == 0 {
+            if summary.map_seed == 0 {
+                continue;
+            }
+            // Standalone escaped fights were never eligible (their single
+            // `killed_bosses` entry is synthetic), so keep skipping them.
+            let is_encounter = summary.encounter_run_id.is_some();
+            if !is_encounter && !summary.killed {
                 continue;
             }
             let mut boss_types: Vec<i32> = summary
@@ -637,7 +643,14 @@ impl CombatHistoryPanel {
                 .map(|(object_type, _)| *object_type)
                 .filter(|object_type| *object_type > 0)
                 .collect();
-            if boss_types.is_empty() && summary.boss_object_type > 0 {
+            // An escaped run still has loot worth linking for the mini-bosses that
+            // *were* completed (e.g. Beisa before an O3 nexus): its `killed_bosses`
+            // holds those killed sections. A fully escaped run has none and stays
+            // skipped.
+            if boss_types.is_empty() {
+                if !summary.killed || summary.boss_object_type <= 0 {
+                    continue;
+                }
                 boss_types.push(summary.boss_object_type);
             }
             boss_types.sort_unstable();
@@ -655,6 +668,19 @@ impl CombatHistoryPanel {
             {
                 boss_types.push(chest);
             }
+            // Reskin variants are separate object types with the same identity;
+            // their anonymously emitted bags are attributed to the canonical boss
+            // (e.g. Janus 8200 vs the Season 31 "Infested" reskin 46385), so query
+            // the whole family or the bags never surface on the reskin's card.
+            for family in boss_types
+                .iter()
+                .map(|t| realmhound_core::assets::boss_loot_family(*t))
+                .collect::<Vec<_>>()
+            {
+                boss_types.extend_from_slice(family);
+            }
+            boss_types.sort_unstable();
+            boss_types.dedup();
 
             let time_lo = summary.started_at - LOOT_LINK_PRE_MS;
             let time_hi = summary.ended_at + LOOT_LINK_POST_MS;
@@ -1277,12 +1303,20 @@ impl CombatHistoryPanel {
                 let search_lower = self.search.trim().to_lowercase();
                 let mut results: Vec<SearchResult> = Vec::new();
                 if !search_lower.is_empty() {
+                    // Names of reskinned encounters matching the query under
+                    // *either* their base or seasonal name, so searching "Grand
+                    // Sphinx" surfaces the "Withered Sphinx" tag and vice versa.
+                    let alias_matches: Vec<String> =
+                        realmhound_core::assets::encounter_alias_names_matching(&self.search);
                     let portal_map = get_dungeon_portal_map();
                     for (object_type, name) in self
                         .autocomplete
                         .bosses
                         .iter()
-                        .filter(|(_, n)| n.to_lowercase().contains(&search_lower))
+                        .filter(|(_, n)| {
+                            n.to_lowercase().contains(&search_lower)
+                                || alias_matches.iter().any(|a| a.eq_ignore_ascii_case(n))
+                        })
                         .take(8)
                     {
                         results.push(SearchResult::Boss {
@@ -2646,6 +2680,7 @@ impl CombatHistoryPanel {
                 filter_type.map_or(true, |t| {
                     d.mob_type == t
                         || realmhound_core::assets::loot_emitter_for_boss(t) == Some(d.mob_type)
+                        || realmhound_core::assets::same_boss_for_loot(d.mob_type, t)
                 })
             })
             .collect();
@@ -3874,7 +3909,12 @@ impl CombatHistoryPanel {
                             &format!("phase_table_{}", phase.id),
                             share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
                             phase.killed,
-                            !enc.killed,
+                            // Scope the "you left" nexus marker to escaped *sections*
+                            // of an escaped run: a completed mini-boss like Beisa
+                            // must not read as nexused just because O3 was escaped,
+                            // and a completed run (whose aux section is never
+                            // "killed") must not flag at all.
+                            !enc.killed && !phase.killed,
                             phase.boss_object_type == O3_BOSS_TYPE,
                             &mut player_click,
                         );

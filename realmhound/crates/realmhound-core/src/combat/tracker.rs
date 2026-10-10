@@ -2151,15 +2151,28 @@ impl CombatTracker {
             return;
         }
         if !self.rng_seeded {
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: RNG not seeded (no map \
+                 seed yet) at weapon={weapon_id} projectile_id={projectile_id}"
+            );
             self.self_damage_available = false;
             return;
         }
         // The local player's stats must be known to compute the attack multiplier.
         let Some(local) = self.objects.get(&self.local_object_id) else {
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: local object {} not in \
+                 the object table at weapon={weapon_id} projectile_id={projectile_id}",
+                self.local_object_id
+            );
             self.self_damage_available = false;
             return;
         };
         if !local.attack_seen {
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: local ATT stat not \
+                 observed yet at weapon={weapon_id} projectile_id={projectile_id}"
+            );
             self.self_damage_available = false;
             return;
         }
@@ -2176,6 +2189,12 @@ impl CombatTracker {
         let Some((min, max, ap, slot)) = resolved else {
             // Unknown projectile data: cannot determine whether this shot advances
             // the RNG, so all later rolls would be unreliable.
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: no projectile data for \
+                 weapon={weapon_id} projectile_id={projectile_id} (index {proj_index}, \
+                 weapon defines {} projectile type(s))",
+                get_asset_manager().projectile_type_count(weapon_id)
+            );
             self.self_damage_available = false;
             return;
         };
@@ -2971,9 +2990,12 @@ impl CombatTracker {
         // Some bosses fought from the realm belong to a rated dungeon the raw
         // map name doesn't reflect (Oryx the Mad God 2 -> Wine Cellar). Remap so
         // the fight classifies by that dungeon's difficulty and shows its card.
-        let dungeon = crate::assets::canonical_dungeon_for_boss(fight.boss_object_type)
-            .map(str::to_string)
-            .unwrap_or(dungeon);
+        let dungeon = crate::assets::canonical_dungeon_for_boss_named(
+            fight.boss_object_type,
+            boss_name.trim(),
+        )
+        .map(str::to_string)
+        .unwrap_or(dungeon);
 
         // Group every boss of a dungeon instance under one card. Curated bosses
         // keep their encounter id (so aux repr types still resolve); non-curated

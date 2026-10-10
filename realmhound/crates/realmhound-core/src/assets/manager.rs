@@ -879,6 +879,116 @@ pub fn boss_for_loot_emitter(chest_type: i32) -> Option<i32> {
         .map(|(dragon, _)| *dragon)
 }
 
+/// Boss reskin groups that are the same fight for loot/fight correlation.
+///
+/// A seasonal reskin is a *different* object type with the same identity, and it
+/// emits loot anonymously, so bags get attributed to the canonical boss (e.g.
+/// via the Mark of Janus rule) while Combat History records the fight against
+/// the reskin's type. Exact-type matching then fails to link them. Members of a
+/// group are treated as interchangeable when correlating bags with fights.
+const BOSS_LOOT_CORRELATION_GROUPS: &[&[i32]] = &[
+    // Janus the Doorwarden: classic (Oryx's Castle) and the Season 31 "Infested"
+    // Halloween reskin.
+    &[8200, 46385],
+];
+
+/// Seasonal reskin groups: each is the set of object types that are the *same*
+/// encounter shipped under different ids and display names (the Halloween
+/// "New ..." / "Infested ..." variants). The first id is the canonical base.
+///
+/// A single id can be recorded under different names by season (e.g. the reskin
+/// object is named "Grand Sphinx" off-season and "Withered Sphinx" during
+/// Halloween), so grouping by id — not name — is what unifies search tags and
+/// history. The UI then labels the encounter by whatever was actually detected
+/// most recently, and matches history under any variant name.
+const ENCOUNTER_RESKIN_GROUPS: &[&[i32]] = &[
+    &[3412, 22000],        // Grand Sphinx / Withered Sphinx
+    &[3417, 22009],        // Cube God / Calcium God
+    &[3414, 22003, 22006], // Skull Shrine / Pumpkin Shrine (+ "New Skull Shrine")
+    &[3639, 22042],        // Ghost Ship / The Flying Dutchman
+    &[3425, 22023],        // Hermit God / Reanimated Hermit God
+    &[3428, 22026],        // Hermit God Tentacle / Reanimated Hermit God Tentacle
+    &[28619, 22149],       // Jade Statue / Blue Oni
+    &[28618, 22150],       // Garnet Statue / Red Oni
+    &[3448, 46390],        // Stone Guardian (right) / Infested
+    &[3449, 46391],        // Stone Guardian (left) / Infested
+    &[8200, 46385],        // Janus the Doorwarden / Infested
+    &[5952, 45973],        // Oryx the Mad God 1 / Infested
+    &[2354, 28989],        // Oryx the Mad God 2 / Infested
+];
+
+/// The reskin group containing `object_type`, or `None`.
+fn reskin_group(object_type: i32) -> Option<&'static [i32]> {
+    ENCOUNTER_RESKIN_GROUPS
+        .iter()
+        .copied()
+        .find(|group| group.contains(&object_type))
+}
+
+/// The base (canonical) object type of `object_type`'s encounter: the classic id
+/// when `object_type` is a seasonal reskin, otherwise `object_type` itself.
+pub fn encounter_canonical_type(object_type: i32) -> i32 {
+    reskin_group(object_type)
+        .and_then(|group| group.first().copied())
+        .unwrap_or(object_type)
+}
+
+/// Every object type of `object_type`'s encounter: the base and, when known, its
+/// seasonal reskins.
+pub fn encounter_variant_types(object_type: i32) -> Vec<i32> {
+    reskin_group(object_type)
+        .map(|group| group.to_vec())
+        .unwrap_or_else(|| vec![object_type])
+}
+
+/// Display names of every reskin encounter one of whose variant names contains
+/// `text` (case-insensitive). Lets a search by either the base name ("Grand
+/// Sphinx") or the reskin name ("Withered Sphinx") match records stored under
+/// the other.
+pub fn encounter_alias_names_matching(text: &str) -> Vec<String> {
+    let needle = text.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let manager = get_asset_manager();
+    let mut out: Vec<String> = Vec::new();
+    for group in ENCOUNTER_RESKIN_GROUPS {
+        let names: Vec<String> = group
+            .iter()
+            .filter_map(|id| manager.object_name(*id))
+            .collect();
+        if names.iter().any(|n| n.to_lowercase().contains(&needle)) {
+            for n in names {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The loot-correlation group containing `object_type` (which is included in the
+/// returned slice), or an empty slice when it has no known reskin siblings.
+pub fn boss_loot_family(object_type: i32) -> &'static [i32] {
+    BOSS_LOOT_CORRELATION_GROUPS
+        .iter()
+        .find(|group| group.contains(&object_type))
+        .copied()
+        .unwrap_or(&[])
+}
+
+/// Whether two object types are the same boss for loot/fight correlation:
+/// identical, or reskin siblings in the same [`BOSS_LOOT_CORRELATION_GROUPS`]
+/// group (e.g. Janus the Doorwarden and its Infested reskin).
+pub fn same_boss_for_loot(a: i32, b: i32) -> bool {
+    if a == b {
+        return true;
+    }
+    let family = boss_loot_family(a);
+    !family.is_empty() && family.contains(&b)
+}
+
 /// The Legacy Lair of Draconis `(dragon_type, chest_type)` pairs, for the combat
 /// database's loot-completion backfill.
 pub fn lod_dragon_chest_pairs() -> &'static [(i32, i32)] {
@@ -2195,10 +2305,26 @@ pub fn encounter_by_id(id: &str) -> Option<&'static Encounter> {
 /// classify by grave difficulty and show the correct portal / card instead of
 /// a bare realm entry.
 const BOSS_DUNGEON_OVERRIDES: &[(i32, &str)] = &[
-    (2354, "Wine Cellar"),   // Oryx the Mad God 2
-    (8200, "Oryx's Castle"), // Janus the Doorwarden
-    (3448, "Oryx's Castle"), // Stone Guardian (variant a)
-    (3449, "Oryx's Castle"), // Stone Guardian (variant b)
+    (2354, "Wine Cellar"),     // Oryx the Mad God 2
+    (8200, "Oryx's Castle"),   // Janus the Doorwarden
+    (3448, "Oryx's Castle"),   // Stone Guardian (variant a)
+    (3449, "Oryx's Castle"),   // Stone Guardian (variant b)
+    (46385, "Oryx's Castle"),  // Infested Janus the Doorwarden (Season 31 reskin)
+    (46390, "Oryx's Castle"),  // Infested Stone Guardian (reskin, variant a)
+    (46391, "Oryx's Castle"),  // Infested Stone Guardian (reskin, variant b)
+    (45973, "Oryx's Chamber"), // Infested Oryx the Mad God 1 (Season 31 reskin)
+    (28989, "Wine Cellar"),    // Infested Oryx the Mad God 2 (Season 31 reskin)
+];
+
+/// Display names whose realm spawns belong to a dungeon regardless of object id.
+///
+/// Seasonal reskins are new object types with the same display name, so this
+/// keeps a reskinned realm spawn (e.g. next season's Janus / Stone Guardian)
+/// logging under Oryx's Castle without adding its id to
+/// [`BOSS_DUNGEON_OVERRIDES`]. Checked only when the id isn't already mapped.
+const BOSS_DUNGEON_NAME_OVERRIDES: &[(&str, &str)] = &[
+    ("Janus the Doorwarden", "Oryx's Castle"),
+    ("Stone Guardian", "Oryx's Castle"),
 ];
 
 /// Canonical dungeon name for a boss type when the raw map name doesn't reflect
@@ -2208,6 +2334,22 @@ pub fn canonical_dungeon_for_boss(boss_object_type: i32) -> Option<&'static str>
         .iter()
         .find(|(t, _)| *t == boss_object_type)
         .map(|(_, d)| *d)
+}
+
+/// Canonical dungeon name for a boss, preferring its object type and falling
+/// back to its display name so reskinned variants (new ids, same name) still
+/// resolve (see [`BOSS_DUNGEON_NAME_OVERRIDES`]).
+pub fn canonical_dungeon_for_boss_named(
+    boss_object_type: i32,
+    boss_name: &str,
+) -> Option<&'static str> {
+    canonical_dungeon_for_boss(boss_object_type).or_else(|| {
+        let name = boss_name.trim();
+        BOSS_DUNGEON_NAME_OVERRIDES
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, d)| *d)
+    })
 }
 
 /// Encounters whose members are alternative/mini bosses that funnel into a single
@@ -3326,21 +3468,24 @@ impl AssetManager {
         projectile_id: usize,
     ) -> Option<(i32, i32, bool, i32)> {
         self.try_load();
-        self.objects
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|list| list.get(id))
-            .and_then(|asset| {
-                asset.projectiles.get(projectile_id).map(|p| {
-                    (
-                        p.min_damage,
-                        p.max_damage,
-                        p.armor_piercing,
-                        asset.slot_type,
-                    )
-                })
-            })
+        let guard = self.objects.read().unwrap();
+        let list = guard.as_ref()?;
+        let asset = list.get(id)?;
+        // Most weapons index their `<Projectile>` list directly, but the client's
+        // `PlayerShoot.projectileId` is the *subattack* index. Longbows fire 3
+        // spread arrows (patterns 0/1/2) that all use projectile 0, so fall back
+        // to the subattack's projectile when the direct index is missing rather
+        // than reporting no data (which disables self-compute for the map).
+        let resolved = asset.projectiles.get(projectile_id).or_else(|| {
+            list.subattack_projectile_index(id, projectile_id)
+                .and_then(|i| asset.projectiles.get(i))
+        })?;
+        Some((
+            resolved.min_damage,
+            resolved.max_damage,
+            resolved.armor_piercing,
+            asset.slot_type,
+        ))
     }
 
     /// Whether the object `id`'s projectile at `projectile_id` is armor-piercing
@@ -5741,6 +5886,65 @@ mod tests {
         // A boss that emits its own loot has no chest alias.
         assert_eq!(loot_emitter_for_boss(47927), None);
         assert_eq!(boss_for_loot_emitter(47927), None);
+    }
+
+    #[test]
+    fn janus_reskin_shares_a_loot_correlation_family() {
+        // Classic Janus (Oryx's Castle) and the Season 31 "Infested" reskin are
+        // separate object types; bags are attributed to 8200, so both must be in
+        // the same correlation family for the fights to link.
+        assert_eq!(boss_loot_family(8200), &[8200, 46385]);
+        assert_eq!(boss_loot_family(46385), &[8200, 46385]);
+        assert!(same_boss_for_loot(8200, 46385));
+        assert!(same_boss_for_loot(46385, 8200));
+        assert!(same_boss_for_loot(8200, 8200));
+        // A boss with no known reskin has no family and matches only itself.
+        assert!(boss_loot_family(47927).is_empty());
+        assert!(!same_boss_for_loot(8200, 47927));
+    }
+
+    #[test]
+    fn encounter_variant_types_cover_reskin_pairs() {
+        // Seasonal reskins share an encounter: the canonical type is the base id
+        // and the variant list holds both, for alias-aware search/filtering.
+        assert_eq!(encounter_canonical_type(22000), 3412); // Withered Sphinx
+        assert_eq!(encounter_canonical_type(3412), 3412); // Grand Sphinx
+        assert_eq!(encounter_variant_types(3412), vec![3412, 22000]);
+        assert_eq!(encounter_variant_types(46385), vec![8200, 46385]); // Janus
+        assert_eq!(encounter_variant_types(28989), vec![2354, 28989]); // Oryx 2
+                                                                       // Skull Shrine spans the base plus both reskin ids.
+        assert_eq!(encounter_canonical_type(22006), 3414);
+        assert_eq!(encounter_variant_types(22003), vec![3414, 22003, 22006]);
+        // Non-reskin types are their own encounter.
+        assert_eq!(encounter_canonical_type(47927), 47927);
+        assert_eq!(encounter_variant_types(47927), vec![47927]);
+    }
+
+    #[test]
+    fn reskinned_realm_bosses_map_to_oryxs_castle() {
+        // Janus and the Stone Guardians are realm-spawned but belong to Oryx's
+        // Castle. The Season 31 reskins are new ids, so all six must resolve.
+        for t in [8200, 3448, 3449, 46385, 46390, 46391] {
+            assert_eq!(canonical_dungeon_for_boss(t), Some("Oryx's Castle"));
+        }
+        // The reskinned Oryx 1 / 2 belong to Oryx's Chamber / Wine Cellar.
+        assert_eq!(canonical_dungeon_for_boss(45973), Some("Oryx's Chamber"));
+        assert_eq!(canonical_dungeon_for_boss(28989), Some("Wine Cellar"));
+        // A future reskin (new id, same name) still resolves via the display name.
+        assert_eq!(
+            canonical_dungeon_for_boss_named(999_999, "Janus the Doorwarden"),
+            Some("Oryx's Castle")
+        );
+        assert_eq!(
+            canonical_dungeon_for_boss_named(999_999, "Stone Guardian"),
+            Some("Oryx's Castle")
+        );
+        // Unrelated bosses are unaffected.
+        assert_eq!(
+            canonical_dungeon_for_boss_named(47927, "Some Other Boss"),
+            None
+        );
+        assert_eq!(canonical_dungeon_for_boss(47927), None);
     }
 
     #[test]

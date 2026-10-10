@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 58;
+pub const SCHEMA_VERSION: i32 = 60;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -597,8 +597,17 @@ impl CombatDatabase {
         let mut open: HashMap<(String, i32, String, i32), Run> = HashMap::new();
         let mut runs: Vec<Run> = Vec::new();
         for row in rows {
-            let Some(enc) = crate::assets::encounter_for_boss_type(row.otype) else {
-                continue;
+            // A curated encounter keeps its id so its members fold into one card;
+            // any other boss in a groupable dungeon uses the "dungeon_run"
+            // sentinel, exactly as it would when recorded live. Hand-written or
+            // legacy rows (e.g. realm-spawned Oryx's Castle bosses stored before
+            // the canonical-dungeon fix) are thus grouped on open like a fresh run.
+            let enc_id = match crate::assets::encounter_for_boss_type(row.otype) {
+                Some(enc) => enc.id.to_string(),
+                None if super::tracker::is_groupable_dungeon(&row.dungeon) => {
+                    "dungeon_run".to_string()
+                }
+                None => continue,
             };
             if row.char_id == 0
                 || row.seed == 0
@@ -606,12 +615,7 @@ impl CombatDatabase {
             {
                 continue;
             }
-            let key = (
-                enc.id.to_string(),
-                row.char_id,
-                row.dungeon.clone(),
-                row.seed,
-            );
+            let key = (enc_id.clone(), row.char_id, row.dungeon.clone(), row.seed);
             let start_new = match open.get(&key) {
                 Some(r) => row.started - r.end > RUN_GAP_MS,
                 None => true,
@@ -623,8 +627,11 @@ impl CombatDatabase {
                 open.insert(
                     key,
                     Run {
-                        run_id: format!("bf-{}-{:x}", enc.id, row.started),
-                        enc_id: enc.id.to_string(),
+                        run_id: format!(
+                            "bf-{}-{}-{}-{:x}",
+                            enc_id, row.seed, row.char_id, row.started
+                        ),
+                        enc_id,
                         dungeon: row.dungeon,
                         ids: vec![row.id],
                         start: row.started,
@@ -1376,6 +1383,48 @@ impl CombatDatabase {
             // guaranteed bag of a boss that drops no Mark (the Head of Shaitan), so
             // bumping re-runs it and fixes fights already stored as Escaped.
             self.conn.execute_batch("PRAGMA user_version = 58")?;
+        }
+        if from_version < 59 {
+            // v58 -> v59: relabel legacy realm-recorded Janus the Doorwarden and
+            // Stone Guardian fights as "Oryx's Castle". These bosses are
+            // realm-spawned but belong to Oryx's Castle; the canonical-dungeon
+            // table only covered the classic object ids, so the Season 31 reskins
+            // (46385/46390/46391) were stored under the raw realm map name and
+            // never classified or grouped with the dungeon. Fixing the table only
+            // affects new records, so repair the already-stored rows here.
+            self.conn.execute_batch(
+                "UPDATE fights SET dungeon = 'Oryx''s Castle'
+                 WHERE dungeon = 'Realm'
+                   AND boss_object_type IN (8200, 3448, 3449, 46385, 46390, 46391);",
+            )?;
+            // Rebuild the synthetic `bf-` runs so they pick up the widened
+            // grouping rule (non-curated bosses in a groupable dungeon now group
+            // under "dungeon_run", like a live run) and the seed/char-scoped run
+            // id that prevents two instances from colliding. Live
+            // "{nonce}-{counter}" ids are authoritative and left untouched; the
+            // backfill that runs right after migration rebuilds these.
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "UPDATE fights SET encounter_id = NULL, encounter_run_id = NULL
+                 WHERE encounter_run_id LIKE 'bf-%'",
+                [],
+            )?;
+            tx.execute("DELETE FROM encounter_runs WHERE run_id LIKE 'bf-%'", [])?;
+            tx.commit()?;
+            self.conn.execute_batch("PRAGMA user_version = 59")?;
+        }
+        if from_version < 60 {
+            // v59 -> v60: relabel the remaining realm-locked dungeon bosses now
+            // that the canonical-dungeon table covers the reskinned Oryx the Mad
+            // God 1 / 2 (Oryx's Chamber / Wine Cellar). Idempotent, so re-running
+            // over rows v59 already fixed is harmless.
+            self.conn.execute_batch(
+                "UPDATE fights SET dungeon = 'Oryx''s Chamber'
+                     WHERE dungeon = 'Realm' AND boss_object_type = 45973;
+                 UPDATE fights SET dungeon = 'Wine Cellar'
+                     WHERE dungeon = 'Realm' AND boss_object_type = 28989;",
+            )?;
+            self.conn.execute_batch("PRAGMA user_version = 60")?;
         }
         Ok(())
     }
@@ -3603,8 +3652,10 @@ impl CombatDatabase {
             // "Realm" map name); a multi-boss dungeon run is headlined by its
             // dungeon; a lone boss keeps its own name.
             let object_types: Vec<i32> = phases.iter().map(|p| p.0).collect();
-            let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
-                name.to_string()
+            let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
+                // Realm-grouped encounter: title by the anchor boss's *current*
+                // name so a seasonally-reskinned fight reads uniformly.
+                display_boss_name(boss_object_type, headline)
             } else if raw_phase_count > 1 {
                 dungeon.clone()
             } else {
@@ -3812,14 +3863,15 @@ impl CombatDatabase {
             // Moonlight Village is cleared by its three dancers; the anchor can
             // land on an escaped Kitsune Umi fought afterwards.
             || mv_dancers_cleared(phases.iter().map(|p| (p.boss_object_type, p.killed)));
-        let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
-            name.to_string()
+        let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
+            // Title by the anchor boss's current (seasonal) name.
+            display_boss_name(anchor_object_type, headline)
         } else if phases.len() > 1 {
             dungeon.clone()
         } else {
             phases
                 .first()
-                .map(|p| p.boss_name.clone())
+                .map(|p| display_boss_name(p.boss_object_type, &p.boss_name))
                 .unwrap_or_else(|| dungeon.clone())
         };
         let roster = aggregate_roster(&phases);
@@ -4010,27 +4062,46 @@ impl CombatDatabase {
         // A self-destructing boss's loot is emitted by a proxy chest (Legacy Lair
         // of Draconis dragons). Resolve the chest's drops back to the boss fight.
         let mob_type = crate::assets::boss_for_loot_emitter(mob_type).unwrap_or(mob_type);
+        // A seasonal reskin is a separate object type, but its anonymously emitted
+        // loot is attributed to the canonical boss (e.g. Janus the Doorwarden
+        // 8200 vs its Season 31 "Infested" reskin 46385), so match the whole
+        // reskin family, not just the exact type.
+        let mut types: Vec<i32> = vec![mob_type];
+        types.extend(crate::assets::boss_loot_family(mob_type).iter().copied());
+        types.sort_unstable();
+        types.dedup();
+
         let lo = timestamp - LOOT_LINK_POST_MS;
         let hi = timestamp + LOOT_LINK_PRE_MS;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, encounter_run_id FROM fights
-             WHERE killed = 1 AND map_seed = ?1 AND boss_object_type = ?2
-               AND ended_at >= ?3 AND started_at <= ?4
-             ORDER BY ABS(ended_at - ?5) ASC, id ASC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![map_seed, mob_type, lo, hi, timestamp], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        match rows.next() {
-            Some(row) => {
-                let (id, run) = row?;
-                Ok(Some(match run {
-                    Some(run) => FightSelection::Encounter(run),
-                    None => FightSelection::Single(id),
-                }))
+        // Nearest killing fight across the family; ties broken by the older id.
+        let mut best: Option<(i64, i64, Option<String>)> = None;
+        for candidate in types {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, encounter_run_id, ended_at FROM fights
+                 WHERE killed = 1 AND map_seed = ?1 AND boss_object_type = ?2
+                   AND ended_at >= ?3 AND started_at <= ?4
+                 ORDER BY ABS(ended_at - ?5) ASC, id ASC LIMIT 1",
+            )?;
+            let mut rows =
+                stmt.query_map(params![map_seed, candidate, lo, hi, timestamp], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+            let Some(row) = rows.next() else { continue };
+            let (id, run, ended) = row?;
+            let distance = (ended - timestamp).abs();
+            if best.as_ref().map_or(true, |(d, _, _)| distance < *d) {
+                best = Some((distance, id, run));
             }
-            None => Ok(None),
         }
+
+        Ok(best.map(|(_, id, run)| match run {
+            Some(run) => FightSelection::Encounter(run),
+            None => FightSelection::Single(id),
+        }))
     }
 
     /// Latch `killed = 1` on the encounter run(s) of a loot-completed realm
@@ -4232,12 +4303,19 @@ impl CombatDatabase {
             binds.push(Box::new(count));
         }
         if let Some(boss) = query.boss_object_type {
-            conds.push(
+            // Any variant of the encounter counts, so a reskin suggestion matches
+            // a run recorded under the base id (and vice versa).
+            let variants = crate::assets::encounter_variant_types(boss);
+            conds.push(format!(
                 "EXISTS (SELECT 1 FROM fights f
-                 WHERE f.encounter_run_id = r.run_id AND f.boss_object_type = ?)"
-                    .to_string(),
-            );
-            binds.push(Box::new(boss));
+                 WHERE f.encounter_run_id = r.run_id AND f.boss_object_type IN ({}))",
+                std::iter::repeat_n("?", variants.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for v in variants {
+                binds.push(Box::new(v));
+            }
         }
         if let Some(groups) = query.groups.as_ref().filter(|g| !g.is_empty()) {
             let placeholders = std::iter::repeat_n("?", groups.len())
@@ -4260,15 +4338,31 @@ impl CombatDatabase {
         {
             let like = format!("%{}%", text.to_lowercase());
             let canonical_ids = crate::assets::encounter_ids_matching_name(text);
+            // Match a reskinned encounter by either name: searching the base name
+            // must also surface runs stored under the reskin name and vice versa.
+            let mut boss_name_parts = vec![
+                "LOWER(f.boss_name) LIKE ?".to_string(),
+                "LOWER(f.dungeon) LIKE ?".to_string(),
+            ];
+            let mut inner_binds: Vec<String> = vec![like.clone(), like.clone()];
+            for alias in crate::assets::encounter_alias_names_matching(text) {
+                boss_name_parts.push("LOWER(f.boss_name) LIKE ?".to_string());
+                inner_binds.push(format!("%{}%", alias.to_lowercase()));
+            }
             let mut text_conds = vec![
                 "LOWER(r.dungeon) LIKE ?".to_string(),
-                "EXISTS (SELECT 1 FROM fights f WHERE f.encounter_run_id = r.run_id
-                 AND (LOWER(f.boss_name) LIKE ? OR LOWER(f.dungeon) LIKE ?))"
-                    .to_string(),
+                format!(
+                    "EXISTS (SELECT 1 FROM fights f WHERE f.encounter_run_id = r.run_id
+                     AND ({}))",
+                    boss_name_parts.join(" OR ")
+                ),
             ];
+            // Binds must follow the placeholder order in the SQL: the run's
+            // dungeon, then the EXISTS subquery's inner matches, then the ids.
             binds.push(Box::new(like.clone()));
-            binds.push(Box::new(like.clone()));
-            binds.push(Box::new(like));
+            for b in inner_binds {
+                binds.push(Box::new(b));
+            }
             if !canonical_ids.is_empty() {
                 text_conds.push(format!(
                     "r.encounter_id IN ({})",
@@ -4290,27 +4384,43 @@ impl CombatDatabase {
         binds: &mut Vec<Box<dyn rusqlite::ToSql>>,
         prefix: &str,
     ) {
+        let p = prefix;
         if let Some(text) = query
             .text
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            conds.push(format!(
-                "({p}boss_name LIKE ? OR {p}dungeon LIKE ?)",
-                p = prefix
-            ));
             let like = format!("%{}%", text);
+            let mut parts = vec![format!("{p}boss_name LIKE ?"), format!("{p}dungeon LIKE ?")];
             binds.push(Box::new(like.clone()));
             binds.push(Box::new(like));
+            // Match a reskinned encounter by either of its names: searching the
+            // base name must also surface fights stored under the reskin name and
+            // vice versa.
+            for alias in crate::assets::encounter_alias_names_matching(text) {
+                parts.push(format!("{p}boss_name LIKE ?"));
+                binds.push(Box::new(format!("%{}%", alias)));
+            }
+            conds.push(format!("({})", parts.join(" OR ")));
         }
         if let Some(dungeon) = &query.dungeon {
             conds.push(format!("{}dungeon = ?", prefix));
             binds.push(Box::new(dungeon.clone()));
         }
         if let Some(boss) = query.boss_object_type {
-            conds.push(format!("{}boss_object_type = ?", prefix));
-            binds.push(Box::new(boss));
+            // Filter the whole encounter, not just the selected variant, so one
+            // suggestion matches fights recorded under either reskin.
+            let variants = crate::assets::encounter_variant_types(boss);
+            conds.push(format!(
+                "{p}boss_object_type IN ({})",
+                std::iter::repeat_n("?", variants.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for v in variants {
+                binds.push(Box::new(v));
+            }
         }
         if let Some(char_id) = query.char_id {
             // Unknown-identity fights (0) are excluded from the character filter.
@@ -4450,24 +4560,51 @@ impl CombatDatabase {
 
     /// Distinct bosses `(object_type, name)` across all recorded fights.
     pub fn distinct_bosses(&self) -> SqlResult<Vec<(i32, String)>> {
+        // Each (object_type, name) with when it was last fought, so the seasonal
+        // reskin variants of one encounter collapse to a single suggestion,
+        // labelled by the most recently fought variant (the season actually in
+        // play). The Marble Colossus survival phases share an object type and so
+        // collapse too, with the phase suffix stripped.
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT boss_object_type, boss_name FROM fights \
-             WHERE boss_object_type <> 0 AND boss_name <> '' ORDER BY boss_name",
+            "SELECT boss_object_type, boss_name, MAX(started_at) AS latest \
+             FROM fights WHERE boss_object_type <> 0 AND boss_name <> '' \
+             GROUP BY boss_object_type, boss_name",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
-        // Collapse the Marble Colossus survival phases (which share an object
-        // type) into a single "Marble Colossus" suggestion. Filtering is by
-        // object type, so the unified suggestion still matches both phases.
-        let mut out: Vec<(i32, String)> = Vec::new();
+        // (latest_started, variant object_type, stored name)
+        let mut by_canonical: std::collections::HashMap<i32, (i64, i32, String)> =
+            std::collections::HashMap::new();
         for row in rows {
-            let (obj_type, name) = row?;
+            let (obj_type, name, latest) = row?;
             let name = strip_boss_phase_suffix(&name).to_string();
-            if !out.iter().any(|(t, n)| *t == obj_type && *n == name) {
-                out.push((obj_type, name));
-            }
+            let canonical = crate::assets::encounter_canonical_type(obj_type);
+            by_canonical
+                .entry(canonical)
+                .and_modify(|entry| {
+                    if latest > entry.0 {
+                        *entry = (latest, obj_type, name.clone());
+                    }
+                })
+                .or_insert((latest, obj_type, name));
         }
+        let manager = crate::assets::get_asset_manager();
+        let mut out: Vec<(i32, String)> = by_canonical
+            .into_iter()
+            .map(|(_, (_, obj_type, stored))| {
+                // Key by the most recently fought variant so its sprite (the
+                // reskin during the season) is shown; name it from the live asset
+                // so the tag carries the current seasonal name.
+                let name = manager.object_name(obj_type).unwrap_or(stored);
+                (obj_type, name)
+            })
+            .collect();
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         Ok(out)
     }
 
@@ -5254,6 +5391,14 @@ fn pick_anchor(phases: &[PhaseStat]) -> Option<(i32, i32, i32, bool)> {
 /// distinction (both share the game DisplayId "Prismimic") so the two mirror
 /// rows read clearly; every other boss keeps its stored name.
 fn display_boss_name(object_type: i32, stored: &str) -> String {
+    // A seasonally-reskinned encounter is named by its *current* asset name (the
+    // reskin's name while the season is live, the base name otherwise), so every
+    // card for the encounter reads uniformly regardless of when it was recorded.
+    if crate::assets::encounter_variant_types(object_type).len() > 1 {
+        if let Some(name) = crate::assets::get_asset_manager().object_name(object_type) {
+            return name;
+        }
+    }
     crate::assets::prismimic_display_name(object_type)
         .map(str::to_string)
         .unwrap_or_else(|| stored.to_string())
@@ -6370,6 +6515,75 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn distinct_bosses_and_filter_coalesce_reskin_variants() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Base variant fought earlier, reskin variant later in the same history.
+        let mut base = flawless_fight("Realm", 3412, vec![]);
+        base.boss_name = "Grand Sphinx".to_string();
+        base.started_at = 1_000;
+        base.ended_at = 2_000;
+        db.insert_fight(&base).unwrap();
+        let mut reskin = flawless_fight("Realm", 22000, vec![]);
+        reskin.boss_name = "Withered Sphinx".to_string();
+        reskin.started_at = 3_000;
+        reskin.ended_at = 4_000;
+        db.insert_fight(&reskin).unwrap();
+
+        // One suggestion for the encounter, labelled by the latest variant.
+        let bosses = db.distinct_bosses().unwrap();
+        let sphinx: Vec<_> = bosses
+            .iter()
+            .filter(|(t, _)| *t == 3412 || *t == 22000)
+            .collect();
+        assert_eq!(sphinx.len(), 1, "one suggestion per encounter");
+        assert_eq!(
+            sphinx[0].0, 22000,
+            "keyed by the most recently fought variant (its sprite)"
+        );
+        assert_eq!(
+            sphinx[0].1, "Withered Sphinx",
+            "labelled by the most recently fought variant"
+        );
+
+        // Filtering the canonical encounter matches the reskin fight too.
+        let q = FightQuery {
+            boss_object_type: Some(3412),
+            ..Default::default()
+        };
+        let hits = db.list_fights(&q, 50).unwrap();
+        let types: std::collections::HashSet<i32> =
+            hits.iter().map(|f| f.boss_object_type).collect();
+        assert!(hits.len() >= 2, "both variants returned: {types:?}");
+    }
+
+    #[test]
+    fn find_killed_fight_links_reskin_variant() {
+        // Season 31 records Janus fights against the "Infested" reskin (46385)
+        // while the bag is attributed to canonical Janus (8200, via the Mark of
+        // Janus rule). The two must still link so the bag surfaces on the card.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let id = db
+            .insert_fight(&flawless_fight(
+                "Realm",
+                46385,
+                vec![flawless_part(
+                    600,
+                    "Alice",
+                    40_000,
+                    None,
+                    ParticipantEndStatus::Present,
+                )],
+            ))
+            .unwrap();
+        assert_eq!(
+            db.find_killed_fight(1, 8200, 61_000).unwrap(),
+            Some(FightSelection::Single(id))
+        );
+        // An unrelated type in the same instance/window still misses.
+        assert_eq!(db.find_killed_fight(1, 99999, 61_000).unwrap(), None);
     }
 
     #[test]
@@ -10108,6 +10322,167 @@ mod tests {
             db.column_exists("fights", "aux_member_count").unwrap(),
             "aux_member_count column added by migration"
         );
+    }
+
+    #[test]
+    fn v58_to_v59_relabels_reskinned_janus_and_stone_guardians() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A database written before the canonical-dungeon table covered the
+        // Season 31 reskins stored their realm-spawned Oryx's Castle bosses under
+        // the raw realm map name.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (12, 130, 'Realm', 7, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (150, 155, 'Realm', 7, 46390, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (200, 210, 'Realm', 7, 4000, 'Some Realm Boss', 90000, 90000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        // Re-run migrations from v58.
+        db.conn.execute_batch("PRAGMA user_version = 58").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let relocated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND boss_object_type IN (46385, 46390)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(relocated, 2, "reskinned realm bosses relabelled");
+        // A genuine realm boss keeps its Realm label.
+        let realm: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE dungeon = 'Realm' AND boss_object_type = 4000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(realm, 1, "unrelated realm boss untouched");
+    }
+
+    #[test]
+    fn backfill_groups_legacy_oryxs_castle_bosses() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // Legacy realm-locked rows (no synthetic run) for the same instance: the
+        // Stone Guardians and Janus must fold into one Oryx's Castle card on open,
+        // like a live run, rather than three separate "Realm" cards.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (1000, 2000, 'Oryx''s Castle', 7, 46390, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (1100, 2100, 'Oryx''s Castle', 7, 46391, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (1200, 3000, 'Oryx''s Castle', 7, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        db.initialize(None).unwrap();
+
+        let runs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND encounter_run_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "same-instance bosses group into one run");
+
+        // A different instance (seed) stays separate.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (1000, 2000, 'Oryx''s Castle', 8, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+        db.initialize(None).unwrap();
+        let runs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND encounter_run_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 2, "a different instance is its own run");
+    }
+
+    #[test]
+    fn v59_to_v60_relabels_reskinned_oryx() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (12, 130, 'Realm', 7, 45973, 'Oryx the Mad God', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (150, 155, 'Realm', 8, 28989, 'Oryx the Mad God', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 59").unwrap();
+        db.initialize(None).unwrap();
+
+        let chamber: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE boss_object_type = 45973 AND dungeon = 'Oryx''s Chamber'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chamber, 1, "infested Oryx 1 relabelled to Oryx's Chamber");
+        let cellar: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE boss_object_type = 28989 AND dungeon = 'Wine Cellar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cellar, 1, "infested Oryx 2 relabelled to Wine Cellar");
     }
 
     #[test]

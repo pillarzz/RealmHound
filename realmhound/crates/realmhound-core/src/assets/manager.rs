@@ -2229,13 +2229,15 @@ pub fn encounter_by_id(id: &str) -> Option<&'static Encounter> {
 /// classify by grave difficulty and show the correct portal / card instead of
 /// a bare realm entry.
 const BOSS_DUNGEON_OVERRIDES: &[(i32, &str)] = &[
-    (2354, "Wine Cellar"),    // Oryx the Mad God 2
-    (8200, "Oryx's Castle"),  // Janus the Doorwarden
-    (3448, "Oryx's Castle"),  // Stone Guardian (variant a)
-    (3449, "Oryx's Castle"),  // Stone Guardian (variant b)
-    (46385, "Oryx's Castle"), // Infested Janus the Doorwarden (Season 31 reskin)
-    (46390, "Oryx's Castle"), // Infested Stone Guardian (reskin, variant a)
-    (46391, "Oryx's Castle"), // Infested Stone Guardian (reskin, variant b)
+    (2354, "Wine Cellar"),     // Oryx the Mad God 2
+    (8200, "Oryx's Castle"),   // Janus the Doorwarden
+    (3448, "Oryx's Castle"),   // Stone Guardian (variant a)
+    (3449, "Oryx's Castle"),   // Stone Guardian (variant b)
+    (46385, "Oryx's Castle"),  // Infested Janus the Doorwarden (Season 31 reskin)
+    (46390, "Oryx's Castle"),  // Infested Stone Guardian (reskin, variant a)
+    (46391, "Oryx's Castle"),  // Infested Stone Guardian (reskin, variant b)
+    (45973, "Oryx's Chamber"), // Infested Oryx the Mad God 1 (Season 31 reskin)
+    (28989, "Wine Cellar"),    // Infested Oryx the Mad God 2 (Season 31 reskin)
 ];
 
 /// Display names whose realm spawns belong to a dungeon regardless of object id.
@@ -5832,6 +5834,9 @@ mod tests {
         for t in [8200, 3448, 3449, 46385, 46390, 46391] {
             assert_eq!(canonical_dungeon_for_boss(t), Some("Oryx's Castle"));
         }
+        // The reskinned Oryx 1 / 2 belong to Oryx's Chamber / Wine Cellar.
+        assert_eq!(canonical_dungeon_for_boss(45973), Some("Oryx's Chamber"));
+        assert_eq!(canonical_dungeon_for_boss(28989), Some("Wine Cellar"));
         // A future reskin (new id, same name) still resolves via the display name.
         assert_eq!(
             canonical_dungeon_for_boss_named(999_999, "Janus the Doorwarden"),

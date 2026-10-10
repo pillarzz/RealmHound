@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 59;
+pub const SCHEMA_VERSION: i32 = 60;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -1412,6 +1412,19 @@ impl CombatDatabase {
             tx.execute("DELETE FROM encounter_runs WHERE run_id LIKE 'bf-%'", [])?;
             tx.commit()?;
             self.conn.execute_batch("PRAGMA user_version = 59")?;
+        }
+        if from_version < 60 {
+            // v59 -> v60: relabel the remaining realm-locked dungeon bosses now
+            // that the canonical-dungeon table covers the reskinned Oryx the Mad
+            // God 1 / 2 (Oryx's Chamber / Wine Cellar). Idempotent, so re-running
+            // over rows v59 already fixed is harmless.
+            self.conn.execute_batch(
+                "UPDATE fights SET dungeon = 'Oryx''s Chamber'
+                     WHERE dungeon = 'Realm' AND boss_object_type = 45973;
+                 UPDATE fights SET dungeon = 'Wine Cellar'
+                     WHERE dungeon = 'Realm' AND boss_object_type = 28989;",
+            )?;
+            self.conn.execute_batch("PRAGMA user_version = 60")?;
         }
         Ok(())
     }
@@ -10211,7 +10224,7 @@ mod tests {
               VALUES
               (12, 130, 'Realm', 7, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL),
               (150, 155, 'Realm', 7, 46390, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
-              (200, 210, 'Realm', 7, 28989, 'Oryx the Mad God', 90000, 90000, 9, 55, 1, NULL, NULL);
+              (200, 210, 'Realm', 7, 4000, 'Some Realm Boss', 90000, 90000, 9, 55, 1, NULL, NULL);
             "#,
             )
             .unwrap();
@@ -10235,11 +10248,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(relocated, 2, "reskinned realm bosses relabelled");
-        // A genuine realm boss (Oryx the Mad God) keeps its Realm label.
+        // A genuine realm boss keeps its Realm label.
         let realm: i64 = db
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM fights WHERE dungeon = 'Realm' AND boss_object_type = 28989",
+                "SELECT COUNT(*) FROM fights WHERE dungeon = 'Realm' AND boss_object_type = 4000",
                 [],
                 |r| r.get(0),
             )
@@ -10308,6 +10321,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runs, 2, "a different instance is its own run");
+    }
+
+    #[test]
+    fn v59_to_v60_relabels_reskinned_oryx() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (12, 130, 'Realm', 7, 45973, 'Oryx the Mad God', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (150, 155, 'Realm', 8, 28989, 'Oryx the Mad God', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 59").unwrap();
+        db.initialize(None).unwrap();
+
+        let chamber: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE boss_object_type = 45973 AND dungeon = 'Oryx''s Chamber'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chamber, 1, "infested Oryx 1 relabelled to Oryx's Chamber");
+        let cellar: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE boss_object_type = 28989 AND dungeon = 'Wine Cellar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cellar, 1, "infested Oryx 2 relabelled to Wine Cellar");
     }
 
     #[test]

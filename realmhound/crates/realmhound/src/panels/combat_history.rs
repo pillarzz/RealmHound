@@ -3909,11 +3909,12 @@ impl CombatHistoryPanel {
                             &format!("phase_table_{}", phase.id),
                             share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
                             phase.killed,
-                            // Scope the "you left" nexus marker to the section the
-                            // local player actually escaped from, not every section
-                            // of an escaped run (a completed miniboss like Beisa
-                            // must not read as nexused just because O3 was escaped).
-                            !phase.killed,
+                            // Scope the "you left" nexus marker to escaped *sections*
+                            // of an escaped run: a completed mini-boss like Beisa
+                            // must not read as nexused just because O3 was escaped,
+                            // and a completed run (whose aux section is never
+                            // "killed") must not flag at all.
+                            !enc.killed && !phase.killed,
                             phase.boss_object_type == O3_BOSS_TYPE,
                             &mut player_click,
                         );

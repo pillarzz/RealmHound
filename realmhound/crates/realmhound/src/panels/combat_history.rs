@@ -628,7 +628,13 @@ impl CombatHistoryPanel {
         let mut fights: Vec<(FightSelection, i64, i64)> = Vec::new();
         let mut candidates: Vec<(usize, LootDropRecord)> = Vec::new();
         for summary in &self.summaries {
-            if !summary.killed || summary.map_seed == 0 {
+            if summary.map_seed == 0 {
+                continue;
+            }
+            // Standalone escaped fights were never eligible (their single
+            // `killed_bosses` entry is synthetic), so keep skipping them.
+            let is_encounter = summary.encounter_run_id.is_some();
+            if !is_encounter && !summary.killed {
                 continue;
             }
             let mut boss_types: Vec<i32> = summary
@@ -637,7 +643,14 @@ impl CombatHistoryPanel {
                 .map(|(object_type, _)| *object_type)
                 .filter(|object_type| *object_type > 0)
                 .collect();
-            if boss_types.is_empty() && summary.boss_object_type > 0 {
+            // An escaped run still has loot worth linking for the mini-bosses that
+            // *were* completed (e.g. Beisa before an O3 nexus): its `killed_bosses`
+            // holds those killed sections. A fully escaped run has none and stays
+            // skipped.
+            if boss_types.is_empty() {
+                if !summary.killed || summary.boss_object_type <= 0 {
+                    continue;
+                }
                 boss_types.push(summary.boss_object_type);
             }
             boss_types.sort_unstable();
@@ -3896,7 +3909,11 @@ impl CombatHistoryPanel {
                             &format!("phase_table_{}", phase.id),
                             share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
                             phase.killed,
-                            !enc.killed,
+                            // Scope the "you left" nexus marker to the section the
+                            // local player actually escaped from, not every section
+                            // of an escaped run (a completed miniboss like Beisa
+                            // must not read as nexused just because O3 was escaped).
+                            !phase.killed,
                             phase.boss_object_type == O3_BOSS_TYPE,
                             &mut player_click,
                         );

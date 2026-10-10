@@ -4300,12 +4300,19 @@ impl CombatDatabase {
             binds.push(Box::new(count));
         }
         if let Some(boss) = query.boss_object_type {
-            conds.push(
+            // Any variant of the encounter counts, so a reskin suggestion matches
+            // a run recorded under the base id (and vice versa).
+            let variants = crate::assets::encounter_variant_types(boss);
+            conds.push(format!(
                 "EXISTS (SELECT 1 FROM fights f
-                 WHERE f.encounter_run_id = r.run_id AND f.boss_object_type = ?)"
-                    .to_string(),
-            );
-            binds.push(Box::new(boss));
+                 WHERE f.encounter_run_id = r.run_id AND f.boss_object_type IN ({}))",
+                std::iter::repeat_n("?", variants.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for v in variants {
+                binds.push(Box::new(v));
+            }
         }
         if let Some(groups) = query.groups.as_ref().filter(|g| !g.is_empty()) {
             let placeholders = std::iter::repeat_n("?", groups.len())
@@ -4328,15 +4335,31 @@ impl CombatDatabase {
         {
             let like = format!("%{}%", text.to_lowercase());
             let canonical_ids = crate::assets::encounter_ids_matching_name(text);
+            // Match a reskinned encounter by either name: searching the base name
+            // must also surface runs stored under the reskin name and vice versa.
+            let mut boss_name_parts = vec![
+                "LOWER(f.boss_name) LIKE ?".to_string(),
+                "LOWER(f.dungeon) LIKE ?".to_string(),
+            ];
+            let mut inner_binds: Vec<String> = vec![like.clone(), like.clone()];
+            for alias in crate::assets::encounter_alias_names_matching(text) {
+                boss_name_parts.push("LOWER(f.boss_name) LIKE ?".to_string());
+                inner_binds.push(format!("%{}%", alias.to_lowercase()));
+            }
             let mut text_conds = vec![
                 "LOWER(r.dungeon) LIKE ?".to_string(),
-                "EXISTS (SELECT 1 FROM fights f WHERE f.encounter_run_id = r.run_id
-                 AND (LOWER(f.boss_name) LIKE ? OR LOWER(f.dungeon) LIKE ?))"
-                    .to_string(),
+                format!(
+                    "EXISTS (SELECT 1 FROM fights f WHERE f.encounter_run_id = r.run_id
+                     AND ({}))",
+                    boss_name_parts.join(" OR ")
+                ),
             ];
+            // Binds must follow the placeholder order in the SQL: the run's
+            // dungeon, then the EXISTS subquery's inner matches, then the ids.
             binds.push(Box::new(like.clone()));
-            binds.push(Box::new(like.clone()));
-            binds.push(Box::new(like));
+            for b in inner_binds {
+                binds.push(Box::new(b));
+            }
             if !canonical_ids.is_empty() {
                 text_conds.push(format!(
                     "r.encounter_id IN ({})",
@@ -4358,27 +4381,43 @@ impl CombatDatabase {
         binds: &mut Vec<Box<dyn rusqlite::ToSql>>,
         prefix: &str,
     ) {
+        let p = prefix;
         if let Some(text) = query
             .text
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            conds.push(format!(
-                "({p}boss_name LIKE ? OR {p}dungeon LIKE ?)",
-                p = prefix
-            ));
             let like = format!("%{}%", text);
+            let mut parts = vec![format!("{p}boss_name LIKE ?"), format!("{p}dungeon LIKE ?")];
             binds.push(Box::new(like.clone()));
             binds.push(Box::new(like));
+            // Match a reskinned encounter by either of its names: searching the
+            // base name must also surface fights stored under the reskin name and
+            // vice versa.
+            for alias in crate::assets::encounter_alias_names_matching(text) {
+                parts.push(format!("{p}boss_name LIKE ?"));
+                binds.push(Box::new(format!("%{}%", alias)));
+            }
+            conds.push(format!("({})", parts.join(" OR ")));
         }
         if let Some(dungeon) = &query.dungeon {
             conds.push(format!("{}dungeon = ?", prefix));
             binds.push(Box::new(dungeon.clone()));
         }
         if let Some(boss) = query.boss_object_type {
-            conds.push(format!("{}boss_object_type = ?", prefix));
-            binds.push(Box::new(boss));
+            // Filter the whole encounter, not just the selected variant, so one
+            // suggestion matches fights recorded under either reskin.
+            let variants = crate::assets::encounter_variant_types(boss);
+            conds.push(format!(
+                "{p}boss_object_type IN ({})",
+                std::iter::repeat_n("?", variants.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for v in variants {
+                binds.push(Box::new(v));
+            }
         }
         if let Some(char_id) = query.char_id {
             // Unknown-identity fights (0) are excluded from the character filter.
@@ -4518,24 +4557,43 @@ impl CombatDatabase {
 
     /// Distinct bosses `(object_type, name)` across all recorded fights.
     pub fn distinct_bosses(&self) -> SqlResult<Vec<(i32, String)>> {
+        // Each (object_type, name) with when it was last fought, so the seasonal
+        // reskin variants of one encounter collapse to a single suggestion,
+        // labelled by the most recently fought variant (the season actually in
+        // play). The Marble Colossus survival phases share an object type and so
+        // collapse too, with the phase suffix stripped.
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT boss_object_type, boss_name FROM fights \
-             WHERE boss_object_type <> 0 AND boss_name <> '' ORDER BY boss_name",
+            "SELECT boss_object_type, boss_name, MAX(started_at) AS latest \
+             FROM fights WHERE boss_object_type <> 0 AND boss_name <> '' \
+             GROUP BY boss_object_type, boss_name",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
-        // Collapse the Marble Colossus survival phases (which share an object
-        // type) into a single "Marble Colossus" suggestion. Filtering is by
-        // object type, so the unified suggestion still matches both phases.
-        let mut out: Vec<(i32, String)> = Vec::new();
+        let mut by_canonical: std::collections::HashMap<i32, (i64, String)> =
+            std::collections::HashMap::new();
         for row in rows {
-            let (obj_type, name) = row?;
+            let (obj_type, name, latest) = row?;
             let name = strip_boss_phase_suffix(&name).to_string();
-            if !out.iter().any(|(t, n)| *t == obj_type && *n == name) {
-                out.push((obj_type, name));
-            }
+            let canonical = crate::assets::encounter_canonical_type(obj_type);
+            by_canonical
+                .entry(canonical)
+                .and_modify(|entry| {
+                    if latest > entry.0 {
+                        *entry = (latest, name.clone());
+                    }
+                })
+                .or_insert((latest, name));
         }
+        let mut out: Vec<(i32, String)> = by_canonical
+            .into_iter()
+            .map(|(obj_type, (_, name))| (obj_type, name))
+            .collect();
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         Ok(out)
     }
 
@@ -6438,6 +6496,45 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn distinct_bosses_and_filter_coalesce_reskin_variants() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Base variant fought earlier, reskin variant later in the same history.
+        let mut base = flawless_fight("Realm", 3412, vec![]);
+        base.boss_name = "Grand Sphinx".to_string();
+        base.started_at = 1_000;
+        base.ended_at = 2_000;
+        db.insert_fight(&base).unwrap();
+        let mut reskin = flawless_fight("Realm", 22000, vec![]);
+        reskin.boss_name = "Withered Sphinx".to_string();
+        reskin.started_at = 3_000;
+        reskin.ended_at = 4_000;
+        db.insert_fight(&reskin).unwrap();
+
+        // One suggestion for the encounter, labelled by the latest variant.
+        let bosses = db.distinct_bosses().unwrap();
+        let sphinx: Vec<_> = bosses
+            .iter()
+            .filter(|(t, _)| *t == 3412 || *t == 22000)
+            .collect();
+        assert_eq!(sphinx.len(), 1, "one suggestion per encounter");
+        assert_eq!(sphinx[0].0, 3412, "keyed by the canonical base type");
+        assert_eq!(
+            sphinx[0].1, "Withered Sphinx",
+            "labelled by the most recently fought variant"
+        );
+
+        // Filtering the canonical encounter matches the reskin fight too.
+        let q = FightQuery {
+            boss_object_type: Some(3412),
+            ..Default::default()
+        };
+        let hits = db.list_fights(&q, 50).unwrap();
+        let types: std::collections::HashSet<i32> =
+            hits.iter().map(|f| f.boss_object_type).collect();
+        assert!(hits.len() >= 2, "both variants returned: {types:?}");
     }
 
     #[test]

@@ -892,6 +892,82 @@ const BOSS_LOOT_CORRELATION_GROUPS: &[&[i32]] = &[
     &[8200, 46385],
 ];
 
+/// Seasonal reskin groups: each is the set of object types that are the *same*
+/// encounter shipped under different ids and display names (the Halloween
+/// "New ..." / "Infested ..." variants). The first id is the canonical base.
+///
+/// A single id can be recorded under different names by season (e.g. the reskin
+/// object is named "Grand Sphinx" off-season and "Withered Sphinx" during
+/// Halloween), so grouping by id — not name — is what unifies search tags and
+/// history. The UI then labels the encounter by whatever was actually detected
+/// most recently, and matches history under any variant name.
+const ENCOUNTER_RESKIN_GROUPS: &[&[i32]] = &[
+    &[3412, 22000],        // Grand Sphinx / Withered Sphinx
+    &[3417, 22009],        // Cube God / Calcium God
+    &[3414, 22003, 22006], // Skull Shrine / Pumpkin Shrine (+ "New Skull Shrine")
+    &[3639, 22042],        // Ghost Ship / The Flying Dutchman
+    &[3425, 22023],        // Hermit God / Reanimated Hermit God
+    &[3428, 22026],        // Hermit God Tentacle / Reanimated Hermit God Tentacle
+    &[28619, 22149],       // Jade Statue / Blue Oni
+    &[28618, 22150],       // Garnet Statue / Red Oni
+    &[3448, 46390],        // Stone Guardian (right) / Infested
+    &[3449, 46391],        // Stone Guardian (left) / Infested
+    &[8200, 46385],        // Janus the Doorwarden / Infested
+    &[5952, 45973],        // Oryx the Mad God 1 / Infested
+    &[2354, 28989],        // Oryx the Mad God 2 / Infested
+];
+
+/// The reskin group containing `object_type`, or `None`.
+fn reskin_group(object_type: i32) -> Option<&'static [i32]> {
+    ENCOUNTER_RESKIN_GROUPS
+        .iter()
+        .copied()
+        .find(|group| group.contains(&object_type))
+}
+
+/// The base (canonical) object type of `object_type`'s encounter: the classic id
+/// when `object_type` is a seasonal reskin, otherwise `object_type` itself.
+pub fn encounter_canonical_type(object_type: i32) -> i32 {
+    reskin_group(object_type)
+        .and_then(|group| group.first().copied())
+        .unwrap_or(object_type)
+}
+
+/// Every object type of `object_type`'s encounter: the base and, when known, its
+/// seasonal reskins.
+pub fn encounter_variant_types(object_type: i32) -> Vec<i32> {
+    reskin_group(object_type)
+        .map(|group| group.to_vec())
+        .unwrap_or_else(|| vec![object_type])
+}
+
+/// Display names of every reskin encounter one of whose variant names contains
+/// `text` (case-insensitive). Lets a search by either the base name ("Grand
+/// Sphinx") or the reskin name ("Withered Sphinx") match records stored under
+/// the other.
+pub fn encounter_alias_names_matching(text: &str) -> Vec<String> {
+    let needle = text.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let manager = get_asset_manager();
+    let mut out: Vec<String> = Vec::new();
+    for group in ENCOUNTER_RESKIN_GROUPS {
+        let names: Vec<String> = group
+            .iter()
+            .filter_map(|id| manager.object_name(*id))
+            .collect();
+        if names.iter().any(|n| n.to_lowercase().contains(&needle)) {
+            for n in names {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The loot-correlation group containing `object_type` (which is included in the
 /// returned slice), or an empty slice when it has no known reskin siblings.
 pub fn boss_loot_family(object_type: i32) -> &'static [i32] {
@@ -5825,6 +5901,23 @@ mod tests {
         // A boss with no known reskin has no family and matches only itself.
         assert!(boss_loot_family(47927).is_empty());
         assert!(!same_boss_for_loot(8200, 47927));
+    }
+
+    #[test]
+    fn encounter_variant_types_cover_reskin_pairs() {
+        // Seasonal reskins share an encounter: the canonical type is the base id
+        // and the variant list holds both, for alias-aware search/filtering.
+        assert_eq!(encounter_canonical_type(22000), 3412); // Withered Sphinx
+        assert_eq!(encounter_canonical_type(3412), 3412); // Grand Sphinx
+        assert_eq!(encounter_variant_types(3412), vec![3412, 22000]);
+        assert_eq!(encounter_variant_types(46385), vec![8200, 46385]); // Janus
+        assert_eq!(encounter_variant_types(28989), vec![2354, 28989]); // Oryx 2
+                                                                       // Skull Shrine spans the base plus both reskin ids.
+        assert_eq!(encounter_canonical_type(22006), 3414);
+        assert_eq!(encounter_variant_types(22003), vec![3414, 22003, 22006]);
+        // Non-reskin types are their own encounter.
+        assert_eq!(encounter_canonical_type(47927), 47927);
+        assert_eq!(encounter_variant_types(47927), vec![47927]);
     }
 
     #[test]

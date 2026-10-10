@@ -655,6 +655,19 @@ impl CombatHistoryPanel {
             {
                 boss_types.push(chest);
             }
+            // Reskin variants are separate object types with the same identity;
+            // their anonymously emitted bags are attributed to the canonical boss
+            // (e.g. Janus 8200 vs the Season 31 "Infested" reskin 46385), so query
+            // the whole family or the bags never surface on the reskin's card.
+            for family in boss_types
+                .iter()
+                .map(|t| realmhound_core::assets::boss_loot_family(*t))
+                .collect::<Vec<_>>()
+            {
+                boss_types.extend_from_slice(family);
+            }
+            boss_types.sort_unstable();
+            boss_types.dedup();
 
             let time_lo = summary.started_at - LOOT_LINK_PRE_MS;
             let time_hi = summary.ended_at + LOOT_LINK_POST_MS;
@@ -2646,6 +2659,7 @@ impl CombatHistoryPanel {
                 filter_type.map_or(true, |t| {
                     d.mob_type == t
                         || realmhound_core::assets::loot_emitter_for_boss(t) == Some(d.mob_type)
+                        || realmhound_core::assets::same_boss_for_loot(d.mob_type, t)
                 })
             })
             .collect();

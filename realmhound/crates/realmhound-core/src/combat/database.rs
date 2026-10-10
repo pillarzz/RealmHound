@@ -4010,27 +4010,46 @@ impl CombatDatabase {
         // A self-destructing boss's loot is emitted by a proxy chest (Legacy Lair
         // of Draconis dragons). Resolve the chest's drops back to the boss fight.
         let mob_type = crate::assets::boss_for_loot_emitter(mob_type).unwrap_or(mob_type);
+        // A seasonal reskin is a separate object type, but its anonymously emitted
+        // loot is attributed to the canonical boss (e.g. Janus the Doorwarden
+        // 8200 vs its Season 31 "Infested" reskin 46385), so match the whole
+        // reskin family, not just the exact type.
+        let mut types: Vec<i32> = vec![mob_type];
+        types.extend(crate::assets::boss_loot_family(mob_type).iter().copied());
+        types.sort_unstable();
+        types.dedup();
+
         let lo = timestamp - LOOT_LINK_POST_MS;
         let hi = timestamp + LOOT_LINK_PRE_MS;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, encounter_run_id FROM fights
-             WHERE killed = 1 AND map_seed = ?1 AND boss_object_type = ?2
-               AND ended_at >= ?3 AND started_at <= ?4
-             ORDER BY ABS(ended_at - ?5) ASC, id ASC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![map_seed, mob_type, lo, hi, timestamp], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        match rows.next() {
-            Some(row) => {
-                let (id, run) = row?;
-                Ok(Some(match run {
-                    Some(run) => FightSelection::Encounter(run),
-                    None => FightSelection::Single(id),
-                }))
+        // Nearest killing fight across the family; ties broken by the older id.
+        let mut best: Option<(i64, i64, Option<String>)> = None;
+        for candidate in types {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, encounter_run_id, ended_at FROM fights
+                 WHERE killed = 1 AND map_seed = ?1 AND boss_object_type = ?2
+                   AND ended_at >= ?3 AND started_at <= ?4
+                 ORDER BY ABS(ended_at - ?5) ASC, id ASC LIMIT 1",
+            )?;
+            let mut rows =
+                stmt.query_map(params![map_seed, candidate, lo, hi, timestamp], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+            let Some(row) = rows.next() else { continue };
+            let (id, run, ended) = row?;
+            let distance = (ended - timestamp).abs();
+            if best.as_ref().map_or(true, |(d, _, _)| distance < *d) {
+                best = Some((distance, id, run));
             }
-            None => Ok(None),
         }
+
+        Ok(best.map(|(_, id, run)| match run {
+            Some(run) => FightSelection::Encounter(run),
+            None => FightSelection::Single(id),
+        }))
     }
 
     /// Latch `killed = 1` on the encounter run(s) of a loot-completed realm
@@ -6370,6 +6389,33 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn find_killed_fight_links_reskin_variant() {
+        // Season 31 records Janus fights against the "Infested" reskin (46385)
+        // while the bag is attributed to canonical Janus (8200, via the Mark of
+        // Janus rule). The two must still link so the bag surfaces on the card.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let id = db
+            .insert_fight(&flawless_fight(
+                "Realm",
+                46385,
+                vec![flawless_part(
+                    600,
+                    "Alice",
+                    40_000,
+                    None,
+                    ParticipantEndStatus::Present,
+                )],
+            ))
+            .unwrap();
+        assert_eq!(
+            db.find_killed_fight(1, 8200, 61_000).unwrap(),
+            Some(FightSelection::Single(id))
+        );
+        // An unrelated type in the same instance/window still misses.
+        assert_eq!(db.find_killed_fight(1, 99999, 61_000).unwrap(), None);
     }
 
     #[test]

@@ -879,6 +879,40 @@ pub fn boss_for_loot_emitter(chest_type: i32) -> Option<i32> {
         .map(|(dragon, _)| *dragon)
 }
 
+/// Boss reskin groups that are the same fight for loot/fight correlation.
+///
+/// A seasonal reskin is a *different* object type with the same identity, and it
+/// emits loot anonymously, so bags get attributed to the canonical boss (e.g.
+/// via the Mark of Janus rule) while Combat History records the fight against
+/// the reskin's type. Exact-type matching then fails to link them. Members of a
+/// group are treated as interchangeable when correlating bags with fights.
+const BOSS_LOOT_CORRELATION_GROUPS: &[&[i32]] = &[
+    // Janus the Doorwarden: classic (Oryx's Castle) and the Season 31 "Infested"
+    // Halloween reskin.
+    &[8200, 46385],
+];
+
+/// The loot-correlation group containing `object_type` (which is included in the
+/// returned slice), or an empty slice when it has no known reskin siblings.
+pub fn boss_loot_family(object_type: i32) -> &'static [i32] {
+    BOSS_LOOT_CORRELATION_GROUPS
+        .iter()
+        .find(|group| group.contains(&object_type))
+        .copied()
+        .unwrap_or(&[])
+}
+
+/// Whether two object types are the same boss for loot/fight correlation:
+/// identical, or reskin siblings in the same [`BOSS_LOOT_CORRELATION_GROUPS`]
+/// group (e.g. Janus the Doorwarden and its Infested reskin).
+pub fn same_boss_for_loot(a: i32, b: i32) -> bool {
+    if a == b {
+        return true;
+    }
+    let family = boss_loot_family(a);
+    !family.is_empty() && family.contains(&b)
+}
+
 /// The Legacy Lair of Draconis `(dragon_type, chest_type)` pairs, for the combat
 /// database's loot-completion backfill.
 pub fn lod_dragon_chest_pairs() -> &'static [(i32, i32)] {
@@ -5744,6 +5778,21 @@ mod tests {
         // A boss that emits its own loot has no chest alias.
         assert_eq!(loot_emitter_for_boss(47927), None);
         assert_eq!(boss_for_loot_emitter(47927), None);
+    }
+
+    #[test]
+    fn janus_reskin_shares_a_loot_correlation_family() {
+        // Classic Janus (Oryx's Castle) and the Season 31 "Infested" reskin are
+        // separate object types; bags are attributed to 8200, so both must be in
+        // the same correlation family for the fights to link.
+        assert_eq!(boss_loot_family(8200), &[8200, 46385]);
+        assert_eq!(boss_loot_family(46385), &[8200, 46385]);
+        assert!(same_boss_for_loot(8200, 46385));
+        assert!(same_boss_for_loot(46385, 8200));
+        assert!(same_boss_for_loot(8200, 8200));
+        // A boss with no known reskin has no family and matches only itself.
+        assert!(boss_loot_family(47927).is_empty());
+        assert!(!same_boss_for_loot(8200, 47927));
     }
 
     #[test]

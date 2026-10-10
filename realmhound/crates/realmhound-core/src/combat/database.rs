@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 58;
+pub const SCHEMA_VERSION: i32 = 59;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -597,8 +597,17 @@ impl CombatDatabase {
         let mut open: HashMap<(String, i32, String, i32), Run> = HashMap::new();
         let mut runs: Vec<Run> = Vec::new();
         for row in rows {
-            let Some(enc) = crate::assets::encounter_for_boss_type(row.otype) else {
-                continue;
+            // A curated encounter keeps its id so its members fold into one card;
+            // any other boss in a groupable dungeon uses the "dungeon_run"
+            // sentinel, exactly as it would when recorded live. Hand-written or
+            // legacy rows (e.g. realm-spawned Oryx's Castle bosses stored before
+            // the canonical-dungeon fix) are thus grouped on open like a fresh run.
+            let enc_id = match crate::assets::encounter_for_boss_type(row.otype) {
+                Some(enc) => enc.id.to_string(),
+                None if super::tracker::is_groupable_dungeon(&row.dungeon) => {
+                    "dungeon_run".to_string()
+                }
+                None => continue,
             };
             if row.char_id == 0
                 || row.seed == 0
@@ -606,12 +615,7 @@ impl CombatDatabase {
             {
                 continue;
             }
-            let key = (
-                enc.id.to_string(),
-                row.char_id,
-                row.dungeon.clone(),
-                row.seed,
-            );
+            let key = (enc_id.clone(), row.char_id, row.dungeon.clone(), row.seed);
             let start_new = match open.get(&key) {
                 Some(r) => row.started - r.end > RUN_GAP_MS,
                 None => true,
@@ -623,8 +627,11 @@ impl CombatDatabase {
                 open.insert(
                     key,
                     Run {
-                        run_id: format!("bf-{}-{:x}", enc.id, row.started),
-                        enc_id: enc.id.to_string(),
+                        run_id: format!(
+                            "bf-{}-{}-{}-{:x}",
+                            enc_id, row.seed, row.char_id, row.started
+                        ),
+                        enc_id,
                         dungeon: row.dungeon,
                         ids: vec![row.id],
                         start: row.started,
@@ -1376,6 +1383,35 @@ impl CombatDatabase {
             // guaranteed bag of a boss that drops no Mark (the Head of Shaitan), so
             // bumping re-runs it and fixes fights already stored as Escaped.
             self.conn.execute_batch("PRAGMA user_version = 58")?;
+        }
+        if from_version < 59 {
+            // v58 -> v59: relabel legacy realm-recorded Janus the Doorwarden and
+            // Stone Guardian fights as "Oryx's Castle". These bosses are
+            // realm-spawned but belong to Oryx's Castle; the canonical-dungeon
+            // table only covered the classic object ids, so the Season 31 reskins
+            // (46385/46390/46391) were stored under the raw realm map name and
+            // never classified or grouped with the dungeon. Fixing the table only
+            // affects new records, so repair the already-stored rows here.
+            self.conn.execute_batch(
+                "UPDATE fights SET dungeon = 'Oryx''s Castle'
+                 WHERE dungeon = 'Realm'
+                   AND boss_object_type IN (8200, 3448, 3449, 46385, 46390, 46391);",
+            )?;
+            // Rebuild the synthetic `bf-` runs so they pick up the widened
+            // grouping rule (non-curated bosses in a groupable dungeon now group
+            // under "dungeon_run", like a live run) and the seed/char-scoped run
+            // id that prevents two instances from colliding. Live
+            // "{nonce}-{counter}" ids are authoritative and left untouched; the
+            // backfill that runs right after migration rebuilds these.
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "UPDATE fights SET encounter_id = NULL, encounter_run_id = NULL
+                 WHERE encounter_run_id LIKE 'bf-%'",
+                [],
+            )?;
+            tx.execute("DELETE FROM encounter_runs WHERE run_id LIKE 'bf-%'", [])?;
+            tx.commit()?;
+            self.conn.execute_batch("PRAGMA user_version = 59")?;
         }
         Ok(())
     }
@@ -10154,6 +10190,124 @@ mod tests {
             db.column_exists("fights", "aux_member_count").unwrap(),
             "aux_member_count column added by migration"
         );
+    }
+
+    #[test]
+    fn v58_to_v59_relabels_reskinned_janus_and_stone_guardians() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A database written before the canonical-dungeon table covered the
+        // Season 31 reskins stored their realm-spawned Oryx's Castle bosses under
+        // the raw realm map name.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (12, 130, 'Realm', 7, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (150, 155, 'Realm', 7, 46390, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (200, 210, 'Realm', 7, 28989, 'Oryx the Mad God', 90000, 90000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        // Re-run migrations from v58.
+        db.conn.execute_batch("PRAGMA user_version = 58").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let relocated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND boss_object_type IN (46385, 46390)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(relocated, 2, "reskinned realm bosses relabelled");
+        // A genuine realm boss (Oryx the Mad God) keeps its Realm label.
+        let realm: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE dungeon = 'Realm' AND boss_object_type = 28989",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(realm, 1, "unrelated realm boss untouched");
+    }
+
+    #[test]
+    fn backfill_groups_legacy_oryxs_castle_bosses() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // Legacy realm-locked rows (no synthetic run) for the same instance: the
+        // Stone Guardians and Janus must fold into one Oryx's Castle card on open,
+        // like a live run, rather than three separate "Realm" cards.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (1000, 2000, 'Oryx''s Castle', 7, 46390, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (1100, 2100, 'Oryx''s Castle', 7, 46391, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (1200, 3000, 'Oryx''s Castle', 7, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        db.initialize(None).unwrap();
+
+        let runs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND encounter_run_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "same-instance bosses group into one run");
+
+        // A different instance (seed) stays separate.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (1000, 2000, 'Oryx''s Castle', 8, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+        db.initialize(None).unwrap();
+        let runs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND encounter_run_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 2, "a different instance is its own run");
     }
 
     #[test]

@@ -1809,12 +1809,20 @@ impl LootPanel {
                 });
             }
 
+            // Names of reskinned sources matching the query under *either* their
+            // base or seasonal name, so searching "Grand Sphinx" surfaces the
+            // "Withered Sphinx" tag and vice versa.
+            let alias_matches: Vec<String> =
+                realmhound_core::assets::encounter_alias_names_matching(&self.search_text);
             // Collect enemy matches
             for (mob_type, mob_name) in self
                 .autocomplete_cache
                 .mobs
                 .iter()
-                .filter(|(_, name)| name.to_lowercase().contains(&search_lower))
+                .filter(|(_, name)| {
+                    name.to_lowercase().contains(&search_lower)
+                        || alias_matches.iter().any(|a| a.eq_ignore_ascii_case(name))
+                })
                 .take(5)
             {
                 results.push(SearchResult::Enemy {

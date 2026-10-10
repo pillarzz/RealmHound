@@ -79,6 +79,28 @@ pub const JANUS_OBJECT_TYPE: i32 = 8200;
 /// Display name for Janus the Doorwarden, matching Combat History's boss name.
 pub const JANUS_NAME: &str = "Janus the Doorwarden";
 
+/// Every known Janus the Doorwarden object type: the classic boss plus the
+/// seasonal reskins (e.g. the Season 31 "Infested" variant, 46385). All of them
+/// keep the [`JANUS_NAME`] display name, which is what the attribution matches
+/// on so new reskins need no code change; the ids are only a backstop for a
+/// reskin that would also rename the boss.
+pub const JANUS_VARIANT_TYPES: &[i32] = &[JANUS_OBJECT_TYPE, 46385];
+
+/// The Janus the Doorwarden killed in `kills` for `map_seed`, if any.
+///
+/// Janus emits loot anonymously, so a Mark-of-Janus bag is attributed from the
+/// recorded kills rather than by proximity. Matching on the display name (shared
+/// by every reskin) keeps the bag linked to the right Combat History card for
+/// future seasonal reskins, whose object ids are unknown ahead of time.
+pub fn janus_kill_in_instance(kills: &[RecentBossKill], map_seed: i32) -> Option<(i32, String)> {
+    kills
+        .iter()
+        .filter(|k| k.map_seed == map_seed)
+        .filter(|k| k.name == JANUS_NAME || JANUS_VARIANT_TYPES.contains(&k.object_type))
+        .max_by_key(|k| k.ended_at_ms)
+        .map(|k| (k.object_type, k.name.clone()))
+}
+
 /// Item id of Mark of Janus, a guaranteed soulbound drop from Janus. Its
 /// presence in a bag is a 100% reliable signal the bag came from Janus (whose
 /// loot is emitted anonymously by an invisible generator, so proximity-based
@@ -1019,6 +1041,48 @@ mod beisa_tests {
         for id in SHINY_PET_STONE_IDS {
             assert_eq!(shiny_bag_tier([*id]), Some(LootBagType::Gold));
         }
+    }
+
+    #[test]
+    fn janus_attribution_resolves_reskin_by_name() {
+        // A reskin is a different object type with the same display name; the
+        // Mark-of-Janus bag must attach to the variant that actually died.
+        let reskin = RecentBossKill {
+            map_seed: 7,
+            object_type: 46385,
+            name: JANUS_NAME.to_string(),
+            started_at_ms: 0,
+            ended_at_ms: 10,
+        };
+        assert_eq!(
+            janus_kill_in_instance(std::slice::from_ref(&reskin), 7),
+            Some((46385, JANUS_NAME.to_string()))
+        );
+        // Same instance only: a Janus in another instance is not this bag's boss.
+        assert_eq!(
+            janus_kill_in_instance(std::slice::from_ref(&reskin), 8),
+            None
+        );
+
+        // The most recent Janus kill wins when the instance recorded several.
+        let classic = RecentBossKill {
+            object_type: JANUS_OBJECT_TYPE,
+            ended_at_ms: 5,
+            ..reskin.clone()
+        };
+        assert_eq!(
+            janus_kill_in_instance(&[classic, reskin.clone()], 7),
+            Some((46385, JANUS_NAME.to_string()))
+        );
+
+        // An unrelated boss in the same instance is not Janus.
+        let other = RecentBossKill {
+            object_type: 1234,
+            name: "Some Other Boss".to_string(),
+            ..reskin.clone()
+        };
+        assert_eq!(janus_kill_in_instance(&[other], 7), None);
+        assert_eq!(janus_kill_in_instance(&[], 7), None);
     }
 
     #[test]

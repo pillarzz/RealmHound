@@ -1290,12 +1290,20 @@ impl CombatHistoryPanel {
                 let search_lower = self.search.trim().to_lowercase();
                 let mut results: Vec<SearchResult> = Vec::new();
                 if !search_lower.is_empty() {
+                    // Names of reskinned encounters matching the query under
+                    // *either* their base or seasonal name, so searching "Grand
+                    // Sphinx" surfaces the "Withered Sphinx" tag and vice versa.
+                    let alias_matches: Vec<String> =
+                        realmhound_core::assets::encounter_alias_names_matching(&self.search);
                     let portal_map = get_dungeon_portal_map();
                     for (object_type, name) in self
                         .autocomplete
                         .bosses
                         .iter()
-                        .filter(|(_, n)| n.to_lowercase().contains(&search_lower))
+                        .filter(|(_, n)| {
+                            n.to_lowercase().contains(&search_lower)
+                                || alias_matches.iter().any(|a| a.eq_ignore_ascii_case(n))
+                        })
                         .take(8)
                     {
                         results.push(SearchResult::Boss {

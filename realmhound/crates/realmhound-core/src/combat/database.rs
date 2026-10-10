@@ -3652,8 +3652,10 @@ impl CombatDatabase {
             // "Realm" map name); a multi-boss dungeon run is headlined by its
             // dungeon; a lone boss keeps its own name.
             let object_types: Vec<i32> = phases.iter().map(|p| p.0).collect();
-            let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
-                name.to_string()
+            let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
+                // Realm-grouped encounter: title by the anchor boss's *current*
+                // name so a seasonally-reskinned fight reads uniformly.
+                display_boss_name(boss_object_type, headline)
             } else if raw_phase_count > 1 {
                 dungeon.clone()
             } else {
@@ -3861,14 +3863,15 @@ impl CombatDatabase {
             // Moonlight Village is cleared by its three dancers; the anchor can
             // land on an escaped Kitsune Umi fought afterwards.
             || mv_dancers_cleared(phases.iter().map(|p| (p.boss_object_type, p.killed)));
-        let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
-            name.to_string()
+        let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
+            // Title by the anchor boss's current (seasonal) name.
+            display_boss_name(anchor_object_type, headline)
         } else if phases.len() > 1 {
             dungeon.clone()
         } else {
             phases
                 .first()
-                .map(|p| p.boss_name.clone())
+                .map(|p| display_boss_name(p.boss_object_type, &p.boss_name))
                 .unwrap_or_else(|| dungeon.clone())
         };
         let roster = aggregate_roster(&phases);
@@ -4574,7 +4577,8 @@ impl CombatDatabase {
                 row.get::<_, i64>(2)?,
             ))
         })?;
-        let mut by_canonical: std::collections::HashMap<i32, (i64, String)> =
+        // (latest_started, variant object_type, stored name)
+        let mut by_canonical: std::collections::HashMap<i32, (i64, i32, String)> =
             std::collections::HashMap::new();
         for row in rows {
             let (obj_type, name, latest) = row?;
@@ -4584,14 +4588,21 @@ impl CombatDatabase {
                 .entry(canonical)
                 .and_modify(|entry| {
                     if latest > entry.0 {
-                        *entry = (latest, name.clone());
+                        *entry = (latest, obj_type, name.clone());
                     }
                 })
-                .or_insert((latest, name));
+                .or_insert((latest, obj_type, name));
         }
+        let manager = crate::assets::get_asset_manager();
         let mut out: Vec<(i32, String)> = by_canonical
             .into_iter()
-            .map(|(obj_type, (_, name))| (obj_type, name))
+            .map(|(_, (_, obj_type, stored))| {
+                // Key by the most recently fought variant so its sprite (the
+                // reskin during the season) is shown; name it from the live asset
+                // so the tag carries the current seasonal name.
+                let name = manager.object_name(obj_type).unwrap_or(stored);
+                (obj_type, name)
+            })
             .collect();
         out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         Ok(out)
@@ -5380,6 +5391,14 @@ fn pick_anchor(phases: &[PhaseStat]) -> Option<(i32, i32, i32, bool)> {
 /// distinction (both share the game DisplayId "Prismimic") so the two mirror
 /// rows read clearly; every other boss keeps its stored name.
 fn display_boss_name(object_type: i32, stored: &str) -> String {
+    // A seasonally-reskinned encounter is named by its *current* asset name (the
+    // reskin's name while the season is live, the base name otherwise), so every
+    // card for the encounter reads uniformly regardless of when it was recorded.
+    if crate::assets::encounter_variant_types(object_type).len() > 1 {
+        if let Some(name) = crate::assets::get_asset_manager().object_name(object_type) {
+            return name;
+        }
+    }
     crate::assets::prismimic_display_name(object_type)
         .map(str::to_string)
         .unwrap_or_else(|| stored.to_string())
@@ -6520,7 +6539,10 @@ mod tests {
             .filter(|(t, _)| *t == 3412 || *t == 22000)
             .collect();
         assert_eq!(sphinx.len(), 1, "one suggestion per encounter");
-        assert_eq!(sphinx[0].0, 3412, "keyed by the canonical base type");
+        assert_eq!(
+            sphinx[0].0, 22000,
+            "keyed by the most recently fought variant (its sprite)"
+        );
         assert_eq!(
             sphinx[0].1, "Withered Sphinx",
             "labelled by the most recently fought variant"

@@ -2797,7 +2797,8 @@ impl LootDatabase {
                 row.get::<_, i64>(2)?,
             ))
         })?;
-        let mut by_canonical: std::collections::HashMap<i32, (i64, String)> =
+        // (latest_dropped, variant mob_type, stored name)
+        let mut by_canonical: std::collections::HashMap<i32, (i64, i32, String)> =
             std::collections::HashMap::new();
         // Unresolved sources (mob_type 0/unknown) keep their distinct names.
         let mut unknown: Vec<(i32, String)> = Vec::new();
@@ -2814,14 +2815,21 @@ impl LootDatabase {
                 .entry(canonical)
                 .and_modify(|entry| {
                     if latest > entry.0 {
-                        *entry = (latest, name.clone());
+                        *entry = (latest, mob_type, name.clone());
                     }
                 })
-                .or_insert((latest, name));
+                .or_insert((latest, mob_type, name));
         }
+        let manager = crate::assets::get_asset_manager();
         let mut out: Vec<(i32, String)> = by_canonical
             .into_iter()
-            .map(|(mob_type, (_, name))| (mob_type, name))
+            .map(|(_, (_, mob_type, stored))| {
+                // Key by the most recently dropped variant (its sprite — the
+                // reskin during the season) and name it from the live asset so
+                // the tag carries the current seasonal name.
+                let name = manager.object_name(mob_type).unwrap_or(stored);
+                (mob_type, name)
+            })
             .chain(unknown)
             .collect();
         out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));

@@ -2990,9 +2990,12 @@ impl CombatTracker {
         // Some bosses fought from the realm belong to a rated dungeon the raw
         // map name doesn't reflect (Oryx the Mad God 2 -> Wine Cellar). Remap so
         // the fight classifies by that dungeon's difficulty and shows its card.
-        let dungeon = crate::assets::canonical_dungeon_for_boss(fight.boss_object_type)
-            .map(str::to_string)
-            .unwrap_or(dungeon);
+        let dungeon = crate::assets::canonical_dungeon_for_boss_named(
+            fight.boss_object_type,
+            boss_name.trim(),
+        )
+        .map(str::to_string)
+        .unwrap_or(dungeon);
 
         // Group every boss of a dungeon instance under one card. Curated bosses
         // keep their encounter id (so aux repr types still resolve); non-curated

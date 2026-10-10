@@ -2229,10 +2229,24 @@ pub fn encounter_by_id(id: &str) -> Option<&'static Encounter> {
 /// classify by grave difficulty and show the correct portal / card instead of
 /// a bare realm entry.
 const BOSS_DUNGEON_OVERRIDES: &[(i32, &str)] = &[
-    (2354, "Wine Cellar"),   // Oryx the Mad God 2
-    (8200, "Oryx's Castle"), // Janus the Doorwarden
-    (3448, "Oryx's Castle"), // Stone Guardian (variant a)
-    (3449, "Oryx's Castle"), // Stone Guardian (variant b)
+    (2354, "Wine Cellar"),    // Oryx the Mad God 2
+    (8200, "Oryx's Castle"),  // Janus the Doorwarden
+    (3448, "Oryx's Castle"),  // Stone Guardian (variant a)
+    (3449, "Oryx's Castle"),  // Stone Guardian (variant b)
+    (46385, "Oryx's Castle"), // Infested Janus the Doorwarden (Season 31 reskin)
+    (46390, "Oryx's Castle"), // Infested Stone Guardian (reskin, variant a)
+    (46391, "Oryx's Castle"), // Infested Stone Guardian (reskin, variant b)
+];
+
+/// Display names whose realm spawns belong to a dungeon regardless of object id.
+///
+/// Seasonal reskins are new object types with the same display name, so this
+/// keeps a reskinned realm spawn (e.g. next season's Janus / Stone Guardian)
+/// logging under Oryx's Castle without adding its id to
+/// [`BOSS_DUNGEON_OVERRIDES`]. Checked only when the id isn't already mapped.
+const BOSS_DUNGEON_NAME_OVERRIDES: &[(&str, &str)] = &[
+    ("Janus the Doorwarden", "Oryx's Castle"),
+    ("Stone Guardian", "Oryx's Castle"),
 ];
 
 /// Canonical dungeon name for a boss type when the raw map name doesn't reflect
@@ -2242,6 +2256,22 @@ pub fn canonical_dungeon_for_boss(boss_object_type: i32) -> Option<&'static str>
         .iter()
         .find(|(t, _)| *t == boss_object_type)
         .map(|(_, d)| *d)
+}
+
+/// Canonical dungeon name for a boss, preferring its object type and falling
+/// back to its display name so reskinned variants (new ids, same name) still
+/// resolve (see [`BOSS_DUNGEON_NAME_OVERRIDES`]).
+pub fn canonical_dungeon_for_boss_named(
+    boss_object_type: i32,
+    boss_name: &str,
+) -> Option<&'static str> {
+    canonical_dungeon_for_boss(boss_object_type).or_else(|| {
+        let name = boss_name.trim();
+        BOSS_DUNGEON_NAME_OVERRIDES
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, d)| *d)
+    })
 }
 
 /// Encounters whose members are alternative/mini bosses that funnel into a single
@@ -5793,6 +5823,30 @@ mod tests {
         // A boss with no known reskin has no family and matches only itself.
         assert!(boss_loot_family(47927).is_empty());
         assert!(!same_boss_for_loot(8200, 47927));
+    }
+
+    #[test]
+    fn reskinned_realm_bosses_map_to_oryxs_castle() {
+        // Janus and the Stone Guardians are realm-spawned but belong to Oryx's
+        // Castle. The Season 31 reskins are new ids, so all six must resolve.
+        for t in [8200, 3448, 3449, 46385, 46390, 46391] {
+            assert_eq!(canonical_dungeon_for_boss(t), Some("Oryx's Castle"));
+        }
+        // A future reskin (new id, same name) still resolves via the display name.
+        assert_eq!(
+            canonical_dungeon_for_boss_named(999_999, "Janus the Doorwarden"),
+            Some("Oryx's Castle")
+        );
+        assert_eq!(
+            canonical_dungeon_for_boss_named(999_999, "Stone Guardian"),
+            Some("Oryx's Castle")
+        );
+        // Unrelated bosses are unaffected.
+        assert_eq!(
+            canonical_dungeon_for_boss_named(47927, "Some Other Boss"),
+            None
+        );
+        assert_eq!(canonical_dungeon_for_boss(47927), None);
     }
 
     #[test]

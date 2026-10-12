@@ -736,6 +736,16 @@ pub struct PlayerMission {
     /// repeatable mission on cooldown this anchors the reset: the mission
     /// restarts at `claimed_at + interval` (interval from the definition).
     pub claimed_at: Option<i64>,
+    /// Number of times the mission's reward has been claimed (5th CSV field).
+    /// `0` for a mission that has never been claimed.
+    ///
+    /// Together with `claimed_at` this is the *durable* completion evidence a
+    /// repeatable mission keeps after its cooldown resets its progress to zero
+    /// (verified against a live capture: a reset repeatable came back as
+    /// `11,21,0,<T_updated>,3,<T_claimed>` -- state 0 and partial progress, but
+    /// count 3 and a claim timestamp). Without it the missions behind a reset
+    /// gate re-lock, which is issue #59.
+    pub claim_count: i32,
 }
 
 /// Parsed `getPlayerMissions` response. Models the per-tree `<Season>` progress
@@ -828,11 +838,16 @@ pub fn parse_player_missions(body: &str) -> PlayerMissions {
                 .split(':')
                 .filter_map(|v| v.trim().parse::<i32>().ok())
                 .collect();
-            // Trailing fields: `T_updated, count, T_claimed`. The last field is
-            // the last-claimed timestamp used to anchor a repeatable mission's
-            // reset.
+            // Trailing fields: `T_updated, count, T_claimed`. `count` is the
+            // number of claims; the last field is the last-claimed timestamp used
+            // to anchor a repeatable mission's reset. Both survive a cooldown
+            // reset and are the durable proof the mission was completed before.
             let _t_updated = parts.next();
-            let _count = parts.next();
+            let claim_count = parts
+                .next()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(0);
             let claimed_at = parts
                 .next()
                 .and_then(|v| v.trim().parse::<i64>().ok())
@@ -844,6 +859,7 @@ pub fn parse_player_missions(body: &str) -> PlayerMissions {
                 state: MissionState::from_raw(raw_state),
                 raw_state,
                 claimed_at,
+                claim_count,
             });
         }
     }
@@ -1343,6 +1359,14 @@ mod tests {
         // Last CSV field is the claimed-at timestamp used to anchor the reset.
         assert_eq!(m15.claimed_at, Some(1786976953));
         assert_eq!(pm.mission(1).unwrap().claimed_at, Some(1785972084));
+        // 5th CSV field is the claim count: durable proof the mission was
+        // completed even after a repeatable's cooldown zeroes its progress.
+        assert_eq!(m15.claim_count, 10);
+        assert_eq!(pm.mission(1).unwrap().claim_count, 1);
+        // A never-claimed mission (3-field row) carries no count.
+        let fresh = parse_player_missions("<Missions><Season id=\"52\">9,0,0</Season></Missions>");
+        assert_eq!(fresh.mission(9).unwrap().claim_count, 0);
+        assert_eq!(fresh.mission(9).unwrap().claimed_at, None);
 
         let m33 = pm.mission(33).unwrap();
         assert_eq!(m33.progress, vec![1]);

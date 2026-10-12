@@ -10,6 +10,12 @@
 //! locally-accumulated progress, so a mid-session launch or a game-side desync
 //! (the "completed -> unclaimable -> rolled back" glitch) reconciles on the next
 //! refresh. Live deltas only ever move the numbers forward between fetches.
+//!
+//! The one thing that is *not* replaced is unlock progress: whether a mission
+//! has been completed/claimed at least once is sticky for the season (in-game a
+//! mission tree unlocks permanently). A repeatable mission's cooldown resets its
+//! progress to zero, so without that memory the missions behind it would re-lock
+//! the moment the cooldown elapsed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +32,16 @@ struct MissionRuntime {
     state: Option<MissionState>,
     /// Unix seconds the mission was last claimed (anchors the reset countdown).
     claimed_at: Option<i64>,
+    /// Sticky "this mission has been completed at least once" flag.
+    ///
+    /// A repeatable mission's progress is wiped back to zero when its claim
+    /// cooldown elapses, and a fetch may report a previously-completed mission
+    /// with zero progress and no claim state. Without a sticky flag that erases
+    /// the prerequisite, so every mission behind a repeatable re-locks as soon
+    /// as the cooldown resets (the reported "repeatable shows as Locked but is
+    /// available in-game" bug). In-game a mission tree unlocks permanently, so
+    /// once satisfied a mission stays satisfied for the season.
+    ever_satisfied: bool,
 }
 
 /// A pending reward claim awaiting its server ack (packet 164).
@@ -127,10 +143,25 @@ impl MissionTracker {
         self.locked = pm.locked_missions.iter().copied().collect();
         self.unlocked = pm.unlocked_missions.iter().copied().collect();
         for m in pm.missions {
+            // A mission that is claimed, has ever been claimed (claim count /
+            // last-claimed timestamp), or is currently complete counts as
+            // satisfied from now on -- and stays so after a repeatable's cooldown
+            // later zeroes its progress. The claim count and timestamp are what
+            // make this survive a cold start: the server keeps them on a reset
+            // repeatable, whereas its progress and state go back to zero.
+            let satisfied = matches!(m.state, MissionState::Claimed)
+                || m.claim_count > 0
+                || m.claimed_at.is_some()
+                || self
+                    .mission_def(m.tree_id, m.mission_id)
+                    .is_some_and(|def| def.is_complete(&m.progress));
             let rt = self.runtime.entry((m.tree_id, m.mission_id)).or_default();
             rt.progress = m.progress;
             rt.state = Some(m.state);
             rt.claimed_at = m.claimed_at;
+            if satisfied {
+                rt.ever_satisfied = true;
+            }
         }
         self.touch();
     }
@@ -150,19 +181,37 @@ impl MissionTracker {
         // A pure zero delta (login-sync presence signal) carries no progress;
         // ensure the mission exists but never overwrite an existing count.
         let all_zero = entry.values.iter().all(|v| *v == 0);
-        let rt = self.runtime.entry(key).or_default();
-        if all_zero {
-            if rt.progress.is_empty() {
-                rt.progress = vec![0; entry.values.len()];
-                self.touch();
+        let changed = {
+            let rt = self.runtime.entry(key).or_default();
+            if all_zero {
+                if rt.progress.is_empty() {
+                    rt.progress = vec![0; entry.values.len()];
+                    true
+                } else {
+                    false
+                }
+            } else {
+                if rt.progress.len() < entry.values.len() {
+                    rt.progress.resize(entry.values.len(), 0);
+                }
+                for (slot, delta) in rt.progress.iter_mut().zip(entry.values.iter()) {
+                    *slot += *delta;
+                }
+                true
             }
+        };
+        if !changed {
             return;
         }
-        if rt.progress.len() < entry.values.len() {
-            rt.progress.resize(entry.values.len(), 0);
-        }
-        for (slot, delta) in rt.progress.iter_mut().zip(entry.values.iter()) {
-            *slot += *delta;
+        // A live delta can complete a mission; remember it as satisfied so a
+        // later cooldown reset cannot re-lock the missions behind it.
+        if self
+            .mission_def(entry.season_id, entry.mission_id)
+            .is_some_and(|def| def.is_complete(&self.runtime[&key].progress))
+        {
+            if let Some(rt) = self.runtime.get_mut(&key) {
+                rt.ever_satisfied = true;
+            }
         }
         self.touch();
     }
@@ -192,6 +241,7 @@ impl MissionTracker {
             .entry((pending.season_id, pending.mission_id))
             .or_default();
         rt.state = Some(MissionState::Claimed);
+        rt.ever_satisfied = true;
         // Anchor the cooldown to the actual claim moment. Without this a
         // repeatable mission re-claimed from packets keeps a stale (past)
         // `claimed_at`, so its `reset_at` lands in the past and the view
@@ -245,6 +295,17 @@ impl MissionTracker {
         let id = self.season_id?;
         defs.season(id)
     }
+
+    /// Definition of one mission within a tree, if the definitions are loaded and
+    /// name it.
+    fn mission_def(
+        &self,
+        tree_id: i32,
+        mission_id: i32,
+    ) -> Option<&realmhound_core::api::MissionDef> {
+        self.defs.as_ref()?.season(tree_id)?.mission(mission_id)
+    }
+
     /// Build a UI-facing snapshot of the current mission state. Merges every
     /// active tree in the definitions into one list; each entry is tagged with
     /// its tree name so the panel can label missions from different trees.
@@ -294,11 +355,18 @@ impl MissionTracker {
     /// prerequisite: it has been claimed, or its objectives are complete. Used to
     /// evaluate the `parentsStr` unlock graph. An unknown or unstarted mission is
     /// not satisfied, so its children stay locked.
+    ///
+    /// Satisfaction is monotonic: once a prerequisite has been completed it stays
+    /// satisfied for the season, so a repeatable parent whose cooldown resets its
+    /// progress back to zero does not re-lock the missions behind it.
     fn mission_satisfied(&self, season: &Season, mission_id: i32) -> bool {
         let Some(def) = season.missions.iter().find(|m| m.id == mission_id) else {
             return false;
         };
         let rt = self.runtime.get(&(season.id, mission_id));
+        if rt.is_some_and(|r| r.ever_satisfied) {
+            return true;
+        }
         let claimed = matches!(rt.and_then(|r| r.state), Some(MissionState::Claimed));
         let empty: Vec<i32> = Vec::new();
         let progress = rt.map(|r| &r.progress).unwrap_or(&empty);
@@ -382,6 +450,11 @@ impl MissionTracker {
         // the tree's whole mission list, and on a season's first day the server
         // sends no block at all. Treating it as one showed every mission of a
         // fresh season as in progress.
+        //
+        // Unlocking is monotonic: a mission that has already been completed (or
+        // whose prerequisite chain has) is never shown as Locked again, so a
+        // repeatable mission that is available in-game after its cooldown elapsed
+        // does not fall back to "Locked" once its progress resets to zero.
         let parents = def.parents();
         let graph_unlocked = parents.iter().all(|&p| self.mission_satisfied(season, p));
         let started = rt.is_some_and(|r| {
@@ -391,8 +464,15 @@ impl MissionTracker {
                     Some(MissionState::Claimable | MissionState::Claimed)
                 )
         });
-        let unlocked = graph_unlocked || self.unlocked.contains(&key) || started;
-        let is_locked = self.locked.contains(&key) || !unlocked;
+        let ever_unlocked = rt.is_some_and(|r| r.ever_satisfied);
+        let unlocked = graph_unlocked || self.unlocked.contains(&key) || started || ever_unlocked;
+        // A `<LockedMissions>` entry only wins while the player has no evidence of
+        // having engaged the mission. A mission the server itself reports as
+        // started or claimed (or that was watched progress at least once) cannot
+        // be locked -- a locked mission can have neither -- so letting the list
+        // mask it would hide a live repeatable's cooldown behind "Locked".
+        let engaged = started || ever_unlocked;
+        let is_locked = (self.locked.contains(&key) && !engaged) || !unlocked;
         let state = if is_locked {
             MissionState::Locked
         } else {
@@ -982,6 +1062,306 @@ mod tests {
         assert_eq!(mission.state, MissionState::InProgress);
         assert_eq!(mission.objectives[0].have, 1);
         assert_eq!(mission.reset_at, None);
+    }
+
+    /// A chain of two repeatable missions (each 0.75-day cooldown) that the
+    /// player has claimed: when the cooldowns elapse the missions are available
+    /// again in-game, so neither may fall back to "Locked" merely because the
+    /// parent's progress was reset to zero.
+    const REPEATABLE_CHAIN_DEFS: &str = r#"
+    {
+      "seasons": [{
+        "name": "S", "current": 1, "id": 52,
+        "missions": [
+          { "id": 1, "name": "First (Repeatable)", "desc": "d", "interval": 0.75,
+            "conds": [{ "type": 2, "target": "", "amount": 1 }],
+            "rewards": [{ "type": 1, "target": "", "amount": 1000 }] },
+          { "id": 2, "name": "Second (Repeatable)", "desc": "d", "interval": 0.75,
+            "parentsStr": "1",
+            "conds": [{ "type": 2, "target": "", "amount": 1 }],
+            "rewards": [{ "type": 1, "target": "", "amount": 1000 }] }
+        ]
+      }]
+    }"#;
+
+    #[test]
+    fn expired_repeatable_chain_stays_unlocked() {
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(REPEATABLE_CHAIN_DEFS).unwrap());
+        // Both claimed; 0.75 days (64_800 s) since the claim has long elapsed.
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><Season id=\"52\">\
+             1,1,3,1787053943,1,1000000|2,1,3,1787053943,1,1000000</Season></Missions>",
+        ));
+        // Claimed repeatables read "on cooldown" with a reset countdown.
+        let v = t.build_view();
+        assert_eq!(entry(&v, 1).state, MissionState::Claimed);
+        assert_eq!(entry(&v, 1).reset_at, Some(1_064_800));
+        assert_eq!(entry(&v, 2).state, MissionState::Claimed);
+
+        // Cooldowns elapse: RH resets both to active, and the chained child must
+        // stay unlocked even though its parent's progress is zeroed.
+        assert!(t.expire_cooldowns(2_000_000));
+        let v = t.build_view();
+        assert_eq!(entry(&v, 1).state, MissionState::InProgress);
+        assert_eq!(entry(&v, 1).reset_at, None);
+        assert_ne!(entry(&v, 2).state, MissionState::Locked);
+        assert_eq!(entry(&v, 2).state, MissionState::InProgress);
+    }
+
+    #[test]
+    fn refresh_reporting_reset_repeatable_keeps_chain_unlocked() {
+        // A fetch after the cooldown has elapsed (e.g. a cold start / Refresh):
+        // the repeatable parent is reported with zero progress and state 0, but
+        // its last-claimed timestamp is retained. That is durable evidence it was
+        // completed, so the child must not re-lock.
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(REPEATABLE_CHAIN_DEFS).unwrap());
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><Season id=\"52\">\
+             1,0,0,1787053943,3,1000000|2,0,0,1787053943,0,0</Season></Missions>",
+        ));
+        let v = t.build_view();
+        assert_ne!(entry(&v, 1).state, MissionState::Locked);
+        assert_ne!(entry(&v, 2).state, MissionState::Locked);
+    }
+
+    // -----------------------------------------------------------------------
+    // Season-proof lock invariants.
+    //
+    // The mission tree is rewritten every season, so a lock regression must be
+    // caught by properties that hold for *any* tree shape instead of by
+    // per-mission expectations. These tests drive whole trees -- including the
+    // live shape, where a repeatable mission gates a multi-branch subtree -- and
+    // assert those properties directly.
+    //
+    // A captured payload can be replayed by `captured_payloads_satisfy_lock_invariants`
+    // (drop `getClientSeasons` + `getPlayerMissions` bodies into
+    // `tests/fixtures/missions/<name>.json` / `<name>.xml`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn claim_count_alone_keeps_a_reset_gate_satisfied() {
+        // A reset repeatable can come back with a claim count but no claim
+        // timestamp (or vice versa); either is proof it was completed, so the
+        // gate stays satisfied and its child must not re-lock.
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(REPEATABLE_CHAIN_DEFS).unwrap());
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><Season id=\"52\">\
+             1,0,0,1787053943,23,0|2,0,0,1787053943,0,0</Season></Missions>",
+        ));
+        let v = t.build_view();
+        assert_ne!(entry(&v, 1).state, MissionState::Locked);
+        assert_ne!(entry(&v, 2).state, MissionState::Locked);
+        assert_eq!(entry(&v, 2).state, MissionState::InProgress);
+    }
+
+    /// The live tree shape that produced #59: mission 2 is a daily repeatable
+    /// that gates a whole multi-branch subtree (missions 3-5).
+    const REPEATABLE_GATE_DEFS: &str = r#"
+    {
+      "seasons": [{
+        "name": "S", "current": 1, "id": 52,
+        "missions": [
+          { "id": 1, "name": "Root", "desc": "d",
+            "conds": [{ "type": 2, "target": "", "amount": 1 }], "rewards": [] },
+          { "id": 2, "name": "Gate (Repeatable)", "desc": "d", "interval": 0.75,
+            "parentsStr": "1",
+            "conds": [{ "type": 2, "target": "", "amount": 1 }], "rewards": [] },
+          { "id": 3, "name": "Branch A", "desc": "d", "parentsStr": "2",
+            "conds": [{ "type": 2, "target": "", "amount": 1 }], "rewards": [] },
+          { "id": 4, "name": "Branch B", "desc": "d", "parentsStr": "2",
+            "conds": [{ "type": 2, "target": "", "amount": 1 }], "rewards": [] },
+          { "id": 5, "name": "Branch C (Repeatable)", "desc": "d", "interval": 0.75,
+            "parentsStr": "2",
+            "conds": [{ "type": 2, "target": "", "amount": 1 }], "rewards": [] }
+        ]
+      }]
+    }"#;
+
+    /// No mission that the server reports as started/claimed (or that has any
+    /// objective progress) may be shown as Locked -- for any tree.
+    fn assert_engaged_missions_are_not_locked(view: &MissionView, label: &str) {
+        for e in &view.entries {
+            let engaged = e.objectives.iter().any(|o| o.have != 0)
+                || matches!(e.state, MissionState::Claimable | MissionState::Claimed);
+            assert!(
+                !engaged || e.state != MissionState::Locked,
+                "{label}: mission {}/{} ({}) is Locked despite server-reported progress",
+                e.tree_id,
+                e.mission_id,
+                e.name
+            );
+        }
+    }
+
+    #[test]
+    fn repeatable_gate_reset_never_relocks_its_subtree() {
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(REPEATABLE_GATE_DEFS).unwrap());
+        // The whole tree has been cleared; the repeatable gate (2) and its
+        // repeatable leaf (5) are claimed with an already-elapsed cooldown.
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><Season id=\"52\">\
+             1,1,2,1787053943,1,1000000|2,1,3,1787053943,1,1000000|\
+             3,1,2,1787053943,1,1000000|4,1,2,1787053943,1,1000000|\
+             5,1,3,1787053943,1,1000000</Season></Missions>",
+        ));
+        let v = t.build_view();
+        assert_engaged_missions_are_not_locked(&v, "cleared tree");
+
+        // Both cooldowns elapse, zeroing the repeatables' progress. The subtree
+        // behind the gate must stay unlocked.
+        assert!(t.expire_cooldowns(2_000_000));
+        let v = t.build_view();
+        assert_eq!(entry(&v, 2).state, MissionState::InProgress);
+        assert_eq!(entry(&v, 5).state, MissionState::InProgress);
+        assert_engaged_missions_are_not_locked(&v, "after gate reset");
+        for id in 1..=5 {
+            assert_ne!(
+                entry(&v, id).state,
+                MissionState::Locked,
+                "mission {id} re-locked after a repeatable gate reset"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_tree_frontier_is_active_for_a_fresh_account() {
+        // The server lists *every* mission of the tree in its <Season> block
+        // (issue #20); a fresh account reports them all at zero progress. Only
+        // the root is active -- everything behind an unfinished parent is locked
+        // rather than "In progress".
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(REPEATABLE_GATE_DEFS).unwrap());
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><TreesUnlocked>52</TreesUnlocked>\
+             <Season id=\"52\">1,0,0|2,0,0|3,0,0|4,0,0|5,0,0</Season></Missions>",
+        ));
+        let v = t.build_view();
+        assert_ne!(entry(&v, 1).state, MissionState::Locked);
+        for id in 2..=5 {
+            assert_eq!(
+                entry(&v, id).state,
+                MissionState::Locked,
+                "mission {id} should stay locked for a fresh account"
+            );
+        }
+    }
+
+    #[test]
+    fn server_locked_entry_only_wins_without_engagement_evidence() {
+        let mut t = tracker_with_defs();
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><LockedMissions>;52,1;52,15</LockedMissions>\
+             <Season id=\"52\">1,75,1|15,0,0</Season></Missions>",
+        ));
+        let v = t.build_view();
+        // Mission 1 has server-reported progress, so an explicit lock cannot
+        // mask it -- a locked mission can never have progress.
+        assert_ne!(entry(&v, 1).state, MissionState::Locked);
+        // Mission 15 has no engagement evidence, so the server lock stands.
+        assert_eq!(entry(&v, 15).state, MissionState::Locked);
+    }
+
+    /// Payload-driven regression harness: replay every captured
+    /// `<name>.json` /`<name>.xml` pair under `tests/fixtures/missions` and check
+    /// the invariants above, plus refresh idempotence (a second identical fetch
+    /// must never turn a visible mission into Locked). No fixtures present means
+    /// nothing to check.
+    #[test]
+    fn captured_payloads_satisfy_lock_invariants() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("missions");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let defs_path = entry.path();
+            if defs_path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let pm_path = defs_path.with_extension("xml");
+            let (Ok(defs_body), Ok(pm_body)) = (
+                std::fs::read_to_string(&defs_path),
+                std::fs::read_to_string(&pm_path),
+            ) else {
+                continue; // an unpaired capture is not a test case
+            };
+            let label = defs_path.display().to_string();
+            let defs = parse_client_seasons(&defs_body)
+                .unwrap_or_else(|e| panic!("{label}: invalid getClientSeasons: {e}"));
+
+            let mut t = MissionTracker::new();
+            t.apply_definitions(defs);
+            t.apply_player_missions(realmhound_core::api::parse_player_missions(&pm_body));
+            let first = t.build_view();
+            assert_engaged_missions_are_not_locked(&first, &label);
+
+            t.apply_player_missions(realmhound_core::api::parse_player_missions(&pm_body));
+            let second = t.build_view();
+            assert_eq!(first.entries.len(), second.entries.len(), "{label}");
+            for (a, b) in first.entries.iter().zip(second.entries.iter()) {
+                assert!(
+                    a.state == MissionState::Locked || b.state != MissionState::Locked,
+                    "{label}: mission {}/{} became Locked on Refresh",
+                    b.tree_id,
+                    b.mission_id
+                );
+            }
+        }
+    }
+
+    /// Regression for the *non-repeatable* half of #59, from a captured tree.
+    ///
+    /// `season52_the_mad_gods_tempest.json` is a real `getClientSeasons` body
+    /// (The Mad God's Tempest, 36 missions; 15 of them repeatable gates). Its
+    /// payload companion is constructed from a real capture: every repeatable
+    /// gate has reset -- state 0 and zero progress, but its claim count and
+    /// claim timestamp retained, which is the shape a live capture shows -- and
+    /// one *non-repeatable* mission (12, "Gathering Storm") sits unstarted behind
+    /// such a gate, exactly like the reported "non-repeatable mission shows as
+    /// Locked while it is available in-game". Nothing in this state is locked
+    /// in-game, so nothing may be locked here.
+    #[test]
+    fn real_tree_with_reset_gates_has_no_locked_missions() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("missions");
+        let defs_body = std::fs::read_to_string(dir.join("season52_the_mad_gods_tempest.json"))
+            .expect("captured getClientSeasons fixture");
+        let pm_body = std::fs::read_to_string(dir.join("season52_the_mad_gods_tempest.xml"))
+            .expect("captured getPlayerMissions fixture");
+
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(&defs_body).expect("fixture JSON parses"));
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(&pm_body));
+        let v = t.build_view();
+        assert_eq!(v.entries.len(), 36);
+
+        let locked: Vec<i32> = v
+            .entries
+            .iter()
+            .filter(|e| e.state == MissionState::Locked)
+            .map(|e| e.mission_id)
+            .collect();
+        assert!(locked.is_empty(), "missions wrongly locked: {locked:?}");
+
+        // The non-repeatable frontier mission behind a reset gate reads as
+        // available; the eight non-repeatable missions gated by repeatables must
+        // never fall back to Locked.
+        assert_eq!(entry(&v, 12).state, MissionState::InProgress);
+        for id in [7, 12, 18, 19, 20, 23, 31, 36] {
+            assert_ne!(
+                entry(&v, id).state,
+                MissionState::Locked,
+                "non-repeatable mission {id} locked behind a reset repeatable gate"
+            );
+        }
     }
 
     #[test]

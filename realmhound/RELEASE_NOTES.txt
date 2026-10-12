@@ -11,6 +11,7 @@
 - Improved tooltips for missions with multiple dungeons.
 - Fixed character-exclusive missions to work correctly for Druid.
 - After a season rollover, locked missions are no longer listed as "In progress".
+- Repeatable missions that came off cooldown no longer show as "Locked", and the missions behind them stay unlocked once completed.
 - The season and battlepass countdowns now use the game's authoritative dates instead of estimating.
 - Fixed dungeon callouts with dungeon names set to "none" to work with the auto copy-to-clipboard feature.
 

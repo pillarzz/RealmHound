@@ -1009,27 +1009,12 @@ fn damage_taken_tooltip(p: DamageTakenProvenance) -> &'static str {
     }
 }
 
-/// Resolve a character's icon sprite id and cloth dyes by char id from account
-/// data. Returns `(icon_id, tex1, tex2)`, or `None` when the character is not in
-/// the cache (e.g. dead/unknown) so callers can fall back to the recorded class.
-fn char_visuals(ctx: &PanelContext, char_id: i32) -> Option<(i32, u32, u32)> {
-    if char_id == 0 {
-        return None;
-    }
-    let c = ctx.account_data.find_character(char_id)?;
-    let icon_id = if c.skin > 0 {
-        c.skin
-    } else {
-        c.class_id as i32
-    };
-    Some((icon_id, c.tex1, c.tex2))
-}
-
 /// Fall back to the appearance recorded on the fight's local participant when
-/// the live account cache no longer has the character (e.g. after death), so
-/// the card icon keeps its skin and dyes instead of reverting to the plain
-/// class sprite. Returns `None` when there is nothing custom to draw (no skin
-/// and no dyes), letting the caller render the default class sprite.
+/// the live account cache no longer has the character (e.g. a character deleted
+/// from the roster, or one from another account), so the card icon keeps its
+/// skin and dyes instead of reverting to the plain class sprite. Returns `None`
+/// when there is nothing custom to draw (no skin and no dyes), letting the
+/// caller render the default class sprite.
 fn stored_char_visuals(fight: &FightSummary) -> Option<(i32, u32, u32)> {
     if fight.local_skin_id <= 0 && fight.local_tex1 == 0 && fight.local_tex2 == 0 {
         return None;
@@ -1683,7 +1668,8 @@ impl CombatHistoryPanel {
                     }
                 }
                 if let Some((char_id, name)) = self.filter_char.clone() {
-                    let (icon, tex1, tex2) = char_visuals(ctx, char_id).unwrap_or((0, 0, 0));
+                    let (icon, tex1, tex2) = crate::panels::character_appearance(&ctx.account_data, char_id)
+                        .unwrap_or((0, 0, 0));
                     if ctx.sprite_renderer.render_filter_pill_character(
                         ui,
                         icon,
@@ -1959,7 +1945,8 @@ impl CombatHistoryPanel {
                 // filter. A fixed 32x32 slot is always reserved so text lines up
                 // across cards even when the character is unknown.
                 let vis =
-                    char_visuals(ctx, fight.local_char_id).or_else(|| stored_char_visuals(fight));
+                    crate::panels::character_appearance(&ctx.account_data, fight.local_char_id)
+                        .or_else(|| stored_char_visuals(fight));
                 let ot = fight.local_object_type.unwrap_or(0);
                 let (crect, cresp) =
                     cui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
@@ -2552,10 +2539,15 @@ impl CombatHistoryPanel {
                             .color(Color32::GRAY),
                         );
                         if fight.local_close_calls > 0 {
-                            // After death the live cache drops the character, so fall
-                            // back to the local participant's stored appearance so the
-                            // icon keeps its skin/dyes instead of disappearing.
-                            let cc_vis = char_visuals(ctx, fight.local_char_id).or_else(|| {
+                            // A dead character keeps its last-seen appearance from the
+                            // graveyard; for one missing from the cache entirely (e.g.
+                            // another account's) fall back to the local participant's
+                            // stored appearance so the icon keeps its skin/dyes.
+                            let cc_vis = crate::panels::character_appearance(
+                                &ctx.account_data,
+                                fight.local_char_id,
+                            )
+                            .or_else(|| {
                                 fight
                                     .participants
                                     .iter()
@@ -3738,19 +3730,22 @@ impl CombatHistoryPanel {
                                 .iter()
                                 .find_map(|p| (p.local_char_id != 0).then_some(p.local_char_id))
                                 .unwrap_or(0);
-                            // After death the live cache drops the character, so fall
-                            // back to the local player's stored roster appearance so
-                            // the icon keeps its skin/dyes instead of disappearing.
-                            let cc_vis = char_visuals(ctx, cc_char_id).or_else(|| {
-                                enc.roster.iter().find(|p| p.is_local).and_then(|p| {
-                                    let icon_id = if p.skin_id > 0 {
-                                        p.skin_id
-                                    } else {
-                                        p.object_type
-                                    };
-                                    (icon_id != 0).then_some((icon_id, p.tex1, p.tex2))
-                                })
-                            });
+                            // A dead character keeps its last-seen appearance from the
+                            // graveyard; for one missing from the cache entirely (e.g.
+                            // another account's) fall back to the local player's stored
+                            // roster appearance so the icon keeps its skin/dyes.
+                            let cc_vis =
+                                crate::panels::character_appearance(&ctx.account_data, cc_char_id)
+                                    .or_else(|| {
+                                        enc.roster.iter().find(|p| p.is_local).and_then(|p| {
+                                            let icon_id = if p.skin_id > 0 {
+                                                p.skin_id
+                                            } else {
+                                                p.object_type
+                                            };
+                                            (icon_id != 0).then_some((icon_id, p.tex1, p.tex2))
+                                        })
+                                    });
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 ui.label(

@@ -441,6 +441,16 @@ impl AccountData {
         self.characters.find_character_mut(char_id)
     }
 
+    /// Find a character by ID across the living roster and the graveyard.
+    ///
+    /// A deceased character is removed from the living list, so view paths that
+    /// still render it - Loot/Combat History rows and their character filter
+    /// pills - must resolve its last-seen appearance through here instead of
+    /// falling back to a per-row snapshot or a missing sprite.
+    pub fn find_any_character(&self, char_id: i32) -> Option<&super::CachedCharacter> {
+        self.characters.find_any_character(char_id)
+    }
+
     /// Get the appropriate vault storage for a vault type.
     pub fn get_vault(&self, vault_type: VaultType) -> &LiveVaultStorage {
         match vault_type {

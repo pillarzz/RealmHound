@@ -361,18 +361,22 @@ define_pcstats! {
         156 => dungeons.neo_untaris,
         157 => dungeons.neo_forax,
         158 => dungeons.neo_katalund,
+        // Season 31 Legacy counters. Benchmarked against a character whose
+        // in-game stats page was compared counter by counter; the indices do
+        // not follow the DungeonName sort the stats page uses. See READ_ORDER
+        // for this block's write order.
         136 => dungeons.legacy_pirate_cave,
-        137 => dungeons.legacy_abyss_of_demons,
+        137 => dungeons.legacy_lair_of_shaitan,
         138 => dungeons.legacy_the_shatters,
         144 => dungeons.legacy_forest_maze,
-        145 => dungeons.legacy_sprite_world,
-        146 => dungeons.legacy_spider_den,
-        147 => dungeons.legacy_undead_lair,
-        148 => dungeons.bilgewaters_grotto,
-        149 => dungeons.legacy_the_crawling_depths,
-        150 => dungeons.legacy_woodland_labyrinth,
-        151 => dungeons.ivory_wyvern_portal,
-        159 => dungeons.legacy_lair_of_shaitan,
+        145 => dungeons.legacy_spider_den,
+        146 => dungeons.legacy_sprite_world,
+        147 => dungeons.legacy_abyss_of_demons,
+        148 => dungeons.legacy_undead_lair,
+        149 => dungeons.bilgewaters_grotto,
+        150 => dungeons.legacy_the_crawling_depths,
+        151 => dungeons.legacy_woodland_labyrinth,
+        159 => dungeons.ivory_wyvern_portal,
         98 => dungeons.white_snake_invasion_i,
         99 => dungeons.white_snake_invasion_ii,
         100 => dungeons.white_snake_invasion_iii,
@@ -457,11 +461,12 @@ define_pcstats! {
         155, 156, 157, 158,
 
         // Legacy/removed dungeons + Bilgewater's Grotto + Ivory Wyvern Portal.
-        // Values are written in the game's enum/add order, NOT ascending bit
-        // order: Legacy The Shatters (bit 138) was added after its low bit slot,
-        // so its value is appended last. Reading 138 in numeric position would
-        // shift every later legacy value by one, so it must be read last.
-        136, 137, 144, 145, 146, 147, 148, 149, 150, 151, 159, 138,
+        // Values are written in ascending bit order for this block, except that
+        // Legacy Lair of Shaitan (137) and Legacy The Shatters (138) were added
+        // to the stat enum after their low bit slots and are appended at the
+        // end, Shaitan first. Reading them in numeric position shifts every
+        // following legacy value by one, which mislabels the whole block.
+        136, 144, 145, 146, 147, 148, 149, 150, 151, 159, 137, 138,
     ]
 }
 
@@ -1047,5 +1052,44 @@ mod tests {
         let s = "AQAAAAEAAEEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAqA8yrAQ=";
         let bytes = six_bit_string_to_bytes(s).unwrap();
         assert_eq!(detect_bitfield_bytes(&bytes[4..]), PCSTATS_BITFIELD_BYTES);
+    }
+
+    #[test]
+    fn test_legacy_counters_match_in_game_benchmark() {
+        // Regression for the Season 31 Legacy dungeon counters, benchmarked
+        // against a real character whose in-game stats page showed:
+        //   Pirate Cave 5, Forest Maze 3, Spider Den 3, Sprite World 95,
+        //   Abyss of Demons 9, Undead Lair 10, Bilgewater's Grotto 255,
+        //   The Crawling Depths 34, Woodland Labyrinth 49, Ivory Wyvern 55,
+        //   Lair of Shaitan 21, The Shatters 9.
+        // The writer emits these in ascending bit order, then appends Lair of
+        // Shaitan (137) and The Shatters (138).
+        let mut bytes = vec![1u8, 0, 0, 0];
+        let mut bitfield = vec![0u8; PCSTATS_BITFIELD_BYTES];
+        for bit in [
+            136usize, 137, 138, 144, 145, 146, 147, 148, 149, 150, 151, 159,
+        ] {
+            bitfield[bit / 8] |= 1 << (bit % 8);
+        }
+        bytes.extend_from_slice(&bitfield);
+        for v in [5u32, 3, 3, 95, 9, 10, 255, 34, 49, 55, 21, 9] {
+            bytes.extend_from_slice(&compressed_2byte(v));
+        }
+
+        let s = encode_six_bit(&bytes);
+        let dungeons = decode_pcstats(&s).expect("should decode").dungeons;
+
+        assert_eq!(dungeons.legacy_pirate_cave, 5);
+        assert_eq!(dungeons.legacy_forest_maze, 3);
+        assert_eq!(dungeons.legacy_spider_den, 3);
+        assert_eq!(dungeons.legacy_sprite_world, 95);
+        assert_eq!(dungeons.legacy_abyss_of_demons, 9);
+        assert_eq!(dungeons.legacy_undead_lair, 10);
+        assert_eq!(dungeons.bilgewaters_grotto, 255);
+        assert_eq!(dungeons.legacy_the_crawling_depths, 34);
+        assert_eq!(dungeons.legacy_woodland_labyrinth, 49);
+        assert_eq!(dungeons.ivory_wyvern_portal, 55);
+        assert_eq!(dungeons.legacy_lair_of_shaitan, 21);
+        assert_eq!(dungeons.legacy_the_shatters, 9);
     }
 }

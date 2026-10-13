@@ -138,8 +138,10 @@ const MAX_RECENT_FIGHTS: usize = 200;
 /// a gravestone spawned within this many tiles of their last-seen position.
 const GRAVE_MATCH_RADIUS: f32 = 3.0;
 /// ...and within this time window of their removal (covers a grave that arrives
-/// slightly before or after the removal packet in the same/adjacent tick).
-const GRAVE_MATCH_WINDOW_MS: i64 = 15_000;
+/// slightly before or after the removal packet in the same/adjacent tick). Also
+/// used by the combat-history database when applying a stored death broadcast to
+/// a fight that was already written.
+pub(crate) const GRAVE_MATCH_WINDOW_MS: i64 = 15_000;
 /// A departure only counts for a fight if it happened no earlier than this before
 /// the fight's start (guards against correlating a much older, unrelated exit).
 const DEPARTURE_GRACE_MS: i64 = 5_000;
@@ -167,6 +169,18 @@ struct Departure {
     x: f32,
     y: f32,
     time: i64,
+}
+
+/// A server death broadcast observed for another player, handed to the caller to
+/// persist so a death announced after its fight was written can still be applied.
+#[derive(Debug, Clone)]
+pub struct DeathBroadcast {
+    /// The victim's name as broadcast.
+    pub player: String,
+    /// Who killed them (best-effort context from the broadcast).
+    pub killer: String,
+    /// When the broadcast was received (unix ms).
+    pub time: i64,
 }
 
 /// Per-instance pet association state. A pet follows its owner, so
@@ -695,6 +709,10 @@ pub struct CombatTracker {
     /// die in a tight cluster), so it overrides a Nexused verdict at finalize.
     /// Cleared on map change / disconnect like the other correlation buffers.
     remote_deaths: HashMap<String, i64>,
+    /// Death broadcasts observed since the last drain, for the caller to persist.
+    /// Never cleared on map change: the caller persists them and the persisted row
+    /// is what lets a death announced after its fight was written be applied.
+    pending_death_broadcasts: Vec<DeathBroadcast>,
     /// Set while a map change / disconnect force-finalizes active fights, so the
     /// local player -- always still in `objects` from their own view -- is scored
     /// as having left (nexused) any boss fight that was not completed.
@@ -826,6 +844,7 @@ impl CombatTracker {
             departures: HashMap::new(),
             pending_local_grave: None,
             remote_deaths: HashMap::new(),
+            pending_death_broadcasts: Vec::new(),
             local_departing: false,
             pet_tracks: HashMap::new(),
             completed_boss_types: HashSet::new(),
@@ -3705,13 +3724,28 @@ impl CombatTracker {
     /// rendering as "<name> died at level N, killed by <killer>"). Buffered by name
     /// until the current fight(s) finalize; this authoritative signal is what marks
     /// a clustered-death player as Died even when their gravestone couldn't be
-    /// position-correlated (see `resolve_end_statuses`).
-    pub fn on_remote_death(&mut self, player_name: &str, time_ms: i64) {
+    /// position-correlated (see `resolve_end_statuses`). The raw broadcast is also
+    /// queued for the caller to persist (see `take_pending_death_broadcasts`), so a
+    /// death announced after its fight was written can still be applied to it.
+    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
         let key = sanitize_player_name(player_name).to_ascii_lowercase();
         if key.is_empty() {
             return;
         }
         self.remote_deaths.insert(key, time_ms);
+        if self.pending_death_broadcasts.len() >= CORRELATION_MAX_ENTRIES {
+            self.pending_death_broadcasts.remove(0);
+        }
+        self.pending_death_broadcasts.push(DeathBroadcast {
+            player: player_name.trim().to_string(),
+            killer: killer.trim().to_string(),
+            time: time_ms,
+        });
+    }
+
+    /// Take the death broadcasts observed since the last drain, for persistence.
+    pub fn take_pending_death_broadcasts(&mut self) -> Vec<DeathBroadcast> {
+        std::mem::take(&mut self.pending_death_broadcasts)
     }
 
     /// Whether a remote death broadcast named `name` and it landed within this
@@ -4525,8 +4559,8 @@ mod tests {
             time: 1_100,
         });
         // Both deaths were broadcast during the fight window.
-        t.on_remote_death("Zannmp", 1_050);
-        t.on_remote_death("Yumiho", 1_050);
+        t.on_remote_death("Zannmp", "Oryx the Mad God", 1_050);
+        t.on_remote_death("Yumiho", "Oryx the Mad God", 1_050);
 
         let mut p1 = participant(1, false);
         p1.name = "Zannmp".into();
@@ -4560,6 +4594,20 @@ mod tests {
     }
 
     #[test]
+    fn remote_death_broadcasts_are_queued_for_persistence() {
+        let mut t = CombatTracker::new();
+        t.on_remote_death("Pillar", "Oryx the Mad God", 1_234);
+        // A broadcast carrying no player name persists nothing.
+        t.on_remote_death("   ", "a Spider", 2_000);
+        let queued = t.take_pending_death_broadcasts();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].player, "Pillar");
+        assert_eq!(queued[0].killer, "Oryx the Mad God");
+        assert_eq!(queued[0].time, 1_234);
+        assert!(t.take_pending_death_broadcasts().is_empty());
+    }
+
+    #[test]
     fn end_status_remote_death_outside_window_is_ignored() {
         let mut t = CombatTracker::new();
         // A death broadcast far outside this fight's window (a later boss) must not
@@ -4572,7 +4620,7 @@ mod tests {
                 time: 1_000,
             },
         );
-        t.on_remote_death("Later", 500_000);
+        t.on_remote_death("Later", "Oryx the Mad God", 500_000);
         let mut p1 = participant(1, false);
         p1.name = "Later".into();
         let mut ps = vec![p1];

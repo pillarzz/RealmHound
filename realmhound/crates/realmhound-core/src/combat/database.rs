@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 60;
+pub const SCHEMA_VERSION: i32 = 61;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -541,6 +541,12 @@ impl CombatDatabase {
         // dragons are defeated, so an Ivory Wyvern fight proves the preceding
         // Lair run was a full clear. Complete such runs from that evidence.
         self.backfill_legacy_lod_from_ivory()?;
+        // A captured death broadcast is authoritative, but it can arrive after the
+        // fight containing the death was already written (a burst of deaths at the
+        // end of a clear). Apply the stored broadcasts to those rows here, both
+        // live (see `insert_death_broadcast`) and for anything a previous session
+        // observed but could not apply.
+        self.repair_remote_deaths()?;
         Ok(())
     }
 
@@ -1425,6 +1431,28 @@ impl CombatDatabase {
                      WHERE dungeon = 'Realm' AND boss_object_type = 28989;",
             )?;
             self.conn.execute_batch("PRAGMA user_version = 60")?;
+        }
+        if from_version < 61 {
+            // v60 -> v61: the death broadcasts we observe. Persisting them lets a
+            // death that was confirmed after the battle containing it was already
+            // written still be applied to that battle (concurrent phases are
+            // recorded up to a few hundred ms apart, so a burst of deaths at the
+            // end of a fight can land in the gap), and keeps the raw signal around
+            // for diagnosing a death that was never captured. No historical rows
+            // are touched: nothing was stored before this version.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS death_broadcasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    player TEXT NOT NULL,
+                    killer TEXT NOT NULL DEFAULT '',
+                    occurred_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_death_broadcasts_time
+                    ON death_broadcasts(occurred_at);
+                PRAGMA user_version = 61;
+                "#,
+            )?;
         }
         Ok(())
     }
@@ -2566,15 +2594,106 @@ impl CombatDatabase {
                 completions INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS death_broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player TEXT NOT NULL,
+                killer TEXT NOT NULL DEFAULT '',
+                occurred_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_fights_started ON fights(started_at);
             CREATE INDEX IF NOT EXISTS idx_fights_run ON fights(encounter_run_id);
             CREATE INDEX IF NOT EXISTS idx_fights_group ON fights(boss_group);
             CREATE INDEX IF NOT EXISTS idx_participants_fight ON fight_participants(fight_id);
+            CREATE INDEX IF NOT EXISTS idx_death_broadcasts_time ON death_broadcasts(occurred_at);
             CREATE INDEX IF NOT EXISTS idx_encounter_runs_recent
                 ON encounter_runs(ended_at DESC, started_at DESC);
             "#,
         )?;
         Ok(())
+    }
+
+    /// Record an observed server death broadcast (`s.death`) so a death confirmed
+    /// after its fight was already stored can still be applied to that fight, and
+    /// so the raw signal survives for diagnosing a death that was never captured.
+    pub fn insert_death_broadcast(
+        &mut self,
+        player: &str,
+        killer: &str,
+        occurred_at: i64,
+    ) -> SqlResult<()> {
+        let player = player.trim();
+        if player.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO death_broadcasts (player, killer, occurred_at) VALUES (?1, ?2, ?3)",
+            params![player, killer.trim(), occurred_at],
+        )?;
+        Ok(())
+    }
+
+    /// Mark stored participants as `died` when a captured death broadcast names
+    /// them inside their fight's window.
+    ///
+    /// The live finalize pass can only use a broadcast that has already arrived.
+    /// Concurrent phases are written up to a few hundred ms apart, so a burst of
+    /// deaths at the end of a clear can be broadcast after the phase containing
+    /// them was stored, which left those deaths recorded as a nexus even though
+    /// they were announced. The broadcast is authoritative, so the stored row is
+    /// corrected here.
+    ///
+    /// Only a `nexused` row with no grave is touched -- exactly the rule the live
+    /// pass applies (death evidence beats a departure, but never presence) -- and
+    /// the grave tier is left at 0, which the UI renders as the default
+    /// gravestone. Idempotent: repaired rows no longer match.
+    pub fn repair_remote_deaths(&mut self) -> SqlResult<usize> {
+        let broadcasts: Vec<(String, i64)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT player, occurred_at FROM death_broadcasts")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<SqlResult<Vec<_>>>()?
+        };
+        if broadcasts.is_empty() {
+            return Ok(0);
+        }
+
+        let mut repaired = 0;
+        for (player, occurred_at) in broadcasts {
+            let key = super::tracker::sanitize_player_name(&player).to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            // Candidate departures whose fight window contains the broadcast.
+            let candidates: Vec<(i64, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT fp.id, fp.name FROM fight_participants fp
+                     JOIN fights f ON f.id = fp.fight_id
+                     WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
+                       AND f.started_at <= ?2 AND f.ended_at >= ?1",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        occurred_at - super::tracker::GRAVE_MATCH_WINDOW_MS,
+                        occurred_at + super::tracker::GRAVE_MATCH_WINDOW_MS
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                rows.collect::<SqlResult<Vec<_>>>()?
+            };
+            for (id, name) in candidates {
+                if super::tracker::sanitize_player_name(&name).to_ascii_lowercase() != key {
+                    continue;
+                }
+                repaired += self.conn.execute(
+                    "UPDATE fight_participants SET end_status = 'died'
+                     WHERE id = ?1 AND end_status = 'nexused'",
+                    params![id],
+                )?;
+            }
+        }
+        Ok(repaired)
     }
 
     /// Add one dungeon run's elapsed time (and, when the boss was killed, one
@@ -8391,6 +8510,115 @@ mod tests {
         assert_eq!(dead.local_skin_id, 4242);
         assert_eq!(dead.local_tex1, 0x0100_00ff);
         assert_eq!(dead.local_tex2, 0x0100_ff00);
+    }
+
+    #[test]
+    fn death_broadcast_repairs_a_stored_nexused_participant() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = fight_with_players("Oryx's Sanctuary", 1_000_000, &["Pillar", "Bystander"]);
+        for p in &mut fight.participants {
+            p.end_status = ParticipantEndStatus::Nexused;
+        }
+        db.insert_fight(&fight).unwrap();
+
+        // The broadcast for a death inside the fight's window arrives afterwards.
+        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_020_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 1);
+
+        // The named participant is corrected with a generic grave (the tier was
+        // never captured); everyone else keeps the nexus verdict.
+        let repaired: (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT end_status, grave_type FROM fight_participants WHERE name = 'Pillar'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired, ("died".to_string(), 0));
+        let bystander: String = db
+            .conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE name = 'Bystander'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bystander, "nexused");
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn death_broadcast_repair_ignores_other_names_and_windows() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = fight_with_players("Mad Lab", 10_000, &["Pillar"]);
+        fight.participants[0].end_status = ParticipantEndStatus::Nexused;
+        db.insert_fight(&fight).unwrap();
+        // Ten minutes later: outside the fight window.
+        db.insert_death_broadcast("Pillar", "a Spider", 610_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+        // In the window, but another player died.
+        db.insert_death_broadcast("Someone", "a Spider", 20_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+        let status: String = db
+            .conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE name = 'Pillar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "nexused");
+    }
+
+    #[test]
+    fn death_broadcast_repair_leaves_presence_alone() {
+        // Presence is not overridden by a broadcast: the same rule the live
+        // finalize pass applies (death evidence beats a departure, not presence).
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let fight = fight_with_players("Mad Lab", 1_000, &["Present"]);
+        db.insert_fight(&fight).unwrap();
+        db.insert_death_broadcast("Present", "a Spider", 20_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+    }
+
+    #[test]
+    fn death_broadcast_repair_runs_on_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat_history.db");
+        {
+            let mut db = CombatDatabase::open_writer(&path).unwrap();
+            let mut fight = fight_with_players("Oryx's Sanctuary", 1_000_000, &["Pillar"]);
+            fight.participants[0].end_status = ParticipantEndStatus::Nexused;
+            db.insert_fight(&fight).unwrap();
+            // Stored, but not applied yet: only the open pass (or the live drain)
+            // repairs stored rows.
+            db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_030_000)
+                .unwrap();
+            let before: String = db
+                .conn
+                .query_row(
+                    "SELECT end_status FROM fight_participants WHERE name = 'Pillar'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(before, "nexused");
+        }
+        let db = CombatDatabase::open_writer(&path).unwrap();
+        let after: String = db
+            .conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE name = 'Pillar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, "died", "the on-open pass applies stored broadcasts");
     }
 
     /// Build a standalone fight with an explicit set of participant IGNs.

@@ -2,7 +2,7 @@
 - Fixed some bosses sometimes incorrectly marked as Escaped when they were actually completed.
 - Fight cards completed by a loot update now update in place instead of showing as Escaped until a reload.
 - Fixed MV still marked as completed sometimes when the player nexused.
-- A player who dies in a fight is no longer shown as having nexused, and clustered deaths now claim their own gravestone.
+- A player who dies in a fight is no longer shown as having nexused, even when the death is announced just after the fight was recorded, and clustered deaths now claim their own gravestone.
 - Dead characters now show their last-seen skin and dyes across Combat History and Loot History, including the character filter pill.
 
 # Taskbar & Missions

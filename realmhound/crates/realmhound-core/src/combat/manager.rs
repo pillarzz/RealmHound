@@ -443,11 +443,12 @@ impl CombatManager {
         self.flush_dungeon_timer(time_ms);
     }
 
-    /// A remote player died, parsed from the server death-broadcast text. Buffers
-    /// the death by name so the finalizing fight marks that participant as dead
-    /// even when their gravestone couldn't be position-correlated.
-    pub fn on_remote_death(&mut self, player_name: &str, time_ms: i64) {
-        self.tracker.on_remote_death(player_name, time_ms);
+    /// A remote player died, parsed from the server death broadcast (`s.death`).
+    /// Buffers the death by name so the finalizing fight marks that participant as
+    /// dead even when their gravestone couldn't be position-correlated; the raw
+    /// broadcast is persisted on the next tick (see `persist_death_broadcasts`).
+    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
+        self.tracker.on_remote_death(player_name, killer, time_ms);
     }
 
     /// Incoming `DamagePacket`: `attacker_id` dealt `amount` to `target_id`.
@@ -550,6 +551,7 @@ impl CombatManager {
     pub fn on_tick(&mut self, time_ms: i64) {
         #[cfg(feature = "latency-diagnostics")]
         let started = std::time::Instant::now();
+        self.persist_death_broadcasts();
         let finished = self.tracker.on_tick(time_ms);
         #[cfg(feature = "latency-diagnostics")]
         let fight_count = finished.len();
@@ -571,6 +573,43 @@ impl CombatManager {
                     participant_count
                 );
             }
+        }
+    }
+
+    /// Persist the death broadcasts observed since the last tick, then apply them
+    /// to already-stored fights.
+    ///
+    /// A broadcast can arrive after the fight containing the death was written:
+    /// concurrent phases are recorded up to a few hundred ms apart, so a burst of
+    /// deaths at the end of a clear can be announced in that gap. The repair pass
+    /// corrects those rows, and running it per drain also keeps the live session
+    /// consistent without waiting for a restart.
+    fn persist_death_broadcasts(&mut self) {
+        // Broadcasts stay queued while no database is open so nothing is lost
+        // before the account's history is available.
+        let Some(db) = self.database.as_mut() else {
+            return;
+        };
+        let pending = self.tracker.take_pending_death_broadcasts();
+        if pending.is_empty() {
+            return;
+        }
+        for broadcast in &pending {
+            if let Err(e) =
+                db.insert_death_broadcast(&broadcast.player, &broadcast.killer, broadcast.time)
+            {
+                tracing::error!("[COMBAT] Failed to persist death broadcast: {}", e);
+                return;
+            }
+        }
+        match db.repair_remote_deaths() {
+            Ok(0) => {}
+            Ok(repaired) => tracing::info!(
+                "[COMBAT] Applied {} stored death broadcast(s), repaired {} participant(s)",
+                pending.len(),
+                repaired
+            ),
+            Err(e) => tracing::error!("[COMBAT] Failed to repair remote deaths: {}", e),
         }
     }
 
@@ -688,6 +727,7 @@ impl CombatManager {
 mod tests {
     use super::super::types::{DamageProvenance, FightParticipant};
     use super::*;
+    use crate::combat::ParticipantEndStatus;
 
     fn fight(dungeon: &str, boss: &str, solo: bool) -> CompletedFight {
         let mut participants = vec![FightParticipant {
@@ -912,6 +952,49 @@ mod tests {
                 .filter(|f| f.map_seed == 0)
                 .all(|f| !f.killed),
             "a bag outside an instance completes nothing"
+        );
+    }
+
+    /// A death broadcast that arrives after the fight containing the death was
+    /// written must still land on the stored participant: a burst of deaths at the
+    /// end of a clear is announced up to a few hundred ms after a concurrent phase
+    /// was already persisted, which used to leave those deaths recorded as nexuses.
+    #[test]
+    fn a_late_death_broadcast_repairs_the_stored_fight() {
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+        let mut f = fight("Oryx's Sanctuary", "Oryx the Mad God", false);
+        f.map_seed = 42;
+        f.started_at = 1_000_000;
+        f.ended_at = 1_060_000;
+        for p in &mut f.participants {
+            if !p.is_local {
+                p.end_status = ParticipantEndStatus::Nexused;
+            }
+        }
+        m.persist(vec![f]);
+        let id = m.database.as_ref().unwrap().recent_fights(1).unwrap()[0].id;
+
+        // The broadcast for a death inside the fight's window lands afterwards.
+        m.on_remote_death("Ally", "Oryx the Mad God", 1_030_000);
+        m.on_tick(1_040_000);
+
+        let record = m
+            .database
+            .as_ref()
+            .unwrap()
+            .fight_detail(id)
+            .unwrap()
+            .unwrap();
+        let ally = record
+            .participants
+            .iter()
+            .find(|p| p.name == "Ally")
+            .unwrap();
+        assert_eq!(
+            ally.end_status,
+            ParticipantEndStatus::Died { grave_type: 0 },
+            "the stored row is corrected from the broadcast"
         );
     }
 

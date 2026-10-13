@@ -2341,7 +2341,7 @@ impl PacketProcessor {
                         victim,
                         killer
                     );
-                    self.combat.on_remote_death(&victim, now_ms());
+                    self.combat.on_remote_death(&victim, &killer, now_ms());
                 } else if text.text.contains("\"s.death\"") {
                     // A death broadcast we could not decode: record the raw shape
                     // so a payload change can be spotted instead of silently

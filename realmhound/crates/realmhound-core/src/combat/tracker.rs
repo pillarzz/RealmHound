@@ -3568,24 +3568,51 @@ impl CombatTracker {
         }
     }
 
-    /// Consume the buffered gravestone spawn closest (in position, then time) to a
-    /// departure at `(x, y, time)`, if one lies within the match radius/window.
-    fn take_matching_grave(&mut self, x: f32, y: f32, time: i64) -> Option<i32> {
+    /// Assign buffered gravestones to departed participants closest pair first,
+    /// consuming the claimed graves. Each participant claims at most one grave and
+    /// each grave is claimed at most once; resolving the closest pairs before the
+    /// farther ones is what stops a clustered death from stealing the grave that
+    /// sits on a neighbour, which would otherwise leave that neighbour with no
+    /// grave at all (and mark them Nexused despite having died).
+    fn match_graves_nearest_first(
+        &mut self,
+        departures: &[(usize, Departure, bool)],
+    ) -> Vec<Option<i32>> {
         let r2 = GRAVE_MATCH_RADIUS * GRAVE_MATCH_RADIUS;
-        let mut best: Option<(usize, f32)> = None;
-        for (i, g) in self.recent_graves.iter().enumerate() {
-            if (g.time - time).abs() > GRAVE_MATCH_WINDOW_MS {
-                continue;
-            }
-            let dx = g.x - x;
-            let dy = g.y - y;
-            let dist2 = dx * dx + dy * dy;
-            if dist2 <= r2 && best.is_none_or(|(_, b)| dist2 < b) {
-                best = Some((i, dist2));
+        let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+        for (di, (_, d, _)) in departures.iter().enumerate() {
+            for (gi, g) in self.recent_graves.iter().enumerate() {
+                if (g.time - d.time).abs() > GRAVE_MATCH_WINDOW_MS {
+                    continue;
+                }
+                let dx = g.x - d.x;
+                let dy = g.y - d.y;
+                let dist2 = dx * dx + dy * dy;
+                if dist2 <= r2 {
+                    pairs.push((dist2, di, gi));
+                }
             }
         }
-        let (idx, _) = best?;
-        self.recent_graves.remove(idx).map(|g| g.grave_type)
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut assigned = vec![None; departures.len()];
+        let mut claimed = vec![false; self.recent_graves.len()];
+        for (_, di, gi) in pairs {
+            if assigned[di].is_none() && !claimed[gi] {
+                assigned[di] = Some(self.recent_graves[gi].grave_type);
+                claimed[gi] = true;
+            }
+        }
+        if claimed.iter().any(|c| *c) {
+            self.recent_graves = self
+                .recent_graves
+                .iter()
+                .zip(&claimed)
+                .filter(|(_, c)| !**c)
+                .map(|(g, _)| *g)
+                .collect();
+        }
+        assigned
     }
 
     /// Resolve each participant's end status (present / died / nexused), consuming
@@ -3598,7 +3625,13 @@ impl CombatTracker {
         local_char_id: i32,
         local_left: bool,
     ) {
-        for p in participants.iter_mut() {
+        // Participants that left the fight and may still own a gravestone, with
+        // their departure and whether the death broadcast confirmed them. Graves
+        // are assigned after the loop so the matching can run nearest-first across
+        // the whole roster instead of in roster order (see `match_graves_nearest_first`).
+        let mut departed: Vec<(usize, Departure, bool)> = Vec::new();
+
+        for (idx, p) in participants.iter_mut().enumerate() {
             // The local player's death is authoritative (from `CharacterDied`), and
             // overrides presence: on a death-to-nexus map change the local object
             // is still in `objects` when this finalize runs.
@@ -3637,19 +3670,26 @@ impl CombatTracker {
             // (type 0, which the UI renders as the default gravestone).
             let name_died = self.remote_death_in_window(&p.name, started, ended);
             // Only a departure inside this fight's lifetime can carry a grave.
-            let dep = self
+            match self
                 .departures
                 .get(&p.object_id)
                 .copied()
-                .filter(|d| d.time >= started - DEPARTURE_GRACE_MS);
-            let grave_type = dep.and_then(|d| self.take_matching_grave(d.x, d.y, d.time));
-            p.end_status = match (grave_type, name_died) {
+                .filter(|d| d.time >= started - DEPARTURE_GRACE_MS)
+            {
+                Some(dep) => departed.push((idx, dep, name_died)),
+                None if name_died => p.end_status = ParticipantEndStatus::Died { grave_type: 0 },
+                None => p.end_status = ParticipantEndStatus::Present,
+            }
+        }
+
+        let graves = self.match_graves_nearest_first(&departed);
+        for (i, (idx, _, name_died)) in departed.iter().enumerate() {
+            participants[*idx].end_status = match (graves[i], name_died) {
                 (Some(grave_type), _) => ParticipantEndStatus::Died { grave_type },
                 (None, true) => ParticipantEndStatus::Died { grave_type: 0 },
                 // No death evidence: a departure inside the fight means they left
                 // (nexused); no departure means they were simply present.
-                (None, false) if dep.is_some() => ParticipantEndStatus::Nexused,
-                (None, false) => ParticipantEndStatus::Present,
+                (None, false) => ParticipantEndStatus::Nexused,
             };
         }
     }
@@ -3661,10 +3701,10 @@ impl CombatTracker {
         self.pending_local_grave = Some((char_id, gravestone_type, time_ms));
     }
 
-    /// Record a remote player's death from the server death-broadcast text
-    /// ("<name> died at level N, killed by <killer>"). Buffered by name until the
-    /// current fight(s) finalize; this authoritative signal is what marks a
-    /// clustered-death player as Died even when their gravestone couldn't be
+    /// Record a remote player's death from the server death broadcast (`s.death`,
+    /// rendering as "<name> died at level N, killed by <killer>"). Buffered by name
+    /// until the current fight(s) finalize; this authoritative signal is what marks
+    /// a clustered-death player as Died even when their gravestone couldn't be
     /// position-correlated (see `resolve_end_statuses`).
     pub fn on_remote_death(&mut self, player_name: &str, time_ms: i64) {
         let key = sanitize_player_name(player_name).to_ascii_lowercase();
@@ -4399,6 +4439,58 @@ mod tests {
         assert_eq!(ps[1].end_status, ParticipantEndStatus::Nexused);
         assert_eq!(ps[2].end_status, ParticipantEndStatus::Present);
         // The grave was consumed so it cannot be claimed twice.
+        assert!(t.recent_graves.is_empty());
+    }
+
+    #[test]
+    fn end_status_clustered_deaths_each_claim_their_own_grave() {
+        // Two players die within the match radius of each other and of both
+        // graves. Roster order must not decide ownership: the nearer departure
+        // claims its own grave and the other is left with its grave, not Nexused.
+        let mut t = CombatTracker::new();
+        // Listed farthest-first, which is what used to steal the near grave.
+        t.departures.insert(
+            1,
+            Departure {
+                x: 12.0,
+                y: 12.0,
+                time: 1_000,
+            },
+        );
+        t.departures.insert(
+            2,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 1_000,
+            },
+        );
+        // Grave A sits on participant 2, grave B on participant 1.
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1829,
+            x: 10.1,
+            y: 10.1,
+            time: 1_100,
+        });
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1837,
+            x: 12.1,
+            y: 12.1,
+            time: 1_100,
+        });
+
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
+        assert_eq!(
+            ps[1].end_status,
+            ParticipantEndStatus::Died { grave_type: 1829 }
+        );
+        // Both graves were consumed.
         assert!(t.recent_graves.is_empty());
     }
 

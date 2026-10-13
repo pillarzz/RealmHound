@@ -166,14 +166,38 @@ fn parse_area_unlock(text: &str) -> Option<AreaUnlockMsg> {
 }
 
 /// Recognize a server death-broadcast line and extract the dead player's name
-/// (and killer). RotMG announces every death in an instance as a Text message
-/// like "Yumiho died at level 20, killed by Plagued Honey"; this is the reliable
-/// death signal for the combat tracker (position-based grave correlation
-/// mis-assigns graves when several players die in a tight cluster). Parses the
-/// name from the text; falls back to the packet `name` field when the line
-/// begins with "died at level". Returns `(player, killer)`.
+/// (and killer). RotMG announces every death in an instance, and that broadcast
+/// is the reliable death signal for the combat tracker (position-based grave
+/// correlation mis-assigns graves when several players die in a tight cluster).
+/// Returns `(player, killer)`.
+///
+/// The server sends the broadcast as the localized stringlist key with its
+/// placeholders, never the rendered sentence:
+/// `{"k":"s.death","t":{"player":"Yumiho","level":"20","enemy":"Plagued Honey"}}`
+/// (`s.death` renders as `{player} died at level {level}, killed by {enemy}`).
+/// The already-rendered sentence form is still accepted for robustness, and the
+/// packet `name` field is the fallback when it carries the victim (it is
+/// `#`-prefixed on server messages).
 fn parse_remote_death(sender: &str, text: &str) -> Option<(String, String)> {
     let text = text.trim();
+
+    if text.contains("\"s.death\"") {
+        let victim = ["player", "PLAYER", "Player"]
+            .into_iter()
+            .find_map(|key| extract_json_string_field(text, key))
+            .or_else(|| sender_name(sender))?;
+        // The killer is context for the log only, so a missing placeholder is fine.
+        let killer = ["enemy", "ENEMY", "Enemy"]
+            .into_iter()
+            .find_map(|key| extract_json_string_field(text, key))
+            .unwrap_or_default();
+        let victim = victim.trim();
+        if victim.is_empty() {
+            return None;
+        }
+        return Some((victim.to_string(), killer.trim().to_string()));
+    }
+
     // The name precedes " died at level "; when the text itself begins with
     // "died at level" the name lives in the packet's sender field instead.
     let (before, after) = if let Some(rest) = text.strip_prefix("died at level ") {
@@ -187,7 +211,7 @@ fn parse_remote_death(sender: &str, text: &str) -> Option<(String, String)> {
         .map(|(_, k)| k.trim().trim_end_matches('.').trim().to_string())
         .unwrap_or_default();
     let name = if before.is_empty() {
-        sender.trim().to_string()
+        sender_name(sender).unwrap_or_default()
     } else {
         before.trim().to_string()
     };
@@ -195,6 +219,13 @@ fn parse_remote_death(sender: &str, text: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name, killer))
+}
+
+/// The victim carried in a Text packet's `name` field, if any. Server messages
+/// prefix it with `#` (e.g. `#Oryx the Mad God`), which is not part of the name.
+fn sender_name(sender: &str) -> Option<String> {
+    let name = sender.trim().trim_start_matches('#').trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// - `{"k":"s.dungeon_unlocked_by","t":{"name":"Wine Cellar","player":"Jeff",}}`
@@ -2302,7 +2333,7 @@ impl PacketProcessor {
                     self.apply_area_unlock(msg);
                 }
 
-                // Server death broadcast ("<name> died at level N, killed by ...").
+                // Server death broadcast ("Player died at level N, killed by ...").
                 // Authoritative remote-death signal for the combat tracker.
                 if let Some((victim, killer)) = parse_remote_death(&text.name, &text.text) {
                     tracing::info!(
@@ -2311,6 +2342,15 @@ impl PacketProcessor {
                         killer
                     );
                     self.combat.on_remote_death(&victim, now_ms());
+                } else if text.text.contains("\"s.death\"") {
+                    // A death broadcast we could not decode: record the raw shape
+                    // so a payload change can be spotted instead of silently
+                    // dropping the authoritative death signal.
+                    tracing::warn!(
+                        "[COMBAT] Undecoded death broadcast: name='{}' text='{}'",
+                        text.name,
+                        text.text
+                    );
                 }
 
                 // Boss taunts drive the Marble Colossus survival-phase split off
@@ -4172,6 +4212,32 @@ mod remote_death_tests {
             parse_remote_death("", "Zannmp died at level 20, killed by Killer Bee Queen.").unwrap();
         assert_eq!(name, "Zannmp");
         assert_eq!(killer, "Killer Bee Queen");
+    }
+
+    #[test]
+    fn parses_the_stringlist_key_the_server_actually_sends() {
+        // `s.death` renders as "{player} died at level {level}, killed by {enemy}";
+        // the packet carries the key plus its placeholders, not the sentence.
+        let raw =
+            r#"{"k":"s.death","t":{"player":"Pillar","level":"20","enemy":"Oryx the Mad God"},}"#;
+        let (name, killer) = parse_remote_death("", raw).unwrap();
+        assert_eq!(name, "Pillar");
+        assert_eq!(killer, "Oryx the Mad God");
+    }
+
+    #[test]
+    fn death_key_falls_back_to_the_packet_sender() {
+        // Older/other payloads carry the victim in the packet name field, which
+        // server messages prefix with '#'.
+        let (name, killer) = parse_remote_death("#Pillar", r#"{"k":"s.death"}"#).unwrap();
+        assert_eq!(name, "Pillar");
+        assert_eq!(killer, "");
+    }
+
+    #[test]
+    fn death_key_without_any_victim_is_ignored() {
+        assert!(parse_remote_death("", r#"{"k":"s.death"}"#).is_none());
+        assert!(parse_remote_death("#", r#"{"k":"s.death","t":{"level":"20"}}"#).is_none());
     }
 
     #[test]

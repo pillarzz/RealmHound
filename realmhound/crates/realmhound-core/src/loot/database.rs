@@ -60,6 +60,12 @@ pub struct LootDropRecord {
     pub bag_type: i32,
     /// Mob type ID that dropped the bag
     pub mob_type: i32,
+    /// Object type whose current name and sprite represent the source in the UI:
+    /// one variant per encounter (the one dropped most recently), so a history
+    /// that spans a seasonal reskin reads and draws uniformly. Equal to
+    /// `mob_type` for a source with no reskin. Kept separate so combat
+    /// correlation and filtering keep using the stored id.
+    pub display_object_type: i32,
     /// Mob name (resolved from ID)
     pub mob_name: String,
     /// Items in the bag
@@ -2146,6 +2152,7 @@ impl LootDatabase {
             .query_map([limit], Self::row_to_drop)?
             .collect::<SqlResult<Vec<_>>>()?;
 
+        let drops = self.apply_display_variants(drops)?;
         self.load_items_for_drops(drops)
     }
 
@@ -2409,6 +2416,7 @@ impl LootDatabase {
             .query_map(param_refs.as_slice(), Self::row_to_drop)?
             .collect::<SqlResult<Vec<_>>>()?;
 
+        let drops = self.apply_display_variants(drops)?;
         self.load_items_for_drops(drops)
     }
 
@@ -2574,6 +2582,7 @@ impl LootDatabase {
         let skin_id: i32 = row.get::<_, i32>("skin_id").unwrap_or(0);
         let tex1: u32 = row.get::<_, i32>("tex1").unwrap_or(0) as u32;
         let tex2: u32 = row.get::<_, i32>("tex2").unwrap_or(0) as u32;
+        let mob_type: i32 = row.get("mob_type")?;
 
         Ok(LootDropRecord {
             id: row.get("id")?,
@@ -2592,10 +2601,68 @@ impl LootDatabase {
             loot_drop_active: row.get::<_, i32>("loot_drop_active")? != 0,
             loot_tier_active: row.get::<_, i32>("loot_tier_active")? != 0,
             bag_type: row.get("bag_type")?,
-            mob_type: row.get("mob_type")?,
+            mob_type,
+            // Defaults to the stored type; the list calls resolve the encounter's
+            // display variant once per load (see `apply_display_variants`).
+            display_object_type: mob_type,
             mob_name: row.get("mob_name")?,
             items: Vec::new(),
         })
+    }
+
+    /// One display variant per reskinned source: the variant whose bag dropped
+    /// most recently, keyed by canonical type. Resolved once per list load so
+    /// every row for one encounter shows a single name and sprite, whichever
+    /// variant's id each drop was stored under (the stored ids are never
+    /// changed). Sources with no reskin never appear.
+    fn display_variants(&self) -> SqlResult<std::collections::HashMap<i32, i32>> {
+        let groups = crate::assets::encounter_reskin_groups();
+        let tracked: Vec<i32> = groups
+            .iter()
+            .flat_map(|group| group.iter().copied())
+            .collect();
+        if tracked.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", tracked.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT mob_type, MAX(timestamp) FROM loot_drops
+             WHERE mob_type IN ({placeholders}) GROUP BY mob_type"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let latest: std::collections::HashMap<i32, i64> = stmt
+            .query_map(rusqlite::params_from_iter(tracked.iter()), |row| {
+                Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<SqlResult<_>>()?;
+        let mut out = std::collections::HashMap::new();
+        for group in groups {
+            let observed = group
+                .iter()
+                .filter_map(|t| latest.get(t).map(|recency| (*t, *recency)));
+            if let Some(display) = crate::assets::encounter_display_variant(observed) {
+                out.insert(crate::assets::encounter_canonical_type(display), display);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Point every drop's `display_object_type` at its encounter's display
+    /// variant (see [`Self::display_variants`]).
+    fn apply_display_variants(&self, drops: Vec<LootDropRecord>) -> SqlResult<Vec<LootDropRecord>> {
+        let variants = self.display_variants()?;
+        Ok(drops
+            .into_iter()
+            .map(|mut drop| {
+                drop.display_object_type = variants
+                    .get(&crate::assets::encounter_canonical_type(drop.mob_type))
+                    .copied()
+                    .unwrap_or(drop.mob_type);
+                drop
+            })
+            .collect())
     }
 
     /// Load items for a list of drops.

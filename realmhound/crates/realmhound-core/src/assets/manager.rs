@@ -917,6 +917,38 @@ const ENCOUNTER_RESKIN_GROUPS: &[&[i32]] = &[
     &[2354, 28989],        // Oryx the Mad God 2 / Infested
 ];
 
+/// Stable, season-independent names for the encounters in
+/// [`ENCOUNTER_RESKIN_GROUPS`], in the same order: the classic name first, then
+/// every seasonal name the encounter has shipped under.
+///
+/// The assets only ever name the variant that is live *now* ("New Grand Sphinx"
+/// today, "Withered Sphinx" during a past Halloween), so an alias list built from
+/// them alone stops matching the moment Deca renames the assets again: a search
+/// for a name from a previous season would silently find nothing. These names are
+/// baked in for search only — they never change what is displayed (see
+/// [`encounter_display_variant`]).
+const ENCOUNTER_RESKIN_NAMES: &[&[&str]] = &[
+    &["Grand Sphinx", "Withered Sphinx"],
+    &["Cube God", "Calcium God"],
+    &["Skull Shrine", "Pumpkin Shrine"],
+    &["Ghost Ship", "The Flying Dutchman"],
+    &["Hermit God", "Reanimated Hermit God"],
+    &["Hermit God Tentacle", "Reanimated Hermit God Tentacle"],
+    &["Jade Statue", "Blue Oni"],
+    &["Garnet Statue", "Red Oni"],
+    &[
+        "Oryx Stone Guardian Right",
+        "Infested Oryx Stone Guardian Right",
+    ],
+    &[
+        "Oryx Stone Guardian Left",
+        "Infested Oryx Stone Guardian Left",
+    ],
+    &["Janus the Doorwarden", "Infested Janus the Doorwarden"],
+    &["Oryx the Mad God 1", "Infested Oryx the Mad God 1"],
+    &["Oryx the Mad God 2", "Infested Oryx the Mad God 2"],
+];
+
 /// The reskin group containing `object_type`, or `None`.
 fn reskin_group(object_type: i32) -> Option<&'static [i32]> {
     ENCOUNTER_RESKIN_GROUPS
@@ -941,10 +973,38 @@ pub fn encounter_variant_types(object_type: i32) -> Vec<i32> {
         .unwrap_or_else(|| vec![object_type])
 }
 
+/// The known seasonal-reskin groups: each group's object types are the same
+/// encounter shipped under different ids. Used by the history databases to look
+/// up one display variant per encounter.
+pub fn encounter_reskin_groups() -> &'static [&'static [i32]] {
+    ENCOUNTER_RESKIN_GROUPS
+}
+
+/// The object type that should represent an encounter in the UI, chosen from the
+/// variants observed in the account's own records.
+///
+/// `observed` pairs a variant object type with a recency stamp (any monotonic
+/// unit of the caller's choosing); the most recent variant wins. An encounter is
+/// therefore named and drawn by whichever variant was live when it was last
+/// played, so every card, tag and sprite reads uniformly regardless of which
+/// variant's id each individual record was stored under (the stored ids are
+/// never changed). Returns `None` when nothing was observed, leaving the
+/// caller's own default in place.
+pub fn encounter_display_variant(observed: impl IntoIterator<Item = (i32, i64)>) -> Option<i32> {
+    observed
+        .into_iter()
+        .max_by_key(|(_, recency)| *recency)
+        .map(|(object_type, _)| object_type)
+}
+
 /// Display names of every reskin encounter one of whose variant names contains
 /// `text` (case-insensitive). Lets a search by either the base name ("Grand
 /// Sphinx") or the reskin name ("Withered Sphinx") match records stored under
 /// the other.
+///
+/// Matches against the stable [`ENCOUNTER_RESKIN_NAMES`] as well as the current
+/// asset names, so a name from a past season keeps working after Deca renames the
+/// assets again.
 pub fn encounter_alias_names_matching(text: &str) -> Vec<String> {
     let needle = text.trim().to_lowercase();
     if needle.is_empty() {
@@ -952,11 +1012,19 @@ pub fn encounter_alias_names_matching(text: &str) -> Vec<String> {
     }
     let manager = get_asset_manager();
     let mut out: Vec<String> = Vec::new();
-    for group in ENCOUNTER_RESKIN_GROUPS {
-        let names: Vec<String> = group
-            .iter()
-            .filter_map(|id| manager.object_name(*id))
-            .collect();
+    for (group, stable) in ENCOUNTER_RESKIN_GROUPS
+        .iter()
+        .copied()
+        .zip(ENCOUNTER_RESKIN_NAMES.iter().copied())
+    {
+        let mut names: Vec<String> = stable.iter().map(|n| (*n).to_string()).collect();
+        for id in group {
+            if let Some(name) = manager.object_name(*id) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
         if names.iter().any(|n| n.to_lowercase().contains(&needle)) {
             for n in names {
                 if !out.contains(&n) {
@@ -5918,6 +5986,67 @@ mod tests {
         // Non-reskin types are their own encounter.
         assert_eq!(encounter_canonical_type(47927), 47927);
         assert_eq!(encounter_variant_types(47927), vec![47927]);
+    }
+
+    #[test]
+    fn every_reskin_group_has_a_stable_name_row() {
+        // The baked-in names are paired with the id groups by position, so the
+        // two tables must stay the same length as encounters are added.
+        assert_eq!(ENCOUNTER_RESKIN_GROUPS.len(), ENCOUNTER_RESKIN_NAMES.len());
+        for (group, names) in ENCOUNTER_RESKIN_GROUPS.iter().zip(ENCOUNTER_RESKIN_NAMES) {
+            assert!(
+                !names.is_empty() && names.len() <= group.len(),
+                "group {group:?} needs one stable name per variant (at least the base)"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_search_keeps_old_seasonal_names_matching() {
+        // "Withered Sphinx" and "Calcium God" are names from past seasons: they
+        // only exist in the stable table, so they must still match after the
+        // assets rename those encounters back (this is the outside-Halloween
+        // search behaviour requested in #56).
+        let withered = encounter_alias_names_matching("Withered Sphinx");
+        assert!(withered.iter().any(|n| n == "Withered Sphinx"));
+        assert!(withered.iter().any(|n| n == "Grand Sphinx"));
+
+        let calcium = encounter_alias_names_matching("calcium god");
+        assert!(calcium
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("Calcium God")));
+        assert!(calcium.iter().any(|n| n.eq_ignore_ascii_case("Cube God")));
+
+        // The classic name still resolves the group, and unrelated text matches
+        // nothing.
+        let grand = encounter_alias_names_matching("Grand Sphinx");
+        assert!(grand.iter().any(|n| n == "Withered Sphinx"));
+        assert!(encounter_alias_names_matching("Withered Sphinx")
+            .iter()
+            .all(|n| !n.contains("Cube God")));
+        assert!(encounter_alias_names_matching("   ").is_empty());
+    }
+
+    #[test]
+    fn display_variant_is_the_most_recently_seen_one() {
+        // One display variant per encounter: whichever was played last, so a
+        // history stored under both the classic and the reskin id reads
+        // uniformly.
+        assert_eq!(
+            encounter_display_variant([(3412, 10), (22000, 40)]),
+            Some(22000)
+        );
+        assert_eq!(
+            encounter_display_variant([(22000, 10), (3412, 40)]),
+            Some(3412)
+        );
+        // A tie resolves to the last maximum in iteration order, so the choice
+        // is deterministic whatever the caller's row order is.
+        assert_eq!(
+            encounter_display_variant([(3412, 7), (22000, 7)]),
+            Some(22000)
+        );
+        assert_eq!(encounter_display_variant(std::iter::empty()), None);
     }
 
     #[test]

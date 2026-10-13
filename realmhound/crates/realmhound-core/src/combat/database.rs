@@ -380,6 +380,12 @@ pub struct FightSummary {
     /// Whether the run was played in The Shatters' hard mode. False for every
     /// other dungeon; set for the whole run when any of its phases recorded it.
     pub shatters_hm: bool,
+    /// Object type whose current name and sprite represent this encounter in the
+    /// UI: one variant per encounter (the most recently recorded one), so a
+    /// history that spans a seasonal reskin reads and draws uniformly. Equal to
+    /// `boss_object_type` when the encounter has no reskin. Kept separate from
+    /// `boss_object_type` so filtering and detection keep using the stored id.
+    pub display_object_type: i32,
 }
 
 impl FightSummary {
@@ -3446,10 +3452,14 @@ impl CombatDatabase {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref()));
+        // One display variant per encounter, so a history stored under both the
+        // classic and the reskin id reads with one name and one portrait.
+        let variants = self.display_variants()?;
         let rows = stmt.query_map(params, |row| {
             let boss_object_type: i32 = row.get(4)?;
             let stored_name: String = row.get(5)?;
-            let boss_name = display_boss_name(boss_object_type, &stored_name);
+            let display_object_type = display_variant_of(&variants, boss_object_type);
+            let boss_name = display_boss_name(display_object_type, &stored_name);
             Ok(FightSummary {
                 id: row.get(0)?,
                 started_at: row.get(1)?,
@@ -3457,6 +3467,7 @@ impl CombatDatabase {
                 dungeon: row.get(3)?,
                 map_seed: row.get(16)?,
                 boss_object_type,
+                display_object_type,
                 boss_name: boss_name.clone(),
                 boss_max_hp: row.get(6)?,
                 boss_start_hp: row.get(7)?,
@@ -3472,7 +3483,7 @@ impl CombatDatabase {
                 encounter_run_id: None,
                 encounter_id: None,
                 phase_count: 1,
-                killed_bosses: vec![(boss_object_type, boss_name)],
+                killed_bosses: vec![(display_object_type, boss_name)],
                 flawless: false,
                 lone_fighter: false,
                 last_hero_standing: false,
@@ -3484,6 +3495,47 @@ impl CombatDatabase {
             })
         })?;
         rows.collect()
+    }
+
+    /// The object type that represents each reskinned encounter for display: the
+    /// variant this database recorded most recently, keyed by canonical type.
+    ///
+    /// Resolved once per list load so every card for one encounter shows a single
+    /// name and sprite, whichever variant's id each row was stored under (the
+    /// stored ids are never changed). Encounters without a reskin are absent:
+    /// their own type is already the display type.
+    fn display_variants(&self) -> SqlResult<HashMap<i32, i32>> {
+        let groups = crate::assets::encounter_reskin_groups();
+        let tracked: Vec<i32> = groups
+            .iter()
+            .flat_map(|group| group.iter().copied())
+            .collect();
+        if tracked.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", tracked.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT boss_object_type, MAX(started_at) FROM fights
+             WHERE boss_object_type IN ({placeholders}) GROUP BY boss_object_type"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let latest: HashMap<i32, i64> = stmt
+            .query_map(rusqlite::params_from_iter(tracked.iter()), |row| {
+                Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<SqlResult<_>>()?;
+        let mut out: HashMap<i32, i32> = HashMap::new();
+        for group in groups {
+            let observed = group
+                .iter()
+                .filter_map(|t| latest.get(t).map(|recency| (*t, *recency)));
+            if let Some(display) = crate::assets::encounter_display_variant(observed) {
+                out.insert(crate::assets::encounter_canonical_type(display), display);
+            }
+        }
+        Ok(out)
     }
 
     /// The anchor phase of a run: the last real (non-aux) boss engaged, which is
@@ -3535,6 +3587,10 @@ impl CombatDatabase {
         if limit <= 0 || run_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
         }
+        // One display variant per encounter (see `display_variants`), so a run
+        // stored under the classic id and one under its seasonal reskin are both
+        // titled and pictured by the same variant.
+        let variants = self.display_variants()?;
 
         let mut sql = String::from(
             "SELECT r.run_id, r.encounter_id, r.dungeon, r.started_at, r.ended_at, r.killed
@@ -3774,14 +3830,16 @@ impl CombatDatabase {
             let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
                 // Realm-grouped encounter: title by the anchor boss's *current*
                 // name so a seasonally-reskinned fight reads uniformly.
-                display_boss_name(boss_object_type, headline)
+                display_boss_name(display_variant_of(&variants, boss_object_type), headline)
             } else if raw_phase_count > 1 {
                 dungeon.clone()
             } else {
                 phases
                     .iter()
                     .max_by_key(|phase| phase.4)
-                    .map(|phase| display_boss_name(phase.0, &phase.5))
+                    .map(|phase| {
+                        display_boss_name(display_variant_of(&variants, phase.0), &phase.5)
+                    })
                     .unwrap_or_else(|| dungeon.clone())
             };
             let local_char_id = phases
@@ -3800,20 +3858,23 @@ impl CombatDatabase {
             ordered.sort_by_key(|phase| (phase.7, phase.4));
             for phase in &ordered {
                 let is_real = crate::assets::aux_target_for_type(phase.0).is_none();
-                if is_real && phase.3 && !killed_bosses.iter().any(|(t, _)| *t == phase.0) {
+                let display_type = display_variant_of(&variants, phase.0);
+                if is_real && phase.3 && !killed_bosses.iter().any(|(t, _)| *t == display_type) {
                     killed_bosses.push((
-                        phase.0,
-                        strip_boss_phase_suffix(&display_boss_name(phase.0, &phase.5)).to_string(),
+                        display_type,
+                        strip_boss_phase_suffix(&display_boss_name(display_type, &phase.5))
+                            .to_string(),
                     ));
                 }
             }
             if killed_bosses.is_empty() {
                 for phase in &ordered {
                     let is_real = crate::assets::aux_target_for_type(phase.0).is_none();
-                    if is_real && !killed_bosses.iter().any(|(t, _)| *t == phase.0) {
+                    let display_type = display_variant_of(&variants, phase.0);
+                    if is_real && !killed_bosses.iter().any(|(t, _)| *t == display_type) {
                         killed_bosses.push((
-                            phase.0,
-                            strip_boss_phase_suffix(&display_boss_name(phase.0, &phase.5))
+                            display_type,
+                            strip_boss_phase_suffix(&display_boss_name(display_type, &phase.5))
                                 .to_string(),
                         ));
                     }
@@ -3837,7 +3898,10 @@ impl CombatDatabase {
                 .find_map(|phase| crate::assets::encounter_for_boss_type(phase.0));
             if let Some(enc) = real_enc {
                 if crate::assets::encounter_headline_only(enc.id) {
-                    killed_bosses = vec![(enc.anchor_type, enc.display_name.to_string())];
+                    killed_bosses = vec![(
+                        display_variant_of(&variants, enc.anchor_type),
+                        enc.display_name.to_string(),
+                    )];
                     // The card's picture is always the headline boss's, even when
                     // only escaping segments took damage and the anchor phase was
                     // never recorded (e.g. Towering Perfection's core).
@@ -3852,6 +3916,7 @@ impl CombatDatabase {
                 dungeon,
                 map_seed: phases.first().map(|p| p.8).unwrap_or(0),
                 boss_object_type,
+                display_object_type: display_variant_of(&variants, boss_object_type),
                 boss_name: display_name,
                 boss_max_hp,
                 boss_start_hp,
@@ -5506,6 +5571,16 @@ fn pick_anchor(phases: &[PhaseStat]) -> Option<(i32, i32, i32, bool)> {
     Some((best.0, best.1, best.2, run_killed(enc_id, phases, best.3)))
 }
 
+/// The display variant of `object_type`'s encounter per a [`CombatDatabase`]
+/// `display_variants` lookup, falling back to `object_type` itself for an
+/// encounter with no reskin (or none recorded yet).
+fn display_variant_of(variants: &HashMap<i32, i32>, object_type: i32) -> i32 {
+    variants
+        .get(&crate::assets::encounter_canonical_type(object_type))
+        .copied()
+        .unwrap_or(object_type)
+}
+
 /// Display name for a boss phase: restores the Prismimic Attacker/Defender
 /// distinction (both share the game DisplayId "Prismimic") so the two mirror
 /// rows read clearly; every other boss keeps its stored name.
@@ -5575,6 +5650,41 @@ mod tests {
         );
         // Never present anywhere -> stays nexused.
         assert_eq!(combine_end_status(Nexused, Nexused), Nexused);
+    }
+
+    #[test]
+    fn reskinned_encounter_history_reads_with_one_display_variant() {
+        // A classic Sphinx fight and a "Withered Sphinx" (its seasonal reskin) are
+        // the same encounter. The list must label and picture both rows with the
+        // variant the player fought most recently -- not each row's own stored id,
+        // which is what made one history show two different boss names.
+        fn sphinx(object_type: i32, name: &str, started_at: i64) -> CompletedFight {
+            let mut fight = sample_fight();
+            fight.boss_object_type = object_type;
+            fight.boss_name = name.to_string();
+            fight.started_at = started_at;
+            fight.ended_at = started_at + 10_000;
+            fight
+        }
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        db.insert_fight(&sphinx(3412, "Grand Sphinx", 1_000))
+            .unwrap();
+        db.insert_fight(&sphinx(22000, "Withered Sphinx", 50_000))
+            .unwrap();
+
+        let rows = db
+            .standalone_summaries(&FightQuery::default(), 10, None)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Stored ids are untouched (newest fight first) ...
+        assert_eq!(rows[0].boss_object_type, 22000);
+        assert_eq!(rows[1].boss_object_type, 3412);
+        // ... while both rows share the encounter's one display variant (the most
+        // recently fought one). The name and portrait are resolved from that
+        // variant, so every row for the encounter reads and draws identically: a
+        // classic row can no longer say "Grand Sphinx" beside a reskin row.
+        assert_eq!(rows[0].display_object_type, 22000);
+        assert_eq!(rows[1].display_object_type, 22000);
     }
 
     fn sample_fight() -> CompletedFight {

@@ -1336,17 +1336,26 @@ impl LootPanel {
         ui.add_space(4.0);
 
         // Mob sprite (with tooltip for mob name) - CLICKABLE
+        // One display variant per encounter (the one dropped most recently), so
+        // every row of a seasonally reskinned source shows the same name and
+        // sprite whichever variant's id the drop was stored under.
         if clickable {
             if let Some((mob_type, mob_name)) = Self::render_mob_sprite_clickable(
                 ui,
-                drop.mob_type,
+                drop.display_object_type,
                 &drop.mob_name,
                 sprite_renderer,
             ) {
                 click_action = Some(HistoryClickAction::FilterMob(mob_type, mob_name));
             }
         } else {
-            Self::render_mob_sprite_impl(ui, drop.mob_type, &drop.mob_name, sprite_renderer, false);
+            Self::render_mob_sprite_impl(
+                ui,
+                drop.display_object_type,
+                &drop.mob_name,
+                sprite_renderer,
+                false,
+            );
         }
 
         ui.add_space(8.0);

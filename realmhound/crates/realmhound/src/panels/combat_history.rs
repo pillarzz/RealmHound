@@ -1905,11 +1905,11 @@ impl CombatHistoryPanel {
                 // Boss portrait (click -> boss filter).
                 let (brect, bresp) =
                     cui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
-                if fight.boss_object_type != 0 {
+                if fight.display_object_type != 0 {
                     draw_boss_sprite(
                         ctx.sprite_renderer,
                         cui,
-                        fight.boss_object_type,
+                        fight.display_object_type,
                         fight.shatters_hm,
                         brect,
                     );
@@ -1929,15 +1929,15 @@ impl CombatHistoryPanel {
                 let boss_display = fight
                     .killed_bosses
                     .iter()
-                    .find(|(t, _)| *t == fight.boss_object_type)
+                    .find(|(t, _)| *t == fight.display_object_type)
                     .map(|(_, n)| n.clone())
                     .unwrap_or_else(|| fight.boss_name.clone());
                 if bresp
                     .hover_tip(format!("{}\n(Click to filter)", boss_display))
                     .clicked()
-                    && fight.boss_object_type != 0
+                    && fight.display_object_type != 0
                 {
-                    set_boss = Some((fight.boss_object_type, boss_display.clone()));
+                    set_boss = Some((fight.display_object_type, boss_display.clone()));
                 }
 
                 // Character sprite (moved to the left, same size as the portal

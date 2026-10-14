@@ -2913,6 +2913,19 @@ impl PacketProcessor {
                         // Fold NewTick stat deltas (e.g. a stat maxed mid-run)
                         // into the live stats accumulator.
                         self.merge_live_stats(status);
+                        // The Blood Ritual's active tier arrives as a string stat
+                        // (155) holding the definition id; an empty string means no
+                        // ritual is active. The server sends it on every toggle, so
+                        // this is what keeps the cached tier current.
+                        for stat in &status.stats {
+                            if stat.stat_type_id == 155 {
+                                let id = stat.string_stat_value.as_deref().unwrap_or("");
+                                if self.account_data.characters.set_active_blood_ritual_id(id) {
+                                    self.account_data.mark_dirty();
+                                    self.char_view_gen += 1;
+                                }
+                            }
+                        }
                     }
                 }
                 // Keep the live character's alive fame current from the observed

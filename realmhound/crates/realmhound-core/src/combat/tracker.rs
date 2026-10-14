@@ -1369,12 +1369,12 @@ impl CombatTracker {
         } else {
             0
         };
-        // Diagnostic: the Blood Ritual (stat 155) and Crucible (stat 128) markers are
-        // the only server signal for those challenges. A numeric read alone proved
-        // useless (every sample is 0, for the local player and for others alike), so
-        // dump the *whole* update that mentions either one -- every id plus its
-        // numeric, string and secondary values -- to find where the challenge state
-        // actually lives. Bounded to those updates, which are rare.
+        // Diagnostic: the Blood Ritual (stat 155) and Crucible (stat 128) markers
+        // are the only server signal for those challenges, and their meaning lives
+        // in the *string* field (the active definition's id), not the number. Kept
+        // at debug level: the processor consumes stat 155 for the live tier, and
+        // the whole-update dump stays available when a new marker needs decoding.
+        // Bounded to updates that mention either id, which are rare.
         if status
             .stats
             .iter()
@@ -1394,7 +1394,7 @@ impl CombatTracker {
                     out
                 })
                 .collect();
-            tracing::info!(
+            tracing::debug!(
                 "challenge marker update (object {}, local={}): {}",
                 object_id,
                 object_id == self.local_object_id,

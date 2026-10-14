@@ -7,6 +7,7 @@
 //! "theoretical" -- they assume out-of-combat regen and, unless a target
 //! defense is supplied, a defenseless target with every projectile landing.
 
+use crate::api::blood_ritual::BloodRitualDef;
 use crate::api::crucible::CrucibleDef;
 use crate::assets::{
     AbilityEffect, AssetManager, EnchantEffectKind, ProcEffect, ProcTrigger, ScalingStat,
@@ -52,19 +53,28 @@ pub struct Attribute {
     pub exalt: i32,
     /// Crucible flat stat modifier (integer per-stat), if crucible-active.
     pub crucible: i32,
+    /// Blood Ritual max-HP modifier (integer), if a ritual tier is active. Kept
+    /// separate from `crucible` so the readout can show each challenge's own
+    /// contribution.
+    pub blood_ritual: i32,
 }
 
 impl Attribute {
     /// Effective total. The relative-stat halving (e.g. Wretched Rags) can yield
     /// a `.5` fraction; the game rounds to nearest for display, so we do too.
     pub fn total(&self) -> i32 {
-        (self.base as f32 + self.gear + self.exalt as f32 + self.crucible as f32).round() as i32
+        (self.base as f32
+            + self.gear
+            + self.exalt as f32
+            + self.crucible as f32
+            + self.blood_ritual as f32)
+            .round() as i32
     }
 
     /// Gear bonus for display, derived so that `base + this + exalt + crucible
     /// == total()` (avoids a rounded gear bracket contradicting the total).
     pub fn gear_display(&self) -> i32 {
-        self.total() - self.base - self.exalt - self.crucible
+        self.total() - self.base - self.exalt - self.crucible - self.blood_ritual
     }
 }
 
@@ -531,6 +541,10 @@ pub struct Loadout {
     /// Active Crucible definition to apply, populated only when the character
     /// carries the crucible marker. Flat stat mods fold into effective stats.
     pub crucible: Option<CrucibleDef>,
+    /// Active Blood Ritual tier, populated when the `BloodRitual` stat names one.
+    /// Its max-HP multiplier folds into the effective stats, its damage
+    /// multiplier into weapon damage.
+    pub blood_ritual: Option<BloodRitualDef>,
 }
 
 // --- RotMG formula helpers -------------------------------------------------
@@ -923,15 +937,24 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
         }
     }
 
+    // Blood Ritual: one max-HP multiplier over the base stat. Its tiers trade HP
+    // for damage, so it scales the stat the character brought in -- the same rule
+    // the Crucible's percentage mods follow -- and lands in its own bracket so the
+    // readout can attribute the change to the ritual rather than to gear.
+    let mut blood_mods = [0.0f32; 8];
+    if let Some(def) = &loadout.blood_ritual {
+        blood_mods[0] = (base[0] * (def.hp_mult - 1.0)).round();
+    }
+
     let attributes = Attributes {
-        max_hp: attr(&base, &gear, &exalt, &crucible_mods, 0),
-        max_mp: attr(&base, &gear, &exalt, &crucible_mods, 1),
-        attack: attr(&base, &gear, &exalt, &crucible_mods, 2),
-        defense: attr(&base, &gear, &exalt, &crucible_mods, 3),
-        speed: attr(&base, &gear, &exalt, &crucible_mods, 4),
-        dexterity: attr(&base, &gear, &exalt, &crucible_mods, 5),
-        vitality: attr(&base, &gear, &exalt, &crucible_mods, 6),
-        wisdom: attr(&base, &gear, &exalt, &crucible_mods, 7),
+        max_hp: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 0),
+        max_mp: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 1),
+        attack: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 2),
+        defense: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 3),
+        speed: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 4),
+        dexterity: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 5),
+        vitality: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 6),
+        wisdom: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 7),
     };
 
     let effective = EffectiveStats {
@@ -1002,6 +1025,7 @@ fn attr(
     gear: &[f32; 8],
     exalt: &[f32; 8],
     crucible: &[f32; 8],
+    blood_ritual: &[f32; 8],
     i: usize,
 ) -> Attribute {
     Attribute {
@@ -1009,6 +1033,7 @@ fn attr(
         gear: gear[i],
         exalt: exalt[i] as i32,
         crucible: crucible[i] as i32,
+        blood_ritual: blood_ritual[i] as i32,
     }
 }
 
@@ -2382,6 +2407,39 @@ mod tests {
         assert_eq!(d.attributes.wisdom.total(), 66);
         // Untouched stats stay clean.
         assert_eq!(d.attributes.attack.crucible, 0);
+    }
+
+    #[test]
+    fn blood_ritual_scales_max_hp_in_its_own_bracket() {
+        // Tier 1 of the season's ritual: "−20% HP Penalty" (max HP x0.8). It must
+        // move the HP total while being attributable to the ritual rather than to
+        // gear, and it must not touch the other seven stats.
+        use crate::api::blood_ritual::BloodRitualDef;
+        let def = BloodRitualDef {
+            id: "5027802235043840".into(),
+            tier: 1,
+            hp_mult: 0.8,
+            damage_mult: 1.24,
+            loot_pct: 25.0,
+        };
+        let loadout = Loadout {
+            base: BaseStats {
+                max_hp: 700,
+                ..Default::default()
+            },
+            blood_ritual: Some(def),
+            ..Default::default()
+        };
+        let d = derive(&AssetManager::new(), &loadout);
+        assert_eq!(d.attributes.max_hp.blood_ritual, -140);
+        assert_eq!(d.attributes.max_hp.total(), 560);
+        assert_eq!(
+            d.attributes.max_hp.gear_display(),
+            0,
+            "the ritual must not appear as a gear bonus"
+        );
+        assert_eq!(d.attributes.attack.blood_ritual, 0);
+        assert_eq!(d.attributes.attack.total(), 0);
     }
 
     #[test]

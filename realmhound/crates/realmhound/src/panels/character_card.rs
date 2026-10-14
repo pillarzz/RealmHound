@@ -37,6 +37,10 @@ pub const FAME_SPRITE_ID: i32 = 24102;
 /// Object ID for the "Gold Shop Icon Object" sprite used as the gold coin icon.
 pub const GOLD_SPRITE_ID: i32 = 0x67FF;
 
+/// Object ID for the Lucky Clover sprite, used as the loot-boost icon on the
+/// card's info row (the same icon the Bonuses section uses for Loot Boost).
+pub const LOOT_BOOST_SPRITE_ID: i32 = 0xcc2;
+
 /// Draw a small pill, roughly half the size of the Missions-tab badge. The text
 /// gets a 1px black outline so it stays legible over any card background.
 fn draw_pill(ui: &mut egui::Ui, text: &str, background: Color32) {
@@ -234,6 +238,10 @@ pub struct CharacterCardWidget {
     /// game in safe areas/loading). Only rendered on the live card; `None`
     /// hides the boost line.
     pub loot_boost_secs: Option<u32>,
+    /// Whether this character has a Blood Ritual in effect, resolved by the caller
+    /// against the tiers the feed delivered. Passed in rather than read off the
+    /// character so the pill is right regardless of refresh timing.
+    blood_ritual_active: bool,
     /// Whether to render the main inventory section.
     pub show_inventory: bool,
     /// Whether to render the backpack section.
@@ -258,6 +266,7 @@ impl CharacterCardWidget {
             stat_display: StatDisplay::None,
             pet: None,
             loot_boost_secs: None,
+            blood_ritual_active: false,
             show_inventory: true,
             show_backpack: true,
             show_extender: true,
@@ -277,6 +286,7 @@ impl CharacterCardWidget {
             stat_display: StatDisplay::None,
             pet: None,
             loot_boost_secs: None,
+            blood_ritual_active: false,
             show_inventory: true,
             show_backpack: true,
             show_extender: true,
@@ -299,6 +309,7 @@ impl CharacterCardWidget {
             stat_display: StatDisplay::None,
             pet: None,
             loot_boost_secs: None,
+            blood_ritual_active: false,
             show_inventory: true,
             show_backpack: true,
             show_extender: true,
@@ -332,6 +343,11 @@ impl CharacterCardWidget {
     }
 
     /// Set the live loot-drop-boost remaining seconds shown on the live card.
+    pub fn with_blood_ritual(mut self, blood_ritual_active: bool) -> Self {
+        self.blood_ritual_active = blood_ritual_active;
+        self
+    }
+
     pub fn with_loot_boost(mut self, loot_boost_secs: Option<u32>) -> Self {
         self.loot_boost_secs = loot_boost_secs;
         self
@@ -641,8 +657,8 @@ impl CharacterCardWidget {
                 ui.vertical(|ui| {
                     ui.add_space(2.0);
                     ui.label(RichText::new(display_name).strong().size(14.0).color(name_color));
-                    if char.crucible_active || char.blood_ritual_active {
-                        draw_season_pills(ui, char.crucible_active, char.blood_ritual_active);
+                    if char.crucible_active || self.blood_ritual_active {
+                        draw_season_pills(ui, char.crucible_active, self.blood_ritual_active);
                         ui.add_space(2.0);
                     }
                 });
@@ -701,7 +717,7 @@ impl CharacterCardWidget {
                         // Season-challenge pills on their own row (row 2), under
                         // the name/live status so a tall card keeps its identity
                         // line clear of them.
-                        draw_season_pills(ui, char.crucible_active, char.blood_ritual_active);
+                        draw_season_pills(ui, char.crucible_active, self.blood_ritual_active);
 
                         // Fame on its own row (row 3). Always shown (0 when none)
                         // so the card height stays consistent and a long value
@@ -717,8 +733,47 @@ impl CharacterCardWidget {
                             );
                         });
 
-                        // Id, level, maxed - dot-separated (row 3).
+                        // Loot boost, id, level and maxed on one row (row 4), so
+                        // every card is exactly as tall as its text no matter what
+                        // it carries -- a reserved row of its own could not keep
+                        // the height steady, because the ⚡ glyph is taller than
+                        // the text beside it. The boost therefore uses a fixed-size
+                        // sprite, which cannot change the row's height.
+                        //
+                        // The remaining seconds are server-driven, so the timer
+                        // naturally freezes when the game pauses it
+                        // (Nexus/vault/loading/offline). The panel pins the value
+                        // to the boosted character, so its card keeps showing the
+                        // last-known timer even when not live.
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if let Some(secs) = self.loot_boost_secs {
+                                const HINT: &str = "Loot-drop boost remaining. Pauses in safe areas (Nexus, vault, etc.) and while loading.";
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(13.0),
+                                    Sense::hover(),
+                                );
+                                if ui.is_rect_visible(rect) {
+                                    sprite_renderer.draw_sprite_in_rect(
+                                        ui,
+                                        LOOT_BOOST_SPRITE_ID,
+                                        rect,
+                                    );
+                                }
+                                resp.on_hover_text(HINT);
+                                ui.label(
+                                    RichText::new(format_loot_boost(secs as u64))
+                                        .small()
+                                        .color(Color32::from_rgb(100, 255, 100)),
+                                )
+                                .on_hover_text(HINT);
+                                if is_live {
+                                    ui.ctx().request_repaint_after(
+                                        std::time::Duration::from_millis(500),
+                                    );
+                                }
+                            }
+
                             ui.label(
                                 RichText::new(format!("#{} • Lv.{}", char.char_id, char.level))
                                     .small()
@@ -738,43 +793,6 @@ impl CharacterCardWidget {
                                     .small()
                                     .color(maxed_color),
                             );
-                        });
-
-                        // Loot-drop boost row (row 4, classic ⚡). Always
-                        // reserved -- even when empty -- so cards without an
-                        // active boost keep the same height as boosted ones.
-                        // The remaining seconds are server-driven, so the timer
-                        // naturally freezes when the game pauses it
-                        // (Nexus/vault/loading/offline). The panel pins the
-                        // value to the boosted character, so its card keeps
-                        // showing the last-known timer even when not live.
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            match self.loot_boost_secs {
-                                Some(secs) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "\u{26a1} {}",
-                                            format_loot_boost(secs as u64)
-                                        ))
-                                        .small()
-                                        .color(Color32::from_rgb(100, 255, 100)),
-                                    )
-                                    .on_hover_text(
-                                        "Loot-drop boost remaining. Pauses in safe areas (Nexus, vault, etc.) and while loading.",
-                                    );
-                                    if is_live {
-                                        ui.ctx().request_repaint_after(
-                                            std::time::Duration::from_millis(500),
-                                        );
-                                    }
-                                }
-                                None => {
-                                    // Reserve the line height with an empty
-                                    // small label so the card stays as tall.
-                                    ui.label(RichText::new(" ").small());
-                                }
-                            }
                         });
                     }
                 });

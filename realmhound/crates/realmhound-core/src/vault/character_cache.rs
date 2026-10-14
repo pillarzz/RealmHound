@@ -855,17 +855,14 @@ impl CharacterCache {
         }
     }
 
-    /// One-time migration: clear the stale char-list crucible flag.
+    /// Void every recorded crucible flag, returning how many were cleared.
     ///
-    /// The char/list `<CrucibleActive>` field does not clear after a season ends,
-    /// so legacy caches were populated with wrong crucible flags for once-crucible
-    /// characters. Clear them all once; from here on crucible status is sourced
-    /// live from the player object's CRUCIBLE stat and preserved across API
-    /// refreshes. Idempotent -- guarded by `crucible_migrated`.
-    pub fn migrate_crucible_flags(&mut self) {
-        if self.crucible_migrated {
-            return;
-        }
+    /// A crucible flag is evidence that a character accepted the challenge *that
+    /// season*, and the character list's own `<CrucibleActive>` field cannot be
+    /// trusted to clear it afterwards -- the flag on a once-crucible character
+    /// keeps coming back. So the only safe way to retire a flag is to drop it and
+    /// let the acceptance be observed again (issue #66).
+    fn clear_crucible_flags(&mut self) -> usize {
         let mut cleared = 0usize;
         for c in self
             .characters
@@ -877,6 +874,21 @@ impl CharacterCache {
                 cleared += 1;
             }
         }
+        cleared
+    }
+
+    /// One-time migration: clear the stale char-list crucible flag.
+    ///
+    /// The char/list `<CrucibleActive>` field does not clear after a season ends,
+    /// so legacy caches were populated with wrong crucible flags for once-crucible
+    /// characters. Clear them all once; from here on crucible status is sourced
+    /// live from the player object's CRUCIBLE stat and preserved across API
+    /// refreshes. Idempotent -- guarded by `crucible_migrated`.
+    pub fn migrate_crucible_flags(&mut self) {
+        if self.crucible_migrated {
+            return;
+        }
+        let cleared = self.clear_crucible_flags();
         self.crucible_migrated = true;
         if cleared > 0 {
             tracing::info!(
@@ -1392,8 +1404,25 @@ impl CharacterCache {
             return false;
         }
         if next != self.active_crucible {
+            // Acceptance is per season, and the feed names the season's crucible by
+            // definition id. A different id therefore means the definition we held
+            // is last season's: every flag recorded against it describes an
+            // acceptance that no longer applies, so drop them all rather than let
+            // them linger on characters that never accepted the new crucible
+            // (issue #66). A first-time feed has nothing to compare against and
+            // clears nothing.
+            let season_changed = match (&self.active_crucible, next.as_ref()) {
+                (Some(old), Some(new)) => old.id != new.id,
+                _ => false,
+            };
             self.active_crucible = next;
             self.last_updated = Some(SystemTime::now());
+            if season_changed {
+                let cleared = self.clear_crucible_flags();
+                tracing::info!(
+                    "[CHARACTERS] New crucible season: cleared {cleared} previous flag(s)"
+                );
+            }
             return true;
         }
         false
@@ -1491,11 +1520,12 @@ impl CharacterCache {
     pub fn update_crucible_status(&mut self, char_id: i32, is_active: bool) {
         if let Some(char) = self.find_character_mut(char_id) {
             if char.crucible_active != is_active {
+                let was_active = char.crucible_active;
                 char.crucible_active = is_active;
                 tracing::info!(
                     "[CHARACTERS] Updated char_id={} crucible status: {} -> {}",
                     char_id,
-                    if !is_active { "ACTIVE" } else { "INACTIVE" },
+                    if was_active { "ACTIVE" } else { "INACTIVE" },
                     if is_active { "ACTIVE" } else { "INACTIVE" }
                 );
                 self.last_updated = Some(SystemTime::now());
@@ -3052,6 +3082,92 @@ mod tests {
         assert!(cache.set_blood_ritual_for_char(Some(1), THIS_SEASONS_RITUAL));
         assert!(!cache.set_blood_ritual_for_char(Some(1), LAST_SEASONS_RITUAL));
         assert_eq!(cache.blood_ritual_for_char(1).unwrap().tier, 1);
+    }
+
+    fn crucible_def(id: &str) -> crate::api::crucible::CrucibleDef {
+        crate::api::crucible::CrucibleDef {
+            id: id.to_string(),
+            title: String::new(),
+            stat_mods: Vec::new(),
+            effects: Vec::new(),
+            bxp_pct: 0.0,
+            xp_pct: 0.0,
+            xp_fame: false,
+            loot_pct: 10.0,
+            damage_mult: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_new_seasons_acceptance_voids_the_previous_crucible_flags() {
+        let mut cache = CharacterCache::new();
+        cache.crucible_migrated = true;
+        let mut seasonal = make_char(1, true);
+        seasonal.crucible_active = true;
+        let mut carried_over = make_char(2, false);
+        carried_over.crucible_active = true;
+        cache.characters.push(seasonal);
+        cache.characters.push(carried_over);
+
+        // This season's definition arrives: the flags stand.
+        assert!(cache.set_crucible_defs(vec![crucible_def("4862928936796160")]));
+        assert!(cache.find_character(1).unwrap().crucible_active);
+        assert!(cache.find_character(2).unwrap().crucible_active);
+
+        // Next season brings a different definition id, so every acceptance made
+        // against the old one is void and no character keeps a flag until it
+        // accepts again. This is the stale-flag case from issue #66.
+        cache.set_crucible_defs(vec![crucible_def("5000000000000000")]);
+        assert!(
+            !cache.find_character(1).unwrap().crucible_active,
+            "the previous season's flag must not survive the new definition"
+        );
+        assert!(
+            !cache.find_character(2).unwrap().crucible_active,
+            "a carried-over once-crucible character must clear too"
+        );
+    }
+
+    #[test]
+    fn the_same_crucible_definition_keeps_the_flags() {
+        let mut cache = CharacterCache::new();
+        cache.crucible_migrated = true;
+        let mut c = make_char(1, true);
+        c.crucible_active = true;
+        cache.characters.push(c);
+
+        assert!(cache.set_crucible_defs(vec![crucible_def("4862928936796160")]));
+        // The same feed re-delivered on a later login must clear nothing.
+        assert!(!cache.set_crucible_defs(vec![crucible_def("4862928936796160")]));
+        assert!(cache.find_character(1).unwrap().crucible_active);
+        // And a re-delivery alongside other entries (the ritual shares this feed).
+        cache.set_crucible_defs(vec![
+            crate::api::crucible::CrucibleDef {
+                loot_pct: 0.0,
+                ..crucible_def("4862928936796160")
+            },
+            crucible_def("4862928936796160"),
+        ]);
+        assert!(cache.find_character(1).unwrap().crucible_active);
+    }
+
+    #[test]
+    fn a_new_seasons_tiers_clear_the_previous_seasons_flag() {
+        let mut cache = CharacterCache::new();
+        cache.characters.push(make_char(1, true));
+        cache.set_blood_ritual_defs(vec![ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24)]);
+        assert!(cache.set_blood_ritual_for_char(Some(1), THIS_SEASONS_RITUAL));
+        assert!(cache.find_character(1).unwrap().blood_ritual_active);
+
+        // The next season's feed defines a new id and no longer knows this one, so
+        // the ritual it named is over: the flag must not survive on the character,
+        // which is how the stale crucible flag should have behaved in issue #66.
+        cache.set_blood_ritual_defs(vec![ritual_tier("7000000000000000", 1, 0.9, 1.1)]);
+        assert!(
+            !cache.find_character(1).unwrap().blood_ritual_active,
+            "an id the new feed does not define is not a ritual"
+        );
+        assert!(cache.blood_ritual_for_char(1).is_none());
     }
 
     #[test]

@@ -176,7 +176,10 @@ pub fn build_context(
     BonusContext {
         loot_boost_active,
         crucible_active: char.crucible_active,
-        blood_ritual_active: char.blood_ritual_active,
+        // Read the tier the cache holds for this character rather than the flag
+        // mirrored onto it: the map is the persisted source of truth and resolves
+        // against the feed, so the readout is right even before a refresh has run.
+        blood_ritual_active: cache.blood_ritual_for_char(char.char_id).is_some(),
         seasonal: char.seasonal,
         is_live,
         weapon_dr_pct,
@@ -1039,19 +1042,23 @@ pub fn render_readout(
         );
     }
     ui.add_space(3.0);
-    render_status_pills(ui, ctx, identity.map(|id| id.subtitle.as_str()));
+    render_status_pills(ui, ctx, None);
 
-    // Character identity folded into the ATTRIBUTES block: name line (the
-    // #id/class/maxed subtitle now rides on the status-pills row above), then
-    // base fame, then (dead) a killed-by line -- all sitting between the status
-    // pills and the gear row.
+    // Character identity folded into the ATTRIBUTES block: the label and the
+    // #id/class/level/maxed line share one row under the pills, then base fame,
+    // then (dead) a killed-by line -- all sitting between the status pills and
+    // the gear row.
     if let Some(id) = identity {
-        ui.label(
-            RichText::new(&id.title)
-                .strong()
-                .size(16.0)
-                .color(Color32::WHITE),
-        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(&id.title)
+                    .strong()
+                    .size(16.0)
+                    .color(Color32::WHITE),
+            );
+            ui.label(RichText::new(&id.subtitle).small().color(Color32::GRAY));
+        });
         fame_line(ui, sr, "Base fame:", id.base_fame);
         if let Some(killed_by) = &id.killed_by {
             ui.horizontal(|ui| {
@@ -1670,6 +1677,37 @@ fn regen_row_icons(
     ui.end_row();
 }
 
+/// Width reserved for a Bonuses row. Fixed so the tags form a left column and
+/// the values a right one: each value is drawn against the row's right edge,
+/// which puts every percent sign on the same x however long its tag is.
+const BONUS_ROW_W: f32 = 178.0;
+
+/// One Bonuses row: the source icon and tag on the left, the value right-aligned
+/// against the row's right edge so the values read as a second column. `hover`
+/// fills the value's tooltip, and `draw_icon` gets the icon cell so each row can
+/// use a game sprite or an embedded one.
+fn bonus_row(
+    ui: &mut egui::Ui,
+    tag: &str,
+    value: String,
+    draw_icon: impl FnOnce(&mut egui::Ui),
+    hover: impl FnOnce(&mut egui::Ui),
+) {
+    fixed_cell(ui, BONUS_ROW_W, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            draw_icon(ui);
+            ui.label(RichText::new(tag).color(LABEL_COLOR));
+            // Spend the row's leftover width on the way to the value, so the
+            // value ends at the row's right edge on every row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(value).color(VALUE_COLOR).strong())
+                    .on_hover_ui(hover);
+            });
+        });
+    });
+}
+
 /// Bonuses: Loot Boost broken down by source (gear + exalts + crucible + active
 /// clover, shown as separate components since the exact in-game stacking formula
 /// is unknown), XP Boost, Dust Boost, and Battle-pass XP. Loot/XP/Dust rows are
@@ -1706,17 +1744,15 @@ fn render_bonuses(
         ("blood ritual", ritual_loot),
         ("clover", clover_loot),
     ];
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        object_icon(ui, sr, 0xcc2, 16.0);
-        ui.label(RichText::new("Loot Boost:").color(LABEL_COLOR));
-        ui.label(
-            RichText::new(format!("~+{:.1}%", loot_total))
-                .color(VALUE_COLOR)
-                .strong(),
-        )
-        .on_hover_ui(|ui| bonus_components_tooltip(ui, &loot_components));
-    });
+    bonus_row(
+        ui,
+        "Loot Boost:",
+        format!("~+{:.0}%", loot_total),
+        |ui| {
+            object_icon(ui, sr, 0xcc2, 16.0);
+        },
+        |ui| bonus_components_tooltip(ui, &loot_components),
+    );
 
     // Fold the base per-item XP bonus (equip.xml `<XPBonus>`) into the gear
     // line alongside gear-enchant XP so the total reflects both. Components fold
@@ -1729,17 +1765,15 @@ fn render_bonuses(
         ("exalts", exalt_xp),
         ("crucible", crucible_xp),
     ];
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        object_icon(ui, sr, 0xc6b, 16.0);
-        ui.label(RichText::new("XP Boost:").color(LABEL_COLOR));
-        ui.label(
-            RichText::new(format!("+{:.1}%", gear_xp + crucible_xp + exalt_xp))
-                .color(VALUE_COLOR)
-                .strong(),
-        )
-        .on_hover_ui(|ui| bonus_components_tooltip(ui, &xp_components));
-    });
+    bonus_row(
+        ui,
+        "XP Boost:",
+        format!("+{:.0}%", gear_xp + crucible_xp + exalt_xp),
+        |ui| {
+            object_icon(ui, sr, 0xc6b, 16.0);
+        },
+        |ui| bonus_components_tooltip(ui, &xp_components),
+    );
 
     // Damage multiplier from the season's challenges: the Crucible's damage bonus
     // and the Blood Ritual tier's bonus/penalty both multiply the weapon's rolled
@@ -1757,39 +1791,35 @@ fn render_bonuses(
         .unwrap_or(0.0);
     let damage_pct = crucible_dmg_pct + ritual_dmg_pct;
     if damage_pct.abs() > 0.001 {
-        // Coloured by source, matching the ATTRIBUTES columns: the ritual's
-        // orange when it is the one in play, the crucible's magenta when it is.
-        let value_color = if ritual_dmg_pct.abs() > 0.001 {
-            BLOOD_RITUAL_COLOR
-        } else {
-            CRUCIBLE_DIM
-        };
-        // The issue asks the hover to attribute the figure to the ritual the
-        // player picked, so the ritual is stated even when it is the only source.
-        let damage_components = [
-            ("from the current Blood Ritual", ritual_dmg_pct),
-            ("from the crucible", crucible_dmg_pct),
-        ];
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            // The condition the multiplier corresponds to: "Damaging" while it
-            // raises damage, "Weak" while it reduces it. The icons ship embedded
-            // because the effects have no object type to look them up by.
-            let condition = if damage_pct > 0.0 {
-                crate::rendering::EmbeddedIcon::Damaging
-            } else {
-                crate::rendering::EmbeddedIcon::Weak
-            };
-            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
-            sr.draw_embedded_icon(ui, condition, rect);
-            ui.label(RichText::new("Damage mult.:").color(LABEL_COLOR));
-            ui.label(
-                RichText::new(format!("{:+.0}%", damage_pct))
-                    .color(value_color)
-                    .strong(),
-            )
-            .on_hover_ui(|ui| bonus_components_tooltip(ui, &damage_components));
-        });
+        // Only the sources that actually contribute are listed -- a challenge
+        // granting no damage multiplier is noise in the hover, not a zero.
+        let damage_components: Vec<(&str, f32)> = [
+            ("blood ritual", ritual_dmg_pct),
+            ("crucible", crucible_dmg_pct),
+        ]
+        .into_iter()
+        .filter(|(_, pct)| pct.abs() > 0.001)
+        .collect();
+        bonus_row(
+            ui,
+            "Damage mult.:",
+            format!("{:+.0}%", damage_pct),
+            |ui| {
+                // "Damaging" while the multiplier raises damage, "Weak" while it
+                // reduces it. The icons ship embedded because the effects have no
+                // object type to look them up by, and are drawn a little larger
+                // than their 16px art so they match the game sprites beside them.
+                let condition = if damage_pct > 0.0 {
+                    crate::rendering::EmbeddedIcon::Damaging
+                } else {
+                    crate::rendering::EmbeddedIcon::Weak
+                };
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
+                sr.draw_embedded_icon(ui, condition, rect);
+            },
+            |ui| bonus_components_tooltip(ui, &damage_components),
+        );
     }
 
     // Dust Boost: total (gear + account potion). The component breakdown folds
@@ -1798,29 +1828,34 @@ fn render_bonuses(
     let dust_gear = d.dust_boost_pct;
     let dust_potion = ctx.account_dust_boost.map(|b| b.bonus_pct).unwrap_or(0.0);
     let account_boost = ctx.account_dust_boost;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        object_icon(ui, sr, 0x2ef, 16.0);
-        ui.label(RichText::new("Dust Boost:").color(LABEL_COLOR));
-        ui.label(
-            RichText::new(format!("+{:.1}%", dust_gear + dust_potion))
-                .color(VALUE_COLOR)
-                .strong(),
-        )
-        .on_hover_ui(|ui| {
-            ui.label(RichText::new(format!("•  gear: {:.1}%", dust_gear)).color(Color32::WHITE));
+    bonus_row(
+        ui,
+        "Dust Boost:",
+        format!("+{:.0}%", dust_gear + dust_potion),
+        |ui| {
+            object_icon(ui, sr, 0x2ef, 16.0);
+        },
+        |ui| {
+            ui.label(
+                RichText::new(format!("\u{2022}  gear: {:.0}%", dust_gear)).color(Color32::WHITE),
+            );
             match account_boost {
                 Some(boost) => {
                     let time_str = format!(
                         "{}{} left",
                         if boost.estimated { "~" } else { "" },
-                        crate::panels::character_card::format_loot_boost(boost.remaining_secs as u64)
+                        crate::panels::character_card::format_loot_boost(
+                            boost.remaining_secs as u64
+                        )
                     );
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.label(
-                            RichText::new(format!("•  account potion: {:.0}%", boost.bonus_pct))
-                                .color(Color32::WHITE),
+                            RichText::new(format!(
+                                "\u{2022}  account potion: {:.0}%",
+                                boost.bonus_pct
+                            ))
+                            .color(Color32::WHITE),
                         );
                         ui.label(RichText::new(format!("({})", time_str)).color(LABEL_COLOR));
                     });
@@ -1837,13 +1872,18 @@ fn render_bonuses(
                 None => {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(RichText::new("•  account potion: ").color(Color32::WHITE));
-                        ui.label(RichText::new("(none)").italics().color(NOTE_COLOR).size(11.0));
+                        ui.label(RichText::new("\u{2022}  account potion: ").color(Color32::WHITE));
+                        ui.label(
+                            RichText::new("(none)")
+                                .italics()
+                                .color(NOTE_COLOR)
+                                .size(11.0),
+                        );
                     });
                 }
             }
-        });
-    });
+        },
+    );
     if account_boost.is_some() && ctx.is_live {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
@@ -1852,16 +1892,16 @@ fn render_bonuses(
     // Battle-pass XP (crucible bonus), with the embedded battle-pass sprite.
     let bxp = d.crucible.as_ref().map(|c| c.bxp_pct).unwrap_or(0.0);
     if bxp != 0.0 {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
-            sr.draw_outlined_embedded_icon(ui, EmbeddedIcon::Bxp, rect);
-            ui.label(RichText::new("BXP:").color(LABEL_COLOR));
-            ui.label(
-                RichText::new(format!("+{:.0}%", bxp))
-                    .color(VALUE_COLOR)
-                    .strong(),
-            );
-        });
+        bonus_row(
+            ui,
+            "BXP:",
+            format!("+{:.0}%", bxp),
+            |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                sr.draw_outlined_embedded_icon(ui, EmbeddedIcon::Bxp, rect);
+            },
+            |_| {},
+        );
     }
 }

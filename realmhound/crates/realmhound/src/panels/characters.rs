@@ -689,10 +689,12 @@ impl CharactersPanel {
             } else {
                 None
             },
-            title: format!("{} Lv.{}", label, char.level),
+            title: label.clone(),
+            // The level belongs with the id/class/maxed line, in that line's own
+            // font and ahead of the maxed count, rather than in the title.
             subtitle: format!(
-                "#{} • {} • {}/8",
-                char.char_id, class_name, char.maxed_count
+                "#{} • {} • Lv.{} • {}/8",
+                char.char_id, class_name, char.level, char.maxed_count
             ),
             base_fame: char.fame,
             killed_by: if char.is_dead {
@@ -1864,6 +1866,9 @@ impl CharactersPanel {
                                 .with_pet(pet_info.clone())
                                 .with_loot_boost(
                                     self.loot_boost_by_char.get(&char.char_id).copied(),
+                                )
+                                .with_blood_ritual(
+                                    self.cache.blood_ritual_for_char(char.char_id).is_some(),
                                 )
                                 .with_sections(show_inv, show_bp, show_ext, show_belt);
                             widget.render(

@@ -917,13 +917,31 @@ impl PacketProcessor {
                 // applied only to characters that are not live: those have their own
                 // `BloodRitual` stat, which is fresher.
                 let live_char_id = self.live_char_id;
-                let mut ritual_changed = false;
+                let mut challenge_changed = false;
                 for char in &data.characters {
                     if Some(char.char_id) == live_char_id {
                         continue;
                     }
+                    // The list's CrucibleActive is the server's own record of this
+                    // season's acceptance, and the game's own character list matches
+                    // it, so it may correct a flag carried over from a previous
+                    // season (issue #66). Only for characters that are not live:
+                    // those keep their own CRUCIBLE stat, which is fresher than any
+                    // list.
+                    let needs_crucible_update = self
+                        .account_data
+                        .characters
+                        .find_character(char.char_id)
+                        .map(|cached| cached.crucible_active != char.crucible_active)
+                        .unwrap_or(false);
+                    if needs_crucible_update {
+                        self.account_data
+                            .characters
+                            .update_crucible_status(char.char_id, char.crucible_active);
+                        challenge_changed = true;
+                    }
                     if let Some(id) = char.blood_ritual_id.as_deref() {
-                        ritual_changed |= self
+                        challenge_changed |= self
                             .account_data
                             .characters
                             .set_blood_ritual_for_char(Some(char.char_id), id);
@@ -931,8 +949,8 @@ impl PacketProcessor {
                 }
                 // Re-derive the per-character flags from the recorded ids, so the
                 // new season's tiers govern a roster that was already cached.
-                ritual_changed |= self.account_data.characters.sync_blood_ritual_flags();
-                if ritual_changed {
+                challenge_changed |= self.account_data.characters.sync_blood_ritual_flags();
+                if challenge_changed {
                     self.account_data.mark_dirty();
                 }
                 self.account_data.characters.exaltation_stats = data.exaltation_stats;
@@ -4868,6 +4886,72 @@ mod isolation_gate_tests {
         assert!(
             p.account_data.characters.blood_ritual_for_char(3).is_none(),
             "a character without the tag has no ritual"
+        );
+    }
+
+    /// A crucible flag carried over from last season is corrected by the character
+    /// list for characters that are not live, while the live character keeps the
+    /// value its own CRUCIBLE stat reported (issue #66).
+    #[test]
+    fn api_account_data_clears_carried_over_crucible_flags() {
+        use realmhound_core::api::RealmCharacter;
+        use realmhound_core::vault::CachedCharacter;
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data.characters.crucible_migrated = true;
+
+        // Two characters carry last season's flag; one of them is being played.
+        let mut stale = CachedCharacter {
+            char_id: 1,
+            ..Default::default()
+        };
+        stale.crucible_active = true;
+        let mut live = CachedCharacter {
+            char_id: 2,
+            ..Default::default()
+        };
+        live.crucible_active = true;
+        p.account_data.characters.characters.push(stale);
+        p.account_data.characters.characters.push(live);
+        p.live_char_id = Some(2);
+
+        // The list now says neither has accepted this season's crucible.
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![
+                RealmCharacter {
+                    char_id: 1,
+                    crucible_active: false,
+                    ..Default::default()
+                },
+                RealmCharacter {
+                    char_id: 2,
+                    crucible_active: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert!(
+            !p.account_data
+                .characters
+                .find_character(1)
+                .unwrap()
+                .crucible_active,
+            "a carried-over flag on a non-live character must clear"
+        );
+        assert!(
+            p.account_data
+                .characters
+                .find_character(2)
+                .unwrap()
+                .crucible_active,
+            "the live character keeps what its own stat reported"
         );
     }
 

@@ -207,6 +207,10 @@ pub struct WeaponDamage {
     /// Exaltation Mastery weapon-damage bonus, in percent (0-10). Already folded
     /// into `min_damage`/`max_damage` and DPS; retained for display.
     pub mastery_pct: f32,
+    /// Combined seasonal challenge multiplier (Crucible damage bonus x Blood
+    /// Ritual tier damage bonus/penalty); 1.0 when neither is active. Already
+    /// folded into the damage figures, retained so the readout can attribute it.
+    pub challenge_mult: f32,
     /// Native on-shoot/on-hit procs contributing to DPS (e.g. poison bursts),
     /// resolved at the current effective stats. Empty when the weapon has none.
     pub procs: Vec<WeaponProcReadout>,
@@ -1053,8 +1057,23 @@ fn derive_weapon(
     let (rof, num) = assets.weapon_fire(weapon_id).unwrap_or((1.0, 1));
 
     let mastery = 1.0 + loadout.mastery_dmg_pct / 100.0;
-    let bmin = ((min_damage as f32 * dmg_min_mult).round() * mastery).floor() as i32;
-    let bmax = ((max_damage as f32 * dmg_max_mult).round() * mastery).floor() as i32;
+    // Seasonal challenge multipliers scale the weapon's rolled damage: the
+    // Crucible's damage bonus and the Blood Ritual tier's damage bonus/penalty.
+    // Both multiply the shot, so they compose, and neither is tied to gear.
+    let challenge_mult = loadout
+        .crucible
+        .as_ref()
+        .map(|c| c.damage_mult)
+        .unwrap_or(1.0)
+        * loadout
+            .blood_ritual
+            .as_ref()
+            .map(|r| r.damage_mult)
+            .unwrap_or(1.0);
+    let bmin =
+        ((min_damage as f32 * dmg_min_mult).round() * mastery * challenge_mult).floor() as i32;
+    let bmax =
+        ((max_damage as f32 * dmg_max_mult).round() * mastery * challenge_mult).floor() as i32;
 
     let mult = attack_multiplier(eff.attack, loadout.exalt_damage_bonus);
     // Fire-rate enchants scale the shot cadence, which is where their DPS lands.
@@ -1070,8 +1089,10 @@ fn derive_weapon(
     let mut total_avg_hit = avg_hit * num as f32;
     for i in 1..proj_types as usize {
         if let Some((pmin, pmax, ap, _)) = assets.weapon_projectile(weapon_id, i) {
-            let emin = ((pmin as f32 * dmg_min_mult).round() * mastery).floor() as i32;
-            let emax = ((pmax as f32 * dmg_max_mult).round() * mastery).floor() as i32;
+            let emin =
+                ((pmin as f32 * dmg_min_mult).round() * mastery * challenge_mult).floor() as i32;
+            let emax =
+                ((pmax as f32 * dmg_max_mult).round() * mastery * challenge_mult).floor() as i32;
             total_avg_hit += avg_hit_for_range(emin, emax, mult) * num as f32;
             extra_types.push((emin, emax, ap));
         }
@@ -1093,6 +1114,7 @@ fn derive_weapon(
         stored_mult: mult,
         damage_mult: dmg_max_mult,
         mastery_pct: loadout.mastery_dmg_pct,
+        challenge_mult,
         procs,
         proc_dps,
         rate_mult,
@@ -2519,6 +2541,7 @@ mod tests {
             stored_mult: 1.0,
             damage_mult: 1.0,
             mastery_pct: 0.0,
+            challenge_mult: 1.0,
             procs: Vec::new(),
             proc_dps: 0.0,
             rate_mult: 1.0,
@@ -2545,6 +2568,7 @@ mod tests {
             stored_mult: 1.0,
             damage_mult: 1.0,
             mastery_pct: 0.0,
+            challenge_mult: 1.0,
             procs: Vec::new(),
             proc_dps: 0.0,
             rate_mult: 1.0,
@@ -2603,6 +2627,7 @@ mod tests {
             stored_mult: 1.0,
             damage_mult: 1.0,
             mastery_pct: 0.0,
+            challenge_mult: 1.0,
             procs: vec![WeaponProcReadout {
                 label: "Poison",
                 damage_per_proc: 1000,

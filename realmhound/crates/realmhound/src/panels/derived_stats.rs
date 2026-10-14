@@ -1682,6 +1682,11 @@ fn regen_row_icons(
 /// which puts every percent sign on the same x however long its tag is.
 const BONUS_ROW_W: f32 = 178.0;
 
+/// One icon slot width for every Bonuses row. The rows draw their icons at
+/// different sizes, so without a shared slot the tags would start at different x
+/// (the Damage-mult. row's larger icon pushed its tag right of the others).
+const BONUS_ICON_W: f32 = 26.0;
+
 /// One Bonuses row: the source icon and tag on the left, the value right-aligned
 /// against the row's right edge so the values read as a second column. `hover`
 /// fills the value's tooltip, and `draw_icon` gets the icon cell so each row can
@@ -1696,7 +1701,9 @@ fn bonus_row(
     fixed_cell(ui, BONUS_ROW_W, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            draw_icon(ui);
+            // Fixed icon slot, so every tag starts at the same x whatever size
+            // this row's icon is drawn at.
+            fixed_cell(ui, BONUS_ICON_W, |ui| draw_icon(ui));
             ui.label(RichText::new(tag).color(LABEL_COLOR));
             // Spend the row's leftover width on the way to the value, so the
             // value ends at the row's right edge on every row.
@@ -1815,7 +1822,7 @@ fn render_bonuses(
                     crate::rendering::EmbeddedIcon::Weak
                 };
                 let (rect, _) =
-                    ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
+                    ui.allocate_exact_size(egui::Vec2::splat(26.0), egui::Sense::hover());
                 sr.draw_embedded_icon(ui, condition, rect);
             },
             |ui| bonus_components_tooltip(ui, &damage_components),

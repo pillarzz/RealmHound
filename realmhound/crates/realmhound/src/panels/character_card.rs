@@ -37,9 +37,15 @@ pub const FAME_SPRITE_ID: i32 = 24102;
 /// Object ID for the "Gold Shop Icon Object" sprite used as the gold coin icon.
 pub const GOLD_SPRITE_ID: i32 = 0x67FF;
 
-/// Object ID for the Lucky Clover sprite, used as the loot-boost icon on the
-/// card's info row (the same icon the Bonuses section uses for Loot Boost).
-pub const LOOT_BOOST_SPRITE_ID: i32 = 0xcc2;
+/// The lightning glyph and green the card uses for its loot-boost readout.
+const LOOT_BOOST_GLYPH: &str = "\u{26a1}";
+const LOOT_BOOST_COLOR: Color32 = Color32::from_rgb(100, 255, 100);
+/// Width reserved for the glyph plus the duration, so a longer timer cannot
+/// shift the id/level line that shares its row. `format_loot_boost` tops out at
+/// "59m 59s", so this holds the longest value it can produce.
+const LOOT_SLOT_W: f32 = 68.0;
+/// Offset of the duration text inside that slot, past the glyph.
+const LOOT_GLYPH_W: f32 = 14.0;
 
 /// Draw a small pill, roughly half the size of the Missions-tab badge. The text
 /// gets a 1px black outline so it stays legible over any card background.
@@ -80,15 +86,22 @@ fn draw_crucible_pill(ui: &mut egui::Ui) {
     draw_pill(ui, "CRUCIBLE", Color32::from_rgb(0xdc, 0x21, 0x15));
 }
 
+/// Height of the reserved season-pill line: the 8px pill's own height plus its
+/// vertical padding, so a card with no pills matches one that has them.
+const SEASON_PILL_ROW_H: f32 = 13.0;
+
 /// Blood Ritual marker, in the ritual panel's own orange so it reads apart from
 /// the crucible's red at a glance.
 fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
     draw_pill(ui, "BLOOD RITUAL", Color32::from_rgb(0xe7, 0x7b, 0x00));
 }
 
-/// The season-challenge pills a character carries, on one line.
+/// The season-challenge pills a character carries, on one line. The line is
+/// reserved even when the character carries no challenge, so every card is the
+/// same height whatever pills its character has. [#64]
 fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool) {
     if !crucible && !blood_ritual {
+        ui.add_space(SEASON_PILL_ROW_H);
         return;
     }
     ui.horizontal(|ui| {
@@ -747,30 +760,32 @@ impl CharacterCardWidget {
                         // last-known timer even when not live.
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
+                            // Loot boost in a fixed-width slot: a longer duration cannot shift the id
+                            // line beside it, and the glyph is painted at a fixed size so an emoji's
+                            // taller line box cannot change the row's height either.
+                            let (loot_slot, loot_resp) =
+                                ui.allocate_exact_size(egui::vec2(LOOT_SLOT_W, 14.0), Sense::hover());
                             if let Some(secs) = self.loot_boost_secs {
                                 const HINT: &str = "Loot-drop boost remaining. Pauses in safe areas (Nexus, vault, etc.) and while loading.";
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    egui::Vec2::splat(13.0),
-                                    Sense::hover(),
+                                let font = egui::FontId::proportional(11.0);
+                                ui.painter().text(
+                                    loot_slot.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    LOOT_BOOST_GLYPH,
+                                    font.clone(),
+                                    LOOT_BOOST_COLOR,
                                 );
-                                if ui.is_rect_visible(rect) {
-                                    sprite_renderer.draw_sprite_in_rect(
-                                        ui,
-                                        LOOT_BOOST_SPRITE_ID,
-                                        rect,
-                                    );
-                                }
-                                resp.on_hover_text(HINT);
-                                ui.label(
-                                    RichText::new(format_loot_boost(secs as u64))
-                                        .small()
-                                        .color(Color32::from_rgb(100, 255, 100)),
-                                )
-                                .on_hover_text(HINT);
+                                ui.painter().text(
+                                    loot_slot.left_center() + egui::vec2(LOOT_GLYPH_W, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    format_loot_boost(secs as u64),
+                                    font,
+                                    LOOT_BOOST_COLOR,
+                                );
+                                loot_resp.on_hover_text(HINT);
                                 if is_live {
-                                    ui.ctx().request_repaint_after(
-                                        std::time::Duration::from_millis(500),
-                                    );
+                                    ui.ctx()
+                                        .request_repaint_after(std::time::Duration::from_millis(500));
                                 }
                             }
 

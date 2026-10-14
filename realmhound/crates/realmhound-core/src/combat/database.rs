@@ -9,12 +9,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{
-    CompletedFight, DamageProvenance, DamageTakenProvenance, FightParticipant, FightSelection,
-    ParticipantEndStatus, PetInfo,
+    AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
+    FightParticipant, FightSelection, ParticipantEndStatus, PetInfo, SummonContribution,
+    WeaponContribution,
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 61;
+pub const SCHEMA_VERSION: i32 = 64;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -92,6 +93,16 @@ pub struct FightRecord {
     /// are revealed only in hard mode). False for every other dungeon and for
     /// rows recorded before the mode was tracked.
     pub shatters_hm: bool,
+    /// Time the boss was vulnerable and taking damage, in ms. `0` means unknown
+    /// (rows recorded before this was tracked), so damage-per-minute falls back
+    /// to the whole fight duration.
+    pub boss_uptime_ms: i64,
+    /// The local player's stat/condition boost windows during this fight, in time
+    /// order. Empty for rows recorded before this was tracked.
+    pub boosts: Vec<BoostWindow>,
+    /// The local player's ability activations during this fight, in time order.
+    /// Empty for rows recorded before this was tracked.
+    pub abilities: Vec<AbilityActivation>,
     /// Participants (sorted by damage descending as stored).
     pub participants: Vec<ParticipantRecord>,
 }
@@ -275,6 +286,24 @@ pub struct ParticipantRecord {
     /// Hits landed on Oryx 3 while Guarded (subset of `hits`), or `None` for
     /// pre-feature rows.
     pub guarded_hits: Option<i64>,
+    /// Incoming hits that were valued into `damage_taken` ("shots tanked"), or
+    /// `None` for rows recorded before this was tracked.
+    pub damage_taken_hits: Option<i64>,
+    /// Summon/pet-sourced damage included in `damage` (0 for pre-feature rows).
+    pub summon_damage: i64,
+    /// Summon/pet-sourced hits included in `hits` (0 for pre-feature rows).
+    pub summon_hits: i64,
+    /// Per-summon/pet breakdown; empty for pre-feature rows.
+    pub summons: Vec<SummonContribution>,
+    /// The local player's damage split per weapon (highest damage first). Empty
+    /// for remote players and for rows recorded before this was tracked.
+    pub weapons: Vec<WeaponContribution>,
+    /// Damage the server attributed to this player directly in a damage packet
+    /// (ability/DoT/proc), separate from the self-computed weapon rows. 0 for
+    /// remote players and for rows recorded before this was tracked.
+    pub packet_damage: i64,
+    /// Number of local damage packets behind `packet_damage`.
+    pub packet_hits: u64,
 }
 
 /// Combat history database manager.
@@ -1460,6 +1489,77 @@ impl CombatDatabase {
                 "#,
             )?;
         }
+        if from_version < 62 {
+            // v61 -> v62: per-fight boss uptime and the summon/pet split on each
+            // participant. Uptime is the time the boss was both vulnerable and
+            // taking damage, so damage-per-minute can divide by actual fight
+            // uptime instead of wall-clock duration; 0 on legacy rows means
+            // "unknown", and consumers fall back to the whole duration. The split
+            // keeps pet damage out of the owner's per-hit average and per-loadout
+            // buckets while still counting it in the owner's totals.
+            if !self.column_exists("fights", "boss_uptime_ms")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN boss_uptime_ms INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "damage_taken_hits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN damage_taken_hits INTEGER;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "summon_damage")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN summon_damage INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "summon_hits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN summon_hits INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "summons")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fight_participants ADD COLUMN summons TEXT;")?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 62")?;
+        }
+        if from_version < 63 {
+            // v62 -> v63: the local player's "My Performance" detail -- the boost
+            // windows observed on them, their ability activations, and their damage
+            // split per weapon. All three are JSON blobs (mirroring how enchants and
+            // summons are stored); NULL/absent on legacy rows means "not recorded".
+            if !self.column_exists("fights", "boosts")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fights ADD COLUMN boosts TEXT;")?;
+            }
+            if !self.column_exists("fights", "abilities")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fights ADD COLUMN abilities TEXT;")?;
+            }
+            if !self.column_exists("fight_participants", "weapons")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fight_participants ADD COLUMN weapons TEXT;")?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 63")?;
+        }
+        if from_version < 64 {
+            // v63 -> v64: split local damage packets away from the self-computed
+            // weapon rows. The weapon rows are reconstructed from the player's own
+            // shot packets; a figure the server reported for them directly (an
+            // ability, DoT or proc) is a different thing and must not be presented as
+            // a weapon's contribution, so it gets its own total.
+            if !self.column_exists("fight_participants", "packet_damage")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN packet_damage INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "packet_hits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN packet_hits INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 64")?;
+        }
         Ok(())
     }
 
@@ -2544,7 +2644,10 @@ impl CombatDatabase {
                 leisurely INTEGER NOT NULL DEFAULT 0,
                 petless INTEGER NOT NULL DEFAULT 0,
                 spectral_hm INTEGER NOT NULL DEFAULT 0,
-                shatters_hm INTEGER NOT NULL DEFAULT 0
+                shatters_hm INTEGER NOT NULL DEFAULT 0,
+                boss_uptime_ms INTEGER NOT NULL DEFAULT 0,
+                boosts TEXT,
+                abilities TEXT
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -2591,6 +2694,13 @@ impl CombatDatabase {
                 guarded_damage INTEGER,
                 guarded_hits INTEGER,
                 damage_blocked INTEGER,
+                damage_taken_hits INTEGER,
+                summon_damage INTEGER NOT NULL DEFAULT 0,
+                summon_hits INTEGER NOT NULL DEFAULT 0,
+                summons TEXT,
+                weapons TEXT,
+                packet_damage INTEGER NOT NULL DEFAULT 0,
+                packet_hits INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (fight_id) REFERENCES fights(id) ON DELETE CASCADE
             );
 
@@ -2761,8 +2871,8 @@ impl CombatDatabase {
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
                 dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, petless, spectral_hm,
-                shatters_hm)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"#,
+                shatters_hm, boss_uptime_ms, boosts, abilities)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -2788,6 +2898,9 @@ impl CombatDatabase {
                 fight.petless as i32,
                 fight.spectral_hm as i32,
                 fight.shatters_hm as i32,
+                fight.boss_uptime_ms,
+                serialize_boosts(&fight.boosts),
+                serialize_abilities(&fight.abilities),
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -2821,8 +2934,10 @@ impl CombatDatabase {
                    (fight_id, object_id, object_type, name, equip0, equip1, equip2, equip3,
                     enchants, damage, hits, is_local, provenance, skin_id, tex1, tex2,
                     end_status, grave_type, pet_type, pet_abilities, damage_taken,
-                    damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"#,
+                    damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked,
+                    damage_taken_hits, summon_damage, summon_hits, summons, weapons,
+                    packet_damage, packet_hits)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)"#,
                 params![
                     fight_id,
                     p.object_id,
@@ -2849,6 +2964,13 @@ impl CombatDatabase {
                     p.guarded_damage,
                     p.guarded_hits.map(|h| h as i64),
                     p.damage_blocked,
+                    p.damage_taken_hits.map(|h| h as i64),
+                    p.summon_damage,
+                    p.summon_hits as i64,
+                    serialize_summons(&p.summons),
+                    serialize_weapons(&p.weapons),
+                    p.packet_damage,
+                    p.packet_hits as i64,
                 ],
             )?;
         }
@@ -2870,7 +2992,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -2903,6 +3026,9 @@ impl CombatDatabase {
             petless: row.get::<_, i32>(17)? != 0,
             spectral_hm: row.get::<_, i32>(18)? != 0,
             shatters_hm: row.get::<_, i32>(19)? != 0,
+            boss_uptime_ms: row.get(20)?,
+            boosts: parse_boosts(row.get::<_, Option<String>>(21)?.as_deref()),
+            abilities: parse_abilities(row.get::<_, Option<String>>(22)?.as_deref()),
             participants: Vec::new(),
         })
     }
@@ -3952,7 +4078,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -3981,7 +4108,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -4024,7 +4152,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -4664,7 +4793,9 @@ impl CombatDatabase {
             r#"SELECT object_id, object_type, name, equip0, equip1, equip2, equip3,
                       enchants, damage, hits, is_local, provenance, skin_id, tex1, tex2,
                       end_status, grave_type, pet_type, pet_abilities, damage_taken,
-                      damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked
+                      damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked,
+                      damage_taken_hits, summon_damage, summon_hits, summons, weapons,
+                    packet_damage, packet_hits
                FROM fight_participants WHERE fight_id = ?1 ORDER BY damage DESC, hits DESC"#,
         )?;
         let rows = stmt.query_map(params![fight_id], |row| {
@@ -4685,6 +4816,9 @@ impl CombatDatabase {
             let guarded_damage: Option<i64> = row.get(21)?;
             let guarded_hits: Option<i64> = row.get(22)?;
             let damage_blocked: Option<i64> = row.get(23)?;
+            let damage_taken_hits: Option<i64> = row.get(24)?;
+            let summon_damage: i64 = row.get(25)?;
+            let summon_hits: i64 = row.get(26)?;
             Ok(ParticipantRecord {
                 object_id: row.get(0)?,
                 object_type: row.get(1)?,
@@ -4705,9 +4839,16 @@ impl CombatDatabase {
                 pet,
                 damage_taken,
                 damage_taken_provenance,
+                damage_taken_hits,
                 damage_blocked,
                 guarded_damage,
                 guarded_hits,
+                summon_damage,
+                summon_hits,
+                summons: parse_summons(row.get::<_, Option<String>>(27)?.as_deref()),
+                weapons: parse_weapons(row.get::<_, Option<String>>(28)?.as_deref()),
+                packet_damage: row.get(29)?,
+                packet_hits: row.get::<_, i64>(30)? as u64,
             })
         })?;
         rows.collect()
@@ -4896,6 +5037,217 @@ fn serialize_pet_abilities(abilities: &[i32]) -> String {
         .join(",")
 }
 
+/// Serialize the per-summon breakdown as one compact line per summon:
+/// `object_id,pet_type,is_pet,damage,hits`, joined by `;`. Kept as text rather
+/// than JSON so a legacy value or a partial write can never fail to parse into
+/// the participant row.
+fn serialize_summons(summons: &[SummonContribution]) -> Option<String> {
+    if summons.is_empty() {
+        return None;
+    }
+    Some(
+        summons
+            .iter()
+            .map(|s| {
+                format!(
+                    "{},{},{},{},{}",
+                    s.object_id, s.pet_type, s.is_pet as i32, s.damage, s.hits
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored summon string back into a breakdown. Malformed or missing
+/// values yield an empty list rather than an error, so old rows read cleanly.
+fn parse_summons(data: Option<&str>) -> Vec<SummonContribution> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let mut parts = entry.split(',');
+            let object_id = parts.next()?.trim().parse::<i32>().ok()?;
+            let pet_type = parts.next()?.trim().parse::<i32>().unwrap_or(0);
+            let is_pet = parts.next()?.trim() != "0";
+            let damage = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let hits = parts.next()?.trim().parse::<u64>().unwrap_or(0);
+            Some(SummonContribution {
+                object_id,
+                pet_type,
+                is_pet,
+                damage,
+                hits,
+            })
+        })
+        .collect()
+}
+
+/// Serialize the per-weapon breakdown as one compact line per weapon:
+/// `weapon_id,damage,hits,enchant:enchant:...`, joined by `;`. Same rationale as
+/// the summon string: text that can never fail to parse.
+fn serialize_weapons(weapons: &[WeaponContribution]) -> Option<String> {
+    if weapons.is_empty() {
+        return None;
+    }
+    Some(
+        weapons
+            .iter()
+            .map(|w| {
+                let enchants = w
+                    .enchants
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(":");
+                format!("{},{},{},{}", w.weapon_id, w.damage, w.hits, enchants)
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored weapon breakdown. Malformed or missing values yield an empty
+/// list rather than an error, so old rows read cleanly.
+fn parse_weapons(data: Option<&str>) -> Vec<WeaponContribution> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let mut parts = entry.split(',');
+            let weapon_id = parts.next()?.trim().parse::<i32>().ok()?;
+            let damage = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let hits = parts.next()?.trim().parse::<u64>().unwrap_or(0);
+            let enchants = parts
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .filter_map(|e| e.trim().parse::<u16>().ok())
+                .collect();
+            Some(WeaponContribution {
+                weapon_id,
+                enchants,
+                damage,
+                hits,
+            })
+        })
+        .collect()
+}
+
+/// Serialize the local player's boost windows as one compact line per window:
+/// `start,end,stat,from,to,source`, joined by `;`. The stat and source are free
+/// text, so both are escaped (`\t` for the field separator inside them is not
+/// needed: the stat never contains a comma and the source is ours).
+fn serialize_boosts(boosts: &[BoostWindow]) -> Option<String> {
+    if boosts.is_empty() {
+        return None;
+    }
+    Some(
+        boosts
+            .iter()
+            .map(|b| {
+                format!(
+                    "{},{},{},{},{},{}",
+                    b.start_offset_ms,
+                    b.end_offset_ms,
+                    b.stat.replace(',', " "),
+                    b.from,
+                    b.to,
+                    b.source.replace(',', " ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored boost windows. Malformed lines are skipped rather than
+/// failing the read, so a partially written row cannot hide the whole fight.
+fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.splitn(6, ',').collect();
+            if parts.len() < 6 {
+                return None;
+            }
+            Some(BoostWindow {
+                start_offset_ms: parts[0].trim().parse::<i64>().ok()?,
+                end_offset_ms: parts[1].trim().parse::<i64>().ok()?,
+                stat: parts[2].to_string(),
+                from: parts[3].trim().parse::<i32>().unwrap_or(0),
+                to: parts[4].trim().parse::<i32>().unwrap_or(0),
+                source: parts[5].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Serialize the local player's ability activations as one compact line each:
+/// `start,window,item_id,damage,hits,enchant:enchant:...`.
+fn serialize_abilities(abilities: &[AbilityActivation]) -> Option<String> {
+    if abilities.is_empty() {
+        return None;
+    }
+    Some(
+        abilities
+            .iter()
+            .map(|a| {
+                let enchants = a
+                    .enchants
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(":");
+                format!(
+                    "{},{},{},{},{},{}",
+                    a.start_offset_ms, a.window_ms, a.item_id, a.damage, a.hits, enchants
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored ability activations, skipping malformed lines.
+fn parse_abilities(data: Option<&str>) -> Vec<AbilityActivation> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let mut parts = entry.split(',');
+            let start_offset_ms = parts.next()?.trim().parse::<i64>().ok()?;
+            let window_ms = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let item_id = parts.next()?.trim().parse::<i32>().ok()?;
+            let damage = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let hits = parts.next()?.trim().parse::<u64>().unwrap_or(0);
+            let enchants = parts
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .filter_map(|e| e.trim().parse::<u16>().ok())
+                .collect();
+            Some(AbilityActivation {
+                item_id,
+                enchants,
+                start_offset_ms,
+                window_ms,
+                damage,
+                hits,
+            })
+        })
+        .collect()
+}
+
 /// Parse the stored pet ability string back into ability type ids. A
 /// `None`/empty value yields an empty vec; unparseable ids are skipped.
 fn parse_pet_abilities(data: Option<&str>) -> Vec<i32> {
@@ -4982,9 +5334,16 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                     pet: p.pet.clone(),
                     damage_taken: None,
                     damage_taken_provenance: DamageTakenProvenance::Observed,
+                    damage_taken_hits: None,
                     damage_blocked: None,
                     guarded_damage: None,
                     guarded_hits: None,
+                    summon_damage: 0,
+                    summon_hits: 0,
+                    summons: Vec::new(),
+                    weapons: Vec::new(),
+                    packet_damage: 0,
+                    packet_hits: 0,
                 },
                 best_equip_damage: i64::MIN,
                 self_pending: 0,
@@ -5005,6 +5364,47 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
             });
             entry.rec.damage += p.damage;
             entry.rec.hits += p.hits;
+            entry.rec.summon_damage += p.summon_damage;
+            entry.rec.summon_hits += p.summon_hits;
+            entry.rec.packet_damage += p.packet_damage;
+            entry.rec.packet_hits += p.packet_hits;
+            // Summons are keyed by object id, which is stable across the phases of
+            // one run for the same pet; summons of different ids (gear summons
+            // resummoned per phase) accumulate separately and are re-ranked below.
+            for s in &p.summons {
+                match entry
+                    .rec
+                    .summons
+                    .iter_mut()
+                    .find(|e| e.object_id == s.object_id)
+                {
+                    Some(existing) => {
+                        existing.damage += s.damage;
+                        existing.hits += s.hits;
+                        existing.is_pet = existing.is_pet || s.is_pet;
+                        if s.pet_type != 0 {
+                            existing.pet_type = s.pet_type;
+                        }
+                    }
+                    None => entry.rec.summons.push(s.clone()),
+                }
+            }
+            // Weapons are keyed by item id + its enchants, which is stable across
+            // a run's phases, so the same weapon's phases accumulate into one row.
+            for w in &p.weapons {
+                match entry
+                    .rec
+                    .weapons
+                    .iter_mut()
+                    .find(|e| e.weapon_id == w.weapon_id && e.enchants == w.enchants)
+                {
+                    Some(existing) => {
+                        existing.damage += w.damage;
+                        existing.hits += w.hits;
+                    }
+                    None => entry.rec.weapons.push(w.clone()),
+                }
+            }
             // Combine end-status across phases with priority Died > Present >
             // Nexused. A participant present at the end of any phase was there
             // (side objects such as Nest hives finalize by timeout ~10s after the
@@ -5022,6 +5422,9 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
             }
             // Carry a pet forward from any phase that has one (prefer keeping an
             // existing match over a later None).
+            if entry.rec.damage_taken_hits.is_none() {
+                entry.rec.damage_taken_hits = p.damage_taken_hits;
+            }
             if entry.rec.pet.is_none() && p.pet.is_some() {
                 entry.rec.pet = p.pet.clone();
             }
@@ -5111,6 +5514,12 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                 a.rec.guarded_hits = Some(a.guarded_hits_sum);
             }
             a.rec
+                .summons
+                .sort_by(|x, y| y.damage.cmp(&x.damage).then(y.hits.cmp(&x.hits)));
+            a.rec
+                .weapons
+                .sort_by(|x, y| y.damage.cmp(&x.damage).then(y.hits.cmp(&x.hits)));
+            a.rec
         })
         .collect();
     roster.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
@@ -5124,6 +5533,48 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
 fn is_addon_phase(p: &FightRecord) -> bool {
     crate::assets::aux_target_for_type(p.boss_object_type).is_some()
         || crate::assets::is_treasure_crate_type(p.boss_object_type)
+}
+
+/// Merge several phases' boost windows into one record's timebase, shifting each
+/// phase's offsets by its start relative to the merged start (so a merged row's
+/// timeline reads against its own start, not a phase's).
+fn merge_boost_windows(started_at: i64, group: &[FightRecord]) -> Vec<BoostWindow> {
+    let mut out: Vec<BoostWindow> = Vec::new();
+    for g in group {
+        let shift = (g.started_at - started_at).max(0);
+        for b in &g.boosts {
+            out.push(BoostWindow {
+                start_offset_ms: b.start_offset_ms + shift,
+                end_offset_ms: b.end_offset_ms + shift,
+                stat: b.stat.clone(),
+                from: b.from,
+                to: b.to,
+                source: b.source.clone(),
+            });
+        }
+    }
+    out.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
+    out
+}
+
+/// Merge several phases' ability activations, shifted like the boost windows.
+fn merge_ability_activations(started_at: i64, group: &[FightRecord]) -> Vec<AbilityActivation> {
+    let mut out: Vec<AbilityActivation> = Vec::new();
+    for g in group {
+        let shift = (g.started_at - started_at).max(0);
+        for a in &g.abilities {
+            out.push(AbilityActivation {
+                item_id: a.item_id,
+                enchants: a.enchants.clone(),
+                start_offset_ms: a.start_offset_ms + shift,
+                window_ms: a.window_ms,
+                damage: a.damage,
+                hits: a.hits,
+            });
+        }
+    }
+    out.sort_by_key(|a| a.start_offset_ms);
+    out
 }
 
 /// Collapse phases that map to the same aggregated aux target (e.g. every Royal
@@ -5207,6 +5658,9 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             spectral_hm: group.iter().any(|g| g.spectral_hm),
             shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
+            boss_uptime_ms: group.iter().map(|g| g.boss_uptime_ms).sum(),
+            boosts: merge_boost_windows(started_at, &group),
+            abilities: merge_ability_activations(started_at, &group),
         });
     }
     out
@@ -5290,6 +5744,9 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             spectral_hm: group.iter().any(|g| g.spectral_hm),
             shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
+            boss_uptime_ms: group.iter().map(|g| g.boss_uptime_ms).sum(),
+            boosts: merge_boost_windows(started_at, &group),
+            abilities: merge_ability_activations(started_at, &group),
         });
     }
     out
@@ -5428,8 +5885,15 @@ impl From<&FightParticipant> for ParticipantRecord {
             damage_taken: p.damage_taken,
             damage_taken_provenance: p.damage_taken_provenance,
             damage_blocked: p.damage_blocked,
+            damage_taken_hits: p.damage_taken_hits.map(|h| h as i64),
             guarded_damage: p.guarded_damage,
             guarded_hits: p.guarded_hits.map(|h| h as i64),
+            summon_damage: p.summon_damage,
+            summon_hits: p.summon_hits as i64,
+            summons: p.summons.clone(),
+            weapons: p.weapons.clone(),
+            packet_damage: p.packet_damage,
+            packet_hits: p.packet_hits,
         }
     }
 }
@@ -5733,9 +6197,16 @@ mod tests {
                     }),
                     damage_taken: Some(5_000),
                     damage_taken_provenance: DamageTakenProvenance::Observed,
+                    damage_taken_hits: None,
                     damage_blocked: None,
                     guarded_damage: None,
                     guarded_hits: None,
+                    summon_damage: 0,
+                    summon_hits: 0,
+                    summons: Vec::new(),
+                    weapons: Vec::new(),
+                    packet_damage: 0,
+                    packet_hits: 0,
                 },
                 FightParticipant {
                     object_id: 1000,
@@ -5757,8 +6228,18 @@ mod tests {
                     damage_blocked: None,
                     guarded_damage: None,
                     guarded_hits: None,
+                    summon_damage: 0,
+                    summon_hits: 0,
+                    summons: Vec::new(),
+                    weapons: Vec::new(),
+                    packet_damage: 0,
+                    packet_hits: 0,
+                    damage_taken_hits: None,
                 },
             ],
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 
@@ -5789,6 +6270,13 @@ mod tests {
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
+            damage_taken_hits: None,
         }
     }
 
@@ -5822,6 +6310,9 @@ mod tests {
             spectral_hm: false,
             shatters_hm: false,
             participants,
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 
@@ -5991,6 +6482,13 @@ mod tests {
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
+            damage_taken_hits: None,
         }
     }
 
@@ -8762,6 +9260,13 @@ mod tests {
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
+                damage_taken_hits: None,
             })
             .collect();
         f
@@ -8931,6 +9436,13 @@ mod tests {
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
+            damage_taken_hits: None,
         }
     }
 
@@ -11756,6 +12268,9 @@ mod tests {
             spectral_hm: false,
             shatters_hm: false,
             participants: vec![],
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 

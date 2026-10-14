@@ -88,15 +88,15 @@ const NOTE_COLOR: Color32 = Color32::from_rgb(220, 180, 120);
 /// so they read as secondary next to the white value.
 const ANNOT_COLOR: Color32 = Color32::from_rgb(150, 150, 150);
 /// Stat value at its class cap (gold), matching the character card.
-const MAXED_COLOR: Color32 = Color32::from_rgb(255, 215, 0);
+pub(crate) const MAXED_COLOR: Color32 = Color32::from_rgb(255, 215, 0);
 /// Stat value not yet at cap (green), matching the character card.
-const UNMAXED_COLOR: Color32 = Color32::from_rgb(100, 220, 100);
+pub(crate) const UNMAXED_COLOR: Color32 = Color32::from_rgb(100, 220, 100);
 
 /// Dimmed gear/exalt/crucible column colors so the bright Total column stands
 /// out. Applied to the Gear / Exalts / Crucible headers and stat brackets.
-const GEAR_DIM: Color32 = Color32::from_rgb(165, 145, 65);
-const EXALT_DIM: Color32 = Color32::from_rgb(70, 120, 185);
-const CRUCIBLE_DIM: Color32 = Color32::from_rgb(150, 95, 170);
+pub(crate) const GEAR_DIM: Color32 = Color32::from_rgb(165, 145, 65);
+pub(crate) const EXALT_DIM: Color32 = Color32::from_rgb(70, 120, 185);
+pub(crate) const CRUCIBLE_DIM: Color32 = Color32::from_rgb(150, 95, 170);
 
 /// Highest enemy defense in the game (5000), so the Enemy-DEF input caps at a
 /// 4-digit number.
@@ -516,6 +516,17 @@ fn weapon_dps_tooltip(ui: &mut egui::Ui, w: &WeaponDamage) {
                 }
             }
             label_row(ui, "Shots / sec", format!("{:.2}", w.shots_per_sec));
+            if (w.rate_mult - 1.0).abs() > 0.0005 {
+                ui.label(RichText::new("").color(LABEL_COLOR));
+                ui.label(
+                    RichText::new(format!(
+                        "{:+.1}% fire rate from enchant",
+                        (w.rate_mult - 1.0) * 100.0
+                    ))
+                    .color(ANNOT_COLOR),
+                );
+                ui.end_row();
+            }
             if w.total_projectiles > 1 {
                 label_row(ui, "Projectiles", w.total_projectiles.to_string());
             }
@@ -547,10 +558,12 @@ fn weapon_dps_tooltip(ui: &mut egui::Ui, w: &WeaponDamage) {
                         } else {
                             "every shot".to_string()
                         };
-                        ui.label(
-                            RichText::new(format!("  ({} dmg {}", p.damage_per_proc, cadence))
-                                .color(ANNOT_COLOR),
-                        );
+                        let detail = if p.min_damage != p.max_damage {
+                            format!("  ({}-{} dmg {}", p.min_damage, p.max_damage, cadence)
+                        } else {
+                            format!("  ({} dmg {}", p.damage_per_proc, cadence)
+                        };
+                        ui.label(RichText::new(detail).color(ANNOT_COLOR));
                         if p.proc_rate < 0.999 {
                             ui.label(
                                 RichText::new(format!(", {:.0}% proc", p.proc_rate * 100.0))
@@ -630,11 +643,11 @@ fn label_row_segments(ui: &mut egui::Ui, label: &str, segments: &[AbilitySegment
 
 /// Reserved pixel widths for the four attribute columns, so switching gear
 /// (e.g. HP crossing 1000) never resizes the grid and shifts the labels.
-struct ColW {
-    total: f32,
-    gear: f32,
-    exalt: f32,
-    crucible: f32,
+pub(crate) struct ColW {
+    pub(crate) total: f32,
+    pub(crate) gear: f32,
+    pub(crate) exalt: f32,
+    pub(crate) crucible: f32,
 }
 
 /// Width of `text` rendered with `font`, used to reserve fixed column widths.
@@ -648,7 +661,7 @@ fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
 /// Compute the reserved column widths from the widest of the header label and a
 /// max-digit sample value: Total 4 digits (+ potion icon), Gear 3, Exalts 2,
 /// Crucible 3. Signs/parens are included in the samples.
-fn attr_col_widths(ui: &egui::Ui) -> ColW {
+pub(crate) fn attr_col_widths(ui: &egui::Ui) -> ColW {
     let body = egui::TextStyle::Body.resolve(ui.style());
     let hdr = egui::FontId::proportional(10.0);
     let pad = 8.0;
@@ -701,18 +714,31 @@ fn attr_cell(
         if let Some(id) = stat_potion_id(potion_label) {
             sr.draw_outlined_sprite_in_rect(ui, id, rect);
         }
-        let value_color = if is_maxed { MAXED_COLOR } else { UNMAXED_COLOR };
-        ui.label(
-            RichText::new(a.total().to_string())
-                .color(value_color)
-                .strong(),
-        );
+        attr_total_label(ui, a, is_maxed);
     });
     // With the breakdown off, only the Total column is shown.
     if !breakdown {
         return;
     }
-    // Cell 2: gear bracket (yellow), fixed 3-digit width.
+    attr_bracket_cells(ui, a, show_crucible, w);
+}
+
+/// The colored total value: gold at the class cap, green below it, matching the
+/// character card and the fight-detail Stats table.
+fn attr_total_label(ui: &mut egui::Ui, a: &Attribute, is_maxed: bool) {
+    let value_color = if is_maxed { MAXED_COLOR } else { UNMAXED_COLOR };
+    ui.label(
+        RichText::new(a.total().to_string())
+            .color(value_color)
+            .strong(),
+    );
+}
+
+/// The Gear / Exalts / Crucible bracket cells, in their dimmed column colors and
+/// fixed widths so the columns stay aligned. An empty bonus emits an empty cell
+/// rather than a placeholder.
+fn attr_bracket_cells(ui: &mut egui::Ui, a: &Attribute, show_crucible: bool, w: &ColW) {
+    // Gear bracket (yellow), fixed 3-digit width.
     fixed_cell(ui, w.gear, |ui| {
         let g = a.gear_display();
         if g != 0 {
@@ -720,14 +746,14 @@ fn attr_cell(
             ui.label(RichText::new(format!("({}{})", sign, g)).color(GEAR_DIM));
         }
     });
-    // Cell 3: exalt bracket (blue), fixed 2-digit width.
+    // Exalt bracket (blue), fixed 2-digit width.
     fixed_cell(ui, w.exalt, |ui| {
         if a.exalt != 0 {
             ui.label(RichText::new(format!("(+{})", a.exalt)).color(EXALT_DIM));
         }
     });
-    // Cell 4: crucible bracket (magenta), fixed 3-digit width, only when the
-    // grid reserves it.
+    // Crucible bracket (magenta), fixed 3-digit width, only when the grid
+    // reserves it.
     if show_crucible {
         fixed_cell(ui, w.crucible, |ui| {
             if a.crucible != 0 {
@@ -736,6 +762,15 @@ fn attr_cell(
             }
         });
     }
+}
+
+/// The four value cells of one attribute row, without the potion icon: Total
+/// (gold when maxed, green otherwise) then the Gear / Exalts / Crucible
+/// breakdown. This is the Character Stats page's own rendering, shared with the
+/// fight-detail Stats table so the two read identically.
+pub(crate) fn attr_value_cells(ui: &mut egui::Ui, a: &Attribute, is_maxed: bool, w: &ColW) {
+    fixed_cell(ui, w.total, |ui| attr_total_label(ui, a, is_maxed));
+    attr_bracket_cells(ui, a, true, w);
 }
 
 /// Draws a 16px stat-potion / pet icon; the cell is reserved even when `id` is
@@ -812,8 +847,6 @@ fn render_gear_row(
     if ctx.equipment.is_empty() && lead.is_none() {
         return;
     }
-    let gear = crate::panels::character_card::CharacterCardWidget::compact();
-    let empty = CharacterItem::empty();
     ui.horizontal(|ui| {
         if let Some(id) = lead {
             // Character skin, sized to match the equipment slots.
@@ -851,17 +884,27 @@ fn render_gear_row(
                 ui.add_space(SLOT_SPACING);
             }
         }
-        for i in 0..4 {
-            let item = ctx.equipment.get(i).unwrap_or(&empty);
-            gear.render_item_slot(ui, item, sr);
-            ui.add_space(crate::panels::character_card::SLOT_SPACING);
-        }
+        gear_cells(ui, sr, &ctx.equipment);
     });
     ui.add_space(4.0);
 }
 
+/// The four gear cells (weapon, ability, armor, ring), drawn left to right in
+/// the caller's layout as large inventory cells. Shared so the fight-detail Gear
+/// section and the Character Stats page cannot drift apart; an item's name and
+/// enchantments appear on hover only.
+pub(crate) fn gear_cells(ui: &mut egui::Ui, sr: &mut SpriteRenderer, items: &[CharacterItem]) {
+    let gear = crate::panels::character_card::CharacterCardWidget::compact();
+    let empty = CharacterItem::empty();
+    for i in 0..4 {
+        let item = items.get(i).unwrap_or(&empty);
+        gear.render_item_slot(ui, item, sr);
+        ui.add_space(crate::panels::character_card::SLOT_SPACING);
+    }
+}
+
 /// A column-header cell for the attribute grid.
-fn attr_header_cell(ui: &mut egui::Ui, width: f32, text: &str, color: Color32) {
+pub(crate) fn attr_header_cell(ui: &mut egui::Ui, width: f32, text: &str, color: Color32) {
     fixed_cell(ui, width, |ui| {
         ui.label(RichText::new(text).size(10.0).color(color));
     });

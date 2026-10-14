@@ -25,6 +25,44 @@ pub enum TabIconSprite {
     SheetIndex(&'static str, i32),
     /// Use embedded PNG icon
     Embedded(EmbeddedIcon),
+    /// Draw a player's own character as the icon (the equipped skin when there
+    /// is one, else the class sprite), dyed like the character's roster row.
+    Character {
+        /// Sprite to draw: skin id when equipped, else class id.
+        sprite_id: i32,
+        /// Clothing/accessory dye texture ids (0 = none).
+        tex1: u32,
+        tex2: u32,
+    },
+    /// Draw a text glyph (e.g. a monochrome Noto Emoji character) as the icon.
+    Text(&'static str),
+}
+
+/// Fight-card sub-tab icons, matching the Vault's icon+label sub-tab style.
+///
+/// - "Team Overview" (the roster view) uses the two-people emote, the same
+///   glyph the app uses elsewhere for a group of players.
+/// - "My Performance" uses the local player's own character sprite.
+pub fn get_team_overview_subtab_icon() -> TabIconSprite {
+    TabIconSprite::Text("👥") // "several people" emote
+}
+
+/// Avatar icon for the "My Performance" sub-tab: the local player's equipped
+/// skin when there is one, else their class sprite, with their dyes. Returns
+/// `None` when the fight has no appearance recorded, and the button then falls
+/// back to a label-only tab.
+pub fn get_character_avatar_icon(
+    object_type: i32,
+    skin_id: i32,
+    tex1: u32,
+    tex2: u32,
+) -> Option<TabIconSprite> {
+    let sprite_id = if skin_id > 0 { skin_id } else { object_type };
+    (sprite_id > 0).then_some(TabIconSprite::Character {
+        sprite_id,
+        tex1,
+        tex2,
+    })
 }
 
 /// Tab icon definitions.

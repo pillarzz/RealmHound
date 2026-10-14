@@ -709,6 +709,18 @@ impl PacketRouter {
             // ----- Crucible definitions -----
             ParsedPacket::CrucibleResponse(resp) => {
                 let defs = crate::api::crucible::parse_crucible_defs(&resp.crucible_jsons);
+                // Diagnostic: the same feed carries other seasonal definitions, and
+                // the parser above consumes only the `crucible` ones (event-dungeon
+                // `modifierEvent` entries are known and deliberately ignored). Any
+                // other payload is logged in full so a newly added entry kind -- e.g.
+                // the Blood Ritual's bonuses -- can be identified from a real capture
+                // rather than guessed at. Bounded by the payload itself, and the feed
+                // arrives rarely (login / season or event change).
+                for json in &resp.crucible_jsons {
+                    if !json.contains("\"crucible\"") && !json.contains("\"modifierEvent\"") {
+                        tracing::info!("unparsed definition payload: {json}");
+                    }
+                }
                 if defs.is_empty() {
                     RouteResult::Routed(vec![])
                 } else {

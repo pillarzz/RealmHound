@@ -747,9 +747,16 @@ mod tests {
             pet: None,
             damage_taken: None,
             damage_taken_provenance: super::super::types::DamageTakenProvenance::Observed,
+            damage_taken_hits: None,
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
         }];
         if !solo {
             participants.push(FightParticipant {
@@ -769,9 +776,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: super::super::types::DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             });
         }
         CompletedFight {
@@ -799,6 +813,9 @@ mod tests {
             spectral_hm: false,
             shatters_hm: false,
             participants,
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 

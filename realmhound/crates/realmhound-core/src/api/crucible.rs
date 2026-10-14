@@ -86,6 +86,21 @@ impl CrucibleDef {
             .sum()
     }
 
+    /// Percentage stat modifier for the given stat index, as a multiplier (1.0
+    /// when the definition carries none). Multiple entries compound, so a season
+    /// listing two percentages for one stat multiplies them.
+    ///
+    /// Seasons differ in how they express their restriction: S30 sent flat
+    /// integers with `percent: 0`, while S31 sends e.g.
+    /// `{"stat":"VIT","percent":1,"value":1.3}` for "+30% VIT". Callers must apply
+    /// both -- [`Self::flat_stat_mod`] alone silently drops a percentage season.
+    pub fn pct_stat_mult(&self, index: usize) -> f32 {
+        self.stat_mods
+            .iter()
+            .filter(|m| m.percent && stat_index(m.stat) == index)
+            .fold(1.0f32, |acc, m| acc * m.value)
+    }
+
     /// True if this definition carries any applicable bonus or restriction.
     pub fn has_content(&self) -> bool {
         !self.stat_mods.is_empty()

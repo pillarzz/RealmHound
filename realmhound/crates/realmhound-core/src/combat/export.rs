@@ -216,9 +216,16 @@ mod tests {
             pet: None,
             damage_taken,
             damage_taken_provenance: DamageTakenProvenance::Estimated,
+            damage_taken_hits: None,
             damage_blocked: None,
             guarded_damage: Some(120),
             guarded_hits: Some(2),
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
         }
     }
 
@@ -245,6 +252,9 @@ mod tests {
             spectral_hm: false,
             shatters_hm: false,
             participants: vec![sample_participant(Some(300))],
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 

@@ -28,3 +28,4 @@
 # Fixes
 - Fixed gift-chest live updates in the Vault.
 - The Season 31 shinies are wired into their dungeon collections.
+- Weapon fire-rate enchantments now count toward the theoretical DPS readout.

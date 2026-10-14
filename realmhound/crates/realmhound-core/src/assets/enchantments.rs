@@ -36,6 +36,10 @@ pub enum EnchantEffectKind {
     MultiplyMinDamage,
     /// Multiplies the weapon's maximum damage by `amount` (e.g. `1.05`).
     MultiplyMaxDamage,
+    /// Multiplies the primary attack's fire rate by `amount` (e.g. `1.02`), which
+    /// scales weapon DPS directly. `amount` may be below `1.0` for the
+    /// fire-rate *penalty* enchantments.
+    MultiplyRateOfFire,
     /// A recognized but purely cosmetic/proc mutator (e.g. on-shoot self buffs)
     /// that grants no persistent stat effect. Modeled so its presence does not
     /// downgrade provenance to Partial.
@@ -54,6 +58,9 @@ impl EnchantEffectKind {
             "DustBonus" => Self::DustBonus,
             "FlatRegen" => Self::FlatRegen,
             "PercentageRegen" => Self::PercentageRegen,
+            // The mutator's element name is normally the kind (see the XML parser),
+            // so this covers only a text-form payload.
+            "MultiplyRateOfFire" => Self::MultiplyRateOfFire,
             // On-shoot / proc self-buffs (e.g. OnShoot Wisdom Boost): recognized
             // but not a persistent stat, so treated as cosmetic.
             "StatBoostSelf" => Self::Cosmetic,
@@ -384,6 +391,23 @@ impl EnchantmentList {
                             }
                             in_mutator_effect = true;
                         }
+                        // Fire-rate multiplier: the tag name is the kind and the
+                        // text content is the multiplier (e.g. 1.02). Its
+                        // `subAttackIndex` is -1 for the primary attack; a
+                        // sub-attack rate change is not modeled (the calc ignores
+                        // a positive index).
+                        b"MultiplyRateOfFire" if in_mutators => {
+                            in_mult_damage = Some(EnchantEffectKind::MultiplyRateOfFire);
+                            pending_mult_projectile = -1;
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == b"subAttackIndex" {
+                                    pending_mult_projectile = String::from_utf8_lossy(&attr.value)
+                                        .trim()
+                                        .parse()
+                                        .unwrap_or(-1);
+                                }
+                            }
+                        }
                         // Damage-multiplier mutators: the tag name is the kind and
                         // the text content is the multiplier (e.g. 1.05).
                         b"MultiplyMinDamage" if in_mutators => {
@@ -448,7 +472,7 @@ impl EnchantmentList {
                     b"AddOnPlayerShootActivate" => {
                         in_mutator_effect = false;
                     }
-                    b"MultiplyMinDamage" | b"MultiplyMaxDamage" => {
+                    b"MultiplyMinDamage" | b"MultiplyMaxDamage" | b"MultiplyRateOfFire" => {
                         in_mult_damage = None;
                     }
                     _ => {}
@@ -665,6 +689,12 @@ mod tests {
       <AddOnPlayerShootActivate amount="7" stat="WIS">StatBoostSelf</AddOnPlayerShootActivate>
     </Mutators>
   </Enchantment>
+  <Enchantment id="Rate_Of_Fire_2" type="0x1A2">
+    <DisplayId>Fire Rate Bonus II</DisplayId>
+    <Mutators>
+      <MultiplyRateOfFire subAttackIndex="-1">1.03</MultiplyRateOfFire>
+    </Mutators>
+  </Enchantment>
 </Enchantments>"#;
         let list = EnchantmentList::parse_xml(xml.as_bytes()).unwrap();
 
@@ -692,6 +722,14 @@ mod tests {
         let cos = list.effects(0x4D);
         assert_eq!(cos.len(), 1);
         assert_eq!(cos[0].kind, EnchantEffectKind::Cosmetic);
+
+        // Fire-rate multiplier: kind from the tag name, amount from the text, and
+        // `subAttackIndex` held like the damage multipliers' `projectileId`.
+        let rof = list.effects(0x1A2);
+        assert_eq!(rof.len(), 1);
+        assert_eq!(rof[0].kind, EnchantEffectKind::MultiplyRateOfFire);
+        assert!((rof[0].amount - 1.03).abs() < 1e-4);
+        assert_eq!(rof[0].projectile_id, -1);
     }
 
     #[test]

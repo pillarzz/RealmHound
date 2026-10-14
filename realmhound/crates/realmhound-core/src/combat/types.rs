@@ -232,6 +232,9 @@ pub struct FightParticipant {
     /// How `damage_taken` was derived (meaningful only when `damage_taken` is
     /// `Some`).
     pub damage_taken_provenance: DamageTakenProvenance,
+    /// Number of incoming hits that were valued into `damage_taken` ("shots
+    /// tanked"). `None` for rows recorded before this was tracked.
+    pub damage_taken_hits: Option<u64>,
     /// Damage negated by the local player's defense and other post-defense
     /// mitigation (the "Mell stat"): the difference between the raw
     /// incoming projectile damage and the amount actually taken. Only
@@ -246,6 +249,105 @@ pub struct FightParticipant {
     /// Hits landed on Oryx 3 while he was Guarded (a subset of `hits`), or `None`
     /// for fights recorded before this was tracked.
     pub guarded_hits: Option<u64>,
+    /// Summon/pet-sourced part of `damage` / `hits`. The totals above include it
+    /// (the game attributes pet damage to the owning player), so the UI can show
+    /// the full figure on the owner's row and the pet's own line beneath it.
+    /// Zero for fights recorded before this was tracked.
+    pub summon_damage: i64,
+    pub summon_hits: u64,
+    /// Per-summon/pet breakdown, one entry per entity that landed a hit.
+    pub summons: Vec<SummonContribution>,
+    /// The local player's own damage split per weapon (one row per weapon, with
+    /// the enchants it was fired with), highest damage first. Empty for remote
+    /// players, who are observed as whole damage packets and have no shot-level
+    /// detail. Always empty for fights recorded before this was tracked.
+    pub weapons: Vec<WeaponContribution>,
+    /// Damage the server itself attributed to this player in a local damage packet
+    /// -- an ability, DoT or proc figure the client did not compute. Only ever
+    /// non-zero for the local player, and kept out of `weapons` so a packet figure
+    /// is never presented as a weapon's contribution.
+    pub packet_damage: i64,
+    /// Number of local damage packets behind `packet_damage`.
+    pub packet_hits: u64,
+}
+
+/// One summon or pet that dealt damage, credited to the player who owns it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SummonContribution {
+    /// Object id of the firing summon / pet entity.
+    pub object_id: i32,
+    /// Pet sprite / skin id (`StatType::PetType`); 0 for item and ability summons.
+    pub pet_type: i32,
+    /// True when the entity carried a pet stat, i.e. a pet rather than a summon.
+    pub is_pet: bool,
+    pub damage: i64,
+    pub hits: u64,
+}
+
+/// One weapon's share of the local player's damage, summed across every loadout
+/// that used that weapon during the fight so a mid-fight armor or ring swap does
+/// not split one weapon's contribution.
+///
+/// Only the local player has this: their damage is reconstructed shot by shot
+/// from outgoing shoot/hit packets (tagged `Self-computed` in the UI), whereas
+/// other players arrive as whole damage packets with no weapon attribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeaponContribution {
+    /// Weapon item id (equipment slot 0).
+    pub weapon_id: i32,
+    /// The weapon's enchant ids at the time of those hits (empty when none).
+    pub enchants: Vec<u16>,
+    pub damage: i64,
+    pub hits: u64,
+}
+
+/// A window during which one of the local player's stats or conditions differed
+/// from its previous value, e.g. an Attack boost from a consumable or a Damaging
+/// condition from an ally's buff.
+///
+/// Derived purely from the server stat stream the tracker already receives, so
+/// it captures every boost the client was told about -- including ones with no
+/// local cause. The `source` is a best-effort hint and is labelled as inferred
+/// in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoostWindow {
+    /// Window start, in milliseconds since the fight started.
+    pub start_offset_ms: i64,
+    /// Window end (the transition back), or the fight's end while still active.
+    pub end_offset_ms: i64,
+    /// Stat or condition name ("Attack", "Damaging", ...).
+    pub stat: String,
+    /// Value before the transition.
+    pub from: i32,
+    /// Value during the window.
+    pub to: i32,
+    /// Best-effort source: the item used locally just before the change, or a
+    /// note that nothing local explains it.
+    pub source: String,
+}
+
+/// One activation of the local player's ability-slot item.
+///
+/// Ability damage is mostly resolved client-side (poison ticks, novas, lightning
+/// and so on never reach the wire), so this records the activation and credits it
+/// the local damage that *was* packet-borne while its window was open. Abilities
+/// whose damage the client resolves locally therefore show activations but no
+/// damage, rather than silently disappearing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbilityActivation {
+    /// Ability item id (equipment slot 1).
+    pub item_id: i32,
+    /// The ability's enchant ids at the time (empty when none).
+    pub enchants: Vec<u16>,
+    /// Activation time, milliseconds since the fight started.
+    pub start_offset_ms: i64,
+    /// How long the activation was assumed to be dealing damage (ms), capped so
+    /// overlapping activations cannot double-count a packet.
+    pub window_ms: i64,
+    /// Packet-borne damage credited to this activation.
+    pub damage: i64,
+    /// Number of packet-borne damage events credited to this activation.
+    pub hits: u64,
 }
 
 /// A completed boss fight ready to persist and display.
@@ -311,6 +413,10 @@ pub struct CompletedFight {
     /// `MV Total Counter` object released at the end of a dance/Umi phase; the
     /// run total drives the dungeon's loot tier.
     pub spirits: i32,
+    /// Total time the boss was vulnerable and taking damage, in ms. `0` means
+    /// unknown (records written before this was tracked), so consumers fall back
+    /// to the whole fight duration.
+    pub boss_uptime_ms: i64,
     /// Whether the run was played in Moonlight Village's Leisurely Mode (the
     /// group consumed a Tofu Delicacy), which shortens the phases and reduces
     /// the loot. False for every other dungeon.
@@ -328,6 +434,13 @@ pub struct CompletedFight {
     /// destroyed the Stone Idol (or The Source) that unlocks the renamed
     /// bosses. Only meaningful for The Shatters' main bosses; false otherwise.
     pub shatters_hm: bool,
+    /// The local player's stat/condition boost windows during this fight,
+    /// in time order. Empty for fights recorded before this was tracked.
+    pub boosts: Vec<BoostWindow>,
+    /// The local player's ability activations during this fight, in time order,
+    /// each with whatever packet-borne damage it could be credited. Empty for
+    /// fights recorded before this was tracked.
+    pub abilities: Vec<AbilityActivation>,
     /// Per-participant contributions, sorted by damage descending on finalize.
     pub participants: Vec<FightParticipant>,
 }

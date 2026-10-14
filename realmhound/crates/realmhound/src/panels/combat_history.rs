@@ -18,9 +18,10 @@ use realmhound_core::{
         DungeonPortalMap, MV_UMI_TYPE,
     },
     combat::{
-        build_bundle, sanitize_player_name, CombatDatabase, DamageProvenance,
-        DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord, FightSelection,
-        FightSummary, ParticipantEndStatus, ParticipantRecord, LOOT_LINK_POST_MS, LOOT_LINK_PRE_MS,
+        build_bundle, sanitize_player_name, AbilityActivation, BoostWindow, CombatDatabase,
+        DamageProvenance, DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord,
+        FightSelection, FightSummary, ParticipantEndStatus, ParticipantRecord, WeaponContribution,
+        LOOT_LINK_POST_MS, LOOT_LINK_PRE_MS,
     },
     loot::{LootDatabase, LootDropRecord, LootItemRecord},
 };
@@ -126,6 +127,93 @@ struct RunModes {
 /// neither is comparable with a normal clear. The Shatters and Spectral
 /// Penitentiary mark hard mode the same way, since its extra mechanics (and, in
 /// the Shatters, its renamed bosses) make it a different fight.
+/// Item display name from the asset catalog, falling back to its id so a missing
+/// name never renders an empty cell.
+fn item_name(item_id: i32) -> String {
+    get_asset_manager()
+        .object_name(item_id)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("Item 0x{item_id:X}"))
+}
+
+/// Enchant display name, falling back to its id for the same reason.
+fn enchant_name(enchant_id: u16) -> String {
+    get_asset_manager()
+        .enchant_name(enchant_id)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("0x{enchant_id:X}"))
+}
+
+/// Hover text listing an item's enchantments. The names are resolved from the
+/// enchant *type* ids recorded on the fight row itself, not from the item's
+/// current state, so re-rolling the item later cannot change what a stored fight
+/// reports. `None` when the item had none.
+fn enchant_tooltip(enchants: Option<&Vec<u16>>) -> Option<String> {
+    let ids = enchants?;
+    if ids.is_empty() {
+        return None;
+    }
+    let mut text = String::from("Enchantments at the time of this fight:");
+    for id in ids {
+        text.push_str("\n  • ");
+        text.push_str(&enchant_name(*id));
+    }
+    Some(text)
+}
+
+/// How a boost window's value changed: level stats show `from -> to`, while a
+/// condition bit (0/1) reads as turning on.
+fn boost_change(b: &BoostWindow) -> String {
+    if b.from == 0 && b.to == 1 {
+        "on".to_string()
+    } else if b.from == 1 && b.to == 0 {
+        "off".to_string()
+    } else {
+        format!("{} -> {}", b.from, b.to)
+    }
+}
+
+/// Merge a run's per-phase boost timelines into one, shifting each phase's offsets
+/// by its start relative to the run's, so the merged list reads against the run.
+fn merge_run_boosts(enc: &EncounterRecord) -> Vec<BoostWindow> {
+    let mut out: Vec<BoostWindow> = Vec::new();
+    for phase in &enc.phases {
+        let shift = (phase.started_at - enc.started_at).max(0);
+        for b in &phase.boosts {
+            out.push(BoostWindow {
+                start_offset_ms: b.start_offset_ms + shift,
+                end_offset_ms: b.end_offset_ms + shift,
+                stat: b.stat.clone(),
+                from: b.from,
+                to: b.to,
+                source: b.source.clone(),
+            });
+        }
+    }
+    out.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
+    out
+}
+
+/// Merge a run's per-phase ability activations, shifted like the boost windows.
+fn merge_run_abilities(enc: &EncounterRecord) -> Vec<AbilityActivation> {
+    let mut out: Vec<AbilityActivation> = Vec::new();
+    for phase in &enc.phases {
+        let shift = (phase.started_at - enc.started_at).max(0);
+        for a in &phase.abilities {
+            out.push(AbilityActivation {
+                item_id: a.item_id,
+                enchants: a.enchants.clone(),
+                start_offset_ms: a.start_offset_ms + shift,
+                window_ms: a.window_ms,
+                damage: a.damage,
+                hits: a.hits,
+            });
+        }
+    }
+    out.sort_by_key(|a| a.start_offset_ms);
+    out
+}
+
 fn dungeon_display_name(portal_map: &DungeonPortalMap, dungeon: &str, modes: RunModes) -> String {
     let name = portal_map.normalize_dungeon_name(dungeon);
     let mut tags: Vec<&str> = Vec::new();
@@ -336,6 +424,9 @@ pub struct CombatHistoryPanel {
     show_damage_taken: bool,
     /// Show the Damage blocked column in the detail table.
     show_damage_blocked: bool,
+    /// Whether the fight card shows the "My Performance" tab instead of the
+    /// roster overview. Both live under the card's header divider.
+    show_performance: bool,
     /// Cached distinct bosses/dungeons for search autocomplete.
     autocomplete: AutocompleteCache,
     /// Whether the search suggestion popup is open.
@@ -403,6 +494,7 @@ impl Default for CombatHistoryPanel {
             show_hits: true,
             show_damage_taken: true,
             show_damage_blocked: true,
+            show_performance: false,
             autocomplete: AutocompleteCache::default(),
             search_popup_open: false,
             search_selected_index: None,
@@ -2630,6 +2722,18 @@ impl CombatHistoryPanel {
                 shadcn.full_width_separator(ui);
                 ui.add_space(4.0);
 
+                // Sub-tabs live under the header divider: the roster overview and
+                // the local player's own performance breakdown, in the same
+                // icon+label style as the Vault's sub-tabs.
+                let local = fight.participants.iter().find(|p| p.is_local);
+                self.render_performance_subtabs(ui, ctx, local);
+                ui.add_space(4.0);
+
+                if self.show_performance {
+                    self.render_my_performance(ui, ctx, &fight);
+                    return;
+                }
+
                 let loot_x = self.render_participant_table(
                     ui,
                     ctx,
@@ -2646,6 +2750,772 @@ impl CombatHistoryPanel {
         if let Some((name, icon, tex1, tex2)) = player_click {
             self.apply_player_click(name, icon, tex1, tex2);
         }
+    }
+
+    /// Section A: the local player's stats as they stood for this fight, split by
+    /// source (base, gear + enchants, exaltations, crucible).
+    ///
+    /// The gear is the loadout recorded for the fight itself, so a later gear
+    /// swap cannot rewrite it. Maxed stats, exaltations and crucible buffs come
+    /// from the account cache, which reflects the present rather than the fight --
+    /// stated in the row note so the breakdown is not read as a historical fact.
+    fn render_stats_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        fight: &FightRecord,
+        local: &ParticipantRecord,
+    ) {
+        ui.add_space(2.0);
+        ui.label(RichText::new("Stats").strong());
+        ui.add_space(4.0);
+
+        let cache = &ctx.account_data.characters;
+        let Some(character) = cache.find_any_character(fight.local_char_id) else {
+            ui.label(
+                RichText::new(
+                    "This character is not in the account cache, so no stat breakdown \
+                     could be built for this fight.",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        };
+        let mut loadout = crate::panels::derived_stats::build_loadout(character, cache);
+        if local.equipment.iter().any(|&slot| slot >= 0) {
+            loadout.equipment = local.equipment.iter().map(|&slot| slot.max(0)).collect();
+            loadout.enchants = local.equipment_enchants.to_vec();
+        }
+        let derived = realmhound_core::stats::derived::derive(get_asset_manager(), &loadout);
+
+        ui.label(
+            RichText::new(
+                "Gear is this fight's recorded loadout; maxed stats, exaltations and \
+                 crucible come from your account data.",
+            )
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.add_space(4.0);
+        let attrs = &derived.attributes;
+        // Exactly the character page's Attributes readout: the stat's potion
+        // icon and name, then the value cells (Total plus the Gear / Exalts /
+        // Crucible breakdown) drawn by the shared renderer, so the colors,
+        // brackets and column widths match the Character Stats page. The maxed
+        // flags come from the account cache, like the maxed/exalt/crucible values
+        // themselves.
+        let maxed = character.maxed_flags();
+        let rows = [
+            ("HP", "Max HP", &attrs.max_hp, maxed[0]),
+            ("MP", "Max MP", &attrs.max_mp, maxed[1]),
+            ("ATT", "Attack", &attrs.attack, maxed[2]),
+            ("DEF", "Defense", &attrs.defense, maxed[3]),
+            ("SPD", "Speed", &attrs.speed, maxed[4]),
+            ("DEX", "Dexterity", &attrs.dexterity, maxed[5]),
+            ("VIT", "Vitality", &attrs.vitality, maxed[6]),
+            ("WIS", "Wisdom", &attrs.wisdom, maxed[7]),
+        ];
+        let widths = crate::panels::derived_stats::attr_col_widths(ui);
+        egui::Grid::new("my_performance_stats")
+            .num_columns(5)
+            .spacing([16.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("");
+                crate::panels::derived_stats::attr_header_cell(
+                    ui,
+                    widths.total,
+                    "Total",
+                    crate::panels::derived_stats::MAXED_COLOR,
+                );
+                crate::panels::derived_stats::attr_header_cell(
+                    ui,
+                    widths.gear,
+                    "Gear",
+                    crate::panels::derived_stats::GEAR_DIM,
+                );
+                crate::panels::derived_stats::attr_header_cell(
+                    ui,
+                    widths.exalt,
+                    "Exalts",
+                    crate::panels::derived_stats::EXALT_DIM,
+                );
+                crate::panels::derived_stats::attr_header_cell(
+                    ui,
+                    widths.crucible,
+                    "Crucible",
+                    crate::panels::derived_stats::CRUCIBLE_DIM,
+                );
+                ui.end_row();
+                for (abbr, label, attr, is_maxed) in rows {
+                    ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                        if let Some(id) = crate::panels::character_card::stat_potion_id(abbr) {
+                            ctx.sprite_renderer.draw_sprite_in_rect(ui, id, rect);
+                        }
+                        ui.label(label);
+                    });
+                    crate::panels::derived_stats::attr_value_cells(ui, attr, is_maxed, &widths);
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Section B: the boosts the server reported on the local player during the
+    /// fight -- consumables, ally buffs and condition effects. Only windows that
+    /// raise a stat (or turn a condition on) are listed; each row's duration is
+    /// how long the value was held before it reverted.
+    fn render_boost_section(&self, ui: &mut egui::Ui, fight: &FightRecord) {
+        ui.add_space(10.0);
+        ui.label(RichText::new("Boosts").strong());
+        ui.add_space(4.0);
+
+        let rising: Vec<&BoostWindow> = fight.boosts.iter().filter(|b| b.to > b.from).collect();
+        if rising.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No stat or condition boost was observed on you in this fight (or the \
+                     fight predates boost tracking).",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new(
+                "Read from the server's stat updates, so an ally's buff or a status \
+                 effect is included. The source is inferred: an item you used just \
+                 before the change, or a note that nothing local explains it.",
+            )
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.add_space(4.0);
+        egui::Grid::new("my_performance_boosts")
+            .num_columns(5)
+            .spacing([18.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for header in ["Time", "Stat", "Change", "Held for", "Source"] {
+                    ui.label(RichText::new(header).color(Color32::GRAY).small());
+                }
+                ui.end_row();
+                for b in rising {
+                    ui.label(fmt_duration(b.start_offset_ms));
+                    ui.label(&b.stat);
+                    ui.label(boost_change(b));
+                    let held = (b.end_offset_ms - b.start_offset_ms).max(0);
+                    ui.label(fmt_duration(held));
+                    ui.label(RichText::new(&b.source).color(Color32::GRAY));
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Section C: the loadout recorded for this fight, each item with the
+    /// enchantments it had at the time.
+    fn render_gear_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        local: &ParticipantRecord,
+    ) {
+        ui.add_space(10.0);
+        ui.label(RichText::new("Gear").strong());
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "The loadout recorded for this fight, weapon first. Hover a slot for \
+                 the item and the enchantments it had at the time.",
+            )
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.add_space(4.0);
+        // The same large inventory cells the Character Stats page uses, laid out
+        // horizontally. The item name and its enchantments are on hover only.
+        let gear: Vec<realmhound_core::vault::CharacterItem> = (0..4)
+            .map(|slot| {
+                if local.equipment[slot] < 0 {
+                    realmhound_core::vault::CharacterItem::empty()
+                } else {
+                    realmhound_core::vault::CharacterItem {
+                        item_id: local.equipment[slot],
+                        enchant_ids: local.equipment_enchants[slot].clone(),
+                        ..Default::default()
+                    }
+                }
+            })
+            .collect();
+        ui.horizontal(|ui| {
+            crate::panels::derived_stats::gear_cells(ui, ctx.sprite_renderer, &gear);
+        });
+
+        // Anything else the player swapped to mid-fight. The recorded buckets
+        // identify the weapon each hit was fired with, so a weapon swap is
+        // recoverable; an armour/ring swap is not (only the damage-best loadout is
+        // kept), so this list is labelled for what it is.
+        let main_weapon = local.equipment[0];
+        let swapped: Vec<&WeaponContribution> = local
+            .weapons
+            .iter()
+            .filter(|w| w.weapon_id != main_weapon && w.damage > 0)
+            .collect();
+        if !swapped.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Also used in this fight").strong());
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(
+                    "Weapons you swapped to during the fight, with what each of them dealt. \
+                     Only the weapon slot is recorded per hit, so armour and ring swaps are \
+                     not listed.",
+                )
+                .color(Color32::GRAY)
+                .small(),
+            );
+            ui.add_space(4.0);
+            for w in swapped {
+                let row = ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
+                    ctx.sprite_renderer
+                        .draw_sprite_in_rect(ui, w.weapon_id, rect);
+                    ui.label(item_name(w.weapon_id));
+                    ui.label(
+                        RichText::new(format!("{} damage in {} hit(s)", w.damage.max(0), w.hits))
+                            .color(Color32::GRAY)
+                            .small(),
+                    );
+                });
+                if let Some(tip) = enchant_tooltip(Some(&w.enchants)) {
+                    row.response.on_hover_text(tip);
+                }
+            }
+        }
+    }
+
+    /// Section E.1: the local player's damage split by weapon. The per-shot value
+    /// is rolled from the map seed and the player's Attack at shoot time -- the
+    /// server never reports your own damage -- hence the `Self-computed` tag.
+    fn render_weapon_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        local: &ParticipantRecord,
+    ) {
+        ui.add_space(10.0);
+        ui.label(RichText::new("Damage by weapon").strong());
+        ui.add_space(4.0);
+        if local.weapons.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No weapon damage was attributed to you in this fight (or the fight \
+                     predates per-weapon tracking).",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new(
+                "Self-computed: each hit's value is rolled from the map seed and your \
+                 Attack at shoot time, then reduced by the target's Defense.",
+            )
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.add_space(4.0);
+        egui::Grid::new("my_performance_weapons")
+            .num_columns(4)
+            .spacing([18.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for header in ["Weapon", "Hits", "Average", "Damage"] {
+                    ui.label(RichText::new(header).color(Color32::GRAY).small());
+                }
+                ui.end_row();
+                for w in &local.weapons {
+                    let row = ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
+                        ctx.sprite_renderer
+                            .draw_sprite_in_rect(ui, w.weapon_id, rect);
+                        ui.label(item_name(w.weapon_id));
+                    });
+                    if let Some(tip) = enchant_tooltip(Some(&w.enchants)) {
+                        row.response.on_hover_text(tip);
+                    }
+                    ui.label(w.hits.to_string());
+                    let avg = if w.hits > 0 {
+                        format!("{:.1}", w.damage.max(0) as f64 / w.hits as f64)
+                    } else {
+                        "-".to_string()
+                    };
+                    ui.label(avg);
+                    ui.label(RichText::new(w.damage.max(0).to_string()).strong());
+                    ui.end_row();
+                }
+            });
+
+        if local.packet_damage > 0 {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Separately, the server reported {} damage across {} hit(s) of your own \
+                     ability/proc/DoT damage. Those are packet-borne figures the client did \
+                     not compute, so they are not part of any weapon row above; they show up \
+                     under whichever ability was active.",
+                    local.packet_damage.max(0),
+                    local.packet_hits,
+                ))
+                .color(Color32::GRAY)
+                .small(),
+            );
+        }
+    }
+
+    /// Section E.2: the local player's ability activations, each credited the
+    /// damage the server itself reported while its window was open.
+    ///
+    /// Most ability damage is resolved client-side (poisons, novas, lightning and
+    /// friends never reach the wire), so those activations stay listed with no
+    /// damage instead of being dropped -- nothing is silently omitted.
+    fn render_ability_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        fight: &FightRecord,
+    ) {
+        ui.add_space(10.0);
+        ui.label(RichText::new("Damage by ability").strong());
+        ui.add_space(4.0);
+        if fight.abilities.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No ability activations were observed in this fight (or the fight \
+                     predates ability tracking).",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new(
+                "From packets where the server reported the damage; abilities the client \
+                 resolves itself show their activations with no packet-borne damage.",
+            )
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.add_space(4.0);
+
+        // One row per ability (item + enchants), with its activations and whatever
+        // packet-borne damage could be credited across them.
+        struct Row {
+            item_id: i32,
+            enchants: Vec<u16>,
+            activations: usize,
+            damage: i64,
+            hits: u64,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for a in &fight.abilities {
+            match rows
+                .iter_mut()
+                .find(|r| r.item_id == a.item_id && r.enchants == a.enchants)
+            {
+                Some(r) => {
+                    r.activations += 1;
+                    r.damage += a.damage;
+                    r.hits += a.hits;
+                }
+                None => rows.push(Row {
+                    item_id: a.item_id,
+                    enchants: a.enchants.clone(),
+                    activations: 1,
+                    damage: a.damage,
+                    hits: a.hits,
+                }),
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.damage
+                .cmp(&a.damage)
+                .then(b.activations.cmp(&a.activations))
+        });
+
+        egui::Grid::new("my_performance_abilities")
+            .num_columns(4)
+            .spacing([18.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for header in ["Ability", "Activations", "From packets", "Notes"] {
+                    ui.label(RichText::new(header).color(Color32::GRAY).small());
+                }
+                ui.end_row();
+                for r in &rows {
+                    let row = ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
+                        ctx.sprite_renderer.draw_sprite_in_rect(ui, r.item_id, rect);
+                        ui.label(item_name(r.item_id));
+                    });
+                    if let Some(tip) = enchant_tooltip(Some(&r.enchants)) {
+                        row.response.on_hover_text(tip);
+                    }
+                    ui.label(r.activations.to_string());
+                    if r.damage > 0 {
+                        ui.label(RichText::new(r.damage.to_string()).strong());
+                        ui.label(RichText::new(format!("{} packet hit(s)", r.hits)).small());
+                    } else {
+                        ui.label(RichText::new("-").color(Color32::GRAY));
+                        ui.label(
+                            RichText::new("no packet-borne damage (client-resolved effect)")
+                                .color(Color32::GRAY)
+                                .small(),
+                        );
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Fold an encounter run's phases into a single record for the "My
+    /// Performance" view: the aggregated roster plus run-level totals, so the
+    /// same renderer works for a grouped card and for a single fight.
+    fn aggregated_performance_fight(&self, enc: &EncounterRecord) -> Option<FightRecord> {
+        let anchor = enc
+            .phases
+            .iter()
+            .find(|p| p.boss_object_type == enc.anchor_object_type)
+            .or_else(|| enc.phases.first())?;
+        let boss_max_hp = enc
+            .phases
+            .iter()
+            .map(|p| p.boss_max_hp as i64)
+            .sum::<i64>()
+            .min(i32::MAX as i64) as i32;
+        Some(FightRecord {
+            id: 0,
+            started_at: enc.started_at,
+            ended_at: enc.ended_at,
+            dungeon: enc.dungeon.clone(),
+            dungeon_entered_at: anchor.dungeon_entered_at,
+            map_seed: anchor.map_seed,
+            boss_object_type: enc.anchor_object_type,
+            boss_name: enc.display_name.clone(),
+            boss_max_hp,
+            boss_start_hp: boss_max_hp,
+            local_object_id: anchor.local_object_id,
+            local_char_id: anchor.local_char_id,
+            killed: enc.killed,
+            local_close_calls: enc.phases.iter().map(|p| p.local_close_calls).sum(),
+            aux_member_count: None,
+            spirits: enc.phases.iter().map(|p| p.spirits).sum(),
+            leisurely: enc.leisurely,
+            petless: enc.petless,
+            spectral_hm: enc.spectral_hm,
+            shatters_hm: enc.shatters_hm,
+            boss_uptime_ms: enc.phases.iter().map(|p| p.boss_uptime_ms).sum(),
+            boosts: merge_run_boosts(enc),
+            abilities: merge_run_abilities(enc),
+            participants: enc.roster.clone(),
+        })
+    }
+
+    /// The fight card's sub-tab row ("Team Overview" / "My Performance"),
+    /// drawn under the header divider in the same icon+label style as the
+    /// Vault's sub-tabs -- the people emote for the roster and the local
+    /// player's own character sprite for their breakdown -- followed by its own
+    /// divider so the tab row reads as a band above the content.
+    fn render_performance_subtabs(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        local: Option<&ParticipantRecord>,
+    ) {
+        ui.horizontal(|ui| {
+            if ctx
+                .sprite_renderer
+                .render_icon_button(
+                    ui,
+                    Some(crate::tab_icons::get_team_overview_subtab_icon()),
+                    "Team Overview",
+                    !self.show_performance,
+                    Some(Color32::WHITE),
+                    None,
+                )
+                .clicked()
+            {
+                self.show_performance = false;
+            }
+
+            let avatar = local.and_then(|p| {
+                crate::tab_icons::get_character_avatar_icon(
+                    p.object_type,
+                    p.skin_id,
+                    p.tex1,
+                    p.tex2,
+                )
+            });
+            if ctx
+                .sprite_renderer
+                .render_icon_button(
+                    ui,
+                    avatar,
+                    "My Performance",
+                    self.show_performance,
+                    Some(Color32::WHITE),
+                    None,
+                )
+                .clicked()
+            {
+                self.show_performance = true;
+            }
+        });
+        ui.add_space(4.0);
+        ctx.shadcn.full_width_separator(ui);
+    }
+
+    /// One boss of a grouped run, in the "My Performance" view: the boss's own
+    /// header -- the same row the Team Overview lists -- over a foldable block of
+    /// that boss's breakdown. Damage is read per boss because a phase is what the
+    /// player actually fought, and it is what the roster rows above report.
+    fn render_boss_performance(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        enc: &EncounterRecord,
+        phase: &FightRecord,
+    ) {
+        let phase_name = match phase.aux_member_count {
+            Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
+            _ => phase.boss_name.clone(),
+        };
+        let (phase_stats, phase_spirits) = boss_row_stats_parts(
+            phase.boss_object_type,
+            phase.boss_start_hp,
+            phase.boss_max_hp,
+            phase.total_damage(),
+            phase.spirits,
+        );
+        let (state, scolor) = if phase.killed || enc.killed {
+            ("Completed", Color32::from_rgb(120, 200, 120))
+        } else {
+            ("Escaped", Color32::GRAY)
+        };
+        ui.horizontal(|ui| {
+            if phase.boss_object_type != 0 {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                draw_boss_sprite(
+                    ctx.sprite_renderer,
+                    ui,
+                    phase.boss_object_type,
+                    phase.shatters_hm,
+                    rect,
+                );
+            }
+            egui::CollapsingHeader::new(
+                RichText::new(format!("{phase_name}   {phase_stats}")).strong(),
+            )
+            .id_salt(("perf_boss", phase.id))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(state).color(scolor).small());
+                    if let Some(spirits) = phase_spirits {
+                        ui.label(
+                            RichText::new(format!("{spirits} spirits"))
+                                .color(Color32::GRAY)
+                                .small(),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+                self.render_my_performance(ui, ctx, phase);
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    /// "My Performance": the local player's own breakdown for one fight -- where
+    /// they placed, what they dealt and took, and how their damage was built.
+    /// Every figure here is Combat History's own reconstruction for the local
+    /// player, which is why the section is labelled by provenance.
+    fn render_my_performance(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        fight: &FightRecord,
+    ) {
+        let Some(local) = fight.participants.iter().find(|p| p.is_local) else {
+            ui.label(
+                RichText::new("No local-player row was recorded for this fight.")
+                    .color(Color32::GRAY),
+            );
+            return;
+        };
+
+        let rank = fight
+            .participants
+            .iter()
+            .position(|p| p.is_local)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        let total = fight.participants.len();
+        let team_damage: i64 = fight
+            .participants
+            .iter()
+            .map(|p| p.damage.max(0))
+            .sum::<i64>()
+            .max(0);
+        // Boss uptime is only known for fights recorded after it was tracked; on
+        // older rows the whole fight duration is the denominator and the row says
+        // so rather than pretending the fight was continuous.
+        let (denom_ms, denom_label) = if fight.boss_uptime_ms > 0 {
+            (fight.boss_uptime_ms, "boss uptime")
+        } else {
+            (fight.duration_ms(), "whole fight duration")
+        };
+        let dpm = if denom_ms > 0 {
+            local.damage.max(0) as f64 * 60_000.0 / denom_ms as f64
+        } else {
+            0.0
+        };
+
+        // Sections run in the order the feature was specified: the stats the
+        // fight was fought with, the boosts observed on the player, the gear worn,
+        // the summary, then how the damage was built.
+        self.render_stats_section(ui, ctx, fight, local);
+        self.render_boost_section(ui, fight);
+        self.render_gear_section(ui, ctx, local);
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Summary").strong());
+        ui.add_space(4.0);
+        egui::Grid::new("my_performance_summary")
+            .num_columns(2)
+            .spacing([18.0, 4.0])
+            .show(ui, |ui| {
+                let pct = |part: i64, whole: i64| -> String {
+                    if whole <= 0 {
+                        "-".to_string()
+                    } else {
+                        format!("{:.1}%", part.max(0) as f64 * 100.0 / whole as f64)
+                    }
+                };
+                let row = |ui: &mut egui::Ui, label: &str, value: String| {
+                    ui.label(RichText::new(label).color(Color32::GRAY));
+                    ui.label(RichText::new(value).strong());
+                    ui.end_row();
+                };
+                row(ui, "Rank", format!("{} of {}", rank, total));
+                row(
+                    ui,
+                    "Damage",
+                    format!(
+                        "{}  ({} of boss HP, {} of team)",
+                        local.damage.max(0),
+                        pct(local.damage, fight.boss_max_hp as i64),
+                        pct(local.damage, team_damage)
+                    ),
+                );
+                row(
+                    ui,
+                    "Damage per minute",
+                    format!("{:.0}  per {}", dpm, denom_label),
+                );
+                // Hits come from hit packets, so they carry no provenance tag;
+                // the tag describes how damage values were derived.
+                row(ui, "Hits landed", local.hits.to_string());
+                row(
+                    ui,
+                    "Shots tanked",
+                    local
+                        .damage_taken_hits
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                row(
+                    ui,
+                    "Damage taken",
+                    match local.damage_taken {
+                        Some(d) => format!("{}  ({})", d, local.damage_taken_provenance.as_str()),
+                        None => "-".to_string(),
+                    },
+                );
+                row(
+                    ui,
+                    "Damage blocked",
+                    local
+                        .damage_blocked
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            });
+
+        self.render_weapon_section(ui, ctx, local);
+        self.render_ability_section(ui, ctx, fight);
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Pets and summons").strong());
+        ui.add_space(4.0);
+        if local.summons.is_empty() {
+            ui.label(
+                RichText::new("No pet or summon hits were recorded in this fight.")
+                    .color(Color32::GRAY),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "Pet and summon hits are credited to you (the game attributes them to the \
+                     owner); they are listed here so the split is visible, and they are excluded \
+                     from your own per-hit average and per-weapon figures.",
+                )
+                .color(Color32::GRAY)
+                .small(),
+            );
+            ui.add_space(4.0);
+            egui::Grid::new("my_performance_pets")
+                .num_columns(4)
+                .spacing([18.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Entity").color(Color32::GRAY).small());
+                    ui.label(RichText::new("Hits").color(Color32::GRAY).small());
+                    ui.label(RichText::new("Damage").color(Color32::GRAY).small());
+                    ui.label(RichText::new("Average").color(Color32::GRAY).small());
+                    ui.end_row();
+                    for s in &local.summons {
+                        let label = if s.is_pet {
+                            if s.pet_type != 0 {
+                                format!("Pet  (type 0x{:X})", s.pet_type)
+                            } else {
+                                "Pet".to_string()
+                            }
+                        } else {
+                            "Summon".to_string()
+                        };
+                        ui.label(label);
+                        ui.label(s.hits.to_string());
+                        ui.label(s.damage.max(0).to_string());
+                        ui.label(if s.hits > 0 {
+                            (s.damage.max(0) / s.hits as i64).to_string()
+                        } else {
+                            "-".to_string()
+                        });
+                        ui.end_row();
+                    }
+                    ui.label(RichText::new("Included in your total").italics());
+                    ui.label(local.summon_hits.to_string());
+                    ui.label(local.summon_damage.max(0).to_string());
+                    ui.label("-");
+                    ui.end_row();
+                });
+        }
+        let _ = ctx;
     }
 
     /// Render the loot dropped by one boss as compact rows (bag sprite + item
@@ -3818,6 +4688,39 @@ impl CombatHistoryPanel {
                 ui.add_space(8.0);
                 shadcn.full_width_separator(ui);
                 ui.add_space(6.0);
+
+                // Same sub-tabs as a single-fight card, so a grouped run offers the
+                // local player's own breakdown too.
+                let local = enc.roster.iter().find(|p| p.is_local);
+                self.render_performance_subtabs(ui, ctx, local);
+                ui.add_space(4.0);
+
+                if self.show_performance {
+                    // One foldable block per boss, under the header the Team Overview
+                    // rows use. A run-wide aggregate mixed the phases into a total
+                    // that reconciled with no single roster row.
+                    let mut shown = false;
+                    for phase in &visible_phases {
+                        if !phase.participants.iter().any(|p| p.is_local) {
+                            continue;
+                        }
+                        shown = true;
+                        self.render_boss_performance(ui, ctx, &enc, phase);
+                    }
+                    if !shown {
+                        // A phase can be hidden from the roster list while the run
+                        // still has a local row, so fall back to the run-wide view.
+                        if let Some(aggregate) = self.aggregated_performance_fight(&enc) {
+                            self.render_my_performance(ui, ctx, &aggregate);
+                        } else {
+                            ui.label(
+                                RichText::new("No local-player row was recorded for this run.")
+                                    .color(Color32::GRAY),
+                            );
+                        }
+                    }
+                    return;
+                }
 
                 for phase in &visible_phases {
                     let expanded = self.expanded_phases.contains(&phase.id);

@@ -165,6 +165,8 @@ const CURATED_BOSS_TYPES: &[i32] = &[
     21943, // New Kage Kami (Adept Hero of Oryx) -- ENEMY,MINION,UNDEAD,MINION_MID, 3000 HP, no boss label
     21946, // New Great Coil Snake (Rookie Hero of Oryx) -- not always labeled MINIBOSS
     22109, // Kogbold Expedition Engine (realm event) -- MINION,BEAST,MINION_WEAK,VETERAN_ENCOUNTER, 700k HP
+    22128, // New Beer God (realm event) -- defined only in encounters.xml, which the catalog
+    //        does not index, so it has no name and no <Labels> at all; 80k HP
     24020, // Criminal Monkey (Animal Merchant realm set-piece spawn) -- no labels
     24021, // Fraudulent Tiger (Animal Merchant realm set-piece spawn) -- no labels
     24023, // Animal Merchant (Adept Hero of Oryx realm set-piece) -- no labels
@@ -1119,7 +1121,12 @@ pub const SHATTERS_TEMPEST_TYPE: i32 = 0x4452;
 /// she has no `DisplayId` in the game files (deliberate on Deca's part -- her
 /// name is only revealed in the fight's dialogue), which would otherwise leave
 /// the fight card reading "Shatters A22".
-const OBJECT_NAME_OVERRIDES: &[(i32, &str)] = &[(SHATTERS_QUEEN_TYPE, "The Shattered Queen")];
+const OBJECT_NAME_OVERRIDES: &[(i32, &str)] = &[
+    (SHATTERS_QUEEN_TYPE, "The Shattered Queen"),
+    // "New Beer God" is defined only in encounters.xml, which the object catalog
+    // does not index, so it has no name to resolve from the XML.
+    (22128, "Beer God"),
+];
 
 /// The display name overriding the catalog name for `id`, or `None` to use the
 /// catalog's. See [`OBJECT_NAME_OVERRIDES`].

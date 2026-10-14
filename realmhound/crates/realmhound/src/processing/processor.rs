@@ -911,6 +911,30 @@ impl PacketProcessor {
                     );
                     return;
                 }
+                // The character list reports each character's Blood Ritual, which is
+                // what makes the ritual known for characters that are not the live
+                // one (issue #64). The list can lag behind the live status, so it is
+                // applied only to characters that are not live: those have their own
+                // `BloodRitual` stat, which is fresher.
+                let live_char_id = self.live_char_id;
+                let mut ritual_changed = false;
+                for char in &data.characters {
+                    if Some(char.char_id) == live_char_id {
+                        continue;
+                    }
+                    if let Some(id) = char.blood_ritual_id.as_deref() {
+                        ritual_changed |= self
+                            .account_data
+                            .characters
+                            .set_blood_ritual_for_char(Some(char.char_id), id);
+                    }
+                }
+                // Re-derive the per-character flags from the recorded ids, so the
+                // new season's tiers govern a roster that was already cached.
+                ritual_changed |= self.account_data.characters.sync_blood_ritual_flags();
+                if ritual_changed {
+                    self.account_data.mark_dirty();
+                }
                 self.account_data.characters.exaltation_stats = data.exaltation_stats;
                 self.account_data.characters.account_accelerators = data.accelerators;
                 self.account_data.max_num_chars = data.max_num_chars;
@@ -4766,6 +4790,84 @@ mod isolation_gate_tests {
             p.account_data.unlocked_blueprints_seasonal,
             vec![8386],
             "char/list has no seasonal list, so it must not clear one"
+        );
+    }
+
+    /// The character list is what makes the Blood Ritual known for characters
+    /// that are not the live one -- the live status only ever describes the
+    /// character being played (issue #64). The list can lag behind that status, so
+    /// the live character must be left to its own `BloodRitual` stat.
+    #[test]
+    fn api_account_data_seeds_blood_ritual_for_non_live_characters() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::api::RealmCharacter;
+
+        /// The tier the current feed defines (Halloween 2026 tier 1).
+        const CURRENT: &str = "5027802235043840";
+        /// An id from an earlier event that the current feed does not define.
+        const STALE: &str = "5704571108229120";
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        // Detected live for the character being played.
+        p.live_char_id = Some(1);
+        assert!(p
+            .account_data
+            .characters
+            .set_blood_ritual_for_char(Some(1), CURRENT));
+
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![
+                RealmCharacter {
+                    char_id: 1,
+                    blood_ritual_id: Some(STALE.into()),
+                    ..Default::default()
+                },
+                RealmCharacter {
+                    char_id: 2,
+                    blood_ritual_id: Some(CURRENT.into()),
+                    ..Default::default()
+                },
+                RealmCharacter {
+                    char_id: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert_eq!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(1)
+                .map(|d| d.tier),
+            Some(1),
+            "the live character keeps what its own stat reported"
+        );
+        assert_eq!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2)
+                .map(|d| d.tier),
+            Some(1),
+            "a character that is not live is known from the character list"
+        );
+        assert!(
+            p.account_data.characters.blood_ritual_for_char(3).is_none(),
+            "a character without the tag has no ritual"
         );
     }
 

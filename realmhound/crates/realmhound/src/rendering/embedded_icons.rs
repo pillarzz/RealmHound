@@ -95,6 +95,12 @@ pub enum EmbeddedIcon {
     /// Moonlight Village spirit/flame collected during a dance or Umi phase
     /// (ForgeFire.png, reused as the spirit sprite).
     MvSpirit,
+    /// "Damaging" condition icon (effects/damaging.png): the season challenge
+    /// damage bonus, shown on the Bonuses row that names the multiplier.
+    Damaging,
+    /// "Weak" condition icon (effects/weak.png): the matching penalty, shown
+    /// when the multiplier is below 1.
+    Weak,
 }
 
 impl EmbeddedIcon {
@@ -122,6 +128,8 @@ impl EmbeddedIcon {
         EmbeddedIcon::ForgeLegendary,
         EmbeddedIcon::ForgeMythical,
         EmbeddedIcon::ForgeFire,
+        EmbeddedIcon::Damaging,
+        EmbeddedIcon::Weak,
         EmbeddedIcon::PartyLeader,
         EmbeddedIcon::PartyWatch,
         EmbeddedIcon::PartyBan,
@@ -226,6 +234,8 @@ impl EmbeddedIcon {
                 include_bytes!("../../assets/portals/shatters_leg.png")
             }
             EmbeddedIcon::MvSpirit => include_bytes!("../../assets/ForgeFire.png"),
+            EmbeddedIcon::Damaging => include_bytes!("../../assets/effects/damaging.png"),
+            EmbeddedIcon::Weak => include_bytes!("../../assets/effects/weak.png"),
         }
     }
 
@@ -254,6 +264,8 @@ impl EmbeddedIcon {
             EmbeddedIcon::ForgeLegendary => "forge_legendary_icon",
             EmbeddedIcon::ForgeMythical => "forge_mythical_icon",
             EmbeddedIcon::ForgeFire => "forge_fire_icon",
+            EmbeddedIcon::Damaging => "damaging_icon",
+            EmbeddedIcon::Weak => "weak_icon",
             EmbeddedIcon::PartyLeader => "party_lead_icon",
             EmbeddedIcon::PartyWatch => "party_watch_icon",
             EmbeddedIcon::PartyBan => "party_ban_icon",

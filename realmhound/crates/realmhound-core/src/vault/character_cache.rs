@@ -370,6 +370,12 @@ pub struct CachedCharacter {
     /// Whether crucible is active for this character
     #[serde(default)]
     pub crucible_active: bool,
+    /// Whether a Blood Ritual is in effect for this character. Derived from
+    /// `blood_ritual_by_char` rather than parsed straight from the character list,
+    /// so the id can be held to account against the tiers the feed delivered: an
+    /// id from a previous event is not a ritual and leaves this false. [#64]
+    #[serde(default)]
+    pub blood_ritual_active: bool,
     /// Whether character has a backpack
     pub has_backpack: bool,
     /// Whether character has a backpack extender (2nd backpack)
@@ -448,6 +454,7 @@ impl Default for CachedCharacter {
             tex2: 0,
             seasonal: false,
             crucible_active: false,
+            blood_ritual_active: false,
             has_backpack: false,
             has_extender: false,
             has_3_quickslots: false,
@@ -655,6 +662,7 @@ impl CachedCharacter {
             tex2: char.tex2,
             seasonal: char.seasonal,
             crucible_active: char.crucible_active,
+            blood_ritual_active: false,
             has_backpack: char.has_backpack || char.backpack_slots >= 8,
             has_extender: char.backpack_slots >= 16,
             has_3_quickslots: char.has_3_quickslots,
@@ -773,9 +781,9 @@ pub struct CharacterCache {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blood_ritual_defs: Vec<crate::api::blood_ritual::BloodRitualDef>,
     /// Active Blood Ritual tier per character (char id -> definition id), from the
-    /// `BloodRitual` stat. Keyed by character rather than stored on the character
-    /// itself: the character-list payload carries no ritual at all, so a field
-    /// living there would be wiped by every refresh.
+    /// live `BloodRitual` stat and the character list's `BloodRitualActive` tag.
+    /// Keyed by character rather than stored on the character itself, so a refresh
+    /// that rebuilds the roster cannot drop what the live status reported.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub blood_ritual_by_char: HashMap<i32, String>,
 }
@@ -1403,6 +1411,9 @@ impl CharacterCache {
             return false;
         }
         self.blood_ritual_defs = defs;
+        // A new season's tiers replace the old ones, so an id only the previous
+        // feed defined stops being a ritual the moment they arrive.
+        self.sync_blood_ritual_flags();
         true
     }
 
@@ -1414,10 +1425,51 @@ impl CharacterCache {
         let Some(char_id) = char_id else {
             return false;
         };
+        let changed = self.record_blood_ritual(char_id, id);
+        if changed {
+            self.sync_blood_ritual_flags();
+        }
+        changed
+    }
+
+    /// The map half of [`Self::set_blood_ritual_for_char`], without the flag sync.
+    fn record_blood_ritual(&mut self, char_id: i32, id: &str) -> bool {
         if id.is_empty() {
             return self.blood_ritual_by_char.remove(&char_id).is_some();
         }
+        // An id the feed does not define names a ritual from a previous event:
+        // it survives on the character (a character that never took this
+        // season's ritual keeps reporting the one it took before), and the game
+        // applies nothing. Record no ritual rather than one that cannot be
+        // resolved -- and never let such an id displace one that does resolve,
+        // which is what keeps a lazy character-list refresh from erasing what
+        // the live status just reported. Until the feed has arrived nothing can
+        // be judged, so the id is kept and resolved later. [#64]
+        if !self.blood_ritual_defs.is_empty() && !self.blood_ritual_defs.iter().any(|d| d.id == id)
+        {
+            tracing::debug!("[RITUAL] Ignoring stale Blood Ritual id {id} on character {char_id}");
+            return false;
+        }
         self.blood_ritual_by_char.insert(char_id, id.to_string()) != Some(id.to_string())
+    }
+
+    /// Re-derive `blood_ritual_active` for every character from the recorded ids,
+    /// so it can be read straight off the character the way `crucible_active` is.
+    /// The flag mirrors *resolution* against the current tiers: an id the feed
+    /// does not define leaves it false.
+    pub fn sync_blood_ritual_flags(&mut self) -> bool {
+        let mut changed = false;
+        for c in &mut self.characters {
+            let active = self
+                .blood_ritual_by_char
+                .get(&c.char_id)
+                .is_some_and(|id| self.blood_ritual_defs.iter().any(|d| &d.id == id));
+            if c.blood_ritual_active != active {
+                c.blood_ritual_active = active;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// The Blood Ritual tier recorded for `char_id`, resolved against the tiers from
@@ -2197,6 +2249,7 @@ mod tests {
             tex2: 0,
             seasonal: false,
             crucible_active: false,
+            blood_ritual_active: false,
             has_backpack: true,
             has_extender: false,
             has_3_quickslots: false,
@@ -2933,5 +2986,84 @@ mod tests {
         assert!(cache.apply_newtick_inventory(1, vec![], vec![], bp.clone(), vec![], vec![]));
         // Identical re-send: no change.
         assert!(!cache.apply_newtick_inventory(1, vec![], vec![], bp, vec![], vec![]));
+    }
+
+    use crate::api::blood_ritual::BloodRitualDef;
+
+    /// One tier as the definitions feed delivers it; only the id and the
+    /// multipliers matter here.
+    fn ritual_tier(id: &str, tier: i32, hp: f32, dmg: f32) -> BloodRitualDef {
+        BloodRitualDef {
+            id: id.to_string(),
+            tier,
+            hp_mult: hp,
+            damage_mult: dmg,
+            loot_pct: 0.0,
+        }
+    }
+
+    /// The tier the current feed defines -- taken from the Halloween 2026 payload.
+    const THIS_SEASONS_RITUAL: &str = "5027802235043840";
+    /// An id from an earlier event, deliberately absent from the current feed. It
+    /// is the value a character that has never taken this season's ritual keeps
+    /// reporting, observed live on character 2228.
+    const LAST_SEASONS_RITUAL: &str = "5704571108229120";
+
+    #[test]
+    fn blood_ritual_is_recorded_per_character() {
+        let mut cache = CharacterCache::new();
+        cache.set_blood_ritual_defs(vec![
+            ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24),
+            ritual_tier("6078214115459072", 2, 0.85, 1.18),
+        ]);
+
+        assert!(cache.set_blood_ritual_for_char(Some(1), THIS_SEASONS_RITUAL));
+        assert!(cache.set_blood_ritual_for_char(Some(2), "6078214115459072"));
+
+        assert_eq!(cache.blood_ritual_for_char(1).unwrap().tier, 1);
+        assert_eq!(cache.blood_ritual_for_char(2).unwrap().tier, 2);
+        assert!(
+            cache.blood_ritual_for_char(3).is_none(),
+            "a character with no ritual resolves to nothing"
+        );
+    }
+
+    #[test]
+    fn a_previous_seasons_ritual_id_is_not_a_ritual() {
+        let mut cache = CharacterCache::new();
+        cache.set_blood_ritual_defs(vec![ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24)]);
+
+        // The id survives on characters that took an earlier season's ritual and
+        // were never played again. The game applies nothing for it, so recording
+        // it would report a ritual that is not in effect.
+        assert!(!cache.set_blood_ritual_for_char(Some(2228), LAST_SEASONS_RITUAL));
+        assert!(cache.blood_ritual_for_char(2228).is_none());
+        assert!(cache.blood_ritual_by_char.is_empty());
+    }
+
+    #[test]
+    fn a_stale_id_cannot_displace_this_seasons() {
+        let mut cache = CharacterCache::new();
+        cache.set_blood_ritual_defs(vec![ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24)]);
+
+        // The live status reports the tier actually in effect. A character-list
+        // refresh still carrying the id from an earlier event -- which is what the
+        // list holds for a re-cast ritual -- must not undo it.
+        assert!(cache.set_blood_ritual_for_char(Some(1), THIS_SEASONS_RITUAL));
+        assert!(!cache.set_blood_ritual_for_char(Some(1), LAST_SEASONS_RITUAL));
+        assert_eq!(cache.blood_ritual_for_char(1).unwrap().tier, 1);
+    }
+
+    #[test]
+    fn a_ritual_id_is_kept_until_the_feed_explains_it() {
+        let mut cache = CharacterCache::new();
+
+        // The character list can arrive before the definitions feed; nothing can
+        // be judged yet, so the id is kept rather than discarded as stale.
+        assert!(cache.set_blood_ritual_for_char(Some(1), THIS_SEASONS_RITUAL));
+        assert!(cache.blood_ritual_for_char(1).is_none());
+
+        cache.set_blood_ritual_defs(vec![ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24)]);
+        assert_eq!(cache.blood_ritual_for_char(1).unwrap().tier, 1);
     }
 }

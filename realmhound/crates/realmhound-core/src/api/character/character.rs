@@ -358,6 +358,13 @@ pub struct RealmCharacter {
     pub seasonal: bool,
     /// Whether crucible is active for this character (non-empty = active)
     pub crucible_active: bool,
+    /// Definition id of the Blood Ritual tier this character last took, or `None`
+    /// for a character without one. This is the `BloodRitualActive` tag of the
+    /// character list, and it is the same id the live `BloodRitual` stat carries.
+    /// It can lag behind the live status, and the id of a previous season's ritual
+    /// survives on characters that have not taken this season's, so it is resolved
+    /// against the current feed before use rather than trusted outright. [#64]
+    pub blood_ritual_id: Option<String>,
     /// Whether character has a backpack
     pub has_backpack: bool,
     /// Number of backpack slots (0, 8, or 16)
@@ -414,6 +421,7 @@ impl Default for RealmCharacter {
             fame: 0,
             seasonal: false,
             crucible_active: false,
+            blood_ritual_id: None,
             has_backpack: false,
             backpack_slots: 0,
             has_3_quickslots: false,

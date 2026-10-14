@@ -211,6 +211,14 @@ pub struct WeaponDamage {
     /// Ritual tier damage bonus/penalty); 1.0 when neither is active. Already
     /// folded into the damage figures, retained so the readout can attribute it.
     pub challenge_mult: f32,
+    /// The Blood Ritual's own share of `challenge_mult`, in percent: negative on
+    /// the penalty tiers and 0.0 when no tier applies. Kept apart from the
+    /// combined multiplier so the readout can name the source.
+    pub blood_ritual_pct: f32,
+    /// Exaltation bonus damage (stat 113) as a percentage of a weapon's rolled
+    /// damage -- the exaltation axis that scales the shot rather than the stat,
+    /// so it is named in the damage readout alongside enchant and mastery.
+    pub exalt_damage_pct: f32,
     /// Native on-shoot/on-hit procs contributing to DPS (e.g. poison bursts),
     /// resolved at the current effective stats. Empty when the weapon has none.
     pub procs: Vec<WeaponProcReadout>,
@@ -505,6 +513,9 @@ pub struct DerivedStats {
     /// Active Crucible definition applied to this loadout, if the character
     /// carries the crucible marker and a definition is known.
     pub crucible: Option<CrucibleDef>,
+    /// Active Blood Ritual tier applied to this loadout, if the character has one
+    /// and its id resolves against the tiers the feed delivered.
+    pub blood_ritual: Option<BloodRitualDef>,
 }
 
 impl DerivedStats {
@@ -1021,6 +1032,7 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
         ability,
         ability_readout,
         crucible: loadout.crucible.clone(),
+        blood_ritual: loadout.blood_ritual.clone(),
     }
 }
 
@@ -1060,6 +1072,17 @@ fn derive_weapon(
     // Seasonal challenge multipliers scale the weapon's rolled damage: the
     // Crucible's damage bonus and the Blood Ritual tier's damage bonus/penalty.
     // Both multiply the shot, so they compose, and neither is tied to gear.
+    let blood_ritual_pct = loadout
+        .blood_ritual
+        .as_ref()
+        .map(|r| r.damage_pct())
+        .unwrap_or(0.0);
+    // Exalt bonus damage is stored as points out of a neutral 1000/1000, the
+    // same convention `attack_multiplier` reads it with.
+    let exalt_damage_pct = loadout
+        .exalt_damage_bonus
+        .map(|points| (points as f32 / 1000.0 - 1.0) * 100.0)
+        .unwrap_or(0.0);
     let challenge_mult = loadout
         .crucible
         .as_ref()
@@ -1115,6 +1138,8 @@ fn derive_weapon(
         damage_mult: dmg_max_mult,
         mastery_pct: loadout.mastery_dmg_pct,
         challenge_mult,
+        blood_ritual_pct,
+        exalt_damage_pct,
         procs,
         proc_dps,
         rate_mult,
@@ -2542,6 +2567,8 @@ mod tests {
             damage_mult: 1.0,
             mastery_pct: 0.0,
             challenge_mult: 1.0,
+            blood_ritual_pct: 0.0,
+            exalt_damage_pct: 0.0,
             procs: Vec::new(),
             proc_dps: 0.0,
             rate_mult: 1.0,
@@ -2569,6 +2596,8 @@ mod tests {
             damage_mult: 1.0,
             mastery_pct: 0.0,
             challenge_mult: 1.0,
+            blood_ritual_pct: 0.0,
+            exalt_damage_pct: 0.0,
             procs: Vec::new(),
             proc_dps: 0.0,
             rate_mult: 1.0,
@@ -2628,6 +2657,8 @@ mod tests {
             damage_mult: 1.0,
             mastery_pct: 0.0,
             challenge_mult: 1.0,
+            blood_ritual_pct: 0.0,
+            exalt_damage_pct: 0.0,
             procs: vec![WeaponProcReadout {
                 label: "Poison",
                 damage_per_proc: 1000,

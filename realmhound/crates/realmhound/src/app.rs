@@ -8509,6 +8509,7 @@ impl RealmHoundApp {
 
         let seasonal = data.bonus.seasonal;
         let crucible = data.bonus.crucible_active;
+        let blood_ritual = data.bonus.blood_ritual_active;
         let resp = egui::Frame::NONE
             .fill(bg)
             .stroke(egui::Stroke::new(1.0_f32, border))
@@ -8563,6 +8564,17 @@ impl RealmHoundApp {
                                 r.center() + egui::vec2(0.0, 1.0),
                                 4.0,
                                 Color32::from_rgb(0xdc, 0x21, 0x15),
+                            );
+                        }
+                        // Blood Ritual (orange) closes the row: Seasonal,
+                        // Crucible, then the ritual. [#64]
+                        if blood_ritual {
+                            let (r, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                r.center() + egui::vec2(0.0, 1.0),
+                                4.0,
+                                Color32::from_rgb(0xe7, 0x7b, 0x00),
                             );
                         }
                     },

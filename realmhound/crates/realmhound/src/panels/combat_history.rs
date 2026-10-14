@@ -2817,7 +2817,7 @@ impl CombatHistoryPanel {
         ];
         let widths = crate::panels::derived_stats::attr_col_widths(ui);
         egui::Grid::new("my_performance_stats")
-            .num_columns(5)
+            .num_columns(6)
             .spacing([16.0, 4.0])
             .striped(true)
             .show(ui, |ui| {
@@ -2845,6 +2845,12 @@ impl CombatHistoryPanel {
                     widths.crucible,
                     "Crucible",
                     crate::panels::derived_stats::CRUCIBLE_DIM,
+                );
+                crate::panels::derived_stats::attr_header_cell(
+                    ui,
+                    widths.blood_ritual,
+                    "Blood Ritual",
+                    crate::panels::derived_stats::BLOOD_RITUAL_COLOR,
                 );
                 ui.end_row();
                 for (abbr, label, attr, is_maxed) in rows {

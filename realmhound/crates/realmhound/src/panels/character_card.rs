@@ -37,25 +37,65 @@ pub const FAME_SPRITE_ID: i32 = 24102;
 /// Object ID for the "Gold Shop Icon Object" sprite used as the gold coin icon.
 pub const GOLD_SPRITE_ID: i32 = 0x67FF;
 
-/// Draw a small red "CRUCIBLE" pill, roughly half the size of the Missions-tab
-/// badge. Used inline on the character info line to mark crucible characters.
-fn draw_crucible_pill(ui: &mut egui::Ui) {
-    const TEXT: &str = "CRUCIBLE";
+/// Draw a small pill, roughly half the size of the Missions-tab badge. The text
+/// gets a 1px black outline so it stays legible over any card background.
+fn draw_pill(ui: &mut egui::Ui, text: &str, background: Color32) {
     let font = egui::FontId::proportional(8.0);
     let galley = ui
         .painter()
-        .layout_no_wrap(TEXT.to_string(), font.clone(), Color32::WHITE);
+        .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE);
     let size = galley.size() + egui::vec2(6.0, 2.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 2.0, Color32::from_rgb(0xdc, 0x21, 0x15));
-    ui.painter().text(
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, background);
+    for offset in [
+        egui::vec2(-1.0, 0.0),
+        egui::vec2(1.0, 0.0),
+        egui::vec2(0.0, -1.0),
+        egui::vec2(0.0, 1.0),
+    ] {
+        painter.text(
+            rect.center() + offset,
+            egui::Align2::CENTER_CENTER,
+            text,
+            font.clone(),
+            Color32::BLACK,
+        );
+    }
+    painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        TEXT,
+        text,
         font,
         Color32::WHITE,
     );
+}
+
+/// Crucible marker on the character card.
+fn draw_crucible_pill(ui: &mut egui::Ui) {
+    draw_pill(ui, "CRUCIBLE", Color32::from_rgb(0xdc, 0x21, 0x15));
+}
+
+/// Blood Ritual marker, in the ritual panel's own orange so it reads apart from
+/// the crucible's red at a glance.
+fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
+    draw_pill(ui, "BLOOD RITUAL", Color32::from_rgb(0xe7, 0x7b, 0x00));
+}
+
+/// The season-challenge pills a character carries, on one line.
+fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool) {
+    if !crucible && !blood_ritual {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if crucible {
+            draw_crucible_pill(ui);
+        }
+        if blood_ritual {
+            draw_blood_ritual_pill(ui);
+        }
+    });
 }
 
 /// Format a fame value with a comma every three digits (e.g. `280087` ->
@@ -592,17 +632,17 @@ impl CharacterCardWidget {
             ui.add_space(8.0);
 
             if self.compact {
-                // Compact mode: name on line 1, crucible pill on line 2 (stacked
-                // in a vertical so a long 20-char name can't stretch the card).
-                // Small top/bottom padding keeps the two lines within the 32px
-                // sprite box.
+                // Compact mode: name on line 1, the season-challenge pills on
+                // line 2 (stacked in a vertical so a long 20-char name can't
+                // stretch the card). Small top/bottom padding keeps the two lines
+                // within the 32px sprite box.
                 let display_name = custom_label.unwrap_or(char.class_name());
                 let name_color = if char.seasonal { SEASONAL_COLOR } else { REGULAR_COLOR };
                 ui.vertical(|ui| {
                     ui.add_space(2.0);
                     ui.label(RichText::new(display_name).strong().size(14.0).color(name_color));
-                    if char.crucible_active {
-                        draw_crucible_pill(ui);
+                    if char.crucible_active || char.blood_ritual_active {
+                        draw_season_pills(ui, char.crucible_active, char.blood_ritual_active);
                         ui.add_space(2.0);
                     }
                 });
@@ -658,9 +698,14 @@ impl CharacterCardWidget {
                             });
                         }
 
-                        // Fame + crucible pill on their own row (row 2). Fame
-                        // is always shown (0 when none) so the card height stays
-                        // consistent and a long value can't stretch the card.
+                        // Season-challenge pills on their own row (row 2), under
+                        // the name/live status so a tall card keeps its identity
+                        // line clear of them.
+                        draw_season_pills(ui, char.crucible_active, char.blood_ritual_active);
+
+                        // Fame on its own row (row 3). Always shown (0 when none)
+                        // so the card height stays consistent and a long value
+                        // can't stretch the card.
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             render_fame_icon(ui, sprite_renderer, 13.0, false);
@@ -670,10 +715,6 @@ impl CharacterCardWidget {
                                     .size(12.5)
                                     .color(Color32::from_rgb(255, 200, 100)),
                             );
-                            if char.crucible_active {
-                                ui.add_space(6.0);
-                                draw_crucible_pill(ui);
-                            }
                         });
 
                         // Id, level, maxed - dot-separated (row 3).

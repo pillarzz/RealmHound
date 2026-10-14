@@ -41,14 +41,23 @@ fn main() {
     for c in &file.characters.characters {
         let mapped = decode_pcstats(&c.pc_stats_raw);
         let unmapped = get_unmapped_pcstats(&c.pc_stats_raw);
-        println!(
-            "char {} class {} crucible={} blob_len={} decoded={}",
-            c.char_id,
-            c.class_id,
-            c.crucible_active,
-            c.pc_stats_raw.len(),
-            mapped.is_some(),
-        );
+        match mapped {
+            Some(stats) => println!(
+                "char {} class {} crucible={} blob_len={} stats={:?}",
+                c.char_id,
+                c.class_id,
+                c.crucible_active,
+                c.pc_stats_raw.len(),
+                stats
+            ),
+            None => println!(
+                "char {} class {} crucible={} blob_len={} stats=<undecoded>",
+                c.char_id,
+                c.class_id,
+                c.crucible_active,
+                c.pc_stats_raw.len(),
+            ),
+        }
         let bits: Vec<String> = unmapped
             .iter()
             .map(|(bit, value)| format!("bit{bit}={value}"))

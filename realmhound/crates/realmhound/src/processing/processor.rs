@@ -2644,6 +2644,21 @@ impl PacketProcessor {
                         &obj.status,
                         time_ms as i64,
                     );
+
+                    // A spawn carries the character's full stat set, so this is where a login
+                    // reports a Blood Ritual tier that was set earlier in Nexus (stat 155's
+                    // string value is the definition id; empty means none).
+                    if Some(obj.object_id()) == self.session.player.object_id {
+                        for stat in &obj.status.stats {
+                            if stat.stat_type_id == 155 {
+                                let id = stat.string_stat_value.as_deref().unwrap_or("");
+                                if self.account_data.characters.set_active_blood_ritual_id(id) {
+                                    self.account_data.mark_dirty();
+                                    self.char_view_gen += 1;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // A pet's full inventory + identity ride only in its spawn
@@ -2913,19 +2928,6 @@ impl PacketProcessor {
                         // Fold NewTick stat deltas (e.g. a stat maxed mid-run)
                         // into the live stats accumulator.
                         self.merge_live_stats(status);
-                        // The Blood Ritual's active tier arrives as a string stat
-                        // (155) holding the definition id; an empty string means no
-                        // ritual is active. The server sends it on every toggle, so
-                        // this is what keeps the cached tier current.
-                        for stat in &status.stats {
-                            if stat.stat_type_id == 155 {
-                                let id = stat.string_stat_value.as_deref().unwrap_or("");
-                                if self.account_data.characters.set_active_blood_ritual_id(id) {
-                                    self.account_data.mark_dirty();
-                                    self.char_view_gen += 1;
-                                }
-                            }
-                        }
                     }
                 }
                 // Keep the live character's alive fame current from the observed
@@ -2938,6 +2940,21 @@ impl PacketProcessor {
                         .on_object_update(status.object_id, status, time_ms);
                     self.combat
                         .on_object_status(status.object_id, status, time_ms as i64);
+                    // The Blood Ritual's active tier rides the player's own status as a string
+                    // stat (155) holding the definition id; empty means none is active. It is
+                    // only ever toggled in Nexus, so the last value seen is the one that applies
+                    // to any fight the character walks into afterwards.
+                    if Some(status.object_id) == self.session.player.object_id {
+                        for stat in &status.stats {
+                            if stat.stat_type_id == 155 {
+                                let id = stat.string_stat_value.as_deref().unwrap_or("");
+                                if self.account_data.characters.set_active_blood_ritual_id(id) {
+                                    self.account_data.mark_dirty();
+                                    self.char_view_gen += 1;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Fold deferred combat tallies onto the character cache.

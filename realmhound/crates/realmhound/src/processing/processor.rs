@@ -2009,6 +2009,16 @@ impl PacketProcessor {
                     self.char_view_gen += 1;
                 }
             }
+            GameEvent::BloodRitualDefinitionsReceived(ref defs) => {
+                if self
+                    .account_data
+                    .characters
+                    .set_blood_ritual_defs(defs.clone())
+                {
+                    self.account_data.mark_dirty();
+                    self.char_view_gen += 1;
+                }
+            }
             GameEvent::ExaltationUpdated {
                 class_type,
                 ref exaltation,

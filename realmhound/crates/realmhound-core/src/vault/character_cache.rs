@@ -768,6 +768,14 @@ pub struct CharacterCache {
     /// to a character's derived stats only when its `crucible_active` flag is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_crucible: Option<crate::api::crucible::CrucibleDef>,
+    /// The season's Blood Ritual tiers (id -> HP / damage / loot modifiers), from
+    /// the definitions feed. Empty until that feed has been seen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blood_ritual_defs: Vec<crate::api::blood_ritual::BloodRitualDef>,
+    /// The tier the loaded character has active, resolved from the `BloodRitual`
+    /// stat (155) whose string value is the definition id. `None` = no ritual.
+    #[serde(default)]
+    pub active_blood_ritual: Option<crate::api::blood_ritual::BloodRitualDef>,
 }
 
 impl Default for CharacterCache {
@@ -787,6 +795,8 @@ impl Default for CharacterCache {
             owner_account_id: None,
             crucible_migrated: true,
             active_crucible: None,
+            blood_ritual_defs: Vec::new(),
+            active_blood_ritual: None,
         }
     }
 }
@@ -1377,6 +1387,33 @@ impl CharacterCache {
             return true;
         }
         false
+    }
+
+    /// Replace the Blood Ritual tiers, reporting whether they changed so the
+    /// caller can mark the cache dirty. Unlike the crucible (only one definition
+    /// is ever active), every tier is kept: the active one is named by the
+    /// `BloodRitual` stat's id.
+    pub fn set_blood_ritual_defs(
+        &mut self,
+        defs: Vec<crate::api::blood_ritual::BloodRitualDef>,
+    ) -> bool {
+        if defs.is_empty() || self.blood_ritual_defs == defs {
+            return false;
+        }
+        self.blood_ritual_defs = defs;
+        true
+    }
+
+    /// Resolve the active Blood Ritual tier from the `BloodRitual` stat's string
+    /// value -- the definition id, or empty when no ritual is active. Reports
+    /// whether the active tier changed.
+    pub fn set_active_blood_ritual_id(&mut self, id: &str) -> bool {
+        let next = self.blood_ritual_defs.iter().find(|d| d.id == id).cloned();
+        if self.active_blood_ritual == next {
+            return false;
+        }
+        self.active_blood_ritual = next;
+        true
     }
 
     ///

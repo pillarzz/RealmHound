@@ -155,6 +155,8 @@ pub enum GameEvent {
     /// entries carrying an actual `crucible` object are included; event-dungeon
     /// modifier entries are filtered out.
     CrucibleDefinitionsReceived(Vec<crate::api::crucible::CrucibleDef>),
+    /// The season's Blood Ritual tiers, from the same definitions feed.
+    BloodRitualDefinitionsReceived(Vec<crate::api::blood_ritual::BloodRitualDef>),
 
     /// Full party member list received (IncomingPartyMemberInfo packet).
     PartyListReceived(IncomingPartyMemberInfoPacket),
@@ -706,26 +708,22 @@ impl PacketRouter {
                 RouteResult::Routed(vec![GameEvent::TextReceived(text.clone())])
             }
 
-            // ----- Crucible definitions -----
+            // ----- Crucible / Blood Ritual definitions -----
             ParsedPacket::CrucibleResponse(resp) => {
+                // One feed carries both seasonal definitions; each parser skips the
+                // entries that are not its own (and the event-dungeon
+                // `modifierEvent` entries, which are deliberately ignored).
                 let defs = crate::api::crucible::parse_crucible_defs(&resp.crucible_jsons);
-                // Diagnostic: the same feed carries other seasonal definitions, and
-                // the parser above consumes only the `crucible` ones (event-dungeon
-                // `modifierEvent` entries are known and deliberately ignored). Any
-                // other payload is logged in full so a newly added entry kind -- e.g.
-                // the Blood Ritual's bonuses -- can be identified from a real capture
-                // rather than guessed at. Bounded by the payload itself, and the feed
-                // arrives rarely (login / season or event change).
-                for json in &resp.crucible_jsons {
-                    if !json.contains("\"crucible\"") && !json.contains("\"modifierEvent\"") {
-                        tracing::info!("unparsed definition payload: {json}");
-                    }
+                let rituals =
+                    crate::api::blood_ritual::parse_blood_ritual_defs(&resp.crucible_jsons);
+                let mut events = Vec::new();
+                if !defs.is_empty() {
+                    events.push(GameEvent::CrucibleDefinitionsReceived(defs));
                 }
-                if defs.is_empty() {
-                    RouteResult::Routed(vec![])
-                } else {
-                    RouteResult::Routed(vec![GameEvent::CrucibleDefinitionsReceived(defs)])
+                if !rituals.is_empty() {
+                    events.push(GameEvent::BloodRitualDefinitionsReceived(rituals));
                 }
+                RouteResult::Routed(events)
             }
 
             // ----- Hello -----

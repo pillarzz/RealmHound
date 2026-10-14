@@ -1685,7 +1685,7 @@ const BONUS_ROW_W: f32 = 178.0;
 /// One icon slot width for every Bonuses row. The rows draw their icons at
 /// different sizes, so without a shared slot the tags would start at different x
 /// (the Damage-mult. row's larger icon pushed its tag right of the others).
-const BONUS_ICON_W: f32 = 26.0;
+const BONUS_ICON_W: f32 = 20.0;
 
 /// One Bonuses row: the source icon and tag on the left, the value right-aligned
 /// against the row's right edge so the values read as a second column. `hover`
@@ -1814,16 +1814,17 @@ fn render_bonuses(
             |ui| {
                 // "Damaging" while the multiplier raises damage, "Weak" while it
                 // reduces it. The icons ship embedded because the effects have no
-                // object type to look them up by, and are drawn a little larger
-                // than their 16px art so they match the game sprites beside them.
+                // object type to look them up by; they are drawn through the same
+                // outlined path as the battle-pass icon so they read as crisply as
+                // the game sprites beside them, at the same 16px.
                 let condition = if damage_pct > 0.0 {
                     crate::rendering::EmbeddedIcon::Damaging
                 } else {
                     crate::rendering::EmbeddedIcon::Weak
                 };
                 let (rect, _) =
-                    ui.allocate_exact_size(egui::Vec2::splat(26.0), egui::Sense::hover());
-                sr.draw_embedded_icon(ui, condition, rect);
+                    ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                sr.draw_outlined_embedded_icon(ui, condition, rect);
             },
             |ui| bonus_components_tooltip(ui, &damage_components),
         );

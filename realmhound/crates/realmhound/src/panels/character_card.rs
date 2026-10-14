@@ -44,11 +44,6 @@ const LOOT_BOOST_COLOR: Color32 = Color32::from_rgb(100, 255, 100);
 /// shift the id/level line that shares its row. `format_loot_boost` tops out at
 /// "59m 59s", so this holds the longest value it can produce.
 const LOOT_SLOT_W: f32 = 56.0;
-/// The full-mode text column starts one sprite column (the 32px sprite box plus
-/// the gap after it) right of the card's content edge. The fame and loot/id rows
-/// belong to the card's *left* column -- under the sprite, as #64 asks -- so they
-/// pull themselves back by this much rather than sitting with the name.
-const CARD_TEXT_INDENT: f32 = 40.0;
 /// Offset of the duration text inside that slot, past the glyph.
 const LOOT_GLYPH_W: f32 = 14.0;
 
@@ -742,8 +737,6 @@ impl CharacterCardWidget {
                         // can't stretch the card.
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            // Left column, aligned with the sprite above it.
-                            ui.add_space(-CARD_TEXT_INDENT);
                             render_fame_icon(ui, sprite_renderer, 13.0, false);
                             ui.add_space(-2.0);
                             ui.label(
@@ -770,10 +763,10 @@ impl CharacterCardWidget {
                             // Loot boost in a fixed-width slot: a longer duration cannot shift the id
                             // line beside it, and the glyph is painted at a fixed size so an emoji's
                             // taller line box cannot change the row's height either.
-                            // Left column as well: with no boost to show the id sits hard against
-                            // the card's left edge, right below the fame, instead of being pushed
-                            // right by a slot that has nothing in it.
-                            ui.add_space(-CARD_TEXT_INDENT);
+                            // The slot is reserved only when there is a boost to put
+                            // in it: with none, the id line starts at the column's edge
+                            // like the fame row above it, instead of being pushed right
+                            // by an empty slot.
                             if let Some(secs) = self.loot_boost_secs {
                                 // Fixed-width slot: a longer duration cannot shift the id line beside it,
                                 // and the glyph is painted at a fixed size so an emoji's taller line box

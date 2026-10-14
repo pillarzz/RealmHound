@@ -772,10 +772,12 @@ pub struct CharacterCache {
     /// the definitions feed. Empty until that feed has been seen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blood_ritual_defs: Vec<crate::api::blood_ritual::BloodRitualDef>,
-    /// The tier the loaded character has active, resolved from the `BloodRitual`
-    /// stat (155) whose string value is the definition id. `None` = no ritual.
-    #[serde(default)]
-    pub active_blood_ritual: Option<crate::api::blood_ritual::BloodRitualDef>,
+    /// Active Blood Ritual tier per character (char id -> definition id), from the
+    /// `BloodRitual` stat. Keyed by character rather than stored on the character
+    /// itself: the character-list payload carries no ritual at all, so a field
+    /// living there would be wiped by every refresh.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub blood_ritual_by_char: HashMap<i32, String>,
 }
 
 impl Default for CharacterCache {
@@ -796,7 +798,7 @@ impl Default for CharacterCache {
             crucible_migrated: true,
             active_crucible: None,
             blood_ritual_defs: Vec::new(),
-            active_blood_ritual: None,
+            blood_ritual_by_char: HashMap::new(),
         }
     }
 }
@@ -1404,16 +1406,29 @@ impl CharacterCache {
         true
     }
 
-    /// Resolve the active Blood Ritual tier from the `BloodRitual` stat's string
-    /// value -- the definition id, or empty when no ritual is active. Reports
-    /// whether the active tier changed.
-    pub fn set_active_blood_ritual_id(&mut self, id: &str) -> bool {
-        let next = self.blood_ritual_defs.iter().find(|d| d.id == id).cloned();
-        if self.active_blood_ritual == next {
+    /// Record which Blood Ritual tier a character has active: `id` is the
+    /// definition id carried by the `BloodRitual` stat, or empty for none. An
+    /// unknown char id is ignored, so a stat that arrives before the character is
+    /// known cannot invent an entry.
+    pub fn set_blood_ritual_for_char(&mut self, char_id: Option<i32>, id: &str) -> bool {
+        let Some(char_id) = char_id else {
             return false;
+        };
+        if id.is_empty() {
+            return self.blood_ritual_by_char.remove(&char_id).is_some();
         }
-        self.active_blood_ritual = next;
-        true
+        self.blood_ritual_by_char.insert(char_id, id.to_string()) != Some(id.to_string())
+    }
+
+    /// The Blood Ritual tier recorded for `char_id`, resolved against the tiers from
+    /// the definitions feed. An id from a previous season, or one the feed has not
+    /// delivered yet, resolves to `None` rather than to a wrong tier.
+    pub fn blood_ritual_for_char(
+        &self,
+        char_id: i32,
+    ) -> Option<crate::api::blood_ritual::BloodRitualDef> {
+        let id = self.blood_ritual_by_char.get(&char_id)?;
+        self.blood_ritual_defs.iter().find(|d| &d.id == id).cloned()
     }
 
     ///

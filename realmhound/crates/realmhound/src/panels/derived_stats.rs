@@ -280,7 +280,7 @@ pub fn build_loadout(char: &CachedCharacter, cache: &CharacterCache) -> Loadout 
     // The Blood Ritual is a live, per-character toggle that the server reports for
     // the loaded character only, so a character that is not the live one shows
     // whatever tier was last observed -- usually none.
-    let blood_ritual = cache.active_blood_ritual.clone();
+    let blood_ritual = cache.blood_ritual_for_char(char.char_id);
 
     Loadout {
         base,

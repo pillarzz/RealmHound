@@ -2652,7 +2652,11 @@ impl PacketProcessor {
                         for stat in &obj.status.stats {
                             if stat.stat_type_id == 155 {
                                 let id = stat.string_stat_value.as_deref().unwrap_or("");
-                                if self.account_data.characters.set_active_blood_ritual_id(id) {
+                                if self
+                                    .account_data
+                                    .characters
+                                    .set_blood_ritual_for_char(self.live_char_id, id)
+                                {
                                     self.account_data.mark_dirty();
                                     self.char_view_gen += 1;
                                 }
@@ -2948,7 +2952,11 @@ impl PacketProcessor {
                         for stat in &status.stats {
                             if stat.stat_type_id == 155 {
                                 let id = stat.string_stat_value.as_deref().unwrap_or("");
-                                if self.account_data.characters.set_active_blood_ritual_id(id) {
+                                if self
+                                    .account_data
+                                    .characters
+                                    .set_blood_ritual_for_char(self.live_char_id, id)
+                                {
                                     self.account_data.mark_dirty();
                                     self.char_view_gen += 1;
                                 }

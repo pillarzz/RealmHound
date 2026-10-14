@@ -40,12 +40,16 @@ pub const GOLD_SPRITE_ID: i32 = 0x67FF;
 /// The lightning glyph and green the card uses for its loot-boost readout.
 const LOOT_BOOST_GLYPH: &str = "\u{26a1}";
 const LOOT_BOOST_COLOR: Color32 = Color32::from_rgb(100, 255, 100);
-/// Width reserved for the glyph plus the duration, so a longer timer cannot
-/// shift the id/level line that shares its row. `format_loot_boost` tops out at
-/// "59m 59s", so this holds the longest value it can produce.
-const LOOT_SLOT_W: f32 = 56.0;
-/// Offset of the duration text inside that slot, past the glyph.
-const LOOT_GLYPH_W: f32 = 14.0;
+/// Width of the painted loot-boost readout, used only for its hover target: the
+/// readout is painted, never laid out, so it cannot affect anything else.
+const LOOT_SLOT_W: f32 = 40.0;
+/// Distance from the card's content edge to its text column: the 32px sprite box
+/// plus the gap after it. The loot readout is painted back at the content edge so
+/// it sits under the sprite, and this is the only place that offset is used -- as
+/// a paint coordinate, not as layout spacing.
+const CARD_TEXT_INDENT: f32 = 40.0;
+/// Offset of the duration text past the painted glyph.
+const LOOT_GLYPH_W: f32 = 12.0;
 
 /// Draw a small pill, roughly half the size of the Missions-tab badge. The text
 /// gets a 1px black outline so it stays legible over any card background.
@@ -138,14 +142,18 @@ pub fn format_fame(value: i64) -> String {
 /// Format a loot-drop-boost countdown. Under one hour it reads `Mm Ss`
 /// (minutes + seconds); at or above one hour it rolls to `Hh Mm`.
 pub fn format_loot_boost(remaining_secs: u64) -> String {
-    if remaining_secs >= 3600 {
-        let h = remaining_secs / 3600;
-        let m = (remaining_secs % 3600) / 60;
-        format!("{}h {}m", h, m)
+    // A clock reads as seconds-accurate without spending the card's narrow left
+    // column on "m"/"s" units, and its width is fixed by the format: five
+    // characters up to an hour, seven beyond it.
+    let (h, m, s) = (
+        remaining_secs / 3600,
+        (remaining_secs % 3600) / 60,
+        remaining_secs % 60,
+    );
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
     } else {
-        let m = remaining_secs / 60;
-        let s = remaining_secs % 60;
-        format!("{}m {}s", m, s)
+        format!("{}:{:02}", m, s)
     }
 }
 
@@ -760,36 +768,39 @@ impl CharacterCardWidget {
                         // last-known timer even when not live.
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            // Loot boost in a fixed-width slot: a longer duration cannot shift the id
-                            // line beside it, and the glyph is painted at a fixed size so an emoji's
-                            // taller line box cannot change the row's height either.
-                            // The slot is reserved only when there is a boost to put
-                            // in it: with none, the id line starts at the column's edge
-                            // like the fame row above it, instead of being pushed right
-                            // by an empty slot.
+                            // The loot boost reads from the card's left column, under the pet sprite,
+                            // while the id line keeps the row's own x. It is painted rather than laid
+                            // out for exactly that reason: laying it out would consume width here and
+                            // push the id across, so a running timer moved the whole line.
                             if let Some(secs) = self.loot_boost_secs {
-                                // Fixed-width slot: a longer duration cannot shift the id line beside it,
-                                // and the glyph is painted at a fixed size so an emoji's taller line box
-                                // cannot change the row's height either.
-                                let (loot_slot, loot_resp) =
-                                    ui.allocate_exact_size(egui::vec2(LOOT_SLOT_W, 14.0), Sense::hover());
                                 const HINT: &str = "Loot-drop boost remaining. Pauses in safe areas (Nexus, vault, etc.) and while loading.";
-                                let font = egui::FontId::proportional(11.0);
+                                // 10px so the five-character clock fits the column the sprite occupies.
+                                let font = egui::FontId::proportional(10.0);
+                                let area = ui.available_rect_before_wrap();
+                                let left = area.left() - CARD_TEXT_INDENT;
+                                let centre = area.top() + 7.0;
                                 ui.painter().text(
-                                    loot_slot.left_center(),
+                                    egui::pos2(left, centre),
                                     egui::Align2::LEFT_CENTER,
                                     LOOT_BOOST_GLYPH,
                                     font.clone(),
                                     LOOT_BOOST_COLOR,
                                 );
                                 ui.painter().text(
-                                    loot_slot.left_center() + egui::vec2(LOOT_GLYPH_W, 0.0),
+                                    egui::pos2(left + LOOT_GLYPH_W, centre),
                                     egui::Align2::LEFT_CENTER,
                                     format_loot_boost(secs as u64),
                                     font,
                                     LOOT_BOOST_COLOR,
                                 );
-                                loot_resp.on_hover_text(HINT);
+                                // Painted text has no response of its own, so the hover hangs off the rect
+                                // it was drawn in -- also paint-only, so it cannot shift the row either.
+                                let hit = egui::Rect::from_min_size(
+                                    egui::pos2(left, centre - 7.0),
+                                    egui::vec2(LOOT_SLOT_W, 14.0),
+                                );
+                                ui.interact(hit, ui.id().with("loot_boost"), Sense::hover())
+                                    .on_hover_text(HINT);
                                 if is_live {
                                     ui.ctx()
                                         .request_repaint_after(std::time::Duration::from_millis(500));
@@ -1078,16 +1089,16 @@ mod tests {
 
     #[test]
     fn loot_boost_uses_minutes_seconds_under_one_hour() {
-        assert_eq!(format_loot_boost(0), "0m 0s");
-        assert_eq!(format_loot_boost(5), "0m 5s");
-        assert_eq!(format_loot_boost(65), "1m 5s");
-        assert_eq!(format_loot_boost(3599), "59m 59s");
+        assert_eq!(format_loot_boost(0), "0:00");
+        assert_eq!(format_loot_boost(5), "0:05");
+        assert_eq!(format_loot_boost(65), "1:05");
+        assert_eq!(format_loot_boost(3599), "59:59");
     }
 
     #[test]
     fn loot_boost_rolls_to_hours_minutes_at_one_hour() {
-        assert_eq!(format_loot_boost(3600), "1h 0m");
-        assert_eq!(format_loot_boost(3660), "1h 1m");
-        assert_eq!(format_loot_boost(7325), "2h 2m");
+        assert_eq!(format_loot_boost(3600), "1:00:00");
+        assert_eq!(format_loot_boost(3660), "1:01:00");
+        assert_eq!(format_loot_boost(7325), "2:02:05");
     }
 }

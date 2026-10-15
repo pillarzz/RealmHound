@@ -911,7 +911,9 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
                         EnchantEffectKind::LootBonus => loot += eff.amount,
                         EnchantEffectKind::XpBonus => xp += eff.amount,
                         EnchantEffectKind::DustBonus => dust += eff.amount,
-                        EnchantEffectKind::Cosmetic | EnchantEffectKind::Other => {}
+                        EnchantEffectKind::Cosmetic
+                        | EnchantEffectKind::StatBoostSelf
+                        | EnchantEffectKind::Other => {}
                     }
                 }
             }

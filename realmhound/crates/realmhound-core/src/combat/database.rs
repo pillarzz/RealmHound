@@ -5150,7 +5150,9 @@ fn serialize_boosts(boosts: &[BoostWindow]) -> Option<String> {
         boosts
             .iter()
             .map(|b| {
-                format!(
+                // A seventh field carries the resolved source item id when there is
+                // one; rows written before it existed simply end at the source.
+                let mut line = format!(
                     "{},{},{},{},{},{}",
                     b.start_offset_ms,
                     b.end_offset_ms,
@@ -5158,7 +5160,11 @@ fn serialize_boosts(boosts: &[BoostWindow]) -> Option<String> {
                     b.from,
                     b.to,
                     b.source.replace(',', " ")
-                )
+                );
+                if let Some(id) = b.source_item {
+                    line.push_str(&format!(",{id}"));
+                }
+                line
             })
             .collect::<Vec<_>>()
             .join(";"),
@@ -5174,7 +5180,7 @@ fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
     };
     data.split(';')
         .filter_map(|entry| {
-            let parts: Vec<&str> = entry.splitn(6, ',').collect();
+            let parts: Vec<&str> = entry.splitn(7, ',').collect();
             if parts.len() < 6 {
                 return None;
             }
@@ -5185,6 +5191,7 @@ fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
                 from: parts[3].trim().parse::<i32>().unwrap_or(0),
                 to: parts[4].trim().parse::<i32>().unwrap_or(0),
                 source: parts[5].to_string(),
+                source_item: parts.get(6).and_then(|v| v.trim().parse::<i32>().ok()),
             })
         })
         .collect()
@@ -5550,6 +5557,7 @@ fn merge_boost_windows(started_at: i64, group: &[FightRecord]) -> Vec<BoostWindo
                 from: b.from,
                 to: b.to,
                 source: b.source.clone(),
+                source_item: b.source_item,
             });
         }
     }

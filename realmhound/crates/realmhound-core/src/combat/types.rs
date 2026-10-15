@@ -307,8 +307,8 @@ pub struct WeaponContribution {
 ///
 /// Derived purely from the server stat stream the tracker already receives, so
 /// it captures every boost the client was told about -- including ones with no
-/// local cause. The `source` is a best-effort hint and is labelled as inferred
-/// in the UI.
+/// local cause. The `source` is a best-effort inference and is labelled as
+/// inferred in the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoostWindow {
     /// Window start, in milliseconds since the fight started.
@@ -321,9 +321,14 @@ pub struct BoostWindow {
     pub from: i32,
     /// Value during the window.
     pub to: i32,
-    /// Best-effort source: the item used locally just before the change, or a
-    /// note that nothing local explains it.
+    /// Best-effort source label: the item that caused the change (verified against
+    /// the item's own declared effects), `<enchant> (<item> proc)` for an
+    /// equipment proc, or `Ally buff` / `Enemy debuff` when nothing local explains
+    /// it. The wire carries no source id, so this is always an inference.
     pub source: String,
+    /// Object id of the item the source names, when one was resolved, so a UI can
+    /// draw exactly that item rather than re-resolving its name.
+    pub source_item: Option<i32>,
 }
 
 /// One activation of the local player's ability-slot item.

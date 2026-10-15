@@ -27,9 +27,10 @@ use super::dungeon_mods_xml::{ModifierDef, ModifierTable};
 use super::enchantments::EnchantmentList;
 use super::item_category::ItemCategorizer;
 use super::object_list::{
-    AbilityEffects, LethalStrikeParams, ObjectAsset, ObjectList, TileAsset, TileList,
+    AbilityEffect, AbilityEffects, LethalStrikeParams, ObjectAsset, ObjectList, TileAsset, TileList,
 };
 use super::sprite_atlas::{SpriteAtlas, SpriteData};
+use super::stat_bonus::StatKind;
 use super::unity::{find_resources_assets, UnityExtractor};
 
 /// How the dye/cloth color is applied.
@@ -3592,6 +3593,63 @@ impl AssetManager {
             .and_then(|list| list.get(id))
             .map(|asset| asset.projectiles.len().max(1) as i32)
             .unwrap_or(1)
+    }
+
+    /// Whether an item's own XML declares a buff that raises `stat` on the player
+    /// (`StatBoostSelf`, or the `StatBoostAura` consumable treats use).
+    ///
+    /// The wire never names what caused a stat change, so the tracker's "you used
+    /// this just before it" hint is checked against the item's declaration first:
+    /// a treat that only raises Speed must never be blamed for an Attack change.
+    pub fn item_declares_stat_boost(&self, item_id: i32, stat: StatKind) -> bool {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        let Some(list) = guard.as_ref() else {
+            return false;
+        };
+        let Some(effects) = list.ability_effects(item_id) else {
+            return false;
+        };
+        effects.effects.iter().any(|e| match e {
+            AbilityEffect::StatBoost(b) => StatKind::parse(&b.stat) == Some(stat),
+            _ => false,
+        })
+    }
+
+    /// The first equipped enchantment that declares an on-shoot / on-hit self
+    /// buff raising `stat` (e.g. "OnShoot Attack Boost IV"), if any. An equipment
+    /// proc rather than a consumable, so a boost that lands while shooting can be
+    /// attributed to the item it came from instead of to an ally's aura.
+    pub fn enchant_declaring_stat_boost(&self, enchant_ids: &[u16], stat: StatKind) -> Option<u16> {
+        self.try_load();
+        let guard = self.enchantments.read().unwrap();
+        let list = guard.as_ref()?;
+        enchant_ids.iter().copied().find(|&id| {
+            list.effects(id).iter().any(|eff| {
+                eff.kind == super::enchantments::EnchantEffectKind::StatBoostSelf
+                    && eff.stat == Some(stat)
+            })
+        })
+    }
+
+    /// Whether an item's own XML applies condition `effect` to the player
+    /// (`ConditionEffectSelf` / `Sneak` / an `EffectBlast`), used for the same
+    /// verification on condition boosts (a treat that strips conditions must not
+    /// be blamed for one landing).
+    pub fn item_declares_condition(&self, item_id: i32, effect: &str) -> bool {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        let Some(list) = guard.as_ref() else {
+            return false;
+        };
+        let Some(effects) = list.ability_effects(item_id) else {
+            return false;
+        };
+        effects.effects.iter().any(|e| match e {
+            AbilityEffect::Condition(c) => c.effect.eq_ignore_ascii_case(effect),
+            AbilityEffect::EffectBlast(b) => b.condition.eq_ignore_ascii_case(effect),
+            _ => false,
+        })
     }
 
     /// Returns the object's base defense (enemy DEF from game data), or `None`

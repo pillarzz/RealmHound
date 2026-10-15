@@ -116,6 +116,29 @@ const BOOST_CONDITIONS: &[(i32, &str)] = &[
 /// ("consumable (Potion of Attack)") rather than left unexplained. The server's
 /// stat update trails the use by a packet or two, so this is a small window.
 const BOOST_SOURCE_HINT_MS: i64 = 1_500;
+/// How long after a local shot an on-shoot proc's stat change may arrive and still
+/// be attributed to that proc. The server applies the buff in the same tick as the
+/// hit it triggered, so this only covers packet ordering.
+const BOOST_PROC_HINT_MS: i64 = 800;
+
+/// The stat a boost-log label describes, for verifying an inferred source against
+/// the game data. `None` for condition labels (`Damaging`, `Weak`, ...), which are
+/// matched against an item's declared conditions instead. `ATT boost` (stat 48) is
+/// the companion of `Attack` (stat 20) and is declared as `ATT` too.
+fn stat_kind_for_boost_label(label: &str) -> Option<crate::assets::StatKind> {
+    use crate::assets::StatKind;
+    match label {
+        "Attack" | "ATT boost" => Some(StatKind::Attack),
+        "Defense" => Some(StatKind::Defense),
+        "Speed" => Some(StatKind::Speed),
+        "Dexterity" => Some(StatKind::Dexterity),
+        "Vitality" => Some(StatKind::Vitality),
+        "Wisdom" => Some(StatKind::Wisdom),
+        "Max HP" => Some(StatKind::MaxHp),
+        "Max MP" => Some(StatKind::MaxMp),
+        _ => None,
+    }
+}
 /// Attribution window for one ability activation, in milliseconds: local damage
 /// packets inside it are credited to that activation. A heuristic -- the wire
 /// carries no effect id -- capped so overlapping activations cannot double-count.
@@ -618,6 +641,8 @@ struct LocalStatChange {
     to: i32,
     /// Best-effort source hint (an item used just before, "expired", or unknown).
     source: String,
+    /// Object id of the item `source` names, when one was resolved.
+    source_item: Option<i32>,
 }
 
 /// One activation of the local player's ability-slot item (absolute time).
@@ -646,11 +671,11 @@ struct BoostSnapshot {
     defense: i32,
     dexterity: i32,
     wisdom: i32,
+    max_hp: i32,
     max_mp: i32,
     vitality: i32,
     speed: i32,
     condition: i32,
-    condition_new: i32,
 }
 
 impl BoostSnapshot {
@@ -661,17 +686,18 @@ impl BoostSnapshot {
             defense: obj.defense,
             dexterity: obj.dexterity,
             wisdom: obj.wisdom,
+            max_hp: obj.max_hp,
             max_mp: obj.max_mp,
             vitality: obj.vitality,
             speed: obj.speed,
             condition: obj.condition,
-            condition_new: obj.condition_new,
         }
     }
 
     /// Level-stat changes between two snapshots, as (label, from, to). Vitality
     /// and Speed are included so a VIT-stacking build's stat swings are visible
-    /// in the fight's boost timeline, not just its damage.
+    /// in the fight's boost timeline, not just its damage; Max HP is included
+    /// because the life-buffing treats raise it.
     fn level_changes(&self, after: &Self) -> Vec<(&'static str, i32, i32)> {
         [
             ("Attack", self.attack, after.attack),
@@ -679,6 +705,7 @@ impl BoostSnapshot {
             ("Defense", self.defense, after.defense),
             ("Dexterity", self.dexterity, after.dexterity),
             ("Wisdom", self.wisdom, after.wisdom),
+            ("Max HP", self.max_hp, after.max_hp),
             ("Max MP", self.max_mp, after.max_mp),
             ("Vitality", self.vitality, after.vitality),
             ("Speed", self.speed, after.speed),
@@ -690,9 +717,15 @@ impl BoostSnapshot {
 
     /// Condition-bit changes between two snapshots, as (label, from, to) with
     /// 0/1 values: a bit turning on opens a window, turning off closes it.
+    ///
+    /// Only the primary mask (stat 29) is read here. The secondary mask (stat 69)
+    /// is a *different* layout -- its bits mean other things (`NEWCON_*` in
+    /// `damage`) -- so testing this mask's bits against the combined value made a
+    /// new-condition bit read as a classic one, e.g. a phantom `Invisible` on a
+    /// character that can never become invisible.
     fn condition_changes(&self, after: &Self) -> Vec<(&'static str, i32, i32)> {
-        let before_bits = self.condition | self.condition_new;
-        let after_bits = after.condition | after.condition_new;
+        let before_bits = self.condition;
+        let after_bits = after.condition;
         BOOST_CONDITIONS
             .iter()
             .filter(|(bit, _)| (before_bits & bit) != (after_bits & bit))
@@ -943,6 +976,9 @@ pub struct CombatTracker {
     /// Last local `UseItem` (item id, time), used to propose a source for a stat
     /// change that follows it. `None` until the first use this session.
     last_local_use: Option<(i32, i64)>,
+    /// Timestamp (epoch millis) of the local player's most recent weapon shot, used
+    /// to tell an on-shoot gear proc from an ally's buff arriving at the same time.
+    last_shot_ms: i64,
     /// Boss object types marked completed for the current run by a Moonlight
     /// Village completion marker. Bosses here go invulnerable
     /// instead of dying, so any fight of these types is force-scored as a kill at
@@ -1074,6 +1110,7 @@ impl CombatTracker {
             local_ability_uses: VecDeque::new(),
             local_damage_events: VecDeque::new(),
             last_local_use: None,
+            last_shot_ms: 0,
             completed_boss_types: HashSet::new(),
             completed_recorded_types: HashSet::new(),
             shield_dr_until: 0,
@@ -2379,35 +2416,101 @@ impl CombatTracker {
         for (label, from, to) in changes {
             // A falling stat is the previous boost expiring; only a rising one can
             // be sourced to an item the player just used.
-            let source = self.boost_source_hint(time_ms, to > from);
+            let (source, source_item) = self.boost_source_hint(time_ms, to > from, label);
             self.local_stat_changes.push_back(LocalStatChange {
                 time_ms,
                 label,
                 from,
                 to,
                 source,
+                source_item,
             });
         }
         self.trim_local_event_logs();
     }
 
-    /// Best-effort source for a local stat change: the item used immediately
-    /// before it, or an explicit note that nothing local explains it (an ally's
-    /// buff, a pet, or a status applied by the server). Always worded as
-    /// inferred -- the wire carries no source id.
-    fn boost_source_hint(&self, time_ms: i64, rising: bool) -> String {
+    /// Best-effort source for a local stat change.
+    ///
+    /// The wire never says what caused a change, so the tracker infers it and the
+    /// UI labels it as an inference. An item use is only accepted as the cause when
+    /// that item's own XML declares the effect: casting a spell is also a `UseItem`
+    /// (so a spell used to be blamed for any nearby Attack boost) and a treat that
+    /// only raises Speed must never be blamed for an Attack change. Failing that,
+    /// an on-shoot enchantment proc on the equipped gear is checked, and only then
+    /// is the change left unexplained.
+    fn boost_source_hint(&self, time_ms: i64, rising: bool, label: &str) -> (String, Option<i32>) {
         if !rising {
-            return "expired".to_string();
+            return ("expired".to_string(), None);
         }
-        match self.last_local_use {
-            Some((item, at)) if item >= 0 && time_ms - at <= BOOST_SOURCE_HINT_MS => {
-                match get_asset_manager().object_name(item) {
-                    Some(name) if !name.is_empty() => format!("consumable ({name}) [inferred]"),
-                    _ => format!("local item use (0x{item:X}) [inferred]"),
-                }
+        let am = get_asset_manager();
+        if let Some((item, at)) = self.last_local_use {
+            if item >= 0 && time_ms - at <= BOOST_SOURCE_HINT_MS && self.item_can_cause(item, label)
+            {
+                let name = am
+                    .object_name(item)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| format!("Item 0x{item:X}"));
+                return (name, Some(item));
             }
-            _ => "external (ally buff, pet, or status) [inferred]".to_string(),
         }
+        if let Some(proc) = self.gear_proc_source(time_ms, label) {
+            return proc;
+        }
+        // Nothing local explains it. These arrive from the server with no source,
+        // and the only distinction available is the effect itself: Weak is a
+        // monster-applied debuff, everything else is credited to an ally.
+        let fallback = if label == "Weak" {
+            "Enemy debuff"
+        } else {
+            "Ally buff"
+        };
+        (fallback.to_string(), None)
+    }
+
+    /// Whether `item` itself declares the effect a boost label names: a stat buff
+    /// for a stat label, a condition for a condition label. A label we do not map
+    /// to a stat is matched as a condition, so an item is never accepted merely
+    /// because the label is unfamiliar.
+    fn item_can_cause(&self, item: i32, label: &str) -> bool {
+        let am = get_asset_manager();
+        match stat_kind_for_boost_label(label) {
+            Some(stat) => am.item_declares_stat_boost(item, stat),
+            None => am.item_declares_condition(item, label),
+        }
+    }
+
+    /// The equipped item and enchantment whose on-shoot proc raises `label`, when
+    /// a local shot landed close enough for that proc to have fired. Returns the
+    /// label to show (`"Attack Boost IV (Staff of The Vital Unity)"`) and the item
+    /// the UI should draw.
+    fn gear_proc_source(&self, time_ms: i64, label: &str) -> Option<(String, Option<i32>)> {
+        let stat = stat_kind_for_boost_label(label)?;
+        if self.last_shot_ms == 0 || time_ms - self.last_shot_ms > BOOST_PROC_HINT_MS {
+            return None;
+        }
+        let local = self.objects.get(&self.local_object_id)?;
+        let am = get_asset_manager();
+        for slot in 0..local.equipment.len() {
+            let item = local.equipment[slot];
+            if item < 0 {
+                continue;
+            }
+            let Some(enchant) =
+                am.enchant_declaring_stat_boost(&local.equipment_enchants[slot], stat)
+            else {
+                continue;
+            };
+            let enchant_name = am.enchant_name(enchant).unwrap_or_default();
+            let item_name = am.object_name(item).unwrap_or_default();
+            let text = match (enchant_name.is_empty(), item_name.is_empty()) {
+                (false, false) => format!("{enchant_name} ({item_name} proc)"),
+                (false, true) => format!("{enchant_name} (proc)"),
+                (true, false) => format!("{item_name} (proc)"),
+                (true, true) => format!("Item 0x{item:X} (proc)"),
+            };
+            return Some((text, Some(item)));
+        }
+        None
     }
 
     /// Trim the rolling local-event logs to their cap.
@@ -2446,6 +2549,7 @@ impl CombatTracker {
                 from: change.from,
                 to: change.to,
                 source: change.source.clone(),
+                source_item: change.source_item,
             });
         }
         out.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
@@ -2622,6 +2726,10 @@ impl CombatTracker {
         // the same id (newest registration owns an id). Done before the guards so
         // the maps stay disjoint even when self-damage is disabled for this map.
         self.pending_server_shots.remove(&bullet_id);
+        // On-shoot procs (an "OnShoot Attack Boost IV" enchantment, say) apply with
+        // the shot that fired them, so the moment of the last shot is what tells a
+        // proc from an ally's buff landing at the same time.
+        self.last_shot_ms = time_ms;
         // A multi-projectile weapon fires several bullets in one trigger, all
         // stamped with the same client time and weapon. The first is the primary
         // projectile; the rest are secondaries. Tracked across the guards so the
@@ -7559,9 +7667,12 @@ mod tests {
             .iter()
             .find(|c| c.label == "Attack" && c.to == 80)
             .unwrap();
+        // The use is only *proposed* as the source: it stands when the item's own
+        // XML declares the stat, and otherwise the change falls back to the ally
+        // label. Either way the log must never blame an item that cannot cause it.
         assert!(
-            boost.source.ends_with("[inferred]"),
-            "a source hint must always be labelled as inferred: {}",
+            boost.source == "Ally buff" || boost.source.contains("Potion"),
+            "unexpected source for a local consumable use: {}",
             boost.source
         );
 
@@ -7573,6 +7684,65 @@ mod tests {
             .expect("the boost is a window");
         assert_eq!(attack.start_offset_ms, 20);
         assert_eq!(attack.end_offset_ms, 100);
+    }
+
+    #[test]
+    fn the_secondary_condition_mask_does_not_read_as_a_classic_condition() {
+        // Condition stat 69 is a *different* bit layout (`NEWCON_*` in `damage`), so
+        // one of its bits must never be tested against the classic bits: a new-mask
+        // bit 0x1000 used to surface as a phantom "Invisible" on a Wizard who has no
+        // way to become invisible.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        // The object must exist first: a change is only diffed against the previous
+        // snapshot, so the very update that creates it logs nothing.
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 5);
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::ConditionNew, 0x1000)]),
+            10,
+        );
+        assert!(
+            !t.local_stat_changes.iter().any(|c| c.label == "Invisible"),
+            "a secondary-mask bit must not read as a classic condition: {:?}",
+            t.local_stat_changes
+                .iter()
+                .map(|c| c.label)
+                .collect::<Vec<_>>()
+        );
+        // The primary mask still reports it, which is what a rogue's cloak sets.
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::Condition, 0x1000)]),
+            20,
+        );
+        assert!(t.local_stat_changes.iter().any(|c| c.label == "Invisible"));
+    }
+
+    #[test]
+    fn weak_is_reported_as_a_monster_debuff_and_other_rises_as_an_ally_buff() {
+        // Nothing local explains either: Weak is applied by monsters, a Damaging
+        // burst by an ally's aura, so the two must not share one label.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        // Establish the object first: the update that creates it is not diffed.
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 5);
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::Condition, 0x4 | 0x0004_0000)]),
+            10,
+        );
+        let source = |label: &str| {
+            t.local_stat_changes
+                .iter()
+                .find(|c| c.label == label && c.to == 1)
+                .map(|c| c.source.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(source("Weak"), "Enemy debuff");
+        assert_eq!(source("Damaging"), "Ally buff");
     }
 
     #[test]
@@ -8309,19 +8479,28 @@ mod tests {
             1000,
             &status(
                 1000,
-                vec![stat(StatType::Vitality, 75), stat(StatType::Speed, 50)],
+                vec![
+                    stat(StatType::Vitality, 75),
+                    stat(StatType::Speed, 50),
+                    stat(StatType::MaxHP, 800),
+                ],
             ),
             5,
         );
         // Open the fight.
         t.pending_server_shots.insert(1, (100, false));
         t.on_local_hit(500, 1, 1000, 1000, 10);
-        // A VIT potion / VIT-buffing ability lands mid-fight; SPD does not move.
+        // A VIT potion / VIT-buffing ability lands mid-fight; SPD does not move,
+        // while a life treat raises Max HP.
         t.on_object_status(
             1000,
             &status(
                 1000,
-                vec![stat(StatType::Vitality, 100), stat(StatType::Speed, 50)],
+                vec![
+                    stat(StatType::Vitality, 100),
+                    stat(StatType::Speed, 50),
+                    stat(StatType::MaxHP, 820),
+                ],
             ),
             20,
         );
@@ -8337,6 +8516,14 @@ mod tests {
             done[0].boosts.iter().all(|b| b.stat != "Speed"),
             "an unchanged SPD must not open a window"
         );
+        // Max HP is a buffed stat too (life treats raise it), so it is tracked.
+        let hp: Vec<_> = done[0]
+            .boosts
+            .iter()
+            .filter(|b| b.stat == "Max HP")
+            .collect();
+        assert_eq!(hp.len(), 1, "exactly one Max HP boost window");
+        assert_eq!((hp[0].from, hp[0].to), (800, 820));
     }
 
     #[test]

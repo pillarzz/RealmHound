@@ -40,9 +40,13 @@ pub enum EnchantEffectKind {
     /// scales weapon DPS directly. `amount` may be below `1.0` for the
     /// fire-rate *penalty* enchantments.
     MultiplyRateOfFire,
-    /// A recognized but purely cosmetic/proc mutator (e.g. on-shoot self buffs)
-    /// that grants no persistent stat effect. Modeled so its presence does not
-    /// downgrade provenance to Partial.
+    /// An on-shoot / on-hit self buff (`AddOnPlayerShootActivate` /
+    /// `AddOnEnemyHitActivate` with `StatBoostSelf`, e.g. "OnShoot Attack Boost
+    /// IV"): a temporary stat proc, not a persistent stat, but named so an
+    /// observed stat change can be attributed back to the item that caused it.
+    StatBoostSelf,
+    /// A recognized but purely cosmetic mutator that grants no stat effect at
+    /// all. Modeled so its presence does not downgrade provenance to Partial.
     Cosmetic,
     /// Any other mutator kind we don't model.
     Other,
@@ -62,8 +66,9 @@ impl EnchantEffectKind {
             // so this covers only a text-form payload.
             "MultiplyRateOfFire" => Self::MultiplyRateOfFire,
             // On-shoot / proc self-buffs (e.g. OnShoot Wisdom Boost): recognized
-            // but not a persistent stat, so treated as cosmetic.
-            "StatBoostSelf" => Self::Cosmetic,
+            // as their own kind so an observed stat change can be traced back to
+            // the item that proc'd it.
+            "StatBoostSelf" => Self::StatBoostSelf,
             _ => Self::Other,
         }
     }
@@ -718,10 +723,13 @@ mod tests {
         assert_eq!(pct[0].stat, Some(StatKind::MaxMp));
         assert!((pct[0].amount - 0.015).abs() < 1e-4);
 
-        // On-shoot self buff is recognized as cosmetic (present, no downgrade).
-        let cos = list.effects(0x4D);
-        assert_eq!(cos.len(), 1);
-        assert_eq!(cos[0].kind, EnchantEffectKind::Cosmetic);
+        // On-shoot self buff: its own kind (a proc the boost log can attribute),
+        // with the stat and amount it grants.
+        let procs = list.effects(0x4D);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].kind, EnchantEffectKind::StatBoostSelf);
+        assert_eq!(procs[0].stat, Some(StatKind::Wisdom));
+        assert!((procs[0].amount - 7.0).abs() < 1e-4);
 
         // Fire-rate multiplier: kind from the tag name, amount from the text, and
         // `subAttackIndex` held like the damage multipliers' `projectileId`.

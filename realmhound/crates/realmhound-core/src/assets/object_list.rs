@@ -729,7 +729,8 @@ impl DamageNovaEffect {
     }
 }
 
-/// A self stat buff (`StatBoostSelf`): grants `amount` of `stat` for `duration`
+/// A self stat buff (`StatBoostSelf`) or a range stat buff (`StatBoostAura`,
+/// which consumable treats use): grants `amount` of `stat` for `duration`
 /// seconds. `amount` may be negative (debuff trade-offs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatBoostEffect {
@@ -2425,7 +2426,9 @@ impl ObjectList {
                         if !is_mechanic_only {
                             pending_shuriken = Some(pending_attrs.clone());
                         }
-                    } else if in_activate && text.as_ref() == "StatBoostSelf" {
+                    } else if in_activate
+                        && (text.as_ref() == "StatBoostSelf" || text.as_ref() == "StatBoostAura")
+                    {
                         current_ability
                             .effects
                             .push(AbilityEffect::StatBoost(StatBoostEffect {

@@ -920,39 +920,44 @@ impl PacketProcessor {
                 let live_char_id = self.live_char_id;
                 let mut challenge_changed = false;
                 for char in &data.characters {
-                    if Some(char.char_id) == live_char_id {
-                        continue;
+                    let is_live = Some(char.char_id) == live_char_id;
+                    if !(is_live && char.blood_ritual_id.is_some()) {
+                        // Crucible is a seasonal challenge, so a non-seasonal character
+                        // cannot carry it. The character list's own CrucibleActive flag
+                        // cannot be trusted to say otherwise: it claimed crucible on most
+                        // of this account's non-seasonal characters, which is the very
+                        // staleness behind issue #66. The flag is therefore only ever
+                        // *set* by the live CRUCIBLE stat; all the list is used for is to
+                        // clear it where it contradicts the season, which also covers a
+                        // character that has rolled out of the season.
+                        let stale_crucible = !char.seasonal
+                            && self
+                                .account_data
+                                .characters
+                                .find_character(char.char_id)
+                                .is_some_and(|cached| cached.crucible_active);
+                        if stale_crucible {
+                            self.account_data
+                                .characters
+                                .update_crucible_status(char.char_id, false);
+                            challenge_changed = true;
+                        }
                     }
-                    // Crucible is a seasonal challenge, so a non-seasonal character
-                    // cannot carry it. The character list's own CrucibleActive flag
-                    // cannot be trusted to say otherwise: it claimed crucible on most
-                    // of this account's non-seasonal characters, which is the very
-                    // staleness behind issue #66. The flag is therefore only ever
-                    // *set* by the live CRUCIBLE stat; all the list is used for is to
-                    // clear it where it contradicts the season, which also covers a
-                    // character that has rolled out of the season.
-                    let stale_crucible = !char.seasonal
-                        && self
+                    // The list is the server's own record of the ritual tag, so an
+                    // absent one means the character has no ritual and any entry held
+                    // for it is stale. It is authoritative for the characters that are
+                    // not live; for the live character it may only *clear* them -- the
+                    // live `BloodRitual` stat is fresher for setting, but a
+                    // deactivation is never reported there (the stat is re-sent empty
+                    // on every zone change), so skipping the live character entirely
+                    // left a ritual switched off in-game stuck until logout. [#64]
+                    if !(is_live && char.blood_ritual_id.is_some()) {
+                        let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
+                        challenge_changed |= self
                             .account_data
                             .characters
-                            .find_character(char.char_id)
-                            .is_some_and(|cached| cached.crucible_active);
-                    if stale_crucible {
-                        self.account_data
-                            .characters
-                            .update_crucible_status(char.char_id, false);
-                        challenge_changed = true;
+                            .set_blood_ritual_for_char(Some(char.char_id), ritual_id);
                     }
-                    // The list is the server's own record of the tag, so an absent
-                    // one means the character has no ritual and any entry held for
-                    // it is stale -- this is what a real deactivation looks like,
-                    // since the live status cannot be trusted to say so (it goes
-                    // empty on every zone change).
-                    let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
-                    challenge_changed |= self
-                        .account_data
-                        .characters
-                        .set_blood_ritual_for_char(Some(char.char_id), ritual_id);
                 }
                 // Re-derive the per-character flags from the recorded ids, so the
                 // new season's tiers govern a roster that was already cached.
@@ -4815,6 +4820,57 @@ mod isolation_gate_tests {
             p.account_data.unlocked_blueprints_seasonal,
             vec![8386],
             "char/list has no seasonal list, so it must not clear one"
+        );
+    }
+
+    /// A deactivation is only ever reported by the character list, and the live
+    /// character was skipped entirely by it, so a ritual switched off in-game stuck
+    /// on that character until logout -- the reset of "[RITUAL] live" that issue #64
+    /// introduced. The list may clear the live character (it may not set it: the live
+    /// `BloodRitual` stat is fresher for that).
+    #[test]
+    fn api_account_data_clears_a_deactivated_live_blood_ritual() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::api::RealmCharacter;
+
+        const CURRENT: &str = "5027802235043840";
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        // Live, ritual active.
+        p.live_char_id = Some(1);
+        assert!(p
+            .account_data
+            .characters
+            .set_blood_ritual_for_char(Some(1), CURRENT));
+        assert!(p.account_data.characters.blood_ritual_for_char(1).is_some());
+
+        // The list reports the tag as absent: the character deactivated it.
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![RealmCharacter {
+                char_id: 1,
+                blood_ritual_id: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert!(
+            p.account_data.characters.blood_ritual_for_char(1).is_none(),
+            "the list clears a ritual the live character switched off"
         );
     }
 

@@ -90,10 +90,6 @@ fn draw_crucible_pill(ui: &mut egui::Ui) {
     draw_pill(ui, "CRUCIBLE", Color32::from_rgb(0xdc, 0x21, 0x15));
 }
 
-/// Height of the reserved season-pill line: the 8px pill's own height plus its
-/// vertical padding, so a card with no pills matches one that has them.
-const SEASON_PILL_ROW_H: f32 = 13.0;
-
 /// Blood Ritual marker, in the ritual panel's own orange so it reads apart from
 /// the crucible's red at a glance.
 fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
@@ -105,7 +101,16 @@ fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
 /// same height whatever pills its character has. [#64]
 fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool) {
     if !crucible && !blood_ritual {
-        ui.add_space(SEASON_PILL_ROW_H);
+        // Reserve exactly what the pills occupy, measured the way a pill is sized
+        // below, so a card with no challenge is precisely as tall as one carrying
+        // two. A hand-picked constant was a hair short, which showed up as shorter
+        // cards in a row.
+        let galley = ui.painter().layout_no_wrap(
+            "CRUCIBLE".to_string(),
+            egui::FontId::proportional(8.0),
+            Color32::WHITE,
+        );
+        ui.add_space(galley.size().y + 2.0);
         return;
     }
     ui.horizontal(|ui| {
@@ -777,8 +782,12 @@ impl CharacterCardWidget {
                                 // 10px so the five-character clock fits the column the sprite occupies.
                                 let font = egui::FontId::proportional(10.0);
                                 let area = ui.available_rect_before_wrap();
-                                let left = area.left() - CARD_TEXT_INDENT;
-                                let centre = area.top() + 7.0;
+                                // Nudged off the column and the id line by eye (7px
+                                // left, 2px down from the column edge and the row's
+                                // middle): the glyph's own bearings push the pair right
+                                // of the column and high of the text's centre.
+                                let left = area.left() - CARD_TEXT_INDENT - 7.0;
+                                let centre = area.top() + 9.0;
                                 ui.painter().text(
                                     egui::pos2(left, centre),
                                     egui::Align2::LEFT_CENTER,

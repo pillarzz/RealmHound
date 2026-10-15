@@ -1446,6 +1446,20 @@ impl CharacterCache {
         true
     }
 
+    /// Record the ritual the *live* status reports.
+    ///
+    /// An empty value is ignored. The game re-sends a player's status on every
+    /// zone change with the `BloodRitual` stat left empty, and reading that as
+    /// "no ritual" dropped the entry, so the pill, the attribute brackets and the
+    /// Bonuses line all flashed on every portal. A genuine deactivation shows up
+    /// as an absent tag in the character list, which the refresh clears.
+    pub fn set_live_blood_ritual(&mut self, char_id: Option<i32>, id: &str) -> bool {
+        if id.trim().is_empty() {
+            return false;
+        }
+        self.set_blood_ritual_for_char(char_id, id)
+    }
+
     /// Record which Blood Ritual tier a character has active: `id` is the
     /// definition id carried by the `BloodRitual` stat, or empty for none. An
     /// unknown char id is ignored, so a stat that arrives before the character is
@@ -3056,6 +3070,23 @@ mod tests {
             cache.blood_ritual_for_char(3).is_none(),
             "a character with no ritual resolves to nothing"
         );
+    }
+
+    #[test]
+    fn a_live_status_without_the_ritual_does_not_clear_a_known_one() {
+        let mut cache = CharacterCache::new();
+        cache.set_blood_ritual_defs(vec![ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24)]);
+        assert!(cache.set_live_blood_ritual(Some(1), THIS_SEASONS_RITUAL));
+
+        // The game re-sends the status on every zone change with the ritual stat
+        // empty. Reading that as the ritual ending made the pill and the stat
+        // brackets flash on every portal.
+        assert!(!cache.set_live_blood_ritual(Some(1), ""));
+        assert_eq!(cache.blood_ritual_for_char(1).unwrap().tier, 1);
+
+        // A genuine removal arrives as an absent tag in the character list.
+        assert!(cache.set_blood_ritual_for_char(Some(1), ""));
+        assert!(cache.blood_ritual_for_char(1).is_none());
     }
 
     #[test]

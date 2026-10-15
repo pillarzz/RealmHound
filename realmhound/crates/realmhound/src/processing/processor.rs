@@ -940,12 +940,16 @@ impl PacketProcessor {
                             .update_crucible_status(char.char_id, char.crucible_active);
                         challenge_changed = true;
                     }
-                    if let Some(id) = char.blood_ritual_id.as_deref() {
-                        challenge_changed |= self
-                            .account_data
-                            .characters
-                            .set_blood_ritual_for_char(Some(char.char_id), id);
-                    }
+                    // The list is the server's own record of the tag, so an absent
+                    // one means the character has no ritual and any entry held for
+                    // it is stale -- this is what a real deactivation looks like,
+                    // since the live status cannot be trusted to say so (it goes
+                    // empty on every zone change).
+                    let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
+                    challenge_changed |= self
+                        .account_data
+                        .characters
+                        .set_blood_ritual_for_char(Some(char.char_id), ritual_id);
                 }
                 // Re-derive the per-character flags from the recorded ids, so the
                 // new season's tiers govern a roster that was already cached.
@@ -2697,7 +2701,7 @@ impl PacketProcessor {
                                 if self
                                     .account_data
                                     .characters
-                                    .set_blood_ritual_for_char(self.live_char_id, id)
+                                    .set_live_blood_ritual(self.live_char_id, id)
                                 {
                                     self.account_data.mark_dirty();
                                     self.char_view_gen += 1;
@@ -2997,7 +3001,7 @@ impl PacketProcessor {
                                 if self
                                     .account_data
                                     .characters
-                                    .set_blood_ritual_for_char(self.live_char_id, id)
+                                    .set_live_blood_ritual(self.live_char_id, id)
                                 {
                                     self.account_data.mark_dirty();
                                     self.char_view_gen += 1;

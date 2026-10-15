@@ -27,6 +27,20 @@ pub const CARD_CONTENT_WIDTH: f32 = 164.0;
 pub const CARD_PADDING: f32 = 8.0;
 pub const CARD_SPACING: f32 = 4.0;
 
+/// Room the card gives its rows on each side of the slot grid.
+///
+/// The grid is [`CARD_CONTENT_WIDTH`] and cannot grow, so a row needing a little
+/// more -- a long name beside the LIVE badge -- used to stretch that one card
+/// wider than its neighbours. Rows are laid out across [`CARD_INNER_WIDTH`]
+/// instead, which is this much wider at each side, and the grid is inset by the
+/// same amount so it stays centred in it.
+pub const CARD_CONTENT_INSET: f32 = 4.0;
+
+/// The width every card's rows are laid out across: the slot grid plus an inset
+/// at each side. Rows are capped to this, so no single card can grow past its
+/// neighbours; the grid itself stays [`CARD_CONTENT_WIDTH`].
+pub const CARD_INNER_WIDTH: f32 = CARD_CONTENT_WIDTH + 2.0 * CARD_CONTENT_INSET;
+
 /// Icon size for graveyard card icons (killer, grave, fame), matching the
 /// loot-history filter pill icon size (16x16).
 const GRAVEYARD_ICON_SIZE: f32 = 16.0;
@@ -42,14 +56,39 @@ const LOOT_BOOST_GLYPH: &str = "\u{26a1}";
 const LOOT_BOOST_COLOR: Color32 = Color32::from_rgb(100, 255, 100);
 /// Width of the painted loot-boost readout, used only for its hover target: the
 /// readout is painted, never laid out, so it cannot affect anything else.
-const LOOT_SLOT_W: f32 = 40.0;
+/// The slot is the run from the readout's left edge to the id column.
+const LOOT_SLOT_W: f32 = CARD_TEXT_INDENT + CARD_CONTENT_INSET - LOOT_BOOST_LEFT;
 /// Distance from the card's content edge to its text column: the 32px sprite box
 /// plus the gap after it. The loot readout is painted back at the content edge so
 /// it sits under the sprite, and this is the only place that offset is used -- as
-/// a paint coordinate, not as layout spacing.
+/// a paint coordinate, not as layout spacing. The column itself sits a further
+/// [`CARD_CONTENT_INSET`] in, in line with the slot grid.
 const CARD_TEXT_INDENT: f32 = 40.0;
 /// Offset of the duration text past the painted glyph.
 const LOOT_GLYPH_W: f32 = 12.0;
+/// The loot readout's left edge, this far left of the card's content edge, so the
+/// pair sits under the sprite.
+///
+/// Anchoring it to the content edge rather than to the text column is what keeps
+/// a long timer clear of the id line: the column is 44px in from that edge, which
+/// leaves the readout 51px to grow into, and `⚡10:45:48` measures 48.6px.
+const LOOT_BOOST_LEFT: f32 = -7.0;
+
+/// The name row's font size and item spacing. Pinned as constants because the
+/// row's width cap is computed from them: the cap has to hold for the same
+/// metrics the text is drawn with.
+const NAME_FONT_SIZE: f32 = 14.0;
+const NAME_ROW_SPACING: f32 = 4.0;
+
+/// Width of `text` laid out as a single line at `font`. Used by the rows that
+/// have to fit a fixed card width, so the cap is computed from the real font
+/// rather than from a guess at how wide the text is.
+fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_string(), font, Color32::WHITE)
+        .size()
+        .x
+}
 
 /// Draw a small pill, roughly half the size of the Missions-tab badge. The text
 /// gets a 1px black outline so it stays legible over any card background.
@@ -710,30 +749,63 @@ impl CharacterCardWidget {
                 // Full mode: name, badges, level, maxed, fame
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    // Label and badges
+                    // Label and badges. The name is the widest text on the card
+                    // and the only row whose content is not fixed, so it is capped
+                    // to whatever the badges leave: a name too long for the card
+                    // clips with an ellipsis instead of stretching this one card
+                    // wider than its neighbours.
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = NAME_ROW_SPACING;
                         let display_name = custom_label.unwrap_or(char.class_name());
                         let name_color = if char.seasonal { SEASONAL_COLOR } else { REGULAR_COLOR };
-                        ui.label(RichText::new(display_name).strong().size(14.0).color(name_color));
 
                         // A live character is flagged with a small green dot +
                         // LIVE right after the name. (The old lightning glyph was
                         // borrowed from Muledump, where it actually means an
                         // active loot boost, not "currently playing".)
+                        let mut badges: Vec<(&str, Color32)> = Vec::new();
                         if is_live {
-                            ui.label(
-                                RichText::new("\u{25cf} LIVE")
-                                    .small()
-                                    .color(Color32::from_rgb(100, 255, 100)),
-                            );
+                            badges.push(("\u{25cf} LIVE", Color32::from_rgb(100, 255, 100)));
+                        }
+                        if char.is_dead && !self.is_graveyard {
+                            badges.push(("\u{1f480} DEAD", Color32::from_rgb(255, 80, 80)));
                         }
 
-                        if char.is_dead && !self.is_graveyard {
-                            ui.label(
-                                RichText::new("💀 DEAD")
-                                    .small()
-                                    .color(Color32::from_rgb(255, 80, 80)),
+                        let small = {
+                            let style = ui.style();
+                            style
+                                .text_styles
+                                .get(&egui::TextStyle::Small)
+                                .cloned()
+                                .unwrap_or_else(|| egui::FontId::proportional(10.0))
+                        };
+                        let badges_w: f32 = badges
+                            .iter()
+                            .map(|(text, _)| {
+                                text_width(ui, text, small.clone()) + NAME_ROW_SPACING
+                            })
+                            .sum();
+                        let name_room = (CARD_INNER_WIDTH
+                            - CARD_TEXT_INDENT
+                            - CARD_CONTENT_INSET
+                            - badges_w)
+                            .max(0.0);
+
+                        ui.scope(|ui| {
+                            ui.set_max_width(name_room);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(display_name)
+                                        .strong()
+                                        .size(NAME_FONT_SIZE)
+                                        .color(name_color),
+                                )
+                                .truncate(),
                             );
+                        });
+
+                        for (text, color) in badges {
+                            ui.label(RichText::new(text).small().color(color));
                         }
                     });
 
@@ -805,11 +877,16 @@ impl CharacterCardWidget {
                                 // 10px so the five-character clock fits the column the sprite occupies.
                                 let font = egui::FontId::proportional(10.0);
                                 let area = ui.available_rect_before_wrap();
+                                // The row starts at the text column, one inset in
+                                // from the content edge; the readout is painted
+                                // back at that edge so it sits under the sprite.
+                                let content_left =
+                                    area.left() - CARD_TEXT_INDENT - CARD_CONTENT_INSET;
                                 // Nudged off the column and the id line by eye (7px
                                 // left, 2px down from the column edge and the row's
                                 // middle): the glyph's own bearings push the pair right
                                 // of the column and high of the text's centre.
-                                let left = area.left() - CARD_TEXT_INDENT - 7.0;
+                                let left = content_left + LOOT_BOOST_LEFT;
                                 let centre = area.top() + 9.0;
                                 ui.painter().text(
                                     egui::pos2(left, centre),
@@ -1117,7 +1194,32 @@ pub(crate) fn stat_potion_id(label: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_loot_boost;
+    use super::*;
+
+    /// Run `f` inside a real egui pass, so text is measured with the fonts the
+    /// card actually draws with rather than a guess at how wide it is.
+    fn measure<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let mut f = Some(f);
+        let mut out = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(f) = f.take() {
+                    out = Some(f(ui));
+                }
+            });
+        });
+        out.expect("egui pass ran")
+    }
+
+    /// The small-text font the card's badges use.
+    fn small_font(ui: &egui::Ui) -> egui::FontId {
+        ui.style()
+            .text_styles
+            .get(&egui::TextStyle::Small)
+            .cloned()
+            .unwrap_or_else(|| egui::FontId::proportional(10.0))
+    }
 
     #[test]
     fn loot_boost_uses_minutes_seconds_under_one_hour() {
@@ -1132,5 +1234,62 @@ mod tests {
         assert_eq!(format_loot_boost(3600), "1:00:00");
         assert_eq!(format_loot_boost(3660), "1:01:00");
         assert_eq!(format_loot_boost(7325), "2:02:05");
+    }
+
+    /// The loot readout is painted between the card's content edge and the id
+    /// column beside it, and a timer past ten hours is the longest the server
+    /// sends. This is the slot that has to hold it: a boost of an hour or more
+    /// (`1:45:48`, `10:45:48`) is what used to run into the id line.
+    #[test]
+    fn the_loot_readout_fits_beside_the_id_line() {
+        let (slot, longest) = measure(|ui| {
+            let longest = format!(
+                "{}{}",
+                LOOT_BOOST_GLYPH,
+                format_loot_boost(10 * 3600 + 45 * 60 + 48)
+            );
+            (
+                LOOT_SLOT_W,
+                text_width(ui, &longest, egui::FontId::proportional(10.0)),
+            )
+        });
+
+        assert!(
+            longest < slot,
+            "the longest readout ({longest:.1}px) does not fit the {slot:.1}px slot"
+        );
+    }
+
+    /// The cap only helps if it holds in a real pass: the row is built the way the
+    /// card builds it, and a name far too long for the card must still leave the
+    /// row inside the card's width rather than stretching it.
+    #[test]
+    fn a_long_name_cannot_widen_the_name_row() {
+        let row_w = measure(|ui| {
+            ui.set_max_width(CARD_INNER_WIDTH);
+            let badge = "\u{25cf} LIVE";
+            let badges_w = text_width(ui, badge, small_font(ui)) + NAME_ROW_SPACING;
+            let room = CARD_INNER_WIDTH - CARD_TEXT_INDENT - CARD_CONTENT_INSET - badges_w;
+            let mut row_w = 0.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = NAME_ROW_SPACING;
+                ui.scope(|ui| {
+                    ui.set_max_width(room);
+                    ui.add(
+                        egui::Label::new(RichText::new("New Mystic NPE").size(NAME_FONT_SIZE))
+                            .truncate(),
+                    );
+                });
+                ui.label(RichText::new(badge).small());
+                row_w = ui.min_rect().width();
+            });
+            row_w
+        });
+
+        let row_budget = CARD_INNER_WIDTH - CARD_TEXT_INDENT - CARD_CONTENT_INSET;
+        assert!(
+            row_w <= row_budget,
+            "the row came to {row_w:.1}px of its {row_budget:.1}px budget"
+        );
     }
 }

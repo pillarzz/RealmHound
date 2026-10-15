@@ -27,8 +27,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::panels::character_card::{
-    format_fame, CharacterCardWidget, StatDisplay, CARD_CONTENT_WIDTH, CARD_PADDING, CARD_SPACING,
-    FAME_SPRITE_ID,
+    format_fame, CharacterCardWidget, StatDisplay, CARD_CONTENT_INSET, CARD_INNER_WIDTH,
+    CARD_PADDING, CARD_SPACING, FAME_SPRITE_ID,
 };
 use crate::panels::derived_stats;
 use crate::panels::exalt_view::{exalt_colors, ExaltSurfaces};
@@ -1942,8 +1942,8 @@ impl CharactersPanel {
             1.0_f32
         };
 
-        // Card width = content + padding*2 + stroke*2
-        let card_width = CARD_CONTENT_WIDTH + CARD_PADDING * 2.0 + 4.0;
+        // Card width = rows + padding*2 + stroke*2
+        let card_width = CARD_INNER_WIDTH + CARD_PADDING * 2.0 + 4.0;
 
         // Use allocate_ui to reserve fixed width while allowing dynamic height.
         // This ensures wrapping works correctly while tall cards don't overlap.
@@ -1955,37 +1955,41 @@ impl CharactersPanel {
                     .corner_radius(8.0)
                     .inner_margin(CARD_PADDING)
                     .show(ui, |ui| {
-                        // Constrain content width
-                        ui.set_min_width(CARD_CONTENT_WIDTH);
-                        ui.set_max_width(CARD_CONTENT_WIDTH);
+                        // Constrain the card's rows to a fixed width, and inset
+                        // them so the slot grid inside stays centred.
+                        ui.set_min_width(CARD_INNER_WIDTH);
+                        ui.set_max_width(CARD_INNER_WIDTH);
 
                         // Delegate card content to shared CharacterCardWidget (full mode)
-                        ui.vertical(|ui| {
-                            let widget = if is_graveyard {
-                                let grave = grave_sprite_for_char(
-                                    char.gravestone_type,
-                                    char.maxed_count,
-                                    char.level,
+                        ui.horizontal(|ui| {
+                            ui.add_space(CARD_CONTENT_INSET);
+                            ui.vertical(|ui| {
+                                let widget = if is_graveyard {
+                                    let grave = grave_sprite_for_char(
+                                        char.gravestone_type,
+                                        char.maxed_count,
+                                        char.level,
+                                    );
+                                    CharacterCardWidget::full_graveyard(grave)
+                                } else {
+                                    CharacterCardWidget::full()
+                                };
+                                let widget = widget
+                                    .with_stat_display(stat_display)
+                                    .with_pet(pet_info.clone())
+                                    .with_loot_boost(self.loot_boost_remaining(char.char_id))
+                                    .with_blood_ritual(
+                                        self.cache.blood_ritual_for_char(char.char_id).is_some(),
+                                    )
+                                    .with_sections(show_inv, show_bp, show_ext, show_belt);
+                                widget.render(
+                                    ui,
+                                    char,
+                                    is_live,
+                                    custom_label.as_deref(),
+                                    sprite_renderer,
                                 );
-                                CharacterCardWidget::full_graveyard(grave)
-                            } else {
-                                CharacterCardWidget::full()
-                            };
-                            let widget = widget
-                                .with_stat_display(stat_display)
-                                .with_pet(pet_info.clone())
-                                .with_loot_boost(self.loot_boost_remaining(char.char_id))
-                                .with_blood_ritual(
-                                    self.cache.blood_ritual_for_char(char.char_id).is_some(),
-                                )
-                                .with_sections(show_inv, show_bp, show_ext, show_belt);
-                            widget.render(
-                                ui,
-                                char,
-                                is_live,
-                                custom_label.as_deref(),
-                                sprite_renderer,
-                            );
+                            });
                         });
                     })
             })

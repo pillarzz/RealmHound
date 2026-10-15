@@ -922,22 +922,24 @@ impl PacketProcessor {
                     if Some(char.char_id) == live_char_id {
                         continue;
                     }
-                    // The list's CrucibleActive is the server's own record of this
-                    // season's acceptance, and the game's own character list matches
-                    // it, so it may correct a flag carried over from a previous
-                    // season (issue #66). Only for characters that are not live:
-                    // those keep their own CRUCIBLE stat, which is fresher than any
-                    // list.
-                    let needs_crucible_update = self
-                        .account_data
-                        .characters
-                        .find_character(char.char_id)
-                        .map(|cached| cached.crucible_active != char.crucible_active)
-                        .unwrap_or(false);
-                    if needs_crucible_update {
+                    // Crucible is a seasonal challenge, so a non-seasonal character
+                    // cannot carry it. The character list's own CrucibleActive flag
+                    // cannot be trusted to say otherwise: it claimed crucible on most
+                    // of this account's non-seasonal characters, which is the very
+                    // staleness behind issue #66. The flag is therefore only ever
+                    // *set* by the live CRUCIBLE stat; all the list is used for is to
+                    // clear it where it contradicts the season, which also covers a
+                    // character that has rolled out of the season.
+                    let stale_crucible = !char.seasonal
+                        && self
+                            .account_data
+                            .characters
+                            .find_character(char.char_id)
+                            .is_some_and(|cached| cached.crucible_active);
+                    if stale_crucible {
                         self.account_data
                             .characters
-                            .update_crucible_status(char.char_id, char.crucible_active);
+                            .update_crucible_status(char.char_id, false);
                         challenge_changed = true;
                     }
                     // The list is the server's own record of the tag, so an absent
@@ -4897,7 +4899,12 @@ mod isolation_gate_tests {
     /// list for characters that are not live, while the live character keeps the
     /// value its own CRUCIBLE stat reported (issue #66).
     #[test]
-    fn api_account_data_clears_carried_over_crucible_flags() {
+    /// Crucible is seasonal-only, and the character list's own flag is stale (it
+    /// claims crucible on non-seasonal characters -- issue #66), so the list never
+    /// grants it. What the list does do is let a character that is not seasonal
+    /// lose a flag it could not legitimately hold.
+    #[test]
+    fn api_account_data_clears_crucible_from_non_seasonal_characters() {
         use realmhound_core::api::RealmCharacter;
         use realmhound_core::vault::CachedCharacter;
 
@@ -4907,33 +4914,29 @@ mod isolation_gate_tests {
         p.set_selected_scope(key, id.clone());
         p.account_data.characters.crucible_migrated = true;
 
-        // Two characters carry last season's flag; one of them is being played.
-        let mut stale = CachedCharacter {
-            char_id: 1,
-            ..Default::default()
-        };
-        stale.crucible_active = true;
-        let mut live = CachedCharacter {
-            char_id: 2,
-            ..Default::default()
-        };
-        live.crucible_active = true;
-        p.account_data.characters.characters.push(stale);
-        p.account_data.characters.characters.push(live);
-        p.live_char_id = Some(2);
+        // One wrongly-flagged regular character, and one legitimately seasonal.
+        for char_id in [1, 2] {
+            let mut c = CachedCharacter {
+                char_id,
+                ..Default::default()
+            };
+            c.crucible_active = true;
+            p.account_data.characters.characters.push(c);
+        }
 
-        // The list now says neither has accepted this season's crucible.
         let data = realmhound_core::api::AccountData {
             account_id: Some("MAIN123".into()),
             characters: vec![
                 RealmCharacter {
                     char_id: 1,
-                    crucible_active: false,
+                    seasonal: false,
+                    crucible_active: true,
                     ..Default::default()
                 },
                 RealmCharacter {
                     char_id: 2,
-                    crucible_active: false,
+                    seasonal: true,
+                    crucible_active: true,
                     ..Default::default()
                 },
             ],
@@ -4947,7 +4950,7 @@ mod isolation_gate_tests {
                 .find_character(1)
                 .unwrap()
                 .crucible_active,
-            "a carried-over flag on a non-live character must clear"
+            "a non-seasonal character cannot be crucible"
         );
         assert!(
             p.account_data
@@ -4955,7 +4958,7 @@ mod isolation_gate_tests {
                 .find_character(2)
                 .unwrap()
                 .crucible_active,
-            "the live character keeps what its own stat reported"
+            "a seasonal character keeps the flag the live stat gave it"
         );
     }
 

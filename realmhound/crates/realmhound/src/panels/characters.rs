@@ -633,16 +633,26 @@ impl CharactersPanel {
     /// authoritative, so this writes the value into the per-character map for
     /// the live character (removing the entry when the boost ends). When no
     /// character is live the map keeps each card's last-known value.
+    /// Record the live loot-drop boost for the character being played.
+    ///
+    /// An unknown value (`None`) leaves the last known one alone: it means the game
+    /// has not reported the boost yet, which is the case until a zone change
+    /// re-sends the player's status. Treating it as "no boost" deleted the value
+    /// the character list had seeded from `<LDTimer>`, so the timer only appeared
+    /// after the player changed zones. A zero is the game saying the boost has run
+    /// out, and clears it.
     pub fn observe_live_loot_boost(&mut self, live: Option<u32>, live_char_id: Option<i32>) {
-        if let Some(id) = live_char_id {
-            match live {
-                Some(secs) => {
-                    self.loot_boost_by_char.insert(id, secs);
-                }
-                None => {
-                    self.loot_boost_by_char.remove(&id);
-                }
+        let Some(id) = live_char_id else {
+            return;
+        };
+        match live {
+            Some(0) => {
+                self.loot_boost_by_char.remove(&id);
             }
+            Some(secs) => {
+                self.loot_boost_by_char.insert(id, secs);
+            }
+            None => {}
         }
     }
 

@@ -85,6 +85,16 @@ fn draw_pill(ui: &mut egui::Ui, text: &str, background: Color32) {
     );
 }
 
+/// Allocate a pill's exact footprint without drawing anything, so a card with no
+/// challenges reserves precisely the row a card with them occupies.
+fn draw_pill_invisible(ui: &mut egui::Ui, text: &str) {
+    let font = egui::FontId::proportional(8.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font, Color32::WHITE);
+    ui.allocate_exact_size(galley.size() + egui::vec2(6.0, 2.0), Sense::hover());
+}
+
 /// Crucible marker on the character card.
 fn draw_crucible_pill(ui: &mut egui::Ui) {
     draw_pill(ui, "CRUCIBLE", Color32::from_rgb(0xdc, 0x21, 0x15));
@@ -96,21 +106,19 @@ fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
     draw_pill(ui, "BLOOD RITUAL", Color32::from_rgb(0xe7, 0x7b, 0x00));
 }
 
-/// The season-challenge pills a character carries, on one line. The line is
-/// reserved even when the character carries no challenge, so every card is the
-/// same height whatever pills its character has. [#64]
-fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool) {
+/// The season-challenge pills a character carries, on one line.
+///
+/// With `reserve` set, a character carrying no challenge still draws an
+/// *invisible* pill, so the row is the same height as one holding two. Going
+/// through the same allocation is the only exact way to do it: a spacer is laid
+/// out slightly differently (the vertical spacing between rows is applied to a
+/// spacer and a pill differently), which left cards without challenges a couple
+/// of pixels short in the grid. [#64]
+fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool, reserve: bool) {
     if !crucible && !blood_ritual {
-        // Reserve exactly what the pills occupy, measured the way a pill is sized
-        // below, so a card with no challenge is precisely as tall as one carrying
-        // two. A hand-picked constant was a hair short, which showed up as shorter
-        // cards in a row.
-        let galley = ui.painter().layout_no_wrap(
-            "CRUCIBLE".to_string(),
-            egui::FontId::proportional(8.0),
-            Color32::WHITE,
-        );
-        ui.add_space(galley.size().y + 2.0);
+        if reserve {
+            draw_pill_invisible(ui, "CRUCIBLE");
+        }
         return;
     }
     ui.horizontal(|ui| {
@@ -684,7 +692,12 @@ impl CharacterCardWidget {
                     ui.add_space(2.0);
                     ui.label(RichText::new(display_name).strong().size(14.0).color(name_color));
                     if char.crucible_active || self.blood_ritual_active {
-                        draw_season_pills(ui, char.crucible_active, self.blood_ritual_active);
+                        draw_season_pills(
+                            ui,
+                            char.crucible_active,
+                            self.blood_ritual_active,
+                            false,
+                        );
                         ui.add_space(2.0);
                     }
                 });
@@ -743,7 +756,12 @@ impl CharacterCardWidget {
                         // Season-challenge pills on their own row (row 2), under
                         // the name/live status so a tall card keeps its identity
                         // line clear of them.
-                        draw_season_pills(ui, char.crucible_active, self.blood_ritual_active);
+                        draw_season_pills(
+                            ui,
+                            char.crucible_active,
+                            self.blood_ritual_active,
+                            true,
+                        );
 
                         // Fame on its own row (row 3). Always shown (0 when none)
                         // so the card height stays consistent and a long value

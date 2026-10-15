@@ -647,6 +647,8 @@ struct BoostSnapshot {
     dexterity: i32,
     wisdom: i32,
     max_mp: i32,
+    vitality: i32,
+    speed: i32,
     condition: i32,
     condition_new: i32,
 }
@@ -660,12 +662,16 @@ impl BoostSnapshot {
             dexterity: obj.dexterity,
             wisdom: obj.wisdom,
             max_mp: obj.max_mp,
+            vitality: obj.vitality,
+            speed: obj.speed,
             condition: obj.condition,
             condition_new: obj.condition_new,
         }
     }
 
-    /// Level-stat changes between two snapshots, as (label, from, to).
+    /// Level-stat changes between two snapshots, as (label, from, to). Vitality
+    /// and Speed are included so a VIT-stacking build's stat swings are visible
+    /// in the fight's boost timeline, not just its damage.
     fn level_changes(&self, after: &Self) -> Vec<(&'static str, i32, i32)> {
         [
             ("Attack", self.attack, after.attack),
@@ -674,6 +680,8 @@ impl BoostSnapshot {
             ("Dexterity", self.dexterity, after.dexterity),
             ("Wisdom", self.wisdom, after.wisdom),
             ("Max MP", self.max_mp, after.max_mp),
+            ("Vitality", self.vitality, after.vitality),
+            ("Speed", self.speed, after.speed),
         ]
         .into_iter()
         .filter(|(_, before, now)| before != now)
@@ -8272,6 +8280,63 @@ mod tests {
             Some(55)
         );
         assert_eq!(local.effective_scaling_stat(ScalingStat::Speed), Some(45));
+    }
+
+    #[test]
+    fn vitality_and_speed_changes_are_recorded_as_boosts() {
+        // A VIT-stacking build's stat swings must reach the fight's boost
+        // timeline, not just the damage math: only ATT/DEF/DEX/WIS/MP used to be
+        // snapshotted, so a VIT potion or VIT-buffing ability was invisible.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        // Pre-fight stats (their arrival precedes the fight, so it is not a boost).
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![stat(StatType::Vitality, 75), stat(StatType::Speed, 50)],
+            ),
+            5,
+        );
+        // Open the fight.
+        t.pending_server_shots.insert(1, (100, false));
+        t.on_local_hit(500, 1, 1000, 1000, 10);
+        // A VIT potion / VIT-buffing ability lands mid-fight; SPD does not move.
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![stat(StatType::Vitality, 100), stat(StatType::Speed, 50)],
+            ),
+            20,
+        );
+        let done = t.on_map_change("Nexus", 0, 40);
+        let vit: Vec<_> = done[0]
+            .boosts
+            .iter()
+            .filter(|b| b.stat == "Vitality")
+            .collect();
+        assert_eq!(vit.len(), 1, "exactly one VIT boost window");
+        assert_eq!((vit[0].from, vit[0].to), (75, 100));
+        assert!(
+            done[0].boosts.iter().all(|b| b.stat != "Speed"),
+            "an unchanged SPD must not open a window"
+        );
     }
 
     #[test]

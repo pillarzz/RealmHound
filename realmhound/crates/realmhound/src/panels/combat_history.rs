@@ -405,16 +405,34 @@ fn condensed_boosts(boosts: &[BoostWindow]) -> Vec<CondensedBoost> {
     rows
 }
 
-/// A section divider that spans `width` points from the current left edge, in the
-/// same stroke as the card's other dividers. The short form ends where the boss
-/// header block ends, so the sections below it read as one column.
-fn section_divider(ui: &mut egui::Ui, width: f32) {
-    let width = width.min(ui.available_width()).max(1.0);
+/// A section divider spanning the Stats table, in the same stroke as the card's
+/// other dividers. Every section closes on the same line -- the right edge of the
+/// table's last column (Blood Ritual) -- so the card reads as one column rather
+/// than as lines of assorted lengths.
+fn section_divider(ui: &mut egui::Ui) {
+    let width = section_divider_width(ui).min(ui.available_width()).max(1.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 7.0), egui::Sense::hover());
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter()
         .hline(rect.left()..=rect.right(), rect.center().y, stroke);
 }
+
+/// Where the section dividers end: the right edge of the Stats table's Blood
+/// Ritual column. The reserved column widths come from the same helper the shared
+/// attribute renderer uses, so the line lands exactly on the table's last column.
+fn section_divider_width(ui: &egui::Ui) -> f32 {
+    let w = crate::panels::derived_stats::attr_col_widths(ui);
+    // The grid lays out twelve columns (the stat icon, then two five-column
+    // groups) with `STATS_GRID_GAP` between each pair.
+    STATS_ICON_CELL
+        + 2.0 * (w.total + w.gear + w.exalt + w.crucible + w.blood_ritual)
+        + STATS_GRID_GAP * 11.0
+}
+
+/// Horizontal gap between the Stats table's columns.
+const STATS_GRID_GAP: f32 = 16.0;
+/// Width of the Stats table's leading stat-icon cell.
+const STATS_ICON_CELL: f32 = 16.0;
 
 /// A PgUp / PgDn page delta in points for the visible height, or `None` when
 /// neither key was pressed this frame. The fight card pages through its own scroll
@@ -693,10 +711,6 @@ pub struct CombatHistoryPanel {
     detail_scroll_offset: f32,
     /// A pending PgUp / PgDn scroll applied to the next frame's fight card.
     detail_scroll_delta: Option<f32>,
-    /// Width of the boss/header block's widest line, measured while the header is
-    /// drawn. The short section dividers (after Summary / Stats / Gear) end there,
-    /// so they line up with the header instead of stopping mid-card.
-    section_width: f32,
     /// Cached distinct bosses/dungeons for search autocomplete.
     autocomplete: AutocompleteCache,
     /// Whether the search suggestion popup is open.
@@ -767,7 +781,6 @@ impl Default for CombatHistoryPanel {
             show_performance: false,
             detail_scroll_offset: 0.0,
             detail_scroll_delta: None,
-            section_width: 320.0,
             autocomplete: AutocompleteCache::default(),
             search_popup_open: false,
             search_selected_index: None,
@@ -2880,19 +2893,11 @@ impl CombatHistoryPanel {
             );
 
             ui.add_space(6.0);
-            // The header block's widest line sets how far the short section dividers
-            // run: they end where this block ends, so the sections below read as one
-            // column rather than stopping at an arbitrary width.
-            let mut meta_w = 0.0f32;
             ui.horizontal(|ui| {
                 ui.add_space(bar_inset);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    meta_w = meta_w.max(
-                        ui.label(RichText::new(&fight.boss_name).size(18.0).strong())
-                            .rect
-                            .width(),
-                    );
+                    ui.label(RichText::new(&fight.boss_name).size(18.0).strong());
 
                     // location · date time (no dot between date and time so the
                     // start time doesn't read as a duration).
@@ -2900,36 +2905,25 @@ impl CombatHistoryPanel {
                         Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
                         None => "-".to_string(),
                     };
-                    meta_w = meta_w.max(
-                        ui.label(
-                            RichText::new(format!(
-                                "{}  ·  {}",
-                                dungeon_display_name(
-                                    portal_map,
-                                    &fight.dungeon,
-                                    RunModes {
-                                        leisurely: fight.leisurely,
-                                        petless: fight.petless,
-                                        hard_mode: fight.shatters_hm || fight.spectral_hm,
-                                    },
-                                ),
-                                datetime_s,
-                            ))
-                            .color(Color32::GRAY),
-                        )
-                        .rect
-                        .width(),
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  ·  {}",
+                            dungeon_display_name(
+                                portal_map,
+                                &fight.dungeon,
+                                RunModes {
+                                    leisurely: fight.leisurely,
+                                    petless: fight.petless,
+                                    hard_mode: fight.shatters_hm || fight.spectral_hm,
+                                },
+                            ),
+                            datetime_s,
+                        ))
+                        .color(Color32::GRAY),
                     );
-                    meta_w = meta_w.max(
-                        ui.label(
-                            RichText::new(format!(
-                                "Duration: {}",
-                                fmt_duration(fight.duration_ms())
-                            ))
+                    ui.label(
+                        RichText::new(format!("Duration: {}", fmt_duration(fight.duration_ms())))
                             .color(Color32::GRAY),
-                        )
-                        .rect
-                        .width(),
                     );
                     if fight.local_close_calls > 0 {
                         // A dead character keeps its last-seen appearance from the
@@ -2993,7 +2987,7 @@ impl CombatHistoryPanel {
                         .filter(|p| matches!(p.end_status, ParticipantEndStatus::Present))
                         .count();
                     let total = fight.participants.len();
-                    let participants = ui.horizontal(|ui| {
+                    ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
                         ui.label(RichText::new("Participants:").color(Color32::GRAY).small());
                         ui.label(
@@ -3013,10 +3007,8 @@ impl CombatHistoryPanel {
                         )
                         .hover_tip("Players who participated in the fight.");
                     });
-                    meta_w = meta_w.max(participants.response.rect.width());
                 });
             });
-            self.section_width = bar_inset + meta_w;
 
             // The fight card header ends here. This divider is the full width of the
             // card, unlike the short ones that close the sections below it.
@@ -3126,7 +3118,7 @@ impl CombatHistoryPanel {
                 );
             });
         ui.add_space(2.0);
-        section_divider(ui, self.section_width);
+        section_divider(ui);
     }
 
     /// Section A: the local player's stats as they stood for this fight, split by
@@ -3196,7 +3188,7 @@ impl CombatHistoryPanel {
         let widths = crate::panels::derived_stats::attr_col_widths(ui);
         egui::Grid::new("my_performance_stats")
             .num_columns(12)
-            .spacing([16.0, 4.0])
+            .spacing([STATS_GRID_GAP, 4.0])
             .show(ui, |ui| {
                 // One header band per stat column.
                 for _ in 0..2 {
@@ -3253,7 +3245,7 @@ impl CombatHistoryPanel {
                 }
             });
         ui.add_space(2.0);
-        section_divider(ui, self.section_width);
+        section_divider(ui);
     }
 
     /// Section B: the boosts the server reported on the local player during the
@@ -3262,7 +3254,10 @@ impl CombatHistoryPanel {
     /// across the whole fight.
     fn render_boost_section(&self, ui: &mut egui::Ui, ctx: &mut PanelContext, fight: &FightRecord) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Boosts").strong());
+        ui.label(RichText::new("Boosts").strong()).hover_tip(
+            "One row per effect and source; the duration is the total time it was held. \
+             The source is inferred -- the wire names none.",
+        );
         ui.add_space(4.0);
 
         let rows = condensed_boosts(&fight.boosts);
@@ -3276,16 +3271,6 @@ impl CombatHistoryPanel {
             );
             return;
         }
-        ui.label(
-            RichText::new(
-                "One row per effect and source; the duration is the total time it was held. \
-                 Read from the server's stat updates, so an ally's buff or a status effect \
-                 is included -- the source is inferred, since the wire carries none.",
-            )
-            .color(Color32::GRAY)
-            .small(),
-        );
-        ui.add_space(4.0);
         egui::Grid::new("my_performance_boosts")
             .num_columns(5)
             .spacing([18.0, 4.0])
@@ -3386,7 +3371,7 @@ impl CombatHistoryPanel {
             }
         });
         ui.add_space(2.0);
-        section_divider(ui, self.section_width);
+        section_divider(ui);
     }
 
     /// Section E.1: the local player's damage split by weapon. The per-shot value
@@ -3399,7 +3384,11 @@ impl CombatHistoryPanel {
         local: &ParticipantRecord,
     ) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Damage by weapon").strong());
+        ui.label(RichText::new("Damage by weapon").strong())
+            .hover_tip(
+                "Self-computed: each hit's value is rolled from the map seed and your \
+                 Attack at shoot time, then reduced by the target's Defense.",
+            );
         ui.add_space(4.0);
         if local.weapons.is_empty() {
             ui.label(
@@ -3411,14 +3400,6 @@ impl CombatHistoryPanel {
             );
             return;
         }
-        ui.label(
-            RichText::new(
-                "Self-computed: each hit's value is rolled from the map seed and your \
-                 Attack at shoot time, then reduced by the target's Defense.",
-            )
-            .color(Color32::GRAY)
-            .small(),
-        );
         ui.add_space(4.0);
         egui::Grid::new("my_performance_weapons")
             .num_columns(4)
@@ -3451,22 +3432,6 @@ impl CombatHistoryPanel {
                     ui.end_row();
                 }
             });
-
-        if local.packet_damage > 0 {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "Separately, the server reported {} damage across {} hit(s) of your own \
-                     ability/proc/DoT damage. Those are packet-borne figures the client did \
-                     not compute, so they are not part of any weapon row above; they show up \
-                     under whichever ability was active.",
-                    local.packet_damage.max(0),
-                    local.packet_hits,
-                ))
-                .color(Color32::GRAY)
-                .small(),
-            );
-        }
     }
 
     /// Section E.2: the local player's ability activations, each credited the
@@ -3482,7 +3447,13 @@ impl CombatHistoryPanel {
         fight: &FightRecord,
     ) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Damage by ability").strong());
+        ui.label(RichText::new("Damage by ability").strong())
+            .hover_tip(
+                "Only damage the game sent us in packets. Damage the client works out \
+                 itself -- novas, poisons, and other hits the server never reports -- \
+                 cannot be measured, so those abilities are listed with their \
+                 activations and no damage.",
+            );
         ui.add_space(4.0);
         if fight.abilities.is_empty() {
             ui.label(
@@ -3494,14 +3465,6 @@ impl CombatHistoryPanel {
             );
             return;
         }
-        ui.label(
-            RichText::new(
-                "From packets where the server reported the damage; abilities the client \
-                 resolves itself show their activations with no packet-borne damage.",
-            )
-            .color(Color32::GRAY)
-            .small(),
-        );
         ui.add_space(4.0);
 
         // One row per ability (item + enchants), with its activations and whatever
@@ -3630,10 +3593,10 @@ impl CombatHistoryPanel {
         local: Option<&ParticipantRecord>,
     ) {
         let shadcn = ctx.shadcn;
+        // The band's own dividers are the row's only top and bottom edges: the
+        // frame's margins alone, as the Vault's sub-tab band has, so the buttons
+        // sit tight between them instead of floating in a padded strip.
         shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
-            // Equal margins above and below the row, which is centered across the
-            // card like the Vault's.
-            ui.add_space(5.0);
             ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
                     if ctx
@@ -3675,11 +3638,8 @@ impl CombatHistoryPanel {
                     }
                 });
             });
-            ui.add_space(5.0);
         });
         ui.add_space(4.0);
-        shadcn.full_width_separator(ui);
-        ui.add_space(6.0);
     }
 
     /// One boss of a grouped run, in the "My Performance" view: the boss's own
@@ -3892,7 +3852,8 @@ impl CombatHistoryPanel {
         // detailed, so everything a reader checks first -- where they placed, the
         // stats, the gear, the damage breakdown -- sits above it, divided off.
         ui.add_space(10.0);
-        ctx.shadcn.full_width_separator(ui);
+        section_divider(ui);
+        ui.add_space(2.0);
         self.render_boost_section(ui, ctx, fight);
     }
 
@@ -4761,17 +4722,6 @@ impl CombatHistoryPanel {
             .filter(|p| !(hide_crates && get_asset_manager().is_treasure_crate(p.boss_object_type)))
             .collect();
 
-        // Display order: the last boss fought at the top, so reading the rows
-        // bottom-to-top is the order the party fought them. Ordering is by fight
-        // start, not finalization: an earlier phase can flush after a later one
-        // (e.g. a Moonlight Village dancer suspended and folded at the run's end),
-        // and it must not jump above the boss the run actually finished on.
-        visible_phases.sort_by(|a, b| {
-            b.started_at
-                .cmp(&a.started_at)
-                .then(b.ended_at.cmp(&a.ended_at))
-        });
-
         // The main dungeon boss: the run anchor (last real boss), else the last
         // non-crate phase. Its section auto-expands and shows the "Main" badge.
         // The latest row of that object type is the anchor phase itself, since a
@@ -4790,6 +4740,30 @@ impl CombatHistoryPanel {
             })
             .or_else(|| enc.phases.last())
             .map(|p| p.id);
+
+        // Display order: the main boss is the top row -- it is what the run was
+        // fought for, and a reader looks for it first -- with every other phase
+        // below it. A treasure-crate (side-room) phase is the one exception and may
+        // stay above the main boss, collapsed like any other row. Below the top the
+        // previous order holds (latest phase first), so the rows still read
+        // bottom-to-top as the party fought them: an earlier phase can flush after a
+        // later one (e.g. a Moonlight Village dancer suspended and folded at the
+        // run's end), and it must not jump above the boss the run finished on.
+        let rank = |p: &FightRecord| -> u8 {
+            if am.is_treasure_crate(p.boss_object_type) {
+                0
+            } else if Some(p.id) == anchor_id {
+                1
+            } else {
+                2
+            }
+        };
+        visible_phases.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then(b.started_at.cmp(&a.started_at))
+                .then(b.ended_at.cmp(&a.ended_at))
+        });
 
         // Anchor sprite for the header icon: the main boss above.
         let icon_type = enc
@@ -4864,14 +4838,11 @@ impl CombatHistoryPanel {
             );
 
             ui.add_space(6.0);
-            // The run header's widest line sets how far the short section dividers run
-            // inside each boss's breakdown (the sections end where the header ends).
-            let mut meta_w = 0.0f32;
             ui.horizontal(|ui| {
                 ui.add_space(bar_inset);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    let title_row = ui.horizontal(|ui| {
+                    ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         ui.label(RichText::new(&header_title).size(18.0).strong());
                         let (state, color) = if enc.killed {
@@ -4881,7 +4852,6 @@ impl CombatHistoryPanel {
                         };
                         ui.label(RichText::new(state).color(color).small());
                     });
-                    meta_w = meta_w.max(title_row.response.rect.width());
                     // location · date time (no dot between date and time so the
                     // start time doesn't read as a duration), then the two
                     // durations on their own labeled lines.
@@ -4889,57 +4859,44 @@ impl CombatHistoryPanel {
                         Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
                         None => "-".to_string(),
                     };
-                    meta_w = meta_w.max(
-                        ui.label(
-                            RichText::new(format!(
-                                "{}  ·  {}",
-                                dungeon_display_name(
-                                    portal_map,
-                                    &enc.dungeon,
-                                    RunModes {
-                                        leisurely: enc.leisurely,
-                                        petless: enc.petless,
-                                        hard_mode: enc.shatters_hm || enc.spectral_hm,
-                                    },
-                                ),
-                                datetime_s,
-                            ))
-                            .color(Color32::GRAY),
-                        )
-                        .rect
-                        .width(),
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  ·  {}",
+                            dungeon_display_name(
+                                portal_map,
+                                &enc.dungeon,
+                                RunModes {
+                                    leisurely: enc.leisurely,
+                                    petless: enc.petless,
+                                    hard_mode: enc.shatters_hm || enc.spectral_hm,
+                                },
+                            ),
+                            datetime_s,
+                        ))
+                        .color(Color32::GRAY),
                     );
-                    meta_w = meta_w.max(
-                        ui.label(
-                            RichText::new(format!(
-                                "Active combat time: {}",
-                                fmt_duration(enc.active_duration_ms())
-                            ))
-                            .color(Color32::GRAY),
-                        )
-                        .hover_tip(
-                            "Sum of each big boss's fight duration - active combat only, \
-                             excluding add-on rows and travel/idle time between bosses.",
-                        )
-                        .rect
-                        .width(),
+                    ui.label(
+                        RichText::new(format!(
+                            "Active combat time: {}",
+                            fmt_duration(enc.active_duration_ms())
+                        ))
+                        .color(Color32::GRAY),
+                    )
+                    .hover_tip(
+                        "Sum of each big boss's fight duration - active combat only, \
+                         excluding add-on rows and travel/idle time between bosses.",
                     );
-                    meta_w = meta_w.max(
-                        ui.label(
-                            RichText::new(format!(
-                                "Total dungeon time: {}",
-                                fmt_duration(enc.total_dungeon_ms())
-                            ))
-                            .color(Color32::GRAY),
-                        )
-                        .hover_tip(
-                            "Wall-clock time from entering the dungeon to the final \
-                             boss death, including minion clear and travel between bosses.",
-                        )
-                        .rect
-                        .width(),
+                    ui.label(
+                        RichText::new(format!(
+                            "Total dungeon time: {}",
+                            fmt_duration(enc.total_dungeon_ms())
+                        ))
+                        .color(Color32::GRAY),
+                    )
+                    .hover_tip(
+                        "Wall-clock time from entering the dungeon to the final \
+                         boss death, including minion clear and travel between bosses.",
                     );
-                    self.section_width = bar_inset + meta_w;
                     // Moonlight Village spirits: each spirit released at the
                     // end of a dance (or Umi) phase is one object, and the
                     // run total sets the dungeon's loot tier. Shown per side
@@ -5086,6 +5043,10 @@ impl CombatHistoryPanel {
                 });
             });
 
+            // The encounter's header -- icons, boss bar, run details, participants
+            // -- ends here, as it does on a single-fight card.
+            ui.add_space(6.0);
+            ctx.shadcn.full_width_separator(ui);
             ui.add_space(4.0);
 
             if self.show_performance {

@@ -27,20 +27,6 @@ pub const CARD_CONTENT_WIDTH: f32 = 164.0;
 pub const CARD_PADDING: f32 = 8.0;
 pub const CARD_SPACING: f32 = 4.0;
 
-/// Room the card gives its rows on each side of the slot grid.
-///
-/// The grid is [`CARD_CONTENT_WIDTH`] and cannot grow, so a row needing a little
-/// more -- a long name beside the LIVE badge -- used to stretch that one card
-/// wider than its neighbours. Rows are laid out across [`CARD_INNER_WIDTH`]
-/// instead, which is this much wider at each side, and the grid is inset by the
-/// same amount so it stays centred in it.
-pub const CARD_CONTENT_INSET: f32 = 4.0;
-
-/// The width every card's rows are laid out across: the slot grid plus an inset
-/// at each side. Rows are capped to this, so no single card can grow past its
-/// neighbours; the grid itself stays [`CARD_CONTENT_WIDTH`].
-pub const CARD_INNER_WIDTH: f32 = CARD_CONTENT_WIDTH + 2.0 * CARD_CONTENT_INSET;
-
 /// Icon size for graveyard card icons (killer, grave, fame), matching the
 /// loot-history filter pill icon size (16x16).
 const GRAVEYARD_ICON_SIZE: f32 = 16.0;
@@ -57,12 +43,11 @@ const LOOT_BOOST_COLOR: Color32 = Color32::from_rgb(100, 255, 100);
 /// Width of the painted loot-boost readout, used only for its hover target: the
 /// readout is painted, never laid out, so it cannot affect anything else.
 /// The slot is the run from the readout's left edge to the id column.
-const LOOT_SLOT_W: f32 = CARD_TEXT_INDENT + CARD_CONTENT_INSET - LOOT_BOOST_LEFT;
+const LOOT_SLOT_W: f32 = CARD_TEXT_INDENT - LOOT_BOOST_LEFT;
 /// Distance from the card's content edge to its text column: the 32px sprite box
 /// plus the gap after it. The loot readout is painted back at the content edge so
 /// it sits under the sprite, and this is the only place that offset is used -- as
-/// a paint coordinate, not as layout spacing. The column itself sits a further
-/// [`CARD_CONTENT_INSET`] in, in line with the slot grid.
+/// a paint coordinate, not as layout spacing.
 const CARD_TEXT_INDENT: f32 = 40.0;
 /// Offset of the duration text past the painted glyph.
 const LOOT_GLYPH_W: f32 = 12.0;
@@ -70,9 +55,10 @@ const LOOT_GLYPH_W: f32 = 12.0;
 /// pair sits under the sprite.
 ///
 /// Anchoring it to the content edge rather than to the text column is what keeps
-/// a long timer clear of the id line: the column is 44px in from that edge, which
-/// leaves the readout 51px to grow into, and `⚡10:45:48` measures 48.6px.
-const LOOT_BOOST_LEFT: f32 = -7.0;
+/// a long timer clear of the id line: the column is 40px in from that edge, which
+/// leaves the readout 51px to grow into, and `⚡10:45:48` measures 48.6px. The
+/// card's side padding is what the 11px of the offset sits in.
+const LOOT_BOOST_LEFT: f32 = -11.0;
 
 /// The name row's font size and item spacing. Pinned as constants because the
 /// row's width cap is computed from them: the cap has to hold for the same
@@ -785,11 +771,8 @@ impl CharacterCardWidget {
                                 text_width(ui, text, small.clone()) + NAME_ROW_SPACING
                             })
                             .sum();
-                        let name_room = (CARD_INNER_WIDTH
-                            - CARD_TEXT_INDENT
-                            - CARD_CONTENT_INSET
-                            - badges_w)
-                            .max(0.0);
+                        let name_room =
+                            (CARD_CONTENT_WIDTH - CARD_TEXT_INDENT - badges_w).max(0.0);
 
                         ui.scope(|ui| {
                             ui.set_max_width(name_room);
@@ -904,7 +887,7 @@ impl CharacterCardWidget {
                                 // from the content edge; the readout is painted
                                 // back at that edge so it sits under the sprite.
                                 let content_left =
-                                    area.left() - CARD_TEXT_INDENT - CARD_CONTENT_INSET;
+                                    area.left() - CARD_TEXT_INDENT;
                                 // Nudged off the column and the row's middle by eye
                                 // (7px left, 2px down): the glyph's own bearings push
                                 // the pair right of the column and high of the text's
@@ -1276,10 +1259,10 @@ mod tests {
     #[test]
     fn a_long_name_cannot_widen_the_name_row() {
         let row_w = measure(|ui| {
-            ui.set_max_width(CARD_INNER_WIDTH);
+            ui.set_max_width(CARD_CONTENT_WIDTH);
             let badge = "\u{25cf} LIVE";
             let badges_w = text_width(ui, badge, small_font(ui)) + NAME_ROW_SPACING;
-            let room = CARD_INNER_WIDTH - CARD_TEXT_INDENT - CARD_CONTENT_INSET - badges_w;
+            let room = CARD_CONTENT_WIDTH - CARD_TEXT_INDENT - badges_w;
             let mut row_w = 0.0;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = NAME_ROW_SPACING;
@@ -1296,7 +1279,7 @@ mod tests {
             row_w
         });
 
-        let row_budget = CARD_INNER_WIDTH - CARD_TEXT_INDENT - CARD_CONTENT_INSET;
+        let row_budget = CARD_CONTENT_WIDTH - CARD_TEXT_INDENT;
         assert!(
             row_w <= row_budget,
             "the row came to {row_w:.1}px of its {row_budget:.1}px budget"

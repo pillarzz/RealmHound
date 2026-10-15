@@ -27,8 +27,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::panels::character_card::{
-    format_fame, CharacterCardWidget, StatDisplay, CARD_CONTENT_INSET, CARD_INNER_WIDTH,
-    CARD_PADDING, CARD_SPACING, FAME_SPRITE_ID,
+    format_fame, CharacterCardWidget, StatDisplay, CARD_CONTENT_WIDTH, CARD_PADDING, CARD_SPACING,
+    FAME_SPRITE_ID,
 };
 use crate::panels::derived_stats;
 use crate::panels::exalt_view::{exalt_colors, ExaltSurfaces};
@@ -44,6 +44,13 @@ use crate::tab_icons::{
 /// predicted rows, so it sits inside the fame column instead of overlapping the
 /// value column and stays aligned with the earned rows' fame icon.
 const FAME_PLUS_GUTTER: f32 = 11.0;
+
+/// Margin between a character card's border and its rows, on the left and right
+/// only. The card is this much wider than its slot grid on each side, which is
+/// the room a row needing more than the grid -- a long name beside the LIVE
+/// badge, or the loot readout -- grows into. Vertical padding stays
+/// [`CARD_PADDING`], so the card's height does not change with it.
+const CARD_FRAME_PADDING_X: i8 = (CARD_PADDING as i8) + 4;
 
 /// Biome display names, in the order shown in the BIOME ENEMY KILLS column.
 /// Used to size the MISC STATS label cell so its value column lines up with
@@ -1942,8 +1949,8 @@ impl CharactersPanel {
             1.0_f32
         };
 
-        // Card width = rows + padding*2 + stroke*2
-        let card_width = CARD_INNER_WIDTH + CARD_PADDING * 2.0 + 4.0;
+        // Card width = rows + the frame's side padding + the stroke
+        let card_width = CARD_CONTENT_WIDTH + CARD_FRAME_PADDING_X as f32 * 2.0 + 4.0;
 
         // Use allocate_ui to reserve fixed width while allowing dynamic height.
         // This ensures wrapping works correctly while tall cards don't overlap.
@@ -1953,43 +1960,49 @@ impl CharactersPanel {
                     .fill(fill)
                     .stroke(egui::Stroke::new(stroke_width, stroke_color))
                     .corner_radius(8.0)
-                    .inner_margin(CARD_PADDING)
+                    // Wider at the sides than above and below: the extra is room
+                    // the rows can grow into (a long name, the loot readout) and
+                    // it must not change the card's height.
+                    .inner_margin(egui::Margin {
+                        left: CARD_FRAME_PADDING_X,
+                        right: CARD_FRAME_PADDING_X,
+                        top: CARD_PADDING as i8,
+                        bottom: CARD_PADDING as i8,
+                    })
                     .show(ui, |ui| {
-                        // Constrain the card's rows to a fixed width, and inset
-                        // them so the slot grid inside stays centred.
-                        ui.set_min_width(CARD_INNER_WIDTH);
-                        ui.set_max_width(CARD_INNER_WIDTH);
+                        // Constrain the rows to the slot grid's width. The frame's
+                        // padding is what makes the card wider than the grid, so
+                        // the grid stays centred on every card.
+                        ui.set_min_width(CARD_CONTENT_WIDTH);
+                        ui.set_max_width(CARD_CONTENT_WIDTH);
 
                         // Delegate card content to shared CharacterCardWidget (full mode)
-                        ui.horizontal(|ui| {
-                            ui.add_space(CARD_CONTENT_INSET);
-                            ui.vertical(|ui| {
-                                let widget = if is_graveyard {
-                                    let grave = grave_sprite_for_char(
-                                        char.gravestone_type,
-                                        char.maxed_count,
-                                        char.level,
-                                    );
-                                    CharacterCardWidget::full_graveyard(grave)
-                                } else {
-                                    CharacterCardWidget::full()
-                                };
-                                let widget = widget
-                                    .with_stat_display(stat_display)
-                                    .with_pet(pet_info.clone())
-                                    .with_loot_boost(self.loot_boost_remaining(char.char_id))
-                                    .with_blood_ritual(
-                                        self.cache.blood_ritual_for_char(char.char_id).is_some(),
-                                    )
-                                    .with_sections(show_inv, show_bp, show_ext, show_belt);
-                                widget.render(
-                                    ui,
-                                    char,
-                                    is_live,
-                                    custom_label.as_deref(),
-                                    sprite_renderer,
+                        ui.vertical(|ui| {
+                            let widget = if is_graveyard {
+                                let grave = grave_sprite_for_char(
+                                    char.gravestone_type,
+                                    char.maxed_count,
+                                    char.level,
                                 );
-                            });
+                                CharacterCardWidget::full_graveyard(grave)
+                            } else {
+                                CharacterCardWidget::full()
+                            };
+                            let widget = widget
+                                .with_stat_display(stat_display)
+                                .with_pet(pet_info.clone())
+                                .with_loot_boost(self.loot_boost_remaining(char.char_id))
+                                .with_blood_ritual(
+                                    self.cache.blood_ritual_for_char(char.char_id).is_some(),
+                                )
+                                .with_sections(show_inv, show_bp, show_ext, show_belt);
+                            widget.render(
+                                ui,
+                                char,
+                                is_live,
+                                custom_label.as_deref(),
+                                sprite_renderer,
+                            );
                         });
                     })
             })
@@ -4368,5 +4381,76 @@ mod tests {
         panel.observe_live_loot_boost(Some(600), Some(2537), true);
 
         assert_eq!(panel.loot_boost_remaining(2537), Some(600));
+    }
+
+    /// Cards flow in rows, so every card in a row must share a top edge.
+    ///
+    /// This pins the frame's *structure*, not just its numbers. Insetting the
+    /// card's content behind an extra `ui.horizontal` (the first attempt at giving
+    /// the rows more room than the slot grid) made each card's top land on the
+    /// previous card's bottom, so a page of cards came out as a ladder -- egui
+    /// advances vertically inside a wrapped row by the tallest item it has placed.
+    /// The drift only showed once cards differed in height, so the content here
+    /// differs per card on purpose.
+    #[test]
+    fn cards_in_a_row_share_a_top_edge() {
+        let ctx = egui::Context::default();
+        let mut tops: Vec<f32> = Vec::new();
+        let mut lefts: Vec<f32> = Vec::new();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1920.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(CARD_SPACING, CARD_SPACING);
+                            for i in 0..3 {
+                                let card_width =
+                                    CARD_CONTENT_WIDTH + CARD_FRAME_PADDING_X as f32 * 2.0 + 4.0;
+                                let r = ui.allocate_ui(
+                                    egui::vec2(card_width, ui.available_height()),
+                                    |ui| {
+                                        egui::Frame::NONE
+                                            .inner_margin(egui::Margin {
+                                                left: CARD_FRAME_PADDING_X,
+                                                right: CARD_FRAME_PADDING_X,
+                                                top: CARD_PADDING as i8,
+                                                bottom: CARD_PADDING as i8,
+                                            })
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(CARD_CONTENT_WIDTH);
+                                                ui.set_max_width(CARD_CONTENT_WIDTH);
+                                                ui.vertical(|ui| {
+                                                    for _ in 0..(2 + i * 4) {
+                                                        ui.label("a row of card content");
+                                                    }
+                                                });
+                                            });
+                                    },
+                                );
+                                tops.push(r.response.rect.min.y);
+                                lefts.push(r.response.rect.min.x);
+                            }
+                        });
+                    });
+            });
+        });
+
+        assert_eq!(tops.len(), 3);
+        assert!(
+            tops.windows(2).all(|w| w[0] == w[1]),
+            "cards in a row drifted apart vertically: {tops:?}"
+        );
+        assert!(
+            lefts.windows(2).all(|w| w[0] < w[1]),
+            "cards did not advance along their row: {lefts:?}"
+        );
     }
 }

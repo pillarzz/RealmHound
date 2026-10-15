@@ -2284,11 +2284,13 @@ impl CombatDatabase {
     ///
     /// Mirrors [`Self::complete_legacy_lod_dragons_from_loot`]: it reads the paired
     /// loot DB (best-effort, a no-op when it is absent or unreadable) for bags that
-    /// prove the kill — those holding a boss Mark, and those of the bosses whose
+    /// prove the kill — those holding a boss Mark, those of the bosses whose
     /// guaranteed bag is itself proof (see [`crate::assets::bag_proves_boss_killed`])
-    /// — and latches the closest still-escaped fight of the bag's attributed boss
-    /// type in the same instance. Idempotent, so it runs on every open; the
-    /// schema-version bump is what forces one pass over existing history.
+    /// and those attributed to a boss at all (see
+    /// [`crate::assets::AssetManager::bag_attribution_proves_kill`]) — and latches
+    /// the closest still-escaped fight of the bag's attributed boss type in the
+    /// same instance. Idempotent, so it runs on every open; the schema-version bump
+    /// is what forces one pass over existing history.
     fn complete_bosses_from_loot(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
         let Some(path) = loot_path else {
             return Ok(());
@@ -2301,7 +2303,20 @@ impl CombatDatabase {
             .into_iter()
             .collect();
         let bag_types = crate::assets::bag_proves_kill_boss_types();
-        if marks.is_empty() && bag_types.is_empty() {
+        // Every boss with a still-escaped fight: a bag attributed to one of them
+        // proves that boss died (see `AssetManager::bag_attribution_proves_kill`),
+        // so those bags are looked up directly rather than by scanning every drop.
+        let attributed: Vec<i32> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT boss_object_type FROM fights
+                 WHERE killed = 0 AND boss_object_type > 0",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, i32>(0))?;
+            rows.filter_map(Result::ok)
+                .filter(|t| crate::assets::get_asset_manager().bag_attribution_proves_kill(*t))
+                .collect()
+        };
+        if marks.is_empty() && bag_types.is_empty() && attributed.is_empty() {
             return Ok(());
         }
         let loot = match Connection::open_with_flags(
@@ -2337,6 +2352,13 @@ impl CombatDatabase {
                 placeholders.join(", ")
             ));
             binds.extend_from_slice(&marks);
+        }
+        if !attributed.is_empty() {
+            let placeholders: Vec<String> = (binds.len() + 1..=binds.len() + attributed.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            clauses.push(format!("mob_type IN ({})", placeholders.join(", ")));
+            binds.extend_from_slice(&attributed);
         }
         let sql = format!(
             "SELECT map_seed, mob_type, timestamp FROM loot_drops
@@ -7827,6 +7849,65 @@ mod tests {
         assert_eq!(killed_in_other_instance, 0, "another instance is untouched");
     }
 
+    /// A bag attributed to a boss proves that boss died even without a Mark: a bag
+    /// only spawns where its dropper died, and the loot tracker pins it to the
+    /// entity the local player hit that left the map nearest the bag. A boss killed
+    /// out of sight is stored Escaped (its removal reads as "left view"), which is
+    /// the case this repairs.
+    #[test]
+    fn a_boss_attributed_bag_completes_its_escaped_fight_on_open() {
+        // Ice Citadel's Esben-style shape, with the Realm's Crystal Worm Father: a
+        // catalogued MINIBOSS whose bag holds no Mark.
+        const CWF: i32 = 22_138;
+        let mgr = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            mgr.set_assets_dir(&dir);
+        }
+        let _ = mgr.try_load();
+        if !mgr.bag_attribution_proves_kill(CWF) {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        // A crate is not a boss, so its own bag proves nothing (its loot is what
+        // the local player took from it, not a death).
+        assert!(
+            !mgr.bag_attribution_proves_kill(34_599),
+            "a crate proves nothing"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let combat_path = temp.path().join("combat_history.db");
+        let loot_path = temp.path().join("loot_history.db");
+        // The bag carries an ordinary potion, never a Mark.
+        write_loot_db_with_drop(&loot_path, 7, CWF, 45_000, &[2_593]);
+
+        let hit_id;
+        {
+            let mut db = CombatDatabase::open_writer(&combat_path).unwrap();
+            let mut escaped = escaped_fight("Realm", CWF, 7);
+            escaped.started_at = 1_000;
+            escaped.ended_at = 61_000;
+            hit_id = db.insert_fight(&escaped).unwrap();
+            // A same-type escaped fight in another instance must stay escaped.
+            db.insert_fight(&escaped_fight("Realm", CWF, 99)).unwrap();
+            assert_eq!(killed_flag(&db, hit_id), 0);
+        }
+
+        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(
+            killed_flag(&db, hit_id),
+            1,
+            "the boss's own bag completes its fight"
+        );
+        let killed_in_other_instance: i64 = db
+            .conn
+            .query_row("SELECT killed FROM fights WHERE map_seed = 99", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(killed_in_other_instance, 0, "another instance is untouched");
+    }
+
     #[test]
     fn mark_loot_completes_the_escaped_boss_on_open() {
         let Some(mark) = a_boss_mark_id() else {
@@ -7882,7 +7963,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_loot_is_ignored_without_a_mark_or_a_usable_loot_db() {
+    fn loot_kill_proofs_ignore_a_non_boss_bag_and_an_unreadable_db() {
         let Some(mark) = a_boss_mark_id() else {
             eprintln!("skipping: game assets not available");
             return;
@@ -7904,15 +7985,11 @@ mod tests {
         assert_eq!(killed_flag(&db, escaped_id), 0);
         drop(db);
 
-        // A bag that holds no Mark proves nothing.
+        // A bag attributed to a mob that is not a boss cannot prove any boss died,
+        // Mark or not: the bag is pinned to whatever dropped it.
+        const NOT_A_BOSS: i32 = 53_007;
         let no_mark_path = temp.path().join("no_mark.db");
-        write_loot_db_with_drop(
-            &no_mark_path,
-            7,
-            boss,
-            65_000,
-            &[mark.saturating_add(1_000_000)],
-        );
+        write_loot_db_with_drop(&no_mark_path, 7, NOT_A_BOSS, 65_000, &[mark]);
         let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&no_mark_path)).unwrap();
         assert_eq!(killed_flag(&db, escaped_id), 0);
         drop(db);

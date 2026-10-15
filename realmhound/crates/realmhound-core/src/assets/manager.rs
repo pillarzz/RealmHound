@@ -3280,6 +3280,31 @@ impl AssetManager {
         is_curated_non_boss_type(id)
     }
 
+    /// Whether a loot bag attributed to `mob_type` proves that mob died in its
+    /// instance.
+    ///
+    /// A bag only ever spawns where its dropper died, and the loot tracker
+    /// attributes one to the entity the local player hit that left the map nearest
+    /// the bag (`loot::attribution::find_attribution_for_bag`), so a bag
+    /// attributed to a boss is that boss's death. A Mark is only needed when the
+    /// bag's source is left Unknown or pinned to a nearby minion: it identifies
+    /// the dungeon's main boss, which an attribution that already names one of the
+    /// two does not need.
+    ///
+    /// This is the proof for a boss killed out of the local player's sight: its
+    /// removal reads as "left view", so its fight is suspended as a despawn and
+    /// stored Escaped with the party's whole damage on it, and the bag is the only
+    /// evidence it was ever killed.
+    ///
+    /// Invulnerable-finish bosses (Moonlight Village) are excluded: they never
+    /// die, their loot is pooled by an invisible emitter, and their runs are
+    /// completed by their own signal instead.
+    pub fn bag_attribution_proves_kill(&self, mob_type: i32) -> bool {
+        mob_type > 0
+            && !is_invuln_finish_boss(mob_type)
+            && (self.is_boss_like(mob_type) || is_curated_boss_type(mob_type))
+    }
+
     /// Whether `id` is a curated wandering boss ([`WANDERING_BOSS_TYPES`]): a
     /// boss that roams in and out of view within a single map instance, so its
     /// fight must be suspended on despawn and resumed on re-entry rather than

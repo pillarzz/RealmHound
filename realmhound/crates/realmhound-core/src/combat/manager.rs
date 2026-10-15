@@ -291,7 +291,14 @@ impl CombatManager {
         }
         let proves_kill = mob_type > 0
             && (crate::loot::bag_has_boss_mark(item_ids)
-                || crate::assets::bag_proves_boss_killed(mob_type));
+                || crate::assets::bag_proves_boss_killed(mob_type)
+                // A boss's own bag proves it died even without a Mark: the bag is
+                // attributed to the entity the local player hit that left the map
+                // nearest it, which is that boss's death (see
+                // `AssetManager::bag_attribution_proves_kill`). Bosses killed out of
+                // sight are exactly the case: their fight is suspended as a despawn
+                // and stored Escaped, with the bag as the only proof of the kill.
+                || crate::assets::get_asset_manager().bag_attribution_proves_kill(mob_type));
         if proves_kill {
             self.pending_kill_proofs
                 .insert((map_seed, mob_type, time_ms));
@@ -969,6 +976,43 @@ mod tests {
                 .filter(|f| f.map_seed == 0)
                 .all(|f| !f.killed),
             "a bag outside an instance completes nothing"
+        );
+    }
+
+    /// A bag attributed to the boss itself proves the kill even when it holds no
+    /// Mark: the fight of a boss killed out of sight is suspended as a despawn and
+    /// stored Escaped, so the bag is the only evidence it ever died.
+    #[test]
+    fn a_boss_bag_without_a_mark_completes_its_escaped_fight() {
+        const CWF: i32 = 22_138;
+        let assets = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        let _ = assets.try_load();
+        if !assets.bag_attribution_proves_kill(CWF) {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+        let mut escaped = fight("Realm", "Crystal Worm Father", false);
+        escaped.map_seed = 42;
+        escaped.boss_object_type = CWF;
+        escaped.killed = false;
+        escaped.reached_zero = false;
+        escaped.started_at = 1_000;
+        escaped.ended_at = 61_000;
+        m.persist(vec![escaped]);
+
+        // The bag lands with an ordinary potion in it: nothing here is a Mark.
+        m.on_boss_loot(CWF, 42, 65_000, &[2_593]);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(
+            fights[0].killed,
+            "a bag attributed to the boss completes the fight it proves was killed"
         );
     }
 

@@ -77,7 +77,7 @@ const LOOT_BOOST_LEFT: f32 = -7.0;
 /// The name row's font size and item spacing. Pinned as constants because the
 /// row's width cap is computed from them: the cap has to hold for the same
 /// metrics the text is drawn with.
-const NAME_FONT_SIZE: f32 = 14.0;
+const NAME_FONT_SIZE: f32 = 13.0;
 const NAME_ROW_SPACING: f32 = 4.0;
 
 /// Width of `text` laid out as a single line at `font`. Used by the rows that
@@ -830,15 +830,31 @@ impl CharacterCardWidget {
                             });
                         }
 
-                        // Season-challenge pills on their own row (row 2), under
-                        // the name/live status so a tall card keeps its identity
-                        // line clear of them.
-                        draw_season_pills(
-                            ui,
-                            char.crucible_active,
-                            self.blood_ritual_active,
-                            true,
-                        );
+                        // Identity line (row 2): id, level, maxed. Always present,
+                        // so the row under the name is never blank -- the optional
+                        // readouts all sit lower down instead.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(
+                                RichText::new(format!("#{} • Lv.{}", char.char_id, char.level))
+                                    .small()
+                                    .color(Color32::LIGHT_GRAY),
+                            );
+
+                            ui.label(RichText::new("•").small().color(Color32::GRAY));
+
+                            let maxed_color = match char.maxed_count {
+                                8 => Color32::from_rgb(255, 215, 0),
+                                7 => Color32::from_rgb(200, 200, 255),
+                                6 => Color32::from_rgb(150, 150, 255),
+                                _ => Color32::LIGHT_GRAY,
+                            };
+                            ui.label(
+                                RichText::new(format!("{}/8", char.maxed_count))
+                                    .small()
+                                    .color(maxed_color),
+                            );
+                        });
 
                         // Fame on its own row (row 3). Always shown (0 when none)
                         // so the card height stays consistent and a long value
@@ -854,12 +870,19 @@ impl CharacterCardWidget {
                             );
                         });
 
-                        // Loot boost, id, level and maxed on one row (row 4), so
-                        // every card is exactly as tall as its text no matter what
-                        // it carries -- a reserved row of its own could not keep
-                        // the height steady, because the ⚡ glyph is taller than
-                        // the text beside it. The boost therefore uses a fixed-size
-                        // sprite, which cannot change the row's height.
+                        // Season-challenge pills and the loot readout share the last
+                        // row (row 4). Both are optional, so pairing them keeps every
+                        // card's name, identity line and fame in the same place, and a
+                        // card carrying neither is blank at the bottom rather than in
+                        // the middle. The pills reserve the row even when empty, so the
+                        // height stays steady either way.
+                        //
+                        // The readout is painted rather than laid out: it belongs to
+                        // the card's left column, under the pet sprite, while the pills
+                        // sit in the text column. Laying it out would consume width here
+                        // and push the pills across, so a running timer moved the row.
+                        // Its font is fixed at 10px so the pair cannot set the row's
+                        // height -- the pill alone does that.
                         //
                         // The remaining seconds are server-driven, so the timer
                         // naturally freezes when the game pauses it
@@ -882,10 +905,10 @@ impl CharacterCardWidget {
                                 // back at that edge so it sits under the sprite.
                                 let content_left =
                                     area.left() - CARD_TEXT_INDENT - CARD_CONTENT_INSET;
-                                // Nudged off the column and the id line by eye (7px
-                                // left, 2px down from the column edge and the row's
-                                // middle): the glyph's own bearings push the pair right
-                                // of the column and high of the text's centre.
+                                // Nudged off the column and the row's middle by eye
+                                // (7px left, 2px down): the glyph's own bearings push
+                                // the pair right of the column and high of the text's
+                                // centre.
                                 let left = content_left + LOOT_BOOST_LEFT;
                                 let centre = area.top() + 9.0;
                                 ui.painter().text(
@@ -916,24 +939,11 @@ impl CharacterCardWidget {
                                 }
                             }
 
-                            ui.label(
-                                RichText::new(format!("#{} • Lv.{}", char.char_id, char.level))
-                                    .small()
-                                    .color(Color32::LIGHT_GRAY),
-                            );
-
-                            ui.label(RichText::new("•").small().color(Color32::GRAY));
-
-                            let maxed_color = match char.maxed_count {
-                                8 => Color32::from_rgb(255, 215, 0),
-                                7 => Color32::from_rgb(200, 200, 255),
-                                6 => Color32::from_rgb(150, 150, 255),
-                                _ => Color32::LIGHT_GRAY,
-                            };
-                            ui.label(
-                                RichText::new(format!("{}/8", char.maxed_count))
-                                    .small()
-                                    .color(maxed_color),
+                            draw_season_pills(
+                                ui,
+                                char.crucible_active,
+                                self.blood_ritual_active,
+                                true,
                             );
                         });
                     }

@@ -136,31 +136,6 @@ fn item_name(item_id: i32) -> String {
         .unwrap_or_else(|| format!("Item 0x{item_id:X}"))
 }
 
-/// Enchant display name, falling back to its id for the same reason.
-fn enchant_name(enchant_id: u16) -> String {
-    get_asset_manager()
-        .enchant_name(enchant_id)
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| format!("0x{enchant_id:X}"))
-}
-
-/// Hover text listing an item's enchantments. The names are resolved from the
-/// enchant *type* ids recorded on the fight row itself, not from the item's
-/// current state, so re-rolling the item later cannot change what a stored fight
-/// reports. `None` when the item had none.
-fn enchant_tooltip(enchants: Option<&Vec<u16>>) -> Option<String> {
-    let ids = enchants?;
-    if ids.is_empty() {
-        return None;
-    }
-    let mut text = String::from("Enchantments at the time of this fight:");
-    for id in ids {
-        text.push_str("\n  • ");
-        text.push_str(&enchant_name(*id));
-    }
-    Some(text)
-}
-
 /// The sprite shown in the effect column of the condensed Boosts table.
 enum BoostIcon {
     /// A game object: the consumable that caused the change, or the affected
@@ -405,21 +380,32 @@ fn condensed_boosts(boosts: &[BoostWindow]) -> Vec<CondensedBoost> {
     rows
 }
 
-/// A section divider spanning the Stats table, in the same stroke as the card's
-/// other dividers. Every section closes on the same line -- the right edge of the
-/// table's last column (Blood Ritual) -- so the card reads as one column rather
-/// than as lines of assorted lengths.
-fn section_divider(ui: &mut egui::Ui) {
-    let width = section_divider_width(ui).min(ui.available_width()).max(1.0);
+/// A section header in the fight card: the same bold, light blue 15px the
+/// character page's stat cards title their sections with, so the two read as one
+/// design. Returns the response so the caller can attach a tooltip.
+fn section_header(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(
+        RichText::new(text)
+            .strong()
+            .size(crate::panels::derived_stats::HEADER_SIZE)
+            .color(crate::panels::derived_stats::HEADER_COLOR),
+    )
+}
+
+/// A section divider of `width` points from the current left edge, in the same
+/// stroke as the card's other dividers.
+fn section_divider(ui: &mut egui::Ui, width: f32) {
+    let width = width.min(ui.available_width()).max(1.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 7.0), egui::Sense::hover());
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter()
         .hline(rect.left()..=rect.right(), rect.center().y, stroke);
 }
 
-/// Where the section dividers end: the right edge of the Stats table's Blood
-/// Ritual column. The reserved column widths come from the same helper the shared
-/// attribute renderer uses, so the line lands exactly on the table's last column.
+/// Where a section divider ends on a card that draws its own sections: the right
+/// edge of the Stats table's Blood Ritual column. The reserved column widths come
+/// from the same helper the shared attribute renderer uses, so the line lands
+/// exactly on the table's last column.
 fn section_divider_width(ui: &egui::Ui) -> f32 {
     let w = crate::panels::derived_stats::attr_col_widths(ui);
     // The grid lays out twelve columns (the stat icon, then two five-column
@@ -427,6 +413,18 @@ fn section_divider_width(ui: &egui::Ui) -> f32 {
     STATS_ICON_CELL
         + 2.0 * (w.total + w.gear + w.exalt + w.crucible + w.blood_ritual)
         + STATS_GRID_GAP * 11.0
+}
+
+/// The rounded box around one boss's expanded section in a grouped run: the same
+/// thin outline and 8px corners the character page's stat cards use.
+fn section_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            crate::ui_colors::card_stroke(ui.visuals()),
+        ))
+        .corner_radius(8.0)
+        .inner_margin(6.0)
 }
 
 /// Horizontal gap between the Stats table's columns.
@@ -3017,7 +3015,7 @@ impl CombatHistoryPanel {
             ui.add_space(4.0);
 
             if self.show_performance {
-                self.render_my_performance(ui, ctx, &fight);
+                self.render_my_performance(ui, ctx, &fight, section_divider_width(ui));
                 return;
             }
 
@@ -3050,12 +3048,12 @@ impl CombatHistoryPanel {
         local: &ParticipantRecord,
         rank: usize,
         total: usize,
-        team_damage: i64,
         dpm: f64,
         denom_label: &str,
+        divider_w: f32,
     ) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Summary").strong());
+        section_header(ui, "Summary");
         ui.add_space(4.0);
         egui::Grid::new("my_performance_summary")
             .num_columns(2)
@@ -3073,21 +3071,37 @@ impl CombatHistoryPanel {
                     ui.label(RichText::new(value).strong());
                     ui.end_row();
                 };
+                // The figure is bright; what qualifies it -- a share of the boss, a
+                // provenance, a rate's basis -- is dimmed grey beside it, so the
+                // number is what the eye lands on.
+                let row_notes = |ui: &mut egui::Ui, label: &str, value: String, notes: String| {
+                    ui.label(RichText::new(label).color(Color32::GRAY));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(value).strong());
+                        if !notes.is_empty() {
+                            ui.label(RichText::new(notes).color(Color32::GRAY));
+                        }
+                    });
+                    ui.end_row();
+                };
+                // The boss-HP share is the fight's own yardstick; the share of the
+                // team's damage only restated it, so it is not shown.
                 row(ui, "Rank", format!("{} of {}", rank, total));
-                row(
+                row_notes(
                     ui,
                     "Damage",
+                    local.damage.max(0).to_string(),
                     format!(
-                        "{}  ({} of boss HP, {} of team)",
-                        local.damage.max(0),
-                        pct(local.damage, fight.boss_max_hp as i64),
-                        pct(local.damage, team_damage)
+                        "({} of boss HP)",
+                        pct(local.damage, fight.boss_max_hp as i64)
                     ),
                 );
-                row(
+                row_notes(
                     ui,
                     "Damage per minute",
-                    format!("{:.0}  per {}", dpm, denom_label),
+                    format!("{:.0}", dpm),
+                    format!("per {denom_label}"),
                 );
                 // Hits come from hit packets, so they carry no provenance tag;
                 // the tag describes how damage values were derived.
@@ -3100,14 +3114,15 @@ impl CombatHistoryPanel {
                         .map(|h| h.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                 );
-                row(
-                    ui,
-                    "Damage taken",
-                    match local.damage_taken {
-                        Some(d) => format!("{}  ({})", d, local.damage_taken_provenance.as_str()),
-                        None => "-".to_string(),
-                    },
-                );
+                match local.damage_taken {
+                    Some(d) => row_notes(
+                        ui,
+                        "Damage taken",
+                        d.to_string(),
+                        format!("({})", local.damage_taken_provenance.as_str()),
+                    ),
+                    None => row(ui, "Damage taken", "-".to_string()),
+                }
                 row(
                     ui,
                     "Damage blocked",
@@ -3118,7 +3133,7 @@ impl CombatHistoryPanel {
                 );
             });
         ui.add_space(2.0);
-        section_divider(ui);
+        section_divider(ui, divider_w);
     }
 
     /// Section A: the local player's stats as they stood for this fight, split by
@@ -3134,9 +3149,10 @@ impl CombatHistoryPanel {
         ctx: &mut PanelContext,
         fight: &FightRecord,
         local: &ParticipantRecord,
+        divider_w: f32,
     ) {
         ui.add_space(2.0);
-        ui.label(RichText::new("Stats").strong());
+        section_header(ui, "Stats");
         ui.add_space(4.0);
 
         let cache = &ctx.account_data.characters;
@@ -3245,7 +3261,7 @@ impl CombatHistoryPanel {
                 }
             });
         ui.add_space(2.0);
-        section_divider(ui);
+        section_divider(ui, divider_w);
     }
 
     /// Section B: the boosts the server reported on the local player during the
@@ -3254,7 +3270,7 @@ impl CombatHistoryPanel {
     /// across the whole fight.
     fn render_boost_section(&self, ui: &mut egui::Ui, ctx: &mut PanelContext, fight: &FightRecord) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Boosts").strong()).hover_tip(
+        section_header(ui, "Boosts").hover_tip(
             "One row per effect and source; the duration is the total time it was held. \
              The source is inferred -- the wire names none.",
         );
@@ -3309,9 +3325,10 @@ impl CombatHistoryPanel {
         ui: &mut egui::Ui,
         ctx: &mut PanelContext,
         local: &ParticipantRecord,
+        divider_w: f32,
     ) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Gear").strong());
+        section_header(ui, "Gear");
         ui.add_space(4.0);
         ui.label(
             RichText::new(
@@ -3371,7 +3388,7 @@ impl CombatHistoryPanel {
             }
         });
         ui.add_space(2.0);
-        section_divider(ui);
+        section_divider(ui, divider_w);
     }
 
     /// Section E.1: the local player's damage split by weapon. The per-shot value
@@ -3384,11 +3401,10 @@ impl CombatHistoryPanel {
         local: &ParticipantRecord,
     ) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Damage by weapon").strong())
-            .hover_tip(
-                "Self-computed: each hit's value is rolled from the map seed and your \
+        section_header(ui, "Damage by weapon").hover_tip(
+            "Self-computed: each hit's value is rolled from the map seed and your \
                  Attack at shoot time, then reduced by the target's Defense.",
-            );
+        );
         ui.add_space(4.0);
         if local.weapons.is_empty() {
             ui.label(
@@ -3411,16 +3427,21 @@ impl CombatHistoryPanel {
                 }
                 ui.end_row();
                 for w in &local.weapons {
-                    let row = ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
-                        ctx.sprite_renderer
-                            .draw_sprite_in_rect(ui, w.weapon_id, rect);
+                    // The item's own cell, enchant gems and tooltip included, the
+                    // way the character page's weapon line draws it: the gems show
+                    // which enchantments were on it, and hovering anywhere on the
+                    // cell opens the same tooltip the big gear icons use.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let ench: Vec<i32> = w.enchants.iter().map(|&e| e as i32).collect();
+                        ctx.sprite_renderer.render_item_sprite_with_enchants_native(
+                            ui,
+                            w.weapon_id,
+                            &ench,
+                            20.0,
+                        );
                         ui.label(item_name(w.weapon_id));
                     });
-                    if let Some(tip) = enchant_tooltip(Some(&w.enchants)) {
-                        row.response.on_hover_text(tip);
-                    }
                     ui.label(w.hits.to_string());
                     let avg = if w.hits > 0 {
                         format!("{:.1}", w.damage.max(0) as f64 / w.hits as f64)
@@ -3447,13 +3468,12 @@ impl CombatHistoryPanel {
         fight: &FightRecord,
     ) {
         ui.add_space(10.0);
-        ui.label(RichText::new("Damage by ability").strong())
-            .hover_tip(
-                "Only damage the game sent us in packets. Damage the client works out \
+        section_header(ui, "Damage by ability").hover_tip(
+            "Only damage the game sent us in packets. Damage the client works out \
                  itself -- novas, poisons, and other hits the server never reports -- \
                  cannot be measured, so those abilities are listed with their \
                  activations and no damage.",
-            );
+        );
         ui.add_space(4.0);
         if fight.abilities.is_empty() {
             ui.label(
@@ -3512,15 +3532,15 @@ impl CombatHistoryPanel {
                 }
                 ui.end_row();
                 for r in &rows {
-                    let row = ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
-                        ctx.sprite_renderer.draw_sprite_in_rect(ui, r.item_id, rect);
+                    // Same item cell as the weapon table: enchant gems, glow and
+                    // the shared item tooltip.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let ench: Vec<i32> = r.enchants.iter().map(|&e| e as i32).collect();
+                        ctx.sprite_renderer
+                            .render_item_sprite_with_enchants_native(ui, r.item_id, &ench, 20.0);
                         ui.label(item_name(r.item_id));
                     });
-                    if let Some(tip) = enchant_tooltip(Some(&r.enchants)) {
-                        row.response.on_hover_text(tip);
-                    }
                     ui.label(r.activations.to_string());
                     if r.damage > 0 {
                         ui.label(RichText::new(r.damage.to_string()).strong());
@@ -3728,9 +3748,15 @@ impl CombatHistoryPanel {
             }
         });
         if expanded {
-            ui.indent(("perf_boss", phase.id), |ui| {
-                ui.add_space(2.0);
-                self.render_my_performance(ui, ctx, phase);
+            // The expanded section reads as its own little card inside the run,
+            // exactly like the character page's stat cards: a rounded outline
+            // instead of an indent line, with the section dividers running the
+            // full width of that box.
+            ui.add_space(2.0);
+            section_frame(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                let divider_w = ui.available_width();
+                self.render_my_performance(ui, ctx, phase, divider_w);
             });
         }
         ui.add_space(6.0);
@@ -3745,6 +3771,7 @@ impl CombatHistoryPanel {
         ui: &mut egui::Ui,
         ctx: &mut PanelContext,
         fight: &FightRecord,
+        divider_w: f32,
     ) {
         let Some(local) = fight.participants.iter().find(|p| p.is_local) else {
             ui.label(
@@ -3761,12 +3788,6 @@ impl CombatHistoryPanel {
             .map(|i| i + 1)
             .unwrap_or(1);
         let total = fight.participants.len();
-        let team_damage: i64 = fight
-            .participants
-            .iter()
-            .map(|p| p.damage.max(0))
-            .sum::<i64>()
-            .max(0);
         // Boss uptime is only known for fights recorded after it was tracked; on
         // older rows the whole fight duration is the denominator and the row says
         // so rather than pretending the fight was continuous.
@@ -3786,15 +3807,15 @@ impl CombatHistoryPanel {
         // section, so it reads directly under the boss header -- then the stats the
         // fight was fought with, the boosts observed on the player, the gear worn,
         // and finally how the damage was built.
-        self.render_summary_section(ui, fight, local, rank, total, team_damage, dpm, denom_label);
-        self.render_stats_section(ui, ctx, fight, local);
-        self.render_gear_section(ui, ctx, local);
+        self.render_summary_section(ui, fight, local, rank, total, dpm, denom_label, divider_w);
+        self.render_stats_section(ui, ctx, fight, local, divider_w);
+        self.render_gear_section(ui, ctx, local, divider_w);
 
         self.render_weapon_section(ui, ctx, local);
         self.render_ability_section(ui, ctx, fight);
 
         ui.add_space(10.0);
-        ui.label(RichText::new("Pets and summons").strong());
+        section_header(ui, "Pets and summons");
         ui.add_space(4.0);
         if local.summons.is_empty() {
             ui.label(
@@ -3852,7 +3873,7 @@ impl CombatHistoryPanel {
         // detailed, so everything a reader checks first -- where they placed, the
         // stats, the gear, the damage breakdown -- sits above it, divided off.
         ui.add_space(10.0);
-        section_divider(ui);
+        section_divider(ui, divider_w);
         ui.add_space(2.0);
         self.render_boost_section(ui, ctx, fight);
     }
@@ -5065,7 +5086,7 @@ impl CombatHistoryPanel {
                     // A phase can be hidden from the roster list while the run
                     // still has a local row, so fall back to the run-wide view.
                     if let Some(aggregate) = self.aggregated_performance_fight(&enc) {
-                        self.render_my_performance(ui, ctx, &aggregate);
+                        self.render_my_performance(ui, ctx, &aggregate, section_divider_width(ui));
                     } else {
                         ui.label(
                             RichText::new("No local-player row was recorded for this run.")

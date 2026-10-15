@@ -16,7 +16,11 @@ use crate::panels::character_card::{
 };
 use crate::rendering::{EmbeddedIcon, SpriteRenderer};
 
-const HEADER_COLOR: Color32 = Color32::from_rgb(150, 200, 255);
+/// Section-header colour across the stat cards: the light blue the ATTRIBUTES
+/// block titles its sections with.
+pub(crate) const HEADER_COLOR: Color32 = Color32::from_rgb(150, 200, 255);
+/// Section-header font size, matching [`HEADER_COLOR`]'s block.
+pub(crate) const HEADER_SIZE: f32 = 15.0;
 /// Font size for the base-fame and fame-on-death lines folded into the top of
 /// the ATTRIBUTES block (slightly smaller than the old footer fame).
 const FAME_FONT_SIZE: f32 = 14.0;
@@ -1037,7 +1041,7 @@ pub fn render_readout(
         ui.label(
             RichText::new("ATTRIBUTES")
                 .strong()
-                .size(15.0)
+                .size(HEADER_SIZE)
                 .color(HEADER_COLOR),
         );
     }

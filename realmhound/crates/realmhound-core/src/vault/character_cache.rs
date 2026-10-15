@@ -376,6 +376,12 @@ pub struct CachedCharacter {
     /// id from a previous event is not a ritual and leaves this false. [#64]
     #[serde(default)]
     pub blood_ritual_active: bool,
+    /// Last loot-drop boost the server reported for this character, in seconds.
+    /// Carried across a refresh and kept on disk, so the card can show the last
+    /// known value on the next launch instead of waiting for the game to mention
+    /// it again. The character list's `<LDTimer>` refreshes it while a boost runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loot_boost_secs: Option<u32>,
     /// Whether character has a backpack
     pub has_backpack: bool,
     /// Whether character has a backpack extender (2nd backpack)
@@ -455,6 +461,7 @@ impl Default for CachedCharacter {
             seasonal: false,
             crucible_active: false,
             blood_ritual_active: false,
+            loot_boost_secs: None,
             has_backpack: false,
             has_extender: false,
             has_3_quickslots: false,
@@ -663,6 +670,7 @@ impl CachedCharacter {
             seasonal: char.seasonal,
             crucible_active: char.crucible_active,
             blood_ritual_active: false,
+            loot_boost_secs: None,
             has_backpack: char.has_backpack || char.backpack_slots >= 8,
             has_extender: char.backpack_slots >= 16,
             has_3_quickslots: char.has_3_quickslots,
@@ -1218,6 +1226,13 @@ impl CharacterCache {
         // season ends), so ignore it here and carry over the live-detected value
         // instead. Unknown/new characters default to not-crucible until observed
         // live.
+        // The character list only mentions a boost while one is running, so a refresh
+        // that omits it must not wipe the value we already hold.
+        let prev_loot: std::collections::HashMap<i32, Option<u32>> = self
+            .characters
+            .iter()
+            .map(|c| (c.char_id, c.loot_boost_secs))
+            .collect();
         let prev_crucible: std::collections::HashMap<i32, bool> = self
             .characters
             .iter()
@@ -1243,6 +1258,10 @@ impl CharacterCache {
                     cached.most_damage_taken = most;
                 }
                 cached.crucible_active = prev_crucible.get(&c.char_id).copied().unwrap_or(false);
+                // This refresh's value if it has one, otherwise what we last knew.
+                cached.loot_boost_secs = c
+                    .loot_boost_secs
+                    .or_else(|| prev_loot.get(&c.char_id).copied().flatten());
                 cached
             })
             .collect();
@@ -1293,9 +1312,11 @@ impl CharacterCache {
             // Crucible is unreliable in the char-list XML; keep the live-detected
             // value across this refresh.
             let prev_crucible = existing.crucible_active;
+            let prev_loot = existing.loot_boost_secs;
             *existing = new_cached;
             existing.last_live_update = live_update;
             existing.fame = existing.fame.max(prev_fame);
+            existing.loot_boost_secs = existing.loot_boost_secs.or(prev_loot);
             existing.close_calls = prev_close_calls;
             existing.lone_fighter = prev_lone;
             existing.last_hero_standing = prev_last;
@@ -2294,6 +2315,7 @@ mod tests {
             seasonal: false,
             crucible_active: false,
             blood_ritual_active: false,
+            loot_boost_secs: None,
             has_backpack: true,
             has_extender: false,
             has_3_quickslots: false,

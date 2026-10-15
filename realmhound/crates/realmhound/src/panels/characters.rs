@@ -411,6 +411,10 @@ pub struct CharactersPanel {
     /// for the currently playing character. A missing entry means no active
     /// boost is known for that character.
     loot_boost_by_char: std::collections::HashMap<i32, u32>,
+    /// When each stored loot-boost value was last reported by the server, so the
+    /// card can count down from it. The boost ticks only while a character is
+    /// loaded, and the server re-reports on zone changes, which re-syncs this.
+    loot_boost_at: std::collections::HashMap<i32, std::time::Instant>,
     /// Whether a character label is being edited
     editing_label: Option<i32>,
     /// Persistent open state for the label edit dialog. Kept in sync with the
@@ -518,11 +522,19 @@ impl CharactersPanel {
         let exaltation_stats = cache.exaltation_stats.clone();
 
         Self {
+            // Seeded as the first field because the cache is moved into the struct a
+            // few fields below: this reads it before the move, so the last known value
+            // shows on launch, before the game has mentioned the boost again.
+            loot_boost_by_char: cache
+                .characters
+                .iter()
+                .filter_map(|c| c.loot_boost_secs.map(|secs| (c.char_id, secs)))
+                .collect(),
             cache,
             fetch_state: CharactersFetchState::Idle,
             api_result_rx: None,
             live_char_id: None,
-            loot_boost_by_char: std::collections::HashMap::new(),
+            loot_boost_at: std::collections::HashMap::new(),
             editing_label: None,
             label_dialog_open: false,
             label_dialog_focus: false,
@@ -648,12 +660,32 @@ impl CharactersPanel {
         match live {
             Some(0) => {
                 self.loot_boost_by_char.remove(&id);
+                self.loot_boost_at.remove(&id);
             }
             Some(secs) => {
                 self.loot_boost_by_char.insert(id, secs);
+                self.loot_boost_at.insert(id, std::time::Instant::now());
             }
             None => {}
         }
+    }
+
+    /// The loot-drop boost to show for a character: the last value the server
+    /// reported, less the time since, but only for the character being played.
+    /// The boost ticks only while a character is loaded, so a non-live one keeps
+    /// the value it held when it was last seen -- which is also why counting down
+    /// is safe: the server re-reports on every zone change and re-syncs it.
+    fn loot_boost_remaining(&self, char_id: i32) -> Option<u32> {
+        let secs = self.loot_boost_by_char.get(&char_id).copied()?;
+        if self.live_char_id != Some(char_id) {
+            return Some(secs);
+        }
+        let elapsed = self
+            .loot_boost_at
+            .get(&char_id)
+            .map(|at| at.elapsed().as_secs() as u32)
+            .unwrap_or(0);
+        Some(secs.saturating_sub(elapsed))
     }
 
     /// Build the Current-Character widget data for `char_id`: the (dyed) sprite
@@ -831,9 +863,18 @@ impl CharactersPanel {
                             match c.loot_boost_secs {
                                 Some(secs) => {
                                     self.loot_boost_by_char.insert(c.char_id, secs);
+                                    self.loot_boost_at
+                                        .insert(c.char_id, std::time::Instant::now());
+                                    if let Some(cached) = self.cache.find_character_mut(c.char_id) {
+                                        cached.loot_boost_secs = Some(secs);
+                                    }
                                 }
                                 None => {
                                     self.loot_boost_by_char.remove(&c.char_id);
+                                    self.loot_boost_at.remove(&c.char_id);
+                                    if let Some(cached) = self.cache.find_character_mut(c.char_id) {
+                                        cached.loot_boost_secs = None;
+                                    }
                                 }
                             }
                         }
@@ -1874,9 +1915,7 @@ impl CharactersPanel {
                             let widget = widget
                                 .with_stat_display(stat_display)
                                 .with_pet(pet_info.clone())
-                                .with_loot_boost(
-                                    self.loot_boost_by_char.get(&char.char_id).copied(),
-                                )
+                                .with_loot_boost(self.loot_boost_remaining(char.char_id))
                                 .with_blood_ritual(
                                     self.cache.blood_ritual_for_char(char.char_id).is_some(),
                                 )

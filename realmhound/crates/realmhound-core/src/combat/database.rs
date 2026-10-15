@@ -582,7 +582,40 @@ impl CombatDatabase {
         // live (see `insert_death_broadcast`) and for anything a previous session
         // observed but could not apply.
         self.repair_remote_deaths()?;
+        // The local player's own row: a fight completed after it was written still
+        // carries the nexus its unfinished state earned it.
+        self.repair_local_nexus_on_completed_fights()?;
         Ok(())
+    }
+
+    /// Clear a `nexused` local row on a fight the boss is now known to have died
+    /// in.
+    ///
+    /// The local player is scored `nexused` only when the map change that closed
+    /// the fight found it unfinished (`local_departing && !killed`, see
+    /// `CombatTracker::resolve_end_statuses`), so a fight stored as killed can
+    /// never carry a `nexused` local row. Such a row was written before its kill
+    /// proof arrived -- a bag that proves the boss died in that instance, applied
+    /// by [`Self::mark_boss_killed_by_loot`] or [`Self::complete_bosses_from_loot`],
+    /// both of which need the local player in the instance to be seen at all. The
+    /// departure it recorded therefore did not happen.
+    ///
+    /// Local rows only: a remote participant can genuinely nexus out of a fight
+    /// the group still cleared. Idempotent, and cheap enough to run on every open.
+    pub fn repair_local_nexus_on_completed_fights(&mut self) -> SqlResult<usize> {
+        // Databases predating the status column (and the synthetic schemas the
+        // migration tests build) hold no statuses to repair.
+        if !self.column_exists("fight_participants", "end_status")?
+            || !self.column_exists("fight_participants", "is_local")?
+        {
+            return Ok(0);
+        }
+        self.conn.execute(
+            "UPDATE fight_participants SET end_status = 'present'
+             WHERE is_local = 1 AND end_status = 'nexused'
+               AND fight_id IN (SELECT id FROM fights WHERE killed = 1)",
+            [],
+        )
     }
 
     /// Group already-recorded fights whose boss belongs to a curated multi-phase
@@ -4511,6 +4544,15 @@ impl CombatDatabase {
             return Ok(None);
         };
         tx.execute("UPDATE fights SET killed = 1 WHERE id = ?1", params![id])?;
+        // The bag proves the boss died with the local player in the instance, so a
+        // nexus recorded against this fight was a departure they did not make (see
+        // `repair_local_nexus_on_completed_fights`). Done here rather than only on
+        // the next open, so a card open at the time loses the stale icon at once.
+        tx.execute(
+            "UPDATE fight_participants SET end_status = 'present'
+             WHERE fight_id = ?1 AND is_local = 1 AND end_status = 'nexused'",
+            params![id],
+        )?;
         tx.commit()?;
         Ok(Some(match encounter_run_id {
             Some(run_id) => FightSelection::Encounter(run_id),
@@ -7527,6 +7569,117 @@ mod tests {
         fight.killed = false;
         fight.reached_zero = false;
         fight
+    }
+
+    /// The local player's stored end status, by name.
+    fn participant_status(db: &CombatDatabase, fight_id: i64, name: &str) -> String {
+        db.conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE fight_id = ?1 AND name = ?2",
+                params![fight_id, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// An escaped fight closed by a map change, so the local player is scored as
+    /// having left it (`local_departing && !killed`) -- the shape a boss that bags
+    /// without its death ever being observed leaves behind. An ally left too, and
+    /// a third participant died.
+    fn escaped_by_nexus_fight(dungeon: &str, boss_type: i32, map_seed: i32) -> CompletedFight {
+        let mut fight = escaped_fight(dungeon, boss_type, map_seed);
+        let mut me = flawless_part(10, "Me", 5_000, None, ParticipantEndStatus::Nexused);
+        me.is_local = true;
+        fight.participants = vec![
+            me,
+            flawless_part(11, "Ally", 4_000, None, ParticipantEndStatus::Nexused),
+            flawless_part(
+                12,
+                "Fallen",
+                3_000,
+                None,
+                ParticipantEndStatus::Died { grave_type: 0 },
+            ),
+        ];
+        fight
+    }
+
+    /// The local row of a fight that a loot bag completed after it was written must
+    /// not keep the nexus the unfinished state earned it: the bag proves the boss
+    /// died in that instance, and the local player is only there to see it while
+    /// they are still in the fight.
+    #[test]
+    fn a_loot_completed_fight_clears_the_local_nexus() {
+        const BOSS: i32 = 40_166;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = escaped_by_nexus_fight("Ice Citadel", BOSS, 7);
+        fight.started_at = 350_000;
+        fight.ended_at = 395_000;
+        let id = db.insert_fight(&fight).unwrap();
+        assert_eq!(participant_status(&db, id, "Me"), "nexused");
+
+        assert_eq!(
+            db.mark_boss_killed_by_loot(7, BOSS, 400_000).unwrap(),
+            Some(FightSelection::Single(id))
+        );
+
+        assert_eq!(killed_flag(&db, id), 1, "the bag proves the kill");
+        assert_eq!(
+            participant_status(&db, id, "Me"),
+            "present",
+            "the local player was in the instance when the boss died"
+        );
+        // Only the local row: an ally can genuinely nexus out of a fight the group
+        // still cleared, and a death is terminal either way.
+        assert_eq!(participant_status(&db, id, "Ally"), "nexused");
+        assert_eq!(participant_status(&db, id, "Fallen"), "died");
+    }
+
+    /// A fight completed by a path that does not touch its participants (a Legacy
+    /// LoD chest bag, or a bag applied by a later session) is repaired when the
+    /// database is next opened, so cards recorded before this repair existed are
+    /// corrected too.
+    #[test]
+    fn opening_the_database_clears_a_local_nexus_on_a_completed_fight() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat_history.db");
+        let id;
+        {
+            let mut db = CombatDatabase::open_writer(&path).unwrap();
+            let mut completed = escaped_by_nexus_fight("Ice Citadel", 40_166, 7);
+            completed.killed = true;
+            id = db.insert_fight(&completed).unwrap();
+            // A still-escaped fight keeps the departure it recorded.
+            db.insert_fight(&escaped_by_nexus_fight("Ice Citadel", 40_166, 8))
+                .unwrap();
+        }
+
+        let db = CombatDatabase::open_writer(&path).unwrap();
+        assert_eq!(
+            participant_status(&db, id, "Me"),
+            "present",
+            "a completed fight cannot carry a departed local row"
+        );
+        assert_eq!(participant_status(&db, id, "Ally"), "nexused");
+        let escaped_local: String = db
+            .conn
+            .query_row(
+                "SELECT fp.end_status FROM fight_participants fp
+                 JOIN fights f ON f.id = fp.fight_id
+                 WHERE fp.is_local = 1 AND f.killed = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            escaped_local, "nexused",
+            "an escaped fight keeps the departure it recorded"
+        );
+        drop(db);
+
+        // Idempotent: a second open changes nothing.
+        let db = CombatDatabase::open_writer(&path).unwrap();
+        assert_eq!(participant_status(&db, id, "Me"), "present");
     }
 
     #[test]

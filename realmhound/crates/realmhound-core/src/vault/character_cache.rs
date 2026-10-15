@@ -670,7 +670,7 @@ impl CachedCharacter {
             seasonal: char.seasonal,
             crucible_active: char.crucible_active,
             blood_ritual_active: false,
-            loot_boost_secs: None,
+            loot_boost_secs: char.loot_boost_secs,
             has_backpack: char.has_backpack || char.backpack_slots >= 8,
             has_extender: char.backpack_slots >= 16,
             has_3_quickslots: char.has_3_quickslots,
@@ -2561,6 +2561,57 @@ mod tests {
 
         cache.update_crucible_status(1, true);
         assert!(cache.find_character(1).unwrap().crucible_active);
+    }
+
+    /// A character list fetch carries the loot-drop boost timer (`<LDTimer>`).
+    /// The per-character update path used to drop it -- the conversion to a
+    /// cached character left the field `None` and the merge then kept the old
+    /// value -- so a refresh could never record a boost and the card had nothing
+    /// to restore on the next launch.
+    #[test]
+    fn update_single_character_adopts_the_loot_boost_timer() {
+        use crate::api::character::RealmCharacter;
+
+        let mut cache = CharacterCache::new();
+
+        let mut reported = RealmCharacter::default();
+        reported.char_id = 2537;
+        reported.loot_boost_secs = Some(3600);
+        cache.update_single_character(&reported);
+        assert_eq!(
+            cache.find_character(2537).unwrap().loot_boost_secs,
+            Some(3600)
+        );
+
+        // A list that omits the timer (no boost running) must not wipe it.
+        let mut quiet = RealmCharacter::default();
+        quiet.char_id = 2537;
+        quiet.loot_boost_secs = None;
+        cache.update_single_character(&quiet);
+        assert_eq!(
+            cache.find_character(2537).unwrap().loot_boost_secs,
+            Some(3600)
+        );
+
+        // A later report replaces it.
+        reported.loot_boost_secs = Some(1200);
+        cache.update_single_character(&reported);
+        assert_eq!(
+            cache.find_character(2537).unwrap().loot_boost_secs,
+            Some(1200)
+        );
+
+        // The value has to reach the file the panel restores from on launch.
+        let json = serde_json::to_string(&cache).unwrap();
+        assert!(
+            json.contains("\"loot_boost_secs\":1200"),
+            "cache JSON lost the loot timer"
+        );
+
+        // A cache written before the field existed still loads.
+        let legacy = json.replace(",\"loot_boost_secs\":1200", "");
+        let restored: CharacterCache = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(restored.find_character(2537).unwrap().loot_boost_secs, None);
     }
 
     #[test]

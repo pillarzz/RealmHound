@@ -653,6 +653,11 @@ impl CharactersPanel {
     /// the character list had seeded from `<LDTimer>`, so the timer only appeared
     /// after the player changed zones. A zero is the game saying the boost has run
     /// out, and clears it.
+    ///
+    /// The countdown is anchored locally, so it must only be re-anchored when the
+    /// value *moves*: this is called every frame, and the session keeps handing
+    /// back the last value the server sent, so re-anchoring on each call pinned
+    /// the clock at the reported value and the timer never ticked down.
     pub fn observe_live_loot_boost(&mut self, live: Option<u32>, live_char_id: Option<i32>) {
         let Some(id) = live_char_id else {
             return;
@@ -663,8 +668,17 @@ impl CharactersPanel {
                 self.loot_boost_at.remove(&id);
             }
             Some(secs) => {
+                // Anchor the local countdown only when the value actually moves
+                // (a fresh server report), otherwise let the clock keep ticking.
+                // An entry seeded from the cache has no anchor yet, so give it one.
+                if self.loot_boost_by_char.get(&id).copied() == Some(secs) {
+                    self.loot_boost_at
+                        .entry(id)
+                        .or_insert_with(std::time::Instant::now);
+                } else {
+                    self.loot_boost_at.insert(id, std::time::Instant::now());
+                }
                 self.loot_boost_by_char.insert(id, secs);
-                self.loot_boost_at.insert(id, std::time::Instant::now());
             }
             None => {}
         }
@@ -4190,5 +4204,65 @@ impl Panel for CharactersPanel {
         } else {
             vec![]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The session hands back the last value the server sent on every frame, so
+    /// an unchanged report must not re-anchor the countdown -- re-anchoring each
+    /// time pinned the clock at the reported value and the timer never ticked.
+    #[test]
+    fn an_unchanged_live_loot_boost_keeps_counting_down() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537));
+
+        // Pretend 30s have passed since that report.
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+        panel.observe_live_loot_boost(Some(600), Some(2537));
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+    }
+
+    /// A fresh server report (a zone change re-syncs the stat) does re-anchor.
+    #[test]
+    fn a_moved_live_loot_boost_re_anchors_the_countdown() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537));
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+        panel.observe_live_loot_boost(Some(500), Some(2537));
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(500));
+    }
+
+    /// An absent stat carries no information: the boost must not be cleared.
+    #[test]
+    fn an_absent_live_value_keeps_the_last_known_boost() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537));
+
+        panel.observe_live_loot_boost(None, Some(2537));
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(600));
+    }
+
+    /// Zero is the game saying the boost has run out.
+    #[test]
+    fn a_zero_live_value_ends_the_boost() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.observe_live_loot_boost(Some(600), Some(2537));
+
+        panel.observe_live_loot_boost(Some(0), Some(2537));
+
+        assert_eq!(panel.loot_boost_remaining(2537), None);
     }
 }

@@ -4954,12 +4954,11 @@ mod isolation_gate_tests {
 
     /// A crucible flag carried over from last season is corrected by the character
     /// list for characters that are not live, while the live character keeps the
-    /// value its own CRUCIBLE stat reported (issue #66).
-    #[test]
-    /// Crucible is seasonal-only, and the character list's own flag is stale (it
-    /// claims crucible on non-seasonal characters -- issue #66), so the list never
-    /// grants it. What the list does do is let a character that is not seasonal
-    /// lose a flag it could not legitimately hold.
+    /// value its own CRUCIBLE stat reported (issue #66). Crucible is seasonal-only,
+    /// and the character list's own flag is stale (it claims crucible on
+    /// non-seasonal characters -- issue #66), so the list never grants it. What the
+    /// list does do is let a character that is not seasonal lose a flag it could not
+    /// legitimately hold.
     #[test]
     fn api_account_data_clears_crucible_from_non_seasonal_characters() {
         use realmhound_core::api::RealmCharacter;

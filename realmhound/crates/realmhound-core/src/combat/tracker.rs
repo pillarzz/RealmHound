@@ -319,6 +319,13 @@ struct TrackedObject {
     /// Dexterity (id 28); the server already folds DexterityBoost (id 53) into
     /// it. Scales DEX-scaled abilities (e.g. Enchantment Orb).
     dexterity: i32,
+    /// Vitality (id 26); the server already folds VitalityBoost (id 51) into
+    /// it. Scales VIT-scaled gear (e.g. the Cloak of the Darkened Sun's Lethal
+    /// Strike).
+    vitality: i32,
+    /// Speed (id 22); the server already folds SpeedBoost (id 50) into it.
+    /// Scales SPD-scaled gear (e.g. Sharktooth Sigil's Lethal Strike).
+    speed: i32,
     /// Whether a base Wisdom stat has been observed (avoids a 0-WIS default
     /// under-applying the Lethal Strike bonus before the first stat arrives).
     wisdom_seen: bool,
@@ -332,6 +339,11 @@ struct TrackedObject {
     /// Whether a Defense stat has been observed (so the local player's damage
     /// taken is not estimated from a zero default).
     defense_seen: bool,
+    /// Whether a Vitality stat has been observed (so a VIT-scaled Lethal Strike
+    /// bonus is not computed from a zero default).
+    vitality_seen: bool,
+    /// Whether a Speed stat has been observed (see `vitality_seen`).
+    speed_seen: bool,
     /// Last time (epoch millis) this object's stats were updated.
     last_seen: i64,
     /// Last-seen world position (tile coords), used to correlate a departed
@@ -370,10 +382,14 @@ impl Default for TrackedObject {
             wisdom: 0,
             max_mp: 0,
             dexterity: 0,
+            vitality: 0,
+            speed: 0,
             wisdom_seen: false,
             attack_seen: false,
             hp_seen: false,
             defense_seen: false,
+            vitality_seen: false,
+            speed_seen: false,
             last_seen: 0,
             last_x: 0.0,
             last_y: 0.0,
@@ -404,8 +420,9 @@ impl TrackedObject {
             ScalingStat::Attack => self.attack_seen.then_some(self.attack),
             ScalingStat::Defense => self.defense_seen.then_some(self.defense),
             ScalingStat::Dexterity => Some(self.dexterity),
+            ScalingStat::Vitality => self.vitality_seen.then_some(self.vitality),
+            ScalingStat::Speed => self.speed_seen.then_some(self.speed),
             ScalingStat::MaxMp => Some(self.max_mp),
-            _ => None,
         }
     }
 
@@ -4377,6 +4394,14 @@ fn apply_stats(obj: &mut TrackedObject, status: &ObjectStatusData, time_ms: i64)
             }
             x if x == StatType::MaxMP as u8 => obj.max_mp = stat.stat_value,
             x if x == StatType::Dexterity as u8 => obj.dexterity = stat.stat_value,
+            x if x == StatType::Vitality as u8 => {
+                obj.vitality = stat.stat_value;
+                obj.vitality_seen = true;
+            }
+            x if x == StatType::Speed as u8 => {
+                obj.speed = stat.stat_value;
+                obj.speed_seen = true;
+            }
             x if x == StatType::PetType as u8 => {
                 obj.is_pet = true;
                 obj.pet_type = stat.stat_value;
@@ -8215,6 +8240,10 @@ mod tests {
                     stat(StatType::WisdomBoost, 20),
                     stat(StatType::Dexterity, 65),
                     stat(StatType::DexterityBoost, 15),
+                    stat(StatType::Vitality, 55),
+                    stat(StatType::VitalityBoost, 20),
+                    stat(StatType::Speed, 45),
+                    stat(StatType::SpeedBoost, 10),
                     stat(StatType::MaxMP, 400),
                     stat(StatType::MaxMPBoost, 100),
                 ],
@@ -8235,6 +8264,109 @@ mod tests {
             Some(65)
         );
         assert_eq!(local.effective_scaling_stat(ScalingStat::MaxMp), Some(400));
+        // VIT- and SPD-scaled gear (Cloak of the Darkened Sun, Sharktooth Sigil)
+        // must resolve too; returning `None` for them silently dropped the whole
+        // stat-scaled proc.
+        assert_eq!(
+            local.effective_scaling_stat(ScalingStat::Vitality),
+            Some(55)
+        );
+        assert_eq!(local.effective_scaling_stat(ScalingStat::Speed), Some(45));
+    }
+
+    #[test]
+    fn unobserved_vitality_does_not_apply_a_vitality_scaled_bonus() {
+        // Before the VIT stat arrives, a VIT-scaled proc must not be computed
+        // from the zero default (which would under-credit it silently).
+        use crate::assets::ScalingStat;
+        let mut t = CombatTracker::new();
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
+        let local = t.objects.get(&1000).expect("local");
+        assert_eq!(local.effective_scaling_stat(ScalingStat::Vitality), None);
+        assert_eq!(local.effective_scaling_stat(ScalingStat::Speed), None);
+    }
+
+    #[test]
+    fn vitality_scaled_lethal_strike_bonus_is_credited() {
+        // Regression for the Cloak of the Darkened Sun: its Lethal Strike scales
+        // off Vitality, so the proc used to resolve to no bonus at all (the stat
+        // was never tracked). Params mirror the parsed asset values.
+        use crate::assets::ScalingStat;
+        let params = LethalStrikeParams {
+            ignore_flat: 60.0,
+            ignore_perc: 0.45,
+            stat_mod_flat: 3.0,
+            stat_mod_perc: 0.01,
+            stat_mod_scaling_min: 24.0,
+            scaling_stat: ScalingStat::Vitality,
+            duration: 2.4,
+            extra_shots: 2,
+        };
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Vitality, 130),
+                    // The server folds the boost into the base stat; adding it
+                    // again would inflate the bonus.
+                    stat(StatType::VitalityBoost, 20),
+                ],
+            ),
+            10,
+        );
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 65),
+                ],
+            ),
+            0,
+        );
+
+        let vit = t
+            .objects
+            .get(&1000)
+            .expect("local")
+            .effective_scaling_stat(ScalingStat::Vitality)
+            .expect("VIT observed");
+        assert_eq!(vit, 130);
+
+        // w = 130 - 24 = 106 -> flat = 60 + 3*106 = 378, perc = 0.45 + 1.06 = 1.51
+        // bonus vs 65 DEF = 378 + 1.51*65 = 476.15 -> 476 (two side procs included)
+        let bonus = damage::lethal_strike_bonus(&params, vit, 65);
+        assert_eq!(bonus, 476);
+
+        t.lethal_strike_windows.push_back((0, 10_000));
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                shot_time: 100,
+                lethal_strike: Some((params, vit)),
+                extra_projectile: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 100);
+        let done = t.on_map_change("Nexus", 0, 200);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local");
+        // weapon 1000 - 65 DEF = 935, plus the main bonus and both side procs.
+        assert_eq!(local.damage, 935 + 3 * 476);
     }
 
     #[test]

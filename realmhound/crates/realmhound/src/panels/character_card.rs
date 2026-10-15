@@ -117,7 +117,12 @@ fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
 fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool, reserve: bool) {
     if !crucible && !blood_ritual {
         if reserve {
-            draw_pill_invisible(ui, "CRUCIBLE");
+            // The same row structure the pills use below, so the reserved row is
+            // identical in height rather than merely close to it.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                draw_pill_invisible(ui, "CRUCIBLE");
+            });
         }
         return;
     }

@@ -415,6 +415,15 @@ pub struct CharactersPanel {
     /// card can count down from it. The boost ticks only while a character is
     /// loaded, and the server re-reports on zone changes, which re-syncs this.
     loot_boost_at: std::collections::HashMap<i32, std::time::Instant>,
+    /// The last loot-boost seconds the server actually reported for a character,
+    /// kept apart from the value on display: the session hands back the same
+    /// number every frame, so only a change is a real report (see
+    /// [`Self::observe_live_loot_boost`]).
+    loot_boost_reported: std::collections::HashMap<i32, u32>,
+    /// Whether the loaded character is standing somewhere the boost timer is
+    /// paused (a safe area, or a map not seen yet). Set every frame from the map
+    /// the game reports; while set, the displayed value is held still.
+    loot_boost_paused: bool,
     /// Whether a character label is being edited
     editing_label: Option<i32>,
     /// Persistent open state for the label edit dialog. Kept in sync with the
@@ -535,6 +544,9 @@ impl CharactersPanel {
             api_result_rx: None,
             live_char_id: None,
             loot_boost_at: std::collections::HashMap::new(),
+            loot_boost_reported: std::collections::HashMap::new(),
+            // Nothing is counted down until the map is known to allow it.
+            loot_boost_paused: true,
             editing_label: None,
             label_dialog_open: false,
             label_dialog_focus: false,
@@ -658,27 +670,58 @@ impl CharactersPanel {
     /// value *moves*: this is called every frame, and the session keeps handing
     /// back the last value the server sent, so re-anchoring on each call pinned
     /// the clock at the reported value and the timer never ticked down.
-    pub fn observe_live_loot_boost(&mut self, live: Option<u32>, live_char_id: Option<i32>) {
+    ///
+    /// `paused` says the loaded character is somewhere the game holds the timer
+    /// still (a safe area, or a map not yet seen).
+    pub fn observe_live_loot_boost(
+        &mut self,
+        live: Option<u32>,
+        live_char_id: Option<i32>,
+        paused: bool,
+    ) {
         let Some(id) = live_char_id else {
+            self.loot_boost_paused = paused;
             return;
         };
+
+        // Crossing into or out of a safe area freezes / resumes the local clock.
+        // Entering one commits what the card currently reads, so the value holds
+        // still there instead of snapping back to the server's last report or
+        // draining away; leaving one restarts the countdown from that value.
+        if paused != self.loot_boost_paused {
+            if paused {
+                if let Some(remaining) = self.loot_boost_remaining(id) {
+                    self.loot_boost_by_char.insert(id, remaining);
+                }
+            }
+            self.loot_boost_at.insert(id, std::time::Instant::now());
+            self.loot_boost_paused = paused;
+        }
+
         match live {
             Some(0) => {
                 self.loot_boost_by_char.remove(&id);
                 self.loot_boost_at.remove(&id);
+                self.loot_boost_reported.remove(&id);
             }
             Some(secs) => {
-                // Anchor the local countdown only when the value actually moves
-                // (a fresh server report), otherwise let the clock keep ticking.
-                // An entry seeded from the cache has no anchor yet, so give it one.
-                if self.loot_boost_by_char.get(&id).copied() == Some(secs) {
+                // The session re-reports the same number every frame, so only a
+                // *change* is a fresh report: that is what may move the displayed
+                // value and re-anchor the clock. Anything else is the echo of a
+                // report already accounted for -- treating it as fresh would both
+                // pin the countdown and refill a frozen safe-area value from the
+                // server's now-stale number.
+                if self.loot_boost_reported.get(&id).copied() == Some(secs) {
+                    // Let a running clock keep ticking; give a cache-seeded entry
+                    // its first anchor.
                     self.loot_boost_at
                         .entry(id)
                         .or_insert_with(std::time::Instant::now);
                 } else {
+                    self.loot_boost_reported.insert(id, secs);
+                    self.loot_boost_by_char.insert(id, secs);
                     self.loot_boost_at.insert(id, std::time::Instant::now());
                 }
-                self.loot_boost_by_char.insert(id, secs);
             }
             None => {}
         }
@@ -691,7 +734,9 @@ impl CharactersPanel {
     /// is safe: the server re-reports on every zone change and re-syncs it.
     fn loot_boost_remaining(&self, char_id: i32) -> Option<u32> {
         let secs = self.loot_boost_by_char.get(&char_id).copied()?;
-        if self.live_char_id != Some(char_id) {
+        // Only the loaded character's boost runs down, and only outside a safe
+        // area: the game pauses the timer there, so the display holds still.
+        if self.live_char_id != Some(char_id) || self.loot_boost_paused {
             return Some(secs);
         }
         let elapsed = self
@@ -4218,13 +4263,13 @@ mod tests {
     fn an_unchanged_live_loot_boost_keeps_counting_down() {
         let mut panel = CharactersPanel::with_cache(CharacterCache::default());
         panel.live_char_id = Some(2537);
-        panel.observe_live_loot_boost(Some(600), Some(2537));
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
 
         // Pretend 30s have passed since that report.
         *panel.loot_boost_at.get_mut(&2537).unwrap() =
             std::time::Instant::now() - std::time::Duration::from_secs(30);
 
-        panel.observe_live_loot_boost(Some(600), Some(2537));
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
 
         assert_eq!(panel.loot_boost_remaining(2537), Some(570));
     }
@@ -4234,11 +4279,11 @@ mod tests {
     fn a_moved_live_loot_boost_re_anchors_the_countdown() {
         let mut panel = CharactersPanel::with_cache(CharacterCache::default());
         panel.live_char_id = Some(2537);
-        panel.observe_live_loot_boost(Some(600), Some(2537));
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
         *panel.loot_boost_at.get_mut(&2537).unwrap() =
             std::time::Instant::now() - std::time::Duration::from_secs(30);
 
-        panel.observe_live_loot_boost(Some(500), Some(2537));
+        panel.observe_live_loot_boost(Some(500), Some(2537), false);
 
         assert_eq!(panel.loot_boost_remaining(2537), Some(500));
     }
@@ -4248,9 +4293,9 @@ mod tests {
     fn an_absent_live_value_keeps_the_last_known_boost() {
         let mut panel = CharactersPanel::with_cache(CharacterCache::default());
         panel.live_char_id = Some(2537);
-        panel.observe_live_loot_boost(Some(600), Some(2537));
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
 
-        panel.observe_live_loot_boost(None, Some(2537));
+        panel.observe_live_loot_boost(None, Some(2537), false);
 
         assert_eq!(panel.loot_boost_remaining(2537), Some(600));
     }
@@ -4259,10 +4304,65 @@ mod tests {
     #[test]
     fn a_zero_live_value_ends_the_boost() {
         let mut panel = CharactersPanel::with_cache(CharacterCache::default());
-        panel.observe_live_loot_boost(Some(600), Some(2537));
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
 
-        panel.observe_live_loot_boost(Some(0), Some(2537));
+        panel.observe_live_loot_boost(Some(0), Some(2537), false);
 
         assert_eq!(panel.loot_boost_remaining(2537), None);
+    }
+
+    /// A safe area holds the timer still: the game pauses it in the Nexus, so the
+    /// local clock must not drain it. The session keeps re-reporting the number it
+    /// last sent, which must not refill the frozen value either.
+    #[test]
+    fn a_safe_area_holds_the_loot_boost_still() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        // 30s of play, then the character nexuses.
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        // Freezes where it stood, not back at the server's stale 600.
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+
+        // Another minute in the safe area must not eat into it.
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+    }
+
+    /// Leaving the safe area resumes from the frozen value.
+    #[test]
+    fn leaving_a_safe_area_resumes_the_countdown() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+    }
+
+    /// Before the first `MapInfo` the map is unknown, so nothing may be spent --
+    /// that also covers a loading screen.
+    #[test]
+    fn an_unknown_map_holds_the_loot_boost_still() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(45);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(600));
     }
 }

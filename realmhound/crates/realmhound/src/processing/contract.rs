@@ -425,6 +425,10 @@ pub struct ViewState {
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
     pub loot_boost_secs: Option<u32>,
+    /// Whether the current map pauses the boost timers: a safe area (the Nexus,
+    /// Vault, Pet Yard, Guild Hall, Bazaar, Chess, Tinkerer Cave), or no map seen
+    /// yet. The card must not count the loot boost down while this is set.
+    pub map_pauses_boost_timers: bool,
 }
 
 impl ViewState {
@@ -448,6 +452,8 @@ impl ViewState {
             capture_queue_drops: 0,
             mission_view_gen: 0,
             loot_boost_secs: None,
+            // Nothing heard yet, so nothing may be counted down.
+            map_pauses_boost_timers: true,
         }
     }
 }

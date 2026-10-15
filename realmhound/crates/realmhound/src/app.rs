@@ -9394,9 +9394,13 @@ impl RealmHoundApp {
         // Loot-boost seconds ride outside the character-cache generation (they
         // change every tick). Observe the live value each frame, attributing it
         // to the currently playing character. The panel keeps each card's
-        // last-known value (also seeded from an API refresh).
-        self.characters_panel
-            .observe_live_loot_boost(self.view_state.loot_boost_secs, self.live_char_id);
+        // last-known value (also seeded from an API refresh), and leaves the
+        // countdown alone in a safe area, where the game pauses the timer.
+        self.characters_panel.observe_live_loot_boost(
+            self.view_state.loot_boost_secs,
+            self.live_char_id,
+            self.view_state.map_pauses_boost_timers,
+        );
 
         // Vault + treasury live-vault data: resync on change.
         if vault_view_gen != self.last_vault_view_gen {

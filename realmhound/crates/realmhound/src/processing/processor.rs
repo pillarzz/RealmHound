@@ -679,6 +679,7 @@ impl PacketProcessor {
             capture_queue_drops: metrics.queue_drops,
             mission_view_gen: self.mission_tracker.generation(),
             loot_boost_secs: self.session.player.loot_boost_secs,
+            map_pauses_boost_timers: self.session.map.pauses_boost_timers(),
         }
     }
 

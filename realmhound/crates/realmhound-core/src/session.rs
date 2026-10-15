@@ -140,6 +140,66 @@ impl MapState {
     pub fn clear(&mut self) {
         *self = Self::default();
     }
+
+    /// Whether the boost timers are paused here.
+    ///
+    /// An unknown map counts as paused: that is the case before the first
+    /// `MapInfo` and on a loading screen, and the timer may only run down once
+    /// we know the player is somewhere the game actually depletes it.
+    pub fn pauses_boost_timers(&self) -> bool {
+        match self.name.as_deref() {
+            Some(name) => pauses_boost_timers(name),
+            None => true,
+        }
+    }
+}
+
+/// The safe areas where the game pauses the loot-drop (and XP) boost timers.
+///
+/// Boost timers keep their value in these maps, so a locally counted-down
+/// display must not deplete there either. Names arrive as localization tokens
+/// (`{s.nexus}`, `{s.vault}`) or resolved (`Nexus`, `Guild Hall`) and vary in
+/// spacing and punctuation, so both sides are reduced to bare letters and digits
+/// before comparing (see [`normalize_map_name`]).
+///
+/// The match is on the whole name, never a substring: "Battle for the Nexus" is
+/// a dungeon and its timer does run. Add a spelling here when a safe area
+/// reports one this list misses.
+const SAFE_AREA_NAMES: &[&str] = &[
+    "nexus",
+    "vault",
+    "petyard",
+    "guildhall",
+    "bazaar",
+    "chess",
+    "tinkerer",
+    "tinkerercave",
+    "tinkererscave",
+    "tinkerersworkshop",
+    "dailyquestroom",
+];
+
+/// Whether a `MapInfo` map name is a safe area where the boost timers pause.
+/// See [`SAFE_AREA_NAMES`].
+pub fn pauses_boost_timers(display_name: &str) -> bool {
+    SAFE_AREA_NAMES.contains(&normalize_map_name(display_name).as_str())
+}
+
+/// Reduce a map name to its bare, comparable form: the localization token
+/// wrapper removed and everything that is not a letter or digit dropped, so
+/// `{s.guildhall}` and `Guild Hall`, or `{s.pet_yard}` and `Pet Yard`, compare
+/// equal.
+fn normalize_map_name(display_name: &str) -> String {
+    let trimmed = display_name.trim();
+    let inner = trimmed
+        .strip_prefix("{s.")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    inner
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// Vault object and page tracking.
@@ -703,6 +763,54 @@ mod tests {
         assert_eq!(session.player.pet_object_id, Some(99));
         assert_eq!(session.vault.chest_object_id, Some(55));
         assert_eq!(session.map.name, Some("Vault".to_string()));
+    }
+
+    #[test]
+    fn safe_areas_pause_the_boost_timers() {
+        // Safe areas, in both the token and the resolved spelling.
+        for name in [
+            "{s.nexus}",
+            "Nexus",
+            "{s.vault}",
+            "Vault",
+            "Pet Yard",
+            "{s.pet_yard}",
+            "{s.guildhall}",
+            "Guild Hall",
+            "{s.bazaar}",
+            "{s.chess}",
+            "{s.tinkerer_cave}",
+            "Tinkerer's Cave",
+            "Daily Quest Room",
+        ] {
+            assert!(pauses_boost_timers(name), "{name} should pause the timers");
+        }
+
+        // Places the timers do run, including one that merely contains a safe
+        // area's name.
+        for name in [
+            "{s.rotmg}",
+            "Meridian",
+            "Oryx",
+            "Plagued Nest",
+            "{s.oryx_s_castle}",
+            "{s.wine_cellar}",
+            "Battle for the Nexus",
+        ] {
+            assert!(
+                !pauses_boost_timers(name),
+                "{name} should let the timers run"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_map_pauses_the_boost_timers() {
+        let mut map = MapState::default();
+        assert!(map.pauses_boost_timers());
+
+        map.name = Some("{s.rotmg}".to_string());
+        assert!(!map.pauses_boost_timers());
     }
 
     #[test]

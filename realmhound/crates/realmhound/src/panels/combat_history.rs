@@ -3750,13 +3750,14 @@ impl CombatHistoryPanel {
         if expanded {
             // The expanded section reads as its own little card inside the run,
             // exactly like the character page's stat cards: a rounded outline
-            // instead of an indent line, with the section dividers running the
-            // full width of that box.
+            // instead of an indent line, hugging the data it holds -- the Stats
+            // table's width -- rather than stretching the whole card, with the
+            // section dividers running that full width.
             ui.add_space(2.0);
+            let width = section_divider_width(ui);
             section_frame(ui).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                let divider_w = ui.available_width();
-                self.render_my_performance(ui, ctx, phase, divider_w);
+                ui.set_min_width(width);
+                self.render_my_performance(ui, ctx, phase, width);
             });
         }
         ui.add_space(6.0);

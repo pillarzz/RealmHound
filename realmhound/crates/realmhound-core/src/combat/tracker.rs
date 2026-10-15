@@ -125,7 +125,10 @@ const BOOST_PROC_HINT_MS: i64 = 800;
 /// the game data. `None` for condition labels (`Damaging`, `Weak`, ...), which are
 /// matched against an item's declared conditions instead. `ATT boost` (stat 48) is
 /// the companion of `Attack` (stat 20) and is declared as `ATT` too.
-fn stat_kind_for_boost_label(label: &str) -> Option<crate::assets::StatKind> {
+///
+/// Public so the UI can apply the same check to rows recorded before the tracker
+/// verified its sources.
+pub fn stat_kind_for_boost_label(label: &str) -> Option<crate::assets::StatKind> {
     use crate::assets::StatKind;
     match label {
         "Attack" | "ATT boost" => Some(StatKind::Attack),

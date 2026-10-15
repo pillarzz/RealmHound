@@ -244,6 +244,46 @@ fn boost_effect(stat: &str) -> (String, Option<&'static str>, bool, Option<Embed
     (text.to_string(), key, mirror, icon)
 }
 
+/// The label for a rise nothing local can explain: Weak is applied by monsters,
+/// everything else is credited to an ally's buff or aura.
+fn unexplained_label(stat: &str) -> &'static str {
+    if stat == "Weak" {
+        "Enemy debuff"
+    } else {
+        "Ally buff"
+    }
+}
+
+/// The game-data lookups the source decoding needs. Behind a trait so the rule can
+/// be tested without the asset files, which the unit tests do not have.
+trait SourceOracle {
+    fn id_for_name(&self, name: &str) -> Option<i32>;
+    fn declares(&self, item: i32, stat: &str) -> bool;
+}
+
+struct AssetOracle;
+
+impl SourceOracle for AssetOracle {
+    fn id_for_name(&self, name: &str) -> Option<i32> {
+        get_asset_manager().object_id_for_display_name(name)
+    }
+
+    /// Whether an item's own XML declares the effect a boost label names: a stat
+    /// buff for a stat label, a condition for a condition label. An item with no
+    /// ability data at all counts as declaring it: unverifiable is not disproven,
+    /// and a gear proc comes from an enchantment the item itself never lists.
+    fn declares(&self, item: i32, stat: &str) -> bool {
+        let am = get_asset_manager();
+        if am.ability_effects(item).is_none() {
+            return true;
+        }
+        match realmhound_core::combat::stat_kind_for_boost_label(stat) {
+            Some(kind) => am.item_declares_stat_boost(item, kind),
+            None => am.item_declares_condition(item, stat),
+        }
+    }
+}
+
 /// Split a recorded boost source into a display label and the item it names.
 ///
 /// The wire carries no source id, so the tracker infers one and the UI presents it
@@ -251,17 +291,49 @@ fn boost_effect(stat: &str) -> (String, Option<&'static str>, bool, Option<Embed
 /// and carry the resolved item id on the window itself, so the icon is exactly the
 /// item involved -- a name round-trip could draw the shiny variant of an item the
 /// player does not own. Rows written before that field existed are decoded from
-/// their wording instead.
+/// their wording instead, and re-checked against the item's own declaration: they
+/// named whatever the player had just used, which is how a spell came to own an
+/// Attack boost on a card recorded by an older build.
 fn boost_source(source: &str, item: Option<i32>, stat: &str) -> (String, Option<i32>) {
+    boost_source_with(&AssetOracle, source, item, stat)
+}
+
+fn boost_source_with(
+    oracle: &dyn SourceOracle,
+    source: &str,
+    item: Option<i32>,
+    stat: &str,
+) -> (String, Option<i32>) {
     if let Some(rest) = source.strip_prefix("consumable (") {
         if let Some(name) = rest.strip_suffix(") [inferred]") {
-            let id = item.or_else(|| get_asset_manager().object_id_for_display_name(name));
+            // A row that carries an id was checked against the game data as it was
+            // written; only the name-only rows older builds wrote are re-checked.
+            if let Some(id) = item {
+                return (name.to_string(), Some(id));
+            }
+            let id = oracle.id_for_name(name);
+            if let Some(id) = id {
+                if !oracle.declares(id, stat) {
+                    // The item cannot cause this change, so the row was miscredited.
+                    return (unexplained_label(stat).to_string(), None);
+                }
+            }
             return (name.to_string(), id);
         }
     }
     if let Some(rest) = source.strip_prefix("local item use (0x") {
         if let Some(hex) = rest.strip_suffix(") [inferred]") {
+            // Same wording rule as above: a recorded id was checked when the row was
+            // written, and the hex an older build inlined is re-checked here.
             let id = item.or_else(|| i32::from_str_radix(hex, 16).ok());
+            if item.is_none() {
+                if let Some(id) = id {
+                    if !oracle.declares(id, stat) {
+                        // The item cannot cause this change, so the row was miscredited.
+                        return (unexplained_label(stat).to_string(), None);
+                    }
+                }
+            }
             return (format!("Item use 0x{hex}"), id);
         }
     }
@@ -269,12 +341,7 @@ fn boost_source(source: &str, item: Option<i32>, stat: &str) -> (String, Option<
         // Rows recorded before the sources were named for what they are all read as
         // one generic "external" note; Weak is a monster-applied debuff, so it is
         // relabelled here instead of being shown as an ally's buff.
-        let label = if stat == "Weak" {
-            "Enemy debuff"
-        } else {
-            "Ally buff"
-        };
-        return (label.to_string(), None);
+        return (unexplained_label(stat).to_string(), None);
     }
     (source.to_string(), item)
 }
@@ -5235,9 +5302,9 @@ fn assign_drops_exclusive(
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_drops_exclusive, boss_bar_label, boss_row_hp_label, boss_row_stats_parts,
-        condensed_boosts, dungeon_display_name, share_hp_pool, spirit_total_label, BoostIcon,
-        RunModes,
+        assign_drops_exclusive, boost_source_with, boss_bar_label, boss_row_hp_label,
+        boss_row_stats_parts, condensed_boosts, dungeon_display_name, share_hp_pool,
+        spirit_total_label, BoostIcon, RunModes, SourceOracle,
     };
     use realmhound_core::assets::get_dungeon_portal_map;
     use realmhound_core::combat::BoostWindow;
@@ -5480,6 +5547,98 @@ mod tests {
         assert!(
             rows.iter().all(|r| r.effect != "Invisible"),
             "a condition held for no time is a mask artifact, not a buff"
+        );
+    }
+
+    /// Stands in for the game data, which is not on disk in tests.
+    struct FixtureOracle;
+
+    impl SourceOracle for FixtureOracle {
+        fn id_for_name(&self, name: &str) -> Option<i32> {
+            match name {
+                "Sporous Spray Spell" => Some(0x0BE7),
+                "Beryl Treat" => Some(0x45E6),
+                _ => None,
+            }
+        }
+
+        fn declares(&self, item: i32, stat: &str) -> bool {
+            match item {
+                // A spell deals nova damage; it declares no Attack.
+                0x0BE7 => false,
+                // Beryl Treat raises Speed for 300s and applies no condition.
+                0x45E6 => stat == "Speed",
+                _ => true,
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_source_the_item_cannot_cause_is_relabelled() {
+        // Rows written by an older build name whatever the player had just used,
+        // which is how a spell came to own an Attack boost, and a treat drunk near
+        // a teammate's Paladin came to own a Damaging one.
+        let oracle = FixtureOracle;
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Sporous Spray Spell) [inferred]",
+                None,
+                "Attack",
+            ),
+            ("Ally buff".to_string(), None)
+        );
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Beryl Treat) [inferred]",
+                None,
+                "Damaging",
+            ),
+            ("Ally buff".to_string(), None)
+        );
+        // A hex-only row is re-checked the same way.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "local item use (0x0BE7) [inferred]",
+                None,
+                "Attack"
+            ),
+            ("Ally buff".to_string(), None)
+        );
+        // Weak is applied by monsters, and both wordings read the same.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                // Stored form: commas become spaces when the row is written.
+                "external (ally buff  pet  or status) [inferred]",
+                None,
+                "Weak",
+            ),
+            ("Enemy debuff".to_string(), None)
+        );
+        // A source the item does declare is kept exactly as recorded.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Beryl Treat) [inferred]",
+                None,
+                "Speed",
+            ),
+            ("Beryl Treat".to_string(), Some(0x45E6))
+        );
+        // An id recorded on the window was checked when the fight was written, and
+        // a gear proc names an item that need not declare the boost itself, so
+        // those rows are trusted as they stand.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Sporous Spray Spell) [inferred]",
+                Some(0x0BE7),
+                "Attack",
+            ),
+            ("Sporous Spray Spell".to_string(), Some(0x0BE7))
         );
     }
 

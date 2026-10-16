@@ -2895,6 +2895,17 @@ impl AssetManager {
             .unwrap_or_default()
     }
 
+    /// The summoned creature's own display name from the spawning item's effect
+    /// text (see `object_list::summon_name_from_text`), for a `DisplayId`-less
+    /// entity like `MV Kimono Summon` whose in-game name is "Friendly Spirit".
+    pub fn summon_name(&self, object_type: i32) -> Option<String> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard
+            .as_ref()
+            .and_then(|list| list.summon_name(object_type).map(str::to_string))
+    }
+
     /// The creatures an item spawns, with the trigger that spawns each (the
     /// reverse of [`Self::summon_sources`]). Used to name the creature behind a
     /// summon that was spawned by an ability activation, where no packet ever

@@ -1250,6 +1250,10 @@ pub struct ObjectList {
     /// have several sources (base + (SB) or shiny variants of one item, or a
     /// handful of items sharing a generic summon), so the value is a list.
     summon_sources: HashMap<i32, Vec<SummonSource>>,
+    /// Display name per summoned creature, read from the spawning item's effect
+    /// text because the creature's own object entry has none (see
+    /// [`summon_name_from_text`]).
+    summon_names: HashMap<i32, String>,
 }
 
 impl ObjectList {
@@ -1266,6 +1270,7 @@ impl ObjectList {
             stat_relatives: HashMap::new(),
             subattack_projectiles: HashMap::new(),
             summon_sources: HashMap::new(),
+            summon_names: HashMap::new(),
         }
     }
 
@@ -1414,6 +1419,7 @@ impl ObjectList {
             stat_relatives: HashMap::new(),
             subattack_projectiles: HashMap::new(),
             summon_sources: HashMap::new(),
+            summon_names: HashMap::new(),
         })
     }
 
@@ -3044,6 +3050,8 @@ impl ObjectList {
             // (see `SummonSource::deals_damage`). Applied to every link this
             // object declares when it ends, so element order cannot matter.
             let mut mentions_damage = false;
+            // The creature's own display name, likewise read from that prose.
+            let mut summoned_name: Option<String> = None;
             // Trigger, proc chance and the entity name of the activate element the
             // reader is inside, whose text names the effect, plus that element's
             // own `lifeTime` when it declares one.
@@ -3079,8 +3087,17 @@ impl ObjectList {
                         b"DisplayId" => in_display_id = true,
                         b"SlotType" => is_item = true,
                         b"EffectInfo" => {
-                            if effect_text_mentions_damage(e) {
-                                mentions_damage = true;
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() != b"description" {
+                                    continue;
+                                }
+                                let text = String::from_utf8_lossy(&attr.value);
+                                if text.to_ascii_lowercase().contains("damage") {
+                                    mentions_damage = true;
+                                }
+                                if let Some(name) = summon_name_from_text(&text) {
+                                    summoned_name = Some(name);
+                                }
                             }
                         }
                         name => {
@@ -3118,8 +3135,17 @@ impl ObjectList {
                         }
                     },
                     Ok(Event::Empty(ref e)) if e.name().as_ref() == b"EffectInfo" => {
-                        if effect_text_mentions_damage(e) {
-                            mentions_damage = true;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() != b"description" {
+                                continue;
+                            }
+                            let text = String::from_utf8_lossy(&attr.value);
+                            if text.to_ascii_lowercase().contains("damage") {
+                                mentions_damage = true;
+                            }
+                            if let Some(name) = summon_name_from_text(&text) {
+                                summoned_name = Some(name);
+                            }
                         }
                     }
                     Ok(Event::Text(ref t)) => {
@@ -3159,6 +3185,9 @@ impl ObjectList {
                             if is_item {
                                 for (entity_type, mut source) in found.drain(..) {
                                     source.deals_damage = mentions_damage;
+                                    if let Some(name) = summoned_name.take() {
+                                        self.summon_names.entry(entity_type).or_insert(name);
+                                    }
                                     let list =
                                         self.summon_sources.entry(entity_type).or_default();
                                     if !list.contains(&source) {
@@ -3168,6 +3197,7 @@ impl ObjectList {
                                 }
                             }
                             mentions_damage = false;
+                            summoned_name = None;
                         }
                         _ => {}
                     },
@@ -3192,6 +3222,13 @@ impl ObjectList {
             .unwrap_or(&[])
     }
 
+    /// The summoned creature's own display name, as the spawning item's effect
+    /// text states it ("Friendly Spirit", "Eye of Marble"). `None` for a creature
+    /// no item names, whose row falls back to the object id's own name.
+    pub fn summon_name(&self, object_type: i32) -> Option<&str> {
+        self.summon_names.get(&object_type).map(|s| s.as_str())
+    }
+
     /// The reverse of [`Self::summon_sources`]: the creatures `item_type` spawns,
     /// each with the entry describing how it does. Lets a summon be traced from an
     /// item that is missing a shoot packet of its own -- a creature spawned by an
@@ -3212,18 +3249,40 @@ impl ObjectList {
     }
 }
 
-/// Whether an `EffectInfo` element's own description says the effect deals
-/// damage. The game describes its effects in prose, and a summon's damage is only
-/// ever stated there -- Sage's Wakibiki's "zaps them for 150 damage/sec" against
-/// the Marble Seal's "Summon an Eye of Marble for 4.5 seconds", which buffs
-/// allies instead of hurting anything.
-fn effect_text_mentions_damage(e: &quick_xml::events::BytesStart) -> bool {
-    e.attributes().flatten().any(|attr| {
-        attr.key.as_ref() == b"description"
-            && String::from_utf8_lossy(&attr.value)
-                .to_ascii_lowercase()
-                .contains("damage")
-    })
+/// The summoned creature's display name, read out of the spawning item's own
+/// effect text.
+///
+/// A summon's object entry carries no `DisplayId` -- `MV Kimono Summon`,
+/// `MV Wakibiki Summon` and `MV Happi Summon` are internal ids -- so the only
+/// place the game names one is the prose: "Summon a Friendly Spirit which slows
+/// enemies and zaps them for 150 damage/sec", "Summon an Eye of Marble for 4.5
+/// seconds". Only a sentence that *is* a summon statement counts: a set bonus
+/// that merely mentions summoning ("Wearing X along with this ring allows you to
+/// summon Blizzard") must not rename the item's real summon.
+fn summon_name_from_text(description: &str) -> Option<String> {
+    let text = description.trim_start();
+    if !text.to_ascii_lowercase().starts_with("summon") {
+        return None;
+    }
+    let mut rest = text["summon".len()..].trim_start();
+    // "Summons a mind minion" -- the plural verb reads the same way.
+    rest = rest.strip_prefix('s').unwrap_or(rest).trim_start();
+    rest = rest
+        .strip_prefix("a ")
+        .or_else(|| rest.strip_prefix("an "))
+        .or_else(|| rest.strip_prefix("the "))
+        .unwrap_or(rest);
+    let stop = rest.find(['.', ',', '!', ';']).unwrap_or(rest.len());
+    let rest = &rest[..stop];
+    // Cut at the earliest clause boundary, so "Summon a Friendly Spirit which
+    // slows..." yields the name and not the sentence.
+    let cut = [" which", " that", " who", " for", " to ", " and ", " when", " in ", " with"]
+        .iter()
+        .filter_map(|c| rest.find(c))
+        .min()
+        .unwrap_or(rest.len());
+    let name = rest[..cut].trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Parse hex type string (e.g., "0xa00" -> 2560).

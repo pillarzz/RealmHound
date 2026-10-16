@@ -483,17 +483,11 @@ fn section_divider(ui: &mut egui::Ui, width: f32) {
         .hline(rect.left()..=rect.right(), rect.center().y, stroke);
 }
 
-/// Where a section divider ends on a card that draws its own sections: the right
-/// edge of the Stats table's Blood Ritual column. The reserved column widths come
-/// from the same helper the shared attribute renderer uses, so the line lands
-/// exactly on the table's last column.
+/// Where a section divider ends on a card that draws its own sections: the full
+/// inner width of the card, so every rule spans the card's content box rather
+/// than stopping at the Stats table's last column.
 fn section_divider_width(ui: &egui::Ui) -> f32 {
-    let w = crate::panels::derived_stats::attr_col_widths(ui);
-    // The grid lays out twelve columns (the stat icon, then two five-column
-    // groups) with `STATS_GRID_GAP` between each pair.
-    STATS_ICON_CELL
-        + 2.0 * (w.total + w.gear + w.exalt + w.crucible + w.blood_ritual)
-        + STATS_GRID_GAP * 11.0
+    ui.available_width()
 }
 
 /// The rounded box around one boss's expanded section in a grouped run: the same
@@ -510,8 +504,6 @@ fn section_frame(ui: &egui::Ui) -> egui::Frame {
 
 /// Horizontal gap between the Stats table's columns.
 const STATS_GRID_GAP: f32 = 16.0;
-/// Width of the Stats table's leading stat-icon cell.
-const STATS_ICON_CELL: f32 = 16.0;
 
 /// A PgUp / PgDn page delta in points for the visible height, or `None` when
 /// neither key was pressed this frame. The fight card pages through its own scroll
@@ -3882,6 +3874,23 @@ impl CombatHistoryPanel {
             );
             return;
         };
+        // The fight's own loadout, derived once for the pet row: the pet's name,
+        // skin and abilities come from the account cache exactly as the ATTRIBUTES
+        // panel shows them, since the wire carries only the pet's type id.
+        let derived: Option<realmhound_core::stats::derived::DerivedStats> = {
+            let cache = &ctx.account_data.characters;
+            cache.find_any_character(fight.local_char_id).map(|character| {
+                let mut loadout = crate::panels::derived_stats::build_loadout(character, cache);
+                if local.equipment.iter().any(|&slot| slot >= 0) {
+                    loadout.equipment = local.equipment.iter().map(|&slot| slot.max(0)).collect();
+                    loadout.enchants = local.equipment_enchants.to_vec();
+                }
+                realmhound_core::stats::derived::derive(
+                    realmhound_core::assets::get_asset_manager(),
+                    &loadout,
+                )
+            })
+        };
 
         let rank = fight
             .participants
@@ -3947,15 +3956,34 @@ impl CombatHistoryPanel {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             if s.is_pet {
+                                // The pet's identity comes from the account cache, exactly as the
+                                // ATTRIBUTES panel shows it: its name, its skin's sprite, and its
+                                // abilities (name, fed power, dps) on hover. The wire only carries
+                                // the pet's type id, which is why this row used to read "Pet" over
+                                // a placeholder sprite.
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::Vec2::splat(16.0),
                                     egui::Sense::hover(),
                                 );
-                                if s.pet_type != 0 {
-                                    ctx.sprite_renderer
-                                        .draw_sprite_in_rect(ui, s.pet_type, rect);
+                                let skin = derived
+                                    .as_ref()
+                                    .and_then(|d| d.pet_skin)
+                                    .or((s.pet_type != 0).then_some(s.pet_type));
+                                if let Some(skin) = skin {
+                                    ctx.sprite_renderer.draw_sprite_in_rect(ui, skin, rect);
                                 }
-                                ui.label("Pet");
+                                let name = derived
+                                    .as_ref()
+                                    .and_then(|d| d.pet_name.clone())
+                                    .unwrap_or_else(|| "Pet".to_string());
+                                let response = if let Some(d) = derived.as_ref().filter(|d| !d.pet.is_empty()) {
+                                    ui.label(name).on_hover_ui(|ui| {
+                                        crate::panels::derived_stats::pet_abilities_tooltip(ui, &d.pet);
+                                    })
+                                } else {
+                                    ui.label(name)
+                                };
+                                let _ = response;
                             } else if s.object_type != 0 {
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::Vec2::splat(16.0),
@@ -3964,9 +3992,22 @@ impl CombatHistoryPanel {
                                 ctx.sprite_renderer
                                     .draw_sprite_in_rect(ui, s.object_type, rect);
                                 let manager = realmhound_core::assets::get_asset_manager();
-                                let name = manager
+                                let raw = manager
                                     .object_name(s.object_type)
                                     .unwrap_or_else(|| format!("0x{:X}", s.object_type));
+                                // A spirit's object entry carries no display name --
+                                // `MV Kimono Summon` is an internal id -- so the name
+                                // the game shows comes from the spawning item's own
+                                // text ("Summon a Friendly Spirit which..."). Only
+                                // substitute it where the object's own name is that
+                                // kind of internal label, so a creature already named
+                                // well ("Summon Bear") keeps its name.
+                                let internal = raw.starts_with("MV ") || raw.contains("Summon");
+                                let name = if internal {
+                                    manager.summon_name(s.object_type).unwrap_or(raw)
+                                } else {
+                                    raw
+                                };
                                 // Where the creature came from. The fight resolves
                                 // the item that actually created it from the
                                 // player's own loadout and activations, so the row

@@ -641,7 +641,7 @@ fn fmt_secs(secs: f32) -> String {
 }
 
 /// Pet ability list (name + fed power / dps) for the pet hover tooltip.
-fn pet_abilities_tooltip(ui: &mut egui::Ui, pet: &[PetAbilityContribution]) {
+pub fn pet_abilities_tooltip(ui: &mut egui::Ui, pet: &[PetAbilityContribution]) {
     use realmhound_core::api::pet_ability_name;
     egui::Grid::new(ui.next_auto_id())
         .num_columns(2)

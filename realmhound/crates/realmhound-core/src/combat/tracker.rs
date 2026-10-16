@@ -4899,6 +4899,12 @@ impl CombatTracker {
     /// declares (Attack Close/Mid/Far, Electric); heal, magic heal, Savage and
     /// Decoy cannot damage anything. Only a pet close enough to its owner to be
     /// the shooter counts, and the nearest wins (ties by lowest id).
+    ///
+    /// It also has to be *the local player's* pet: see [`Self::pet_follows_local`].
+    /// In a group a teammate's pet stands next to the local player too, and
+    /// distance alone let it claim the local player's own unattributed packets --
+    /// which is how a fight whose only pet of theirs was a Decoy pet still ended
+    /// up with a pet row, credited from a teammate's Great Jelly standing nearby.
     fn damage_capable_pet_near_local(&self) -> Option<i32> {
         let local = self.objects.get(&self.local_object_id)?;
         let (lx, ly) = (local.last_x, local.last_y);
@@ -4908,6 +4914,9 @@ impl CombatTracker {
                 continue;
             }
             if !o.pet_abilities.iter().any(|&a| pet_ability_deals_damage(a)) {
+                continue;
+            }
+            if !self.pet_follows_local(oid) {
                 continue;
             }
             let dx = o.last_x - lx;
@@ -4921,6 +4930,27 @@ impl CombatTracker {
             }
         }
         best.map(|(_, oid)| oid)
+    }
+
+    /// Whether a pet object follows the local player, by the same proximity vote
+    /// that resolves a participant's own pet row ([`Self::assign_pets`]).
+    ///
+    /// A pet with no vote recorded at all is left to proximity: a fight whose pet
+    /// was never observed following anyone keeps the behaviour it had, while a pet
+    /// whose owner *is* known -- every pet in a group fight -- has to be the local
+    /// player's before it can claim their damage.
+    fn pet_follows_local(&self, pet_id: i32) -> bool {
+        let Some(track) = self.pet_tracks.get(&pet_id) else {
+            return true;
+        };
+        match track
+            .votes
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        {
+            Some((&owner, &votes)) if votes > 0 => owner == self.local_object_id,
+            _ => true,
+        }
     }
 
     /// The summons an activation of the local player's loadout can spawn, as
@@ -12533,6 +12563,48 @@ mod tests {
         t.local_summons.get_mut(&900).unwrap().y = 1.0;
         t.on_object_removed(900, 200);
         assert_eq!(t.local_summon_attacking(500, 150), None);
+    }
+
+    #[test]
+    fn a_teammates_damage_pet_cannot_claim_the_local_players_packets() {
+        // In a group every pet stands near someone. Proximity alone made the
+        // nearest damage-capable pet the local player's, so a teammate's pet beside
+        // them claimed the local player's own unattributed packets: a fight whose
+        // only pet of theirs was a Decoy pet still grew a pet row worth 943 damage,
+        // which was really a teammate's Great Jelly standing nearby.
+        let mut t = pet_packet_tracker(&[], 0);
+        // A teammate (a Necromancer) with their Electric pet at their side; the
+        // local player is at the origin, well inside pet range of it.
+        t.on_object_spawn(
+            600,
+            0x0321,
+            &status_at(600, 1.0, 1.0, vec![name_stat("Friend")]),
+            0,
+        );
+        t.on_object_spawn(
+            901,
+            0x9999,
+            &status_at(
+                901,
+                1.0,
+                2.0,
+                vec![
+                    stat(StatType::PetType, 32_645),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        assert_eq!(
+            t.pet_tracks.get(&901).map(|p| p.votes.clone()),
+            Some(HashMap::from([(600, 1)])),
+            "the pet follows the teammate, not the local player"
+        );
+        assert_eq!(
+            t.damage_capable_pet_near_local(),
+            None,
+            "a teammate's pet is not the local player's, however close it stands"
+        );
     }
 
     #[test]

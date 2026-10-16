@@ -2933,6 +2933,30 @@ impl CombatTracker {
         out
     }
 
+    /// Whether the engine knows `shooter_id` as a creature of the local player's: a
+    /// summon whose ownership it learned from the summon's own shoot packet, a
+    /// creature it has watched as the local player's summon in the world, or the pet
+    /// the character cache names.
+    fn knows_local_creature(&self, shooter_id: i32) -> bool {
+        if self.summon_owners.get(&shooter_id) == Some(&self.local_object_id) {
+            return true;
+        }
+        if self.local_summons.contains_key(&shooter_id) {
+            return true;
+        }
+        let Some(o) = self.objects.get(&shooter_id) else {
+            return false;
+        };
+        if !o.is_pet || o.pet_type == 0 {
+            return false;
+        }
+        let mine = self.local_snapshot.pet_type;
+        if mine != 0 {
+            return o.pet_type == mine;
+        }
+        self.pet_follows_local(shooter_id)
+    }
+
     /// The identity of a pet credited to the local player: the skin the character
     /// cache reports, which is what ATTRIBUTES draws and names. The wire carries
     /// the pet's *type* id, which is not a sprite, so it is only the fallback for
@@ -3700,7 +3724,14 @@ impl CombatTracker {
         // tracked separately: the owner's row keeps it in the totals (the game
         // attributes it to the player) but not in the owner's per-hit average or
         // per-loadout buckets.
-        let is_summon = shooter_id != local_id;
+        //
+        // That holds only for a creature the engine actually knows is theirs. A
+        // secondary projectile names a shooter id that can belong to an object that
+        // is no creature of the player's at all -- ids are reused as objects despawn
+        // -- and reading that object's identity as the source invented pet rows out
+        // of other players' pets (a Battle God, a Poison Drake) hit by nobody's pet
+        // (see `Self::knows_local_creature`). Anything else is the player's own hit.
+        let is_summon = shooter_id != local_id && self.knows_local_creature(shooter_id);
         let (summon_pet_type, summon_is_pet, summon_object_type) = if is_summon {
             self.objects
                 .get(&shooter_id)
@@ -12691,6 +12722,44 @@ mod tests {
             Some(902),
             "the pet the cache names is the one that can claim"
         );
+    }
+
+    #[test]
+    fn a_shooter_that_is_no_creature_of_mine_is_my_own_hit() {
+        // A secondary projectile names a shooter id that can belong to an object that
+        // is no creature of the player's -- ids are reused as objects despawn -- and
+        // reading that object as the source invented pet rows out of other players'
+        // pets: rows for a Battle God, a Poison Drake, a Great Jelly, none of them
+        // the player's, on the player's own row.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.set_local_snapshot(false, false, 24_724, 32_548);
+        t.on_object_spawn(
+            700,
+            0x9999,
+            &status_at(
+                700,
+                3.0,
+                3.0,
+                vec![
+                    stat(StatType::PetType, 32_645),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        // The local player's own hit, reported with that pet's id as its shooter.
+        t.on_local_hit(500, 5, 700, 1000, 10);
+        let accum = t
+            .fights
+            .get(&500)
+            .and_then(|f| f.attackers.get(&1000))
+            .expect("the local player's row");
+        assert!(
+            accum.summons.is_empty(),
+            "no creature of the local player's fired this shot"
+        );
+        assert_eq!((accum.summon_damage, accum.summon_hits), (0, 0));
+        assert_eq!(accum.hits, 1, "it stays a hit of theirs");
     }
 
     #[test]

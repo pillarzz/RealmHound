@@ -19,6 +19,7 @@ pub use collections::{
     dungeon_tracked, get_dungeon_list, Dungeon, DungeonCollection, ALL_DUNGEONS,
     DUNGEON_COLLECTIONS, UNTRACKED_DUNGEON_TOOLTIP,
 };
+pub use derived::{shot_damage_bonus, ShotDamageBonus};
 pub use dungeon_collection::{
     build_all_collections, build_collection_for_dungeon, is_sectioned_dungeon, CollectionItem,
     CollectionSection, DungeonCollectionDef, ItemGroup,

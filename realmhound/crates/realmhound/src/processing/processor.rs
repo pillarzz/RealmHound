@@ -17,9 +17,9 @@ use realmhound_core::{
     protocol::{ip_to_server_name, parse_packet_with_status, Packet, ParsedPacket},
     session::{AccountVerifyResult, HelloAction},
     stats::{
-        extract_account_identity, extract_encounter_spawns, extract_inventory_changes,
-        extract_pet_identity, extract_pet_inventory_updates, parse_player_appearance,
-        parse_player_inventory,
+        exalt_proficiency::mastery_dmg_tenths, extract_account_identity, extract_encounter_spawns,
+        extract_inventory_changes, extract_pet_identity, extract_pet_inventory_updates,
+        parse_player_appearance, parse_player_inventory, shot_damage_bonus, ShotDamageBonus,
     },
     stream::{parse_tcp_segment, ConnectionKey, TcpReassembler},
     vault::{
@@ -967,6 +967,10 @@ impl PacketProcessor {
                 }
                 self.account_data.characters.exaltation_stats = data.exaltation_stats;
                 self.account_data.characters.account_accelerators = data.accelerators;
+                // A refresh can change this character's class, exaltations,
+                // crucible marker or ritual tier; the engine needs the new
+                // multipliers before the next hit.
+                self.sync_shot_damage_bonus();
                 self.account_data.max_num_chars = data.max_num_chars;
                 self.account_data.next_char_slot_price = data.next_char_slot_price;
                 self.account_data.owned_skins_count = data.owned_skins_count;
@@ -1247,6 +1251,39 @@ impl PacketProcessor {
                 }
             }
         }
+    }
+
+    /// Push the live character's shot damage multipliers into the combat engine:
+    /// the class mastery from exaltations and the seasonal challenge multipliers
+    /// (Crucible x Blood Ritual tier). None of these ride the wire during a fight,
+    /// so the engine can only learn them from here; resolving them through the
+    /// same helper the theoretical DPS page uses is what keeps the two readouts
+    /// on the same numbers (issue #64).
+    fn sync_shot_damage_bonus(&mut self) {
+        let bonus = self
+            .live_char_id
+            .and_then(|char_id| self.account_data.characters.find_character(char_id))
+            .map(|ch| {
+                let cache = &self.account_data.characters;
+                let mastery_dmg_pct = cache
+                    .exaltation_stats
+                    .get(&(ch.class_id as i32))
+                    .map(|ex| mastery_dmg_tenths(ex) as f32 / 10.0)
+                    .unwrap_or(0.0);
+                // The Crucible season buffs apply only to characters carrying
+                // the marker, exactly as the character panel reads them.
+                let crucible = ch
+                    .crucible_active
+                    .then(|| cache.active_crucible.as_ref())
+                    .flatten();
+                shot_damage_bonus(
+                    mastery_dmg_pct,
+                    crucible,
+                    cache.blood_ritual_for_char(ch.char_id).as_ref(),
+                )
+            })
+            .unwrap_or_else(ShotDamageBonus::none);
+        self.combat.set_shot_damage_bonus(bonus);
     }
 
     /// Merge the local player's stats from a status snapshot/delta into the raw
@@ -2043,6 +2080,7 @@ impl PacketProcessor {
                 self.account_data
                     .characters
                     .update_crucible_status(char_id, is_active);
+                self.sync_shot_damage_bonus();
                 self.account_data.mark_dirty();
                 self.char_view_gen += 1;
             }
@@ -2059,6 +2097,7 @@ impl PacketProcessor {
             }
             GameEvent::CrucibleDefinitionsReceived(ref defs) => {
                 if self.account_data.characters.set_crucible_defs(defs.clone()) {
+                    self.sync_shot_damage_bonus();
                     self.account_data.mark_dirty();
                     self.char_view_gen += 1;
                 }
@@ -2069,6 +2108,7 @@ impl PacketProcessor {
                     .characters
                     .set_blood_ritual_defs(defs.clone())
                 {
+                    self.sync_shot_damage_bonus();
                     self.account_data.mark_dirty();
                     self.char_view_gen += 1;
                 }
@@ -2093,6 +2133,7 @@ impl PacketProcessor {
                             .characters
                             .exaltation_stats
                             .insert(class_type, exaltation.clone());
+                        self.sync_shot_damage_bonus();
                         self.account_data.mark_dirty();
                         self.char_view_gen += 1;
                     }
@@ -2222,6 +2263,9 @@ impl PacketProcessor {
 
                 // Mark as live character
                 self.live_char_id = Some(char_id);
+                // The combat engine reads the mastery/seasonal shot multipliers
+                // from the character data, so it needs them for this character.
+                self.sync_shot_damage_bonus();
                 // Fresh character: drop any prior character's accumulated stats so
                 // base = stat - boost is derived from this character's snapshot.
                 self.live_stat_raw.clear();
@@ -2711,6 +2755,7 @@ impl PacketProcessor {
                                     .characters
                                     .set_live_blood_ritual(self.live_char_id, id)
                                 {
+                                    self.sync_shot_damage_bonus();
                                     self.account_data.mark_dirty();
                                     self.char_view_gen += 1;
                                 }
@@ -3011,6 +3056,7 @@ impl PacketProcessor {
                                     .characters
                                     .set_live_blood_ritual(self.live_char_id, id)
                                 {
+                                    self.sync_shot_damage_bonus();
                                     self.account_data.mark_dirty();
                                     self.char_view_gen += 1;
                                 }

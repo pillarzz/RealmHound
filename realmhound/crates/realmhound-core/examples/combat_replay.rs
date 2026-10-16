@@ -54,6 +54,19 @@ fn main() {
 
     let mut reassembler = TcpReassembler::new();
     let mut tracker = CombatTracker::new();
+
+    // Optional: the shot multipliers the client applies to its own weapon rolls
+    // (exaltation mastery x the seasonal challenge multipliers). In the live app
+    // they come from the character cache; an offline replay has no cache, so pass
+    // them here -- `combat_replay <capture> [mastery] [challenge]`.
+    if let (Some(mastery), Some(challenge)) = (
+        std::env::args().nth(2).and_then(|v| v.parse::<f32>().ok()),
+        std::env::args().nth(3).and_then(|v| v.parse::<f32>().ok()),
+    ) {
+        println!("shot_damage_bonus: mastery={mastery} challenge={challenge}");
+        tracker
+            .set_shot_damage_bonus(realmhound_core::stats::ShotDamageBonus { mastery, challenge });
+    }
     let mut finished: Vec<CompletedFight> = Vec::new();
 
     // Synthetic monotonic clock (ms). Real timestamps are per-packet but the

@@ -15,6 +15,63 @@ use crate::assets::{
 };
 use crate::combat::damage::damage_with_defense;
 
+/// The damage multipliers the game applies to a *rolled weapon shot* on top of
+/// the Attack stat: the class mastery earned from exaltations, and the season's
+/// challenge multipliers (the Crucible's damage bonus times the active Blood
+/// Ritual tier's).
+///
+/// These are not part of the packet stream, so both consumers have to be handed
+/// them: the theoretical DPS readout on the character page, and the live combat
+/// engine that reconstructs the player's own damage. They share
+/// [`shot_damage_bonus`] so the two cannot disagree -- which they did once: the
+/// page folded a +24% Blood Ritual and the mastery in while Combat History
+/// credited the raw roll, and every staff hit in a fight came out ~20% low.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShotDamageBonus {
+    /// `1 + mastery_dmg_pct / 100`: the Exaltation Mastery weapon-damage bonus.
+    pub mastery: f32,
+    /// Crucible damage multiplier times the Blood Ritual tier's (1.0 when
+    /// neither is active, so it is a no-op by default).
+    pub challenge: f32,
+}
+
+impl Default for ShotDamageBonus {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl ShotDamageBonus {
+    /// No multiplier at all: what an unknown character (or a pre-season one)
+    /// gets, and the neutral default for the combat engine.
+    pub fn none() -> Self {
+        Self {
+            mastery: 1.0,
+            challenge: 1.0,
+        }
+    }
+
+    /// Both factors together, as the single multiplier the shot's rolled range
+    /// is scaled by.
+    pub fn total(&self) -> f32 {
+        self.mastery * self.challenge
+    }
+}
+
+/// Resolve the shot damage multipliers from the character's mastery percentage
+/// and the seasonal definitions that apply to them.
+pub fn shot_damage_bonus(
+    mastery_dmg_pct: f32,
+    crucible: Option<&CrucibleDef>,
+    blood_ritual: Option<&BloodRitualDef>,
+) -> ShotDamageBonus {
+    ShotDamageBonus {
+        mastery: 1.0 + mastery_dmg_pct / 100.0,
+        challenge: crucible.map(|c| c.damage_mult).unwrap_or(1.0)
+            * blood_ritual.map(|r| r.damage_mult).unwrap_or(1.0),
+    }
+}
+
 /// The eight base character stats (leveled/pot stats, WITHOUT gear or enchants).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BaseStats {
@@ -1070,10 +1127,20 @@ fn derive_weapon(
     let (min_damage, max_damage, armor_piercing, _slot) = assets.weapon_projectile(weapon_id, 0)?;
     let (rof, num) = assets.weapon_fire(weapon_id).unwrap_or((1.0, 1));
 
-    let mastery = 1.0 + loadout.mastery_dmg_pct / 100.0;
-    // Seasonal challenge multipliers scale the weapon's rolled damage: the
-    // Crucible's damage bonus and the Blood Ritual tier's damage bonus/penalty.
-    // Both multiply the shot, so they compose, and neither is tied to gear.
+    // Damage multipliers the game applies to the rolled shot on top of the
+    // Attack stat: the class mastery from exaltations, and the seasonal
+    // challenge multipliers (Crucible x Blood Ritual tier). Both this readout
+    // and the live combat engine take them from `shot_damage_bonus`, so Combat
+    // History can never credit a different number than the theoretical page.
+    let shot_bonus = shot_damage_bonus(
+        loadout.mastery_dmg_pct,
+        loadout.crucible.as_ref(),
+        loadout.blood_ritual.as_ref(),
+    );
+    let mastery = shot_bonus.mastery;
+    let challenge_mult = shot_bonus.challenge;
+    // The Blood Ritual's own share, kept apart so the readout can name it: it is
+    // negative on the penalty tiers.
     let blood_ritual_pct = loadout
         .blood_ritual
         .as_ref()
@@ -1085,16 +1152,6 @@ fn derive_weapon(
         .exalt_damage_bonus
         .map(|points| (points as f32 / 1000.0 - 1.0) * 100.0)
         .unwrap_or(0.0);
-    let challenge_mult = loadout
-        .crucible
-        .as_ref()
-        .map(|c| c.damage_mult)
-        .unwrap_or(1.0)
-        * loadout
-            .blood_ritual
-            .as_ref()
-            .map(|r| r.damage_mult)
-            .unwrap_or(1.0);
     let bmin =
         ((min_damage as f32 * dmg_min_mult).round() * mastery * challenge_mult).floor() as i32;
     let bmax =
@@ -2615,6 +2672,76 @@ mod tests {
         let bmin = ((165.0f32 * 1.0).round() * mastery).floor() as i32;
         let bmax = ((205.0f32 * 1.0).round() * mastery).floor() as i32;
         assert_eq!((bmin, bmax), (181, 225));
+    }
+
+    /// The Blood Ritual's tier-1 definition ("+24% Damage"), the one the capture
+    /// evidence for the shot-bonus fix was measured against.
+    fn ritual_tier1() -> BloodRitualDef {
+        BloodRitualDef {
+            id: "5027802235043840".into(),
+            tier: 1,
+            hp_mult: 0.8,
+            damage_mult: 1.24,
+            loot_pct: 25.0,
+        }
+    }
+
+    #[test]
+    fn shot_damage_bonus_folds_mastery_and_challenge() {
+        // Nothing known: a neutral multiplier, so a character with no exalt
+        // mastery and no seasonal challenge keeps the raw roll.
+        assert_eq!(shot_damage_bonus(0.0, None, None), ShotDamageBonus::none());
+        assert_eq!(shot_damage_bonus(0.0, None, None).total(), 1.0);
+        // +10% mastery alone.
+        assert_eq!(shot_damage_bonus(10.0, None, None).mastery, 1.1);
+        // A Crucible with no damage bonus leaves the challenge factor to the
+        // ritual tier; the two compound when both apply.
+        let crucible = CrucibleDef {
+            damage_mult: 1.0,
+            ..Default::default()
+        };
+        let bonus = shot_damage_bonus(10.0, Some(&crucible), Some(&ritual_tier1()));
+        assert_eq!(bonus.mastery, 1.1);
+        assert!(
+            (bonus.challenge - 1.24).abs() < 1e-6,
+            "{:?}",
+            bonus.challenge
+        );
+        assert!((bonus.total() - 1.364).abs() < 1e-6, "{:?}", bonus.total());
+        let penalty = BloodRitualDef {
+            damage_mult: 0.78,
+            ..ritual_tier1()
+        };
+        assert!((shot_damage_bonus(0.0, None, Some(&penalty)).total() - 0.78).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shot_bonus_scales_the_readout_and_the_engine_alike() {
+        // Combat History credits a weapon hit by rolling inside the range the
+        // theoretical page prints, so both must scale it identically. They did
+        // not once: the page folded mastery and the seasonal multipliers in while
+        // the engine rolled the raw weapon range, and every staff hit in a fight
+        // came out ~25% low. Wand of Retribution 165-205 at +10% mastery and a
+        // +24% ritual thus reads 225-279 on both sides.
+        let bonus = shot_damage_bonus(10.0, None, Some(&ritual_tier1()));
+        let bmin = ((165.0f32 * 1.0).round() * bonus.mastery * bonus.challenge).floor() as i32;
+        let bmax = ((205.0f32 * 1.0).round() * bonus.mastery * bonus.challenge).floor() as i32;
+        assert_eq!((bmin, bmax), (225, 279));
+
+        let atk = crate::combat::damage::AttackerStats {
+            mastery_mult: bonus.mastery,
+            challenge_mult: bonus.challenge,
+            ..Default::default()
+        };
+        // A fixed-damage shot (min == max, no roll) is exactly the scaled
+        // endpoint, so the engine's arithmetic is comparable value for value.
+        // Ability slot 10 keeps the attack multiplier out of it.
+        let mut rng = crate::combat::damage::Rng::new(1);
+        for (base, expected) in [(165, bmin), (205, bmax)] {
+            let rolled =
+                crate::combat::damage::roll_base_damage(&mut rng, base, base, 1.0, 1.0, 10, &atk);
+            assert_eq!(rolled, expected, "engine disagrees at base {base}");
+        }
     }
 
     #[test]

@@ -246,6 +246,15 @@ impl CombatManager {
         self.tracker.on_player_loaded(object_id, char_id);
     }
 
+    /// Set the local player's shot damage multipliers (exaltation mastery x the
+    /// seasonal Crucible/Blood Ritual multipliers). The app resolves them from
+    /// the character's data and must push them on character load and whenever
+    /// the mastery or the seasonal definitions change, because they never appear
+    /// in the packet stream the combat engine reads.
+    pub fn set_shot_damage_bonus(&mut self, bonus: crate::stats::derived::ShotDamageBonus) {
+        self.tracker.set_shot_damage_bonus(bonus);
+    }
+
     /// Entered a new map.
     pub fn on_map_change(&mut self, map_name: &str, map_seed: i32, time_ms: i64) {
         let finished = self.tracker.on_map_change(map_name, map_seed, time_ms);

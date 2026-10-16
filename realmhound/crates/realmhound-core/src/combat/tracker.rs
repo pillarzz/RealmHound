@@ -515,6 +515,10 @@ impl TrackedObject {
             attack: self.attack,
             condition: self.condition,
             exalt_bonus: self.exalt_bonus,
+            // Mastery and the seasonal challenge multipliers are character data,
+            // not object stats, so they are not known here; `on_local_shot` fills
+            // them from the tracker (see `set_shot_damage_bonus`).
+            ..Default::default()
         }
     }
 }
@@ -858,6 +862,14 @@ pub struct CombatTracker {
     dungeon_entered_at: Option<i64>,
     /// Local player's object id (0 until known).
     local_object_id: i32,
+    /// Mastery and seasonal challenge damage multipliers applied to the local
+    /// player's rolled weapon shots. Character data, not packets: the app pushes
+    /// them with [`CombatTracker::set_shot_damage_bonus`], resolved through
+    /// [`crate::stats::derived::shot_damage_bonus`] -- the same helper the
+    /// theoretical DPS page uses, so Combat History and that page cannot
+    /// disagree about what the player's own shot is worth. Neutral (1.0) until
+    /// set, which reproduces the pre-existing numbers exactly.
+    shot_damage_bonus: crate::stats::derived::ShotDamageBonus,
     /// Local player's character id / char_id (0 until known). Stamped onto each
     /// fight when it begins so the UI can filter by character.
     local_char_id: i32,
@@ -1103,6 +1115,7 @@ impl CombatTracker {
             dungeon_entered_at: None,
             local_object_id: 0,
             local_char_id: 0,
+            shot_damage_bonus: crate::stats::derived::ShotDamageBonus::none(),
             objects: HashMap::new(),
             fights: HashMap::new(),
             aux_fights: HashMap::new(),
@@ -1158,6 +1171,15 @@ impl CombatTracker {
             shatters_bridge_engaged: false,
             shatters_hm_named: HashSet::new(),
         }
+    }
+
+    /// Set the local player's shot damage multipliers (exaltation mastery times
+    /// the seasonal challenge multipliers). The app derives them from the
+    /// character's own data with [`crate::stats::derived::shot_damage_bonus`],
+    /// the same helper the theoretical DPS page uses. Until they are set the
+    /// engine runs neutral, i.e. exactly as it did before they existed.
+    pub fn set_shot_damage_bonus(&mut self, bonus: crate::stats::derived::ShotDamageBonus) {
+        self.shot_damage_bonus = bonus;
     }
 
     /// Recently completed fights held in memory.
@@ -2837,7 +2859,16 @@ impl CombatTracker {
             self.self_damage_available = false;
             return;
         }
-        let atk = local.attacker_stats();
+        // Mastery and the seasonal Crucible/Blood Ritual multipliers are
+        // character data rather than object stats, so they are folded in from the
+        // tracker (see `set_shot_damage_bonus`) -- the game scales the weapon's
+        // whole damage range by them, and the server-side spell values the
+        // ability rows use already include them.
+        let atk = AttackerStats {
+            mastery_mult: self.shot_damage_bonus.mastery,
+            challenge_mult: self.shot_damage_bonus.challenge,
+            ..local.attacker_stats()
+        };
         let lethal_strike = self.lethal_strike_snapshot();
 
         let proj_index = if projectile_id < 0 {
@@ -6190,6 +6221,30 @@ mod tests {
             !t.self_damage_available,
             "missing attack stat disables self-damage"
         );
+    }
+
+    #[test]
+    fn shot_damage_bonus_defaults_neutral_and_is_settable() {
+        // The engine must start at the raw roll (what every pre-fix fight was
+        // credited with) and take whatever the character data resolves to. The
+        // roll arithmetic itself is covered in damage.rs; this pins the plumbing
+        // the app pushes through.
+        let mut t = CombatTracker::new();
+        assert_eq!(
+            t.shot_damage_bonus,
+            crate::stats::ShotDamageBonus::none(),
+            "a new tracker applies no shot multiplier"
+        );
+        let bonus = crate::stats::ShotDamageBonus {
+            mastery: 1.1,
+            challenge: 1.24,
+        };
+        t.set_shot_damage_bonus(bonus);
+        assert_eq!(t.shot_damage_bonus, bonus);
+        assert!((t.shot_damage_bonus.total() - 1.364).abs() < 1e-6);
+        // Back to neutral: the pre-fix numbers exactly.
+        t.set_shot_damage_bonus(crate::stats::ShotDamageBonus::none());
+        assert_eq!(t.shot_damage_bonus.total(), 1.0);
     }
 
     #[test]

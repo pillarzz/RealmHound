@@ -5176,6 +5176,143 @@ mod new_selected_tests {
 }
 
 #[cfg(test)]
+mod shot_bonus_tests {
+    use std::sync::{Arc, RwLock};
+
+    use realmhound_core::api::blood_ritual::BloodRitualDef;
+    use realmhound_core::api::crucible::CrucibleDef;
+    use realmhound_core::api::ClassExaltation;
+    use realmhound_core::stats::ShotDamageBonus;
+    use realmhound_core::vault::{AccountData, AccountDataRepository, CachedCharacter};
+    use realmhound_core::Settings;
+
+    use super::PacketProcessor;
+
+    /// A processor over a throwaway profile, plus the character cache it can be
+    /// fed. Same construction the other processor tests use.
+    fn processor() -> (tempfile::TempDir, PacketProcessor) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = AccountDataRepository::for_profile(temp.path().join("account_data.json"));
+        let processor = PacketProcessor::new_selected(
+            Arc::new(RwLock::new(Settings::default())),
+            AccountData::new(),
+            repo,
+            temp.path().join("loot_history.db"),
+            temp.path().join("combat_history.db"),
+            None,
+            None,
+        )
+        .expect("writers open for a valid profile");
+        (temp, processor)
+    }
+
+    /// A fully-exalted class: every stat at raw 50+ -> exalt level 5 -> Mastery
+    /// level 4 -> +10% weapon damage.
+    fn maxed_exalt(class_type: i32) -> ClassExaltation {
+        ClassExaltation {
+            class_type,
+            attack: 108,
+            defense: 164,
+            speed: 76,
+            dexterity: 103,
+            vitality: 99,
+            wisdom: 131,
+            hp: 80,
+            mp: 78,
+        }
+    }
+
+    fn ritual_tier1() -> BloodRitualDef {
+        BloodRitualDef {
+            id: "5027802235043840".into(),
+            tier: 1,
+            hp_mult: 0.8,
+            damage_mult: 1.24,
+            loot_pct: 25.0,
+        }
+    }
+
+    #[test]
+    fn pushes_the_characters_mastery_and_ritual_into_the_engine() {
+        // This is the whole point of the push: the engine reconstructs the
+        // player's own weapon damage and cannot see any of these three inputs in
+        // the packet stream. When the character is not known the engine must stay
+        // neutral rather than apply a stale bonus from a previously loaded one.
+        let (_temp, mut processor) = processor();
+        assert_eq!(
+            processor.combat.shot_damage_bonus(),
+            ShotDamageBonus::none(),
+            "no live character yet: neutral"
+        );
+
+        processor.live_char_id = Some(2538);
+        processor.sync_shot_damage_bonus();
+        assert_eq!(
+            processor.combat.shot_damage_bonus(),
+            ShotDamageBonus::none(),
+            "unknown character: still neutral"
+        );
+
+        let character = CachedCharacter {
+            char_id: 2538,
+            class_id: 819,
+            crucible_active: true,
+            ..Default::default()
+        };
+        let cache = &mut processor.account_data.characters;
+        cache.characters.push(character);
+        cache.exaltation_stats.insert(819, maxed_exalt(819));
+        cache.active_crucible = Some(CrucibleDef {
+            // The season's Crucible carries no damage bonus of its own.
+            damage_mult: 1.0,
+            ..Default::default()
+        });
+        cache.set_blood_ritual_defs(vec![ritual_tier1()]);
+        cache.blood_ritual_by_char.insert(2538, ritual_tier1().id);
+
+        processor.sync_shot_damage_bonus();
+        let bonus = processor.combat.shot_damage_bonus();
+        assert_eq!(bonus.mastery, 1.1, "class mastery from exaltations");
+        assert!((bonus.challenge - 1.24).abs() < 1e-6, "{bonus:?}");
+        assert!((bonus.total() - 1.364).abs() < 1e-6, "{bonus:?}");
+    }
+
+    #[test]
+    fn crucible_and_ritual_compound_and_the_marker_gates_the_crucible() {
+        let (_temp, mut processor) = processor();
+        processor.live_char_id = Some(7);
+        let cache = &mut processor.account_data.characters;
+        cache.characters.push(CachedCharacter {
+            char_id: 7,
+            class_id: 768,
+            crucible_active: false,
+            ..Default::default()
+        });
+        cache.active_crucible = Some(CrucibleDef {
+            damage_mult: 1.15,
+            ..Default::default()
+        });
+
+        // Not a Crucible character: the seasonal bonus must not apply.
+        processor.sync_shot_damage_bonus();
+        assert!((processor.combat.shot_damage_bonus().challenge - 1.0).abs() < 1e-6);
+
+        processor
+            .account_data
+            .characters
+            .find_character_mut(7)
+            .unwrap()
+            .crucible_active = true;
+        processor.sync_shot_damage_bonus();
+        assert!(
+            (processor.combat.shot_damage_bonus().challenge - 1.15).abs() < 1e-6,
+            "{:?}",
+            processor.combat.shot_damage_bonus()
+        );
+    }
+}
+
+#[cfg(test)]
 mod shutdown_tests {
     use std::sync::{Arc, RwLock};
 

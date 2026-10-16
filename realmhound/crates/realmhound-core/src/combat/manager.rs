@@ -255,6 +255,11 @@ impl CombatManager {
         self.tracker.set_shot_damage_bonus(bonus);
     }
 
+    /// The shot damage multipliers currently applied to self-computed shots.
+    pub fn shot_damage_bonus(&self) -> crate::stats::derived::ShotDamageBonus {
+        self.tracker.shot_damage_bonus()
+    }
+
     /// Entered a new map.
     pub fn on_map_change(&mut self, map_name: &str, map_seed: i32, time_ms: i64) {
         let finished = self.tracker.on_map_change(map_name, map_seed, time_ms);

@@ -1182,6 +1182,12 @@ impl CombatTracker {
         self.shot_damage_bonus = bonus;
     }
 
+    /// The shot damage multipliers currently applied to self-computed shots.
+    /// Neutral (1.0/1.0) until the app pushes the character's values.
+    pub fn shot_damage_bonus(&self) -> crate::stats::derived::ShotDamageBonus {
+        self.shot_damage_bonus
+    }
+
     /// Recently completed fights held in memory.
     pub fn recent_fights(&self) -> &[CompletedFight] {
         &self.recent_fights

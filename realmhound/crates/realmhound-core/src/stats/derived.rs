@@ -800,6 +800,16 @@ const ATTACK_FAR_POWER: &[(i32, f32)] = &[
 const ELECTRIC_POWER: &[(i32, f32)] =
     &[(1, 5.0), (30, 20.0), (50, 54.0), (70, 117.0), (100, 200.0)];
 
+/// Whether a pet ability deals damage at all. The ids are the ability object
+/// types in `pets.xml`: `Attack Close` 0x192, `Attack Mid` 0x194, `Attack Far`
+/// 0x195 and `Electric` 0x196 (group `Shoot Attack` / `AOE Attack`). `Savage`
+/// (0x199) only runs the pet at nearby enemies -- its own base behavior declares
+/// tiles and frequency, no projectile and no damage -- so a pet whose abilities
+/// are Savage plus heals deals none.
+pub fn pet_ability_deals_damage(ability_type: i32) -> bool {
+    matches!(ability_type, 402 | 404 | 405 | 406)
+}
+
 fn pet_contribution(ability_type: i32, level: i32) -> PetAbilityContribution {
     let mut c = PetAbilityContribution {
         ability_type,
@@ -820,12 +830,25 @@ fn pet_contribution(ability_type: i32, level: i32) -> PetAbilityContribution {
             // Magic Heal
             c.mp_per_sec = interp(MAGIC_HEAL_AMOUNT, level) / interp(HEAL_DELAY, level);
         }
-        404 => c.dps = interp(ATTACK_CLOSE_POWER, level) / interp(ATTACK_FREQ, level),
-        405 => c.dps = interp(ATTACK_MID_POWER, level) / interp(ATTACK_FREQ, level),
-        409 => c.dps = interp(ATTACK_FAR_POWER, level) / interp(ATTACK_FREQ, level),
+        // Damage abilities, keyed by the ability object ids `pets.xml` declares
+        // (`Attack Close` 0x192, `Attack Mid` 0x194, `Attack Far` 0x195,
+        // `Electric` 0x196). Grouping follows each object's own description:
+        // Close deals heavy, Mid medium, Far light damage.
+        402 => c.dps = interp(ATTACK_CLOSE_POWER, level) / interp(ATTACK_FREQ, level),
+        404 => c.dps = interp(ATTACK_MID_POWER, level) / interp(ATTACK_FREQ, level),
+        405 => c.dps = interp(ATTACK_FAR_POWER, level) / interp(ATTACK_FREQ, level),
         406 => c.dps = interp(ELECTRIC_POWER, level) / interp(ATTACK_FREQ, level),
+        // 409 Savage, 410 Decoy and 407/408 carry no damage of their own: Savage
+        // only runs the pet at nearby enemies (`pets.xml`: "increase its frequency
+        // and range", base behavior parameters are tiles and frequency only), so a
+        // pet with no attack ability above deals nothing.
         _ => {}
     }
+    debug_assert_eq!(
+        c.dps > 0.0,
+        pet_ability_deals_damage(ability_type) && level > 0,
+        "damage abilities and the predicate must agree"
+    );
     c
 }
 
@@ -2582,6 +2605,30 @@ mod tests {
         // Magic heal level 30 = 3 MP / 3.82s.
         let m = pet_contribution(408, 30);
         assert!((m.mp_per_sec - 3.0 / 3.82).abs() < 1e-3);
+    }
+
+    #[test]
+    fn pet_damage_abilities_use_the_game_ability_ids() {
+        // Ability ids are the object types in `pets.xml`: Attack Close 0x192,
+        // Attack Mid 0x194, Attack Far 0x195, Electric 0x196, Savage 0x199.
+        let close = pet_contribution(402, 90).dps;
+        let mid = pet_contribution(404, 90).dps;
+        let far = pet_contribution(405, 90).dps;
+        let electric = pet_contribution(406, 90).dps;
+        assert!(close > 0.0 && mid > 0.0 && far > 0.0 && electric > 0.0);
+        // Close deals heavy, mid medium, far light.
+        assert!(close > mid && mid > far);
+        // Savage only moves the pet at enemies, so it adds no damage of its own
+        // -- a pet whose other slots are heal/magic heal deals none at all.
+        assert_eq!(pet_contribution(409, 100).dps, 0.0);
+        assert_eq!(pet_contribution(409, 100).hp_per_sec, 0.0);
+        for ability in [407, 408, 409, 410] {
+            assert_eq!(pet_contribution(ability, 100).dps, 0.0, "ability {ability}");
+            assert!(!pet_ability_deals_damage(ability));
+        }
+        for ability in [402, 404, 405, 406] {
+            assert!(pet_ability_deals_damage(ability));
+        }
     }
 
     #[test]

@@ -829,6 +829,18 @@ pub struct SummonSource {
     pub trigger: SummonTrigger,
     /// Proc chance when the XML declares one (`proc`), otherwise 1.0 for a use.
     pub chance: f32,
+    /// Whether the item's own effect text says this summon deals damage.
+    ///
+    /// The game states a summon's damage in prose, not in an attribute: Sage's
+    /// Wakibiki reads "Summon a Friendly Spirit which slows enemies and zaps them
+    /// for 150 damage/sec", where the Marble Seal's Eye of Marble is only
+    /// "Summon an Eye of Marble for 4.5 seconds" because it buffs allies instead
+    /// of hurting anything. This flag is what keeps a buffing totem from taking
+    /// credit for a spirit's hits. A summon whose text never claims damage is
+    /// simply not credited packet damage -- its figure stays in the fight's
+    /// unattributed packet total rather than landing on a row that cannot deal
+    /// it.
+    pub deals_damage: bool,
 }
 /// A summoned creature (`SpawnCreep`): spawns an entity that attacks enemies
 /// for its lifetime (Summoner maces, some UTs).
@@ -3017,6 +3029,10 @@ impl ObjectList {
             let mut is_item = false;
             let mut item_name = String::new();
             let mut in_display_id = false;
+            // Whether the item's own effect text claims its summon deals damage
+            // (see `SummonSource::deals_damage`). Applied to every link this
+            // object declares when it ends, so element order cannot matter.
+            let mut mentions_damage = false;
             // Trigger, proc chance and the entity name of the activate element the
             // reader is inside, whose text names the effect.
             let mut pending: Option<(SummonTrigger, f32, String)> = None;
@@ -3033,6 +3049,7 @@ impl ObjectList {
                             item_type = None;
                             item_name.clear();
                             found.clear();
+                            mentions_damage = false;
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
                                     b"id" => {
@@ -3048,6 +3065,11 @@ impl ObjectList {
                         }
                         b"DisplayId" => in_display_id = true,
                         b"SlotType" => is_item = true,
+                        b"EffectInfo" => {
+                            if effect_text_mentions_damage(e) {
+                                mentions_damage = true;
+                            }
+                        }
                         name => {
                             if in_object {
                                 if let Some(trigger) = SummonTrigger::from_element(name) {
@@ -3072,6 +3094,11 @@ impl ObjectList {
                             }
                         }
                     },
+                    Ok(Event::Empty(ref e)) if e.name().as_ref() == b"EffectInfo" => {
+                        if effect_text_mentions_damage(e) {
+                            mentions_damage = true;
+                        }
+                    }
                     Ok(Event::Text(ref t)) => {
                         let text = t.unescape().unwrap_or_default().to_string();
                         if in_display_id {
@@ -3092,6 +3119,7 @@ impl ObjectList {
                                             item_name: item_name.clone(),
                                             trigger,
                                             chance,
+                                            deals_damage: false,
                                         },
                                     ));
                                 }
@@ -3104,14 +3132,17 @@ impl ObjectList {
                             in_object = false;
                             pending = None;
                             if is_item {
-                                for (entity_type, source) in found.drain(..) {
-                                    let list = self.summon_sources.entry(entity_type).or_default();
+                                for (entity_type, mut source) in found.drain(..) {
+                                    source.deals_damage = mentions_damage;
+                                    let list =
+                                        self.summon_sources.entry(entity_type).or_default();
                                     if !list.contains(&source) {
                                         list.push(source);
                                         added += 1;
                                     }
                                 }
                             }
+                            mentions_damage = false;
                         }
                         _ => {}
                     },
@@ -3154,6 +3185,20 @@ impl ObjectList {
         out.sort_by_key(|(creature, _)| *creature);
         out
     }
+}
+
+/// Whether an `EffectInfo` element's own description says the effect deals
+/// damage. The game describes its effects in prose, and a summon's damage is only
+/// ever stated there -- Sage's Wakibiki's "zaps them for 150 damage/sec" against
+/// the Marble Seal's "Summon an Eye of Marble for 4.5 seconds", which buffs
+/// allies instead of hurting anything.
+fn effect_text_mentions_damage(e: &quick_xml::events::BytesStart) -> bool {
+    e.attributes().flatten().any(|attr| {
+        attr.key.as_ref() == b"description"
+            && String::from_utf8_lossy(&attr.value)
+                .to_ascii_lowercase()
+                .contains("damage")
+    })
 }
 
 /// Parse hex type string (e.g., "0xa00" -> 2560).
@@ -3533,6 +3578,7 @@ mod tests {
     <Class>Equipment</Class>
     <SlotType>19</SlotType>
     <Activate objectId="Summon Bear" summonCost="60" lifeTime="45">SpawnCreep</Activate>
+    <EffectInfo description="Summons a Bear that deals damage." name="On Use" />
   </Object>
   <Object type="0x9581" id="Sovereign Mace (SB)">
     <DisplayId>Sovereign Mace</DisplayId>
@@ -3592,12 +3638,20 @@ mod tests {
         assert_eq!(bear[0].item_type, 0x3849);
         assert_eq!(bear[0].trigger, SummonTrigger::Use);
         assert_eq!(bear[0].chance, 1.0);
+        // The item's own effect text claims damage, and it says so in an element
+        // *after* the Activate that names the creature: the flag is applied to
+        // every link an object declares, so element order cannot matter.
+        assert!(bear[0].deals_damage);
+        // The second mace declares no effect text at all.
+        assert!(!bear[1].deals_damage);
 
         let soul = list.summon_sources(0x6101);
         assert_eq!(soul.len(), 1);
         assert_eq!(soul[0].item_name, "Soul's Guidance");
         assert_eq!(soul[0].trigger, SummonTrigger::OnShoot);
         assert!((soul[0].chance - 0.15).abs() < 1e-6);
+        // Nothing claims it deals damage, so it is not credited packet damage.
+        assert!(!soul[0].deals_damage);
 
         let undead = list.summon_sources(0x16b0);
         assert_eq!(undead.len(), 1);

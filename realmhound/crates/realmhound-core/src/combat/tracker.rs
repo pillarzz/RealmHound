@@ -4693,6 +4693,12 @@ impl CombatTracker {
                 continue;
             }
             for (creature, source) in manager.summoned_by_item(item) {
+                // A summon the item's own text never claims damage for (the Marble
+                // Seal's Eye of Marble buffers allies) cannot be the source of a
+                // damage packet, however close it stands to the target.
+                if !source.deals_damage {
+                    continue;
+                }
                 let only_item = match source.trigger {
                     SummonTrigger::OnAbilityUse => None,
                     SummonTrigger::Use => Some(item),

@@ -6141,12 +6141,14 @@ mod my_performance_summons_tests {
                 item_name: "Sovereign Mace".into(),
                 trigger: realmhound_core::assets::SummonTrigger::Use,
                 chance: 1.0,
+                deals_damage: true,
             },
             realmhound_core::assets::SummonSource {
                 item_type: 0x9581,
                 item_name: "Sovereign Mace".into(),
                 trigger: realmhound_core::assets::SummonTrigger::Use,
                 chance: 1.0,
+                deals_damage: true,
             },
         ];
         let (names, tooltip) = summon_source_labels(&sources);
@@ -6160,12 +6162,14 @@ mod my_performance_summons_tests {
                 item_name: "Soul's Guidance".into(),
                 trigger: realmhound_core::assets::SummonTrigger::OnShoot,
                 chance: 0.15,
+                deals_damage: false,
             },
             realmhound_core::assets::SummonSource {
                 item_type: 0x8114,
                 item_name: "Yarn Ball".into(),
                 trigger: realmhound_core::assets::SummonTrigger::Use,
                 chance: 1.0,
+                deals_damage: false,
             },
         ];
         let (names, tooltip) = summon_source_labels(&sources);

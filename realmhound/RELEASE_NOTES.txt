@@ -1,4 +1,5 @@
 # Combat History
+- Your own weapon damage in a fight now includes your Class Mastery and the seasonal Crucible / Blood Ritual damage bonuses, so a fight you solo no longer under-reports the damage you did.
 - Fixed some bosses sometimes incorrectly marked as Escaped when they were actually completed.
 - Fight cards completed by a loot update now update in place instead of showing as Escaped until a reload.
 - Fixed MV still marked as completed sometimes when the player nexused.

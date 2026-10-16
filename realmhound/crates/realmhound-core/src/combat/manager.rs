@@ -202,6 +202,13 @@ impl CombatManager {
         &self.tracker
     }
 
+    /// Access the underlying engine mutably, for state the manager itself does not
+    /// route (a Blood Ritual or Crucible switch, which the API reports rather than
+    /// the wire).
+    pub fn tracker_mut(&mut self) -> &mut CombatTracker {
+        &mut self.tracker
+    }
+
     /// Drain the lifetime close-call counter accumulated in the tracker since the
     /// last call.
     pub fn take_pending_close_calls(&mut self) -> u32 {

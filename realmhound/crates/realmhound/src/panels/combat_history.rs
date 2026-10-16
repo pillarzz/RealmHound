@@ -3255,6 +3255,25 @@ impl CombatHistoryPanel {
             loadout.equipment = local.equipment.iter().map(|&slot| slot.max(0)).collect();
             loadout.enchants = local.equipment_enchants.to_vec();
         }
+        // Blood Ritual and Crucible come from the *fight's* own boost log, not from
+        // the character's state now: both are recorded live by the processor, and a
+        // fight fought with no ritual on has to read that way even if one is active
+        // when the card is opened. The definitions stay the character's (they are
+        // per-season/ritual values); only whether they applied is the fight's. A
+        // fight recorded before this was tracked has no window and so reads as off,
+        // like every other pre-tracking field.
+        let was_on = |label: &str| {
+            fight
+                .boosts
+                .iter()
+                .any(|b| b.stat == label && b.to > b.from)
+        };
+        if !was_on("Blood Ritual") {
+            loadout.blood_ritual = None;
+        }
+        if !was_on("Crucible") {
+            loadout.crucible = None;
+        }
         let derived = realmhound_core::stats::derived::derive(get_asset_manager(), &loadout);
 
         let attrs = &derived.attributes;
@@ -3360,7 +3379,17 @@ impl CombatHistoryPanel {
         );
         ui.add_space(4.0);
 
-        let rows = condensed_boosts(&fight.boosts);
+        // Blood Ritual and Crucible are recorded so the stats block can show the
+        // state the fight was actually fought under (see `render_stats_section`);
+        // as boosts they would only repeat the pill the stats table already
+        // breaks down, so they stay out of this table.
+        let live: Vec<_> = fight
+            .boosts
+            .iter()
+            .filter(|b| b.stat != "Blood Ritual" && b.stat != "Crucible")
+            .cloned()
+            .collect();
+        let rows = condensed_boosts(&live);
         if rows.is_empty() {
             ui.label(
                 RichText::new(

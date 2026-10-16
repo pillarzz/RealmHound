@@ -2849,7 +2849,60 @@ impl CombatTracker {
         self.trim_local_event_logs();
     }
 
-    /// Best-effort source for a local stat change.
+    /// Record a state change the character cache knows directly rather than
+    /// through a numeric stat: a Blood Ritual or the seasonal Crucible being
+    /// switched on or off.
+    ///
+    /// Both ride the wire as non-numeric stats (the ritual's id string, the
+    /// crucible marker), so they never appear in the numeric snapshot above. Logged
+    /// in the same rolling transition log, they let a fight be read back with the
+    /// state it was actually fought under -- the stats card otherwise shows
+    /// whatever the character's Blood Ritual and Crucible state is *now*, which is
+    /// how a fight fought without a ritual ended up displaying one.
+    pub fn note_local_boost(&mut self, label: &'static str, active: bool, time_ms: Option<i64>) {
+        let to = i32::from(active);
+        let from = self
+            .local_stat_changes
+            .iter()
+            .rev()
+            .find(|c| c.label == label)
+            .map(|c| c.to)
+            .unwrap_or(0);
+        if from == to {
+            return;
+        }
+        let time_ms = time_ms.or_else(|| self.latest_known_time_ms()).unwrap_or(0);
+        self.local_stat_changes.push_back(LocalStatChange {
+            time_ms,
+            label,
+            from,
+            to,
+            source: if active {
+                "character state".to_string()
+            } else {
+                "expired".to_string()
+            },
+            source_item: None,
+        });
+        self.trim_local_event_logs();
+    }
+
+    /// The newest time the tracker has seen. A state change the API reports (the
+    /// Crucible status) arrives with no packet to timestamp it, and it matters
+    /// only that it lands outside any fight still being fought.
+    fn latest_known_time_ms(&self) -> Option<i64> {
+        let seen = [
+            self.local_stat_changes.back().map(|c| c.time_ms),
+            self.local_ability_uses.back().map(|u| u.time_ms),
+            self.local_damage_events.back().map(|e| e.time_ms),
+            self.local_volley_hits.back().map(|h| h.time_ms),
+        ];
+        seen.into_iter()
+            .flatten()
+            .max()
+            .or_else(|| (self.last_shot_ms > 0).then_some(self.last_shot_ms))
+    }
+
     ///
     /// The wire never says what caused a change, so the tracker infers it and the
     /// UI labels it as an inference. An item use is only accepted as the cause when
@@ -12419,6 +12472,37 @@ mod tests {
             20,
         );
         assert_eq!(t.damage_capable_pet_near_local(), None);
+    }
+
+    #[test]
+    fn a_blood_ritual_switch_is_recorded_once_per_state_change() {
+        // The processor reports these from the character cache, not from a packet,
+        // so the tracker has to log them itself -- and a fight card reads the
+        // windows back to show the state the fight was fought under.
+        let mut t = CombatTracker::new();
+        t.note_local_boost("Blood Ritual", true, Some(1_000));
+        t.note_local_boost("Blood Ritual", true, Some(1_200));
+        assert_eq!(t.local_stat_changes.len(), 1, "no duplicate transition");
+        t.note_local_boost("Blood Ritual", false, Some(3_000));
+        assert_eq!(t.local_stat_changes.len(), 2);
+        // An API event carries no packet to date it: it lands on the newest time
+        // the tracker has seen.
+        t.note_local_boost("Crucible", true, None);
+        assert_eq!(t.local_stat_changes.back().unwrap().time_ms, 3_000);
+
+        let windows = t.boost_windows_for(500, 4_000);
+        // A window is opened for each transition, so the one that means "it was on"
+        // is the rising one -- the same test the fight card makes.
+        let on: Vec<_> = windows
+            .iter()
+            .filter(|w| w.stat == "Blood Ritual" && w.to > w.from)
+            .collect();
+        assert_eq!(on.len(), 1);
+        assert_eq!(
+            (on[0].start_offset_ms, on[0].end_offset_ms),
+            (500, 2_500),
+            "on at 1000, off at 3000, clipped to the fight"
+        );
     }
 
     fn ability_use_with(time_ms: i64, item_id: i32, enchants: &[u16]) -> LocalAbilityUse {

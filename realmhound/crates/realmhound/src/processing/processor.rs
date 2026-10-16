@@ -1278,6 +1278,7 @@ impl PacketProcessor {
                 .characters
                 .set_live_blood_ritual(self.live_char_id, id)
             {
+                self.note_local_boost("Blood Ritual", true, Some(now_ms));
                 self.sync_shot_damage_bonus();
                 self.account_data.mark_dirty();
                 self.char_view_gen += 1;
@@ -1289,7 +1290,7 @@ impl PacketProcessor {
             return;
         }
         self.blood_ritual_clear_at = None;
-        self.clear_live_blood_ritual();
+        self.clear_live_blood_ritual(now_ms);
     }
 
     /// Resolve an empty `BloodRitual` spawn once it has settled: an active ritual is
@@ -1303,20 +1304,33 @@ impl PacketProcessor {
             return;
         }
         self.blood_ritual_clear_at = None;
-        self.clear_live_blood_ritual();
+        self.clear_live_blood_ritual(now_ms);
     }
 
     /// Drop the live character's ritual and re-derive the shot multipliers from it.
-    fn clear_live_blood_ritual(&mut self) {
+    fn clear_live_blood_ritual(&mut self, now_ms: i64) {
         if self
             .account_data
             .characters
             .clear_live_blood_ritual(self.live_char_id)
         {
+            self.note_local_boost("Blood Ritual", false, Some(now_ms));
             self.sync_shot_damage_bonus();
             self.account_data.mark_dirty();
             self.char_view_gen += 1;
         }
+    }
+    /// Record a Blood Ritual / Crucible transition in the fight's boost log.
+    ///
+    /// Neither rides the wire as a numeric stat, so the combat engine cannot see
+    /// them the way it sees an Attack boost. Without this, a fight card derives its
+    /// stats from whatever the character's state is *when the card is read*, which
+    /// is how a fight fought with no ritual on showed a live Blood Ritual bonus.
+    fn note_local_boost(&mut self, label: &'static str, active: bool, now_ms: Option<i64>) {
+        if self.live_char_id.is_none() {
+            return;
+        }
+        self.combat.tracker_mut().note_local_boost(label, active, now_ms);
     }
 
     /// Push the live character's shot damage multipliers into the combat engine:
@@ -2146,7 +2160,7 @@ impl PacketProcessor {
                 self.account_data
                     .characters
                     .update_crucible_status(char_id, is_active);
-                self.sync_shot_damage_bonus();
+                self.note_local_boost("Crucible", is_active, None);                self.sync_shot_damage_bonus();
                 self.account_data.mark_dirty();
                 self.char_view_gen += 1;
             }

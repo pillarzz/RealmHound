@@ -3496,10 +3496,12 @@ impl CombatDatabase {
 
     /// Whether an Exaltation card earns the "flawless" marker: at
     /// least one participant who finished the fight (never died/nexused) dealt at
-    /// least [`FLAWLESS_MIN_BOSS_DAMAGE_FRACTION`] of the boss's HP and took zero
-    /// observed damage across every tracked entity in the card. `damage_taken`
-    /// of `None`/`Some(0)` counts as "took zero" (a positive value is required to
-    /// disqualify), since remote players who are never hit record no value.
+    /// least [`FLAWLESS_MIN_BOSS_DAMAGE_FRACTION`] of the boss's HP, took zero
+    /// observed damage across every tracked entity in the card and was never hit.
+    /// `damage_taken` of `None`/`Some(0)` counts as "took zero" (a positive value
+    /// is required to disqualify), since remote players who are never hit record
+    /// no value; hits taken disqualify only when the row recorded any, so a card
+    /// from before hits-taken tracking keeps the damage-only reading.
     fn card_is_flawless(&self, s: &FightSummary) -> SqlResult<bool> {
         if s.boss_max_hp <= 0 {
             return Ok(false);
@@ -3537,16 +3539,17 @@ impl CombatDatabase {
             return Ok(false);
         }
         // Per participant across the whole card: (boss damage, took any positive
-        // damage, finished the fight everywhere). `any_taken_recorded` guards
-        // against legacy rows (recorded before damage-taken tracking) whose
-        // all-NULL values would otherwise read as a factual zero taken.
-        let mut acc: std::collections::HashMap<i32, (i64, bool, bool)> =
+        // damage, finished the fight everywhere, was ever hit, hits recorded).
+        // `any_taken_recorded` guards against legacy rows (recorded before
+        // damage-taken tracking) whose all-NULL values would otherwise read as a
+        // factual zero taken.
+        let mut acc: std::collections::HashMap<i32, (i64, bool, bool, bool, bool)> =
             std::collections::HashMap::new();
         let mut any_taken_recorded = false;
         for (fid, _) in &fights {
             let is_boss_fight = boss_ids.contains(fid);
             let mut stmt = self.conn.prepare(
-                "SELECT object_id, damage, damage_taken, end_status
+                "SELECT object_id, damage, damage_taken, end_status, damage_taken_hits
                  FROM fight_participants WHERE fight_id = ?1",
             )?;
             let rows = stmt.query_map(params![fid], |r| {
@@ -3555,11 +3558,12 @@ impl CombatDatabase {
                     r.get::<_, i64>(1)?,
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
                 ))
             })?;
             for row in rows {
-                let (oid, damage, taken, status) = row?;
-                let e = acc.entry(oid).or_insert((0, false, true));
+                let (oid, damage, taken, status, hits_taken) = row?;
+                let e = acc.entry(oid).or_insert((0, false, true, false, false));
                 if is_boss_fight {
                     e.0 += damage;
                 }
@@ -3572,6 +3576,12 @@ impl CombatDatabase {
                 if status != "present" {
                     e.2 = false;
                 }
+                if let Some(hits) = hits_taken {
+                    e.4 = true;
+                    if hits > 0 {
+                        e.3 = true;
+                    }
+                }
             }
         }
         if !any_taken_recorded {
@@ -3579,9 +3589,16 @@ impl CombatDatabase {
         }
         let threshold =
             (s.boss_max_hp as f64 * Self::FLAWLESS_MIN_BOSS_DAMAGE_FRACTION).ceil() as i64;
-        Ok(acc.values().any(|(boss_dmg, took_positive, finished)| {
-            *finished && !*took_positive && *boss_dmg >= threshold
-        }))
+        Ok(acc.values().any(
+            |(boss_dmg, took_positive, finished, was_hit, hits_recorded)| {
+                *finished
+                    && !*took_positive
+                    // A recorded hit disqualifies; unknown hits (a card from before
+                    // hits-taken tracking) leave the damage-only reading.
+                    && !(*hits_recorded && *was_hit)
+                    && *boss_dmg >= threshold
+            },
+        ))
     }
 
     /// Summaries for standalone (non-grouped) fights only.
@@ -5371,6 +5388,8 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
         taken_any: bool,
         taken_partial: bool,
         taken_estimated: bool,
+        hits_taken_sum: i64,
+        hits_taken_any: bool,
         blocked_sum: i64,
         blocked_any: bool,
         guarded_dmg_sum: i64,
@@ -5427,6 +5446,8 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                 taken_any: false,
                 taken_partial: false,
                 taken_estimated: false,
+                hits_taken_sum: 0,
+                hits_taken_any: false,
                 blocked_sum: 0,
                 blocked_any: false,
                 guarded_dmg_sum: 0,
@@ -5493,9 +5514,6 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
             }
             // Carry a pet forward from any phase that has one (prefer keeping an
             // existing match over a later None).
-            if entry.rec.damage_taken_hits.is_none() {
-                entry.rec.damage_taken_hits = p.damage_taken_hits;
-            }
             if entry.rec.pet.is_none() && p.pet.is_some() {
                 entry.rec.pet = p.pet.clone();
             }
@@ -5524,6 +5542,12 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                     DamageTakenProvenance::Estimated => entry.taken_estimated = true,
                     DamageTakenProvenance::Observed => {}
                 }
+            }
+            // Hits taken add up across the run's phases, so a player who was
+            // never hit in one phase is not read as never hit in the run.
+            if let Some(h) = p.damage_taken_hits {
+                entry.hits_taken_sum += h as i64;
+                entry.hits_taken_any = true;
             }
             if let Some(db) = p.damage_blocked {
                 entry.blocked_sum += db;
@@ -5574,6 +5598,9 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                 };
             } else {
                 a.rec.damage_taken = None;
+            }
+            if a.hits_taken_any {
+                a.rec.damage_taken_hits = Some(a.hits_taken_sum.max(0));
             }
             a.rec.damage_blocked = if a.blocked_any {
                 Some(a.blocked_sum)
@@ -6464,28 +6491,78 @@ mod tests {
     fn flawless_marker_set_when_finisher_takes_no_damage() {
         // Fungal Cavern (Crystal Worm Mother) is an Exaltation dungeon boss.
         let mut db = CombatDatabase::open_in_memory().unwrap();
-        db.insert_fight(&flawless_fight(
-            "Fungal Cavern",
-            45712,
-            vec![
-                // Present, 40k damage (>= 5% of 100k), no observed damage taken.
-                flawless_part(600, "Alice", 40_000, None, ParticipantEndStatus::Present),
-                // Present and high damage, but took damage -> not itself flawless.
-                flawless_part(
-                    601,
-                    "Bob",
-                    40_000,
-                    Some(3_000),
-                    ParticipantEndStatus::Present,
-                ),
-            ],
-        ))
-        .unwrap();
+        // Alice took nothing and was never hit; Bob took damage and was hit.
+        let mut alice = flawless_part(600, "Alice", 40_000, None, ParticipantEndStatus::Present);
+        alice.damage_taken_hits = Some(0);
+        let mut bob = flawless_part(
+            601,
+            "Bob",
+            40_000,
+            Some(3_000),
+            ParticipantEndStatus::Present,
+        );
+        bob.damage_taken_hits = Some(4);
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![alice, bob]))
+            .unwrap();
         let list = db.list_fights(&FightQuery::default(), 50).unwrap();
         assert_eq!(list.len(), 1);
         assert!(
             list[0].flawless,
             "Alice qualifies: heavy damage, zero taken"
+        );
+    }
+
+    #[test]
+    fn flawless_marker_needs_a_finisher_who_was_never_hit() {
+        // Zero damage taken is not enough any more: a player who was hit but
+        // blocked (or had every hit valued at zero) did not finish untouched.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut hit_but_unharmed =
+            flawless_part(600, "Alice", 40_000, Some(0), ParticipantEndStatus::Present);
+        hit_but_unharmed.damage_taken_hits = Some(3);
+        db.insert_fight(&flawless_fight(
+            "Fungal Cavern",
+            45712,
+            vec![hit_but_unharmed],
+        ))
+        .unwrap();
+        let list = db.list_fights(&FightQuery::default(), 50).unwrap();
+        assert!(
+            !list[0].flawless,
+            "a finisher who took hits is not flawless even at zero damage"
+        );
+        drop(db);
+
+        // Same card, but the hits were recorded as none: flawless.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut untouched =
+            flawless_part(600, "Alice", 40_000, Some(0), ParticipantEndStatus::Present);
+        untouched.damage_taken_hits = Some(0);
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![untouched]))
+            .unwrap();
+        let list = db.list_fights(&FightQuery::default(), 50).unwrap();
+        assert!(list[0].flawless, "never hit, never damaged");
+
+        // And a card from before hits-taken tracking (no count recorded) keeps the
+        // damage-only reading rather than losing the marker.
+        let mut legacy = CombatDatabase::open_in_memory().unwrap();
+        legacy
+            .insert_fight(&flawless_fight(
+                "Fungal Cavern",
+                45712,
+                vec![flawless_part(
+                    600,
+                    "Alice",
+                    40_000,
+                    Some(0),
+                    ParticipantEndStatus::Present,
+                )],
+            ))
+            .unwrap();
+        let list = legacy.list_fights(&FightQuery::default(), 50).unwrap();
+        assert!(
+            list[0].flawless,
+            "a legacy card keeps the damage-only reading"
         );
     }
 

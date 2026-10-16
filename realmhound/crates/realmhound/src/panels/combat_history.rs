@@ -702,6 +702,9 @@ pub struct CombatHistoryPanel {
     show_damage_taken: bool,
     /// Show the Damage blocked column in the detail table.
     show_damage_blocked: bool,
+    /// Whether the Team Overview table shows the "Hits taken" column. Off by
+    /// default: it is a per-player survivability detail, not a headline figure.
+    show_hits_taken: bool,
     /// Whether the fight card shows the "My Performance" tab instead of the
     /// roster overview. Both sit above the card's header, under its own divider.
     show_performance: bool,
@@ -776,6 +779,7 @@ impl Default for CombatHistoryPanel {
             show_hits: true,
             show_damage_taken: true,
             show_damage_blocked: true,
+            show_hits_taken: false,
             show_performance: false,
             detail_scroll_offset: 0.0,
             detail_scroll_delta: None,
@@ -2834,6 +2838,7 @@ impl CombatHistoryPanel {
                 ui.checkbox(&mut self.show_dmg, "DMG");
                 ui.checkbox(&mut self.show_hits, "Hits landed");
                 ui.checkbox(&mut self.show_damage_taken, "Damage taken");
+                ui.checkbox(&mut self.show_hits_taken, "Hits taken");
                 ui.checkbox(&mut self.show_damage_blocked, "Damage blocked");
             });
         });
@@ -4176,6 +4181,20 @@ impl CombatHistoryPanel {
         } else {
             None
         };
+        let total_taken_hits: Option<i64> = if self.show_hits_taken {
+            let vals: Vec<i64> = participants
+                .iter()
+                .filter_map(|p| p.damage_taken_hits)
+                .map(|h| h as i64)
+                .collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.iter().sum())
+            }
+        } else {
+            None
+        };
         let total_blocked: Option<i64> = if self.show_damage_blocked {
             let vals: Vec<i64> = participants
                 .iter()
@@ -4195,7 +4214,11 @@ impl CombatHistoryPanel {
 
         let mut col1_x: f32 = ui.min_rect().left();
         egui::Grid::new(salt)
-            .num_columns(8 + show_guarded as usize + self.show_damage_blocked as usize)
+            .num_columns(
+                8 + show_guarded as usize
+                    + self.show_damage_blocked as usize
+                    + self.show_hits_taken as usize,
+            )
             .striped(true)
             .spacing(egui::vec2(6.0, 6.0))
             .show(ui, |ui| {
@@ -4232,6 +4255,13 @@ impl CombatHistoryPanel {
                              the fight. Exact for other visible players; estimated \
                              for you (the game never sends your own damage taken). \
                              \"-\" means no data was captured.",
+                    );
+                }
+                if self.show_hits_taken {
+                    ui.label(RichText::new("Hits taken").strong()).hover_tip(
+                        "Number of incoming hits this player took from the \
+                         boss/enemies during the fight. \"-\" means the fight \
+                         predates hits-taken tracking.",
                     );
                 }
                 if self.show_damage_blocked {
@@ -4449,6 +4479,29 @@ impl CombatHistoryPanel {
                             }
                         }
                     }
+                    if self.show_hits_taken {
+                        match p.damage_taken_hits {
+                            Some(hits) => {
+                                track(
+                                    ui.label(dimmed(format!("{}", hits)))
+                                        .hover_tip(
+                                            "Incoming hits this player took from the \
+                                             boss/enemies during the fight.",
+                                        )
+                                        .rect,
+                                    &mut row_rect,
+                                );
+                            }
+                            None => {
+                                track(
+                                    ui.label(RichText::new("-").color(Color32::GRAY))
+                                        .hover_tip("Hits taken was not recorded for this fight.")
+                                        .rect,
+                                    &mut row_rect,
+                                );
+                            }
+                        }
+                    }
                     if self.show_damage_blocked {
                         match p.damage_blocked {
                             Some(blocked) => {
@@ -4584,6 +4637,9 @@ impl CombatHistoryPanel {
                         if self.show_damage_taken {
                             ui.label("");
                         }
+                        if self.show_hits_taken {
+                            ui.label("");
+                        }
                         if self.show_damage_blocked {
                             ui.label("");
                         }
@@ -4617,6 +4673,16 @@ impl CombatHistoryPanel {
                     }
                     if self.show_damage_taken {
                         match total_taken {
+                            Some(t) => {
+                                ui.label(RichText::new(format!("{}", t)).strong());
+                            }
+                            None => {
+                                ui.label(RichText::new("-").strong().color(Color32::GRAY));
+                            }
+                        }
+                    }
+                    if self.show_hits_taken {
+                        match total_taken_hits {
                             Some(t) => {
                                 ui.label(RichText::new(format!("{}", t)).strong());
                             }
@@ -4706,6 +4772,7 @@ impl CombatHistoryPanel {
                 ui.checkbox(&mut self.show_dmg, "DMG");
                 ui.checkbox(&mut self.show_hits, "Hits landed");
                 ui.checkbox(&mut self.show_damage_taken, "Damage taken");
+                ui.checkbox(&mut self.show_hits_taken, "Hits taken");
                 ui.checkbox(&mut self.show_damage_blocked, "Damage blocked");
             });
         });

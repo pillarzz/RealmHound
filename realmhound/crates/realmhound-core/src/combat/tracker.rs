@@ -4136,7 +4136,10 @@ impl CombatTracker {
             pet: None,
             damage_taken,
             damage_taken_provenance,
-            damage_taken_hits: (accum.damage_taken_hits > 0).then_some(accum.damage_taken_hits),
+            // Recorded for every participant, a zero included: the flawless
+            // marker has to tell "never hit" apart from "this fight predates
+            // hits-taken tracking" (a NULL row), and only a recorded zero can.
+            damage_taken_hits: Some(accum.damage_taken_hits),
             damage_blocked,
             guarded_damage: Some(accum.guarded_damage),
             guarded_hits: Some(accum.guarded_hits),
@@ -9566,6 +9569,59 @@ mod tests {
         assert_eq!(
             alice.damage_taken_provenance,
             DamageTakenProvenance::Observed
+        );
+    }
+
+    #[test]
+    fn hits_taken_is_recorded_for_every_participant_including_zero() {
+        // Every participant's row carries a hit count, a zero included, so the UI
+        // can tell "never hit" apart from a fight recorded before the field
+        // existed (a NULL row).
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 50_000), stat(StatType::HP, 50_000)],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Alice")]), 0);
+        t.on_object_spawn(601, 0x0321, &status(601, vec![name_stat("Bob")]), 0);
+
+        // Local engages the boss; Alice and Bob both deal damage, only Alice is hit.
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        t.on_damage(500, 600, 5000, 20);
+        t.on_damage(500, 601, 4000, 21);
+        t.on_damage(600, 500, 300, 30);
+        t.on_damage(600, 500, 200, 35);
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 40);
+        let done = t.on_tick(40);
+        let hits_taken = |name: &str| {
+            done[0]
+                .participants
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} recorded"))
+                .damage_taken_hits
+        };
+        assert_eq!(hits_taken("Alice"), Some(2), "both incoming hits counted");
+        assert_eq!(
+            hits_taken("Bob"),
+            Some(0),
+            "a player who was never hit records a zero, not None"
         );
     }
 

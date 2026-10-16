@@ -232,8 +232,10 @@ pub struct FightParticipant {
     /// How `damage_taken` was derived (meaningful only when `damage_taken` is
     /// `Some`).
     pub damage_taken_provenance: DamageTakenProvenance,
-    /// Number of incoming hits that were valued into `damage_taken` ("shots
-    /// tanked"). `None` for rows recorded before this was tracked.
+    /// Number of incoming hits this participant took ("hits taken", the local
+    /// player's "shots tanked"). Recorded for every row from the build that added
+    /// it -- a zero included, so "never hit" is distinguishable from the `None` of
+    /// rows recorded before that.
     pub damage_taken_hits: Option<u64>,
     /// Damage negated by the local player's defense and other post-defense
     /// mitigation (the "Mell stat"): the difference between the raw

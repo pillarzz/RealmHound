@@ -473,14 +473,61 @@ fn group_summons(
     out
 }
 
-/// A section divider of `width` points from the current left edge, in the same
-/// stroke as the card's other dividers.
+/// The horizontal padding a card leaves inside its own outline, on every side.
+const CARD_PADDING: f32 = 6.0;
+
+/// A section divider: the empty row it occupies is allocated at `width` so the
+/// card keeps the width the stats table gives it, and where the rule goes is
+/// recorded for [`paint_divider_rows`] to draw once the card's own width is known.
+///
+/// The rules cannot be laid here. The card grows to its widest section -- the stats
+/// table, whose grid lays out a few tens of points wider than the width this module
+/// computes for it -- so a rule of that computed width would stop short of the
+/// card's right edge while its left margin stayed at the card's padding, which is
+/// exactly the lopsided look this replaced.
 fn section_divider(ui: &mut egui::Ui, width: f32) {
     let width = width.min(ui.available_width()).max(1.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 7.0), egui::Sense::hover());
+    let y = rect.center().y;
+    ui.data_mut(|d| {
+        let mut rows = d
+            .get_persisted::<Vec<f32>>(divider_rows_id())
+            .unwrap_or_default();
+        rows.push(y);
+        d.insert_persisted(divider_rows_id(), rows);
+    });
+}
+
+/// Where the rules of the card currently being laid out belong (see
+/// [`section_divider`]). One card is drawn at a time, so a single slot serves.
+fn divider_rows_id() -> egui::Id {
+    egui::Id::new("my_performance_divider_rows")
+}
+
+/// Start a card: forget any rule positions from the previous one.
+fn clear_divider_rows(ui: &mut egui::Ui) {
+    ui.data_mut(|d| d.insert_persisted(divider_rows_id(), Vec::<f32>::new()));
+}
+
+/// Draw the card's section rules across its own content box, so the gap on the
+/// right of a rule matches the card's padding on the left, whatever width the
+/// card ended up with.
+fn paint_divider_rows(ui: &egui::Ui, content: egui::Rect) {
+    let rows = ui.data_mut(|d| {
+        let rows = d
+            .get_persisted::<Vec<f32>>(divider_rows_id())
+            .unwrap_or_default();
+        d.insert_persisted(divider_rows_id(), Vec::<f32>::new());
+        rows
+    });
+    if rows.is_empty() {
+        return;
+    }
     let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
-    ui.painter()
-        .hline(rect.left()..=rect.right(), rect.center().y, stroke);
+    for y in rows {
+        ui.painter()
+            .hline(content.left()..=content.right(), y, stroke);
+    }
 }
 
 /// Where a section divider ends on a card that draws its own sections: the right
@@ -505,7 +552,7 @@ fn section_frame(ui: &egui::Ui) -> egui::Frame {
             crate::ui_colors::card_stroke(ui.visuals()),
         ))
         .corner_radius(8.0)
-        .inner_margin(6.0)
+        .inner_margin(CARD_PADDING)
 }
 
 /// Horizontal gap between the Stats table's columns.
@@ -3104,10 +3151,12 @@ impl CombatHistoryPanel {
                 // One boss, one section: the whole card reads as a single rounded
                 // box, exactly like each collapsible section of a multi-boss run.
                 let width = section_divider_width(ui);
-                section_frame(ui).show(ui, |ui| {
+                clear_divider_rows(ui);
+                let card = section_frame(ui).show(ui, |ui| {
                     ui.set_min_width(width);
                     self.render_my_performance(ui, ctx, &fight, width);
                 });
+                paint_divider_rows(ui, card.response.rect.shrink(CARD_PADDING));
                 return;
             }
 
@@ -3891,10 +3940,12 @@ impl CombatHistoryPanel {
             // section dividers running that full width.
             ui.add_space(2.0);
             let width = section_divider_width(ui);
-            section_frame(ui).show(ui, |ui| {
+            clear_divider_rows(ui);
+            let card = section_frame(ui).show(ui, |ui| {
                 ui.set_min_width(width);
                 self.render_my_performance(ui, ctx, phase, width);
             });
+            paint_divider_rows(ui, card.response.rect.shrink(CARD_PADDING));
         }
         ui.add_space(6.0);
     }
@@ -5402,10 +5453,12 @@ impl CombatHistoryPanel {
                         // The fallback is the run shown as one section, so it gets
                         // the same single rounded box a one-boss card does.
                         let width = section_divider_width(ui);
-                        section_frame(ui).show(ui, |ui| {
+                        clear_divider_rows(ui);
+                        let card = section_frame(ui).show(ui, |ui| {
                             ui.set_min_width(width);
                             self.render_my_performance(ui, ctx, &aggregate, width);
                         });
+                        paint_divider_rows(ui, card.response.rect.shrink(CARD_PADDING));
                     } else {
                         ui.label(
                             RichText::new("No local-player row was recorded for this run.")

@@ -170,6 +170,11 @@ const SUMMON_ATTACK_MAX_DIST: f32 = 5.0;
 /// How long a tracked summoned creature stays a candidate with no further sight
 /// of it. Bounds the map when a removal packet never arrives.
 const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;
+/// Source label for a transition the character cache reported directly rather
+/// than a numeric stat the wire moved: a Blood Ritual or Crucible switch. Only
+/// these are seeded into a fight's windows when they were already active before
+/// it, since a stat's first reading (VIT arriving at 75) is not a boost.
+const CHARACTER_STATE_SOURCE: &str = "character state";
 /// Cap on the rolling local-event logs the performance sections are rebuilt
 /// from. A long session keeps the most recent entries; the alternative (growing
 /// without bound) is worse than losing detail from very old fights.
@@ -2878,7 +2883,7 @@ impl CombatTracker {
             from,
             to,
             source: if active {
-                "character state".to_string()
+                CHARACTER_STATE_SOURCE.to_string()
             } else {
                 "expired".to_string()
             },
@@ -2887,7 +2892,7 @@ impl CombatTracker {
         self.trim_local_event_logs();
     }
 
-    /// The newest time the tracker has seen. A state change the API reports (the
+/// The newest time the tracker has seen. A state change the API reports (the
     /// Crucible status) arrives with no packet to timestamp it, and it matters
     /// only that it lands outside any fight still being fought.
     fn latest_known_time_ms(&self) -> Option<i64> {
@@ -3007,6 +3012,47 @@ impl CombatTracker {
     /// transition of the same label, or at the fight's end while still active.
     fn boost_windows_for(&self, started_at: i64, ended_at: i64) -> Vec<BoostWindow> {
         let mut out: Vec<BoostWindow> = Vec::new();
+        let window = |change: &LocalStatChange, start: i64, end: i64| BoostWindow {
+            start_offset_ms: (start - started_at).max(0),
+            end_offset_ms: (end - started_at).max(0),
+            stat: change.label.to_string(),
+            from: change.from,
+            to: change.to,
+            source: change.source.clone(),
+            source_item: change.source_item,
+        };
+        // A buff already held when the fight starts has no transition inside it, so
+        // seed every label with its last change at or before the start: a Blood
+        // Ritual switched on at login is still on twenty minutes later, and the card
+        // has to see that rather than read the fight as unritualed.
+        for (i, change) in self.local_stat_changes.iter().enumerate() {
+            if change.time_ms > started_at || change.to <= change.from {
+                continue;
+            }
+            // Only a state the character cache reported (a ritual or crucible
+            // switch) is carried in. A stat's first reading is not a boost: VIT
+            // simply arriving at 75 would otherwise open a window on every fight.
+            if change.source != CHARACTER_STATE_SOURCE {
+                continue;
+            }
+            // Superseded by a later change of the same label before the fight?
+            if self
+                .local_stat_changes
+                .iter()
+                .skip(i + 1)
+                .any(|c| c.label == change.label && c.time_ms <= started_at)
+            {
+                continue;
+            }
+            let end = self
+                .local_stat_changes
+                .iter()
+                .skip(i + 1)
+                .find(|c| c.label == change.label && c.time_ms <= ended_at)
+                .map(|c| c.time_ms)
+                .unwrap_or(ended_at);
+            out.push(window(change, started_at, end));
+        }
         for (i, change) in self.local_stat_changes.iter().enumerate() {
             if change.time_ms < started_at || change.time_ms > ended_at {
                 continue;
@@ -3018,15 +3064,7 @@ impl CombatTracker {
                 .find(|c| c.label == change.label && c.time_ms <= ended_at)
                 .map(|c| c.time_ms)
                 .unwrap_or(ended_at);
-            out.push(BoostWindow {
-                start_offset_ms: (change.time_ms - started_at).max(0),
-                end_offset_ms: (end - started_at).max(0),
-                stat: change.label.to_string(),
-                from: change.from,
-                to: change.to,
-                source: change.source.clone(),
-                source_item: change.source_item,
-            });
+            out.push(window(change, change.time_ms, end));
         }
         out.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
         out

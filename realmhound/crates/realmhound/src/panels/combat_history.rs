@@ -483,11 +483,17 @@ fn section_divider(ui: &mut egui::Ui, width: f32) {
         .hline(rect.left()..=rect.right(), rect.center().y, stroke);
 }
 
-/// Where a section divider ends on a card that draws its own sections: the full
-/// inner width of the card, so every rule spans the card's content box rather
-/// than stopping at the Stats table's last column.
+/// Where a section divider ends on a card that draws its own sections: the right
+/// edge of the Stats table's Blood Ritual column, which is what sets the card's
+/// own width. Using the panel's available width here instead would make the
+/// divider claim the whole panel and stretch the card with it.
 fn section_divider_width(ui: &egui::Ui) -> f32 {
-    ui.available_width()
+    let w = crate::panels::derived_stats::attr_col_widths(ui);
+    // The grid lays out twelve columns (the stat icon, then two five-column
+    // groups) with `STATS_GRID_GAP` between each pair.
+    STATS_ICON_CELL
+        + 2.0 * (w.total + w.gear + w.exalt + w.crucible + w.blood_ritual)
+        + STATS_GRID_GAP * 11.0
 }
 
 /// The rounded box around one boss's expanded section in a grouped run: the same

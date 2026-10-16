@@ -957,10 +957,17 @@ impl PacketProcessor {
                     // empty spawn, which this refresh usually confirms first.
                     if !(is_live && char.blood_ritual_id.is_some()) {
                         let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
+                        let had = !ritual_id.trim().is_empty();
                         challenge_changed |= self
                             .account_data
                             .characters
                             .set_blood_ritual_for_char(Some(char.char_id), ritual_id);
+                        // The character list is how a ritual already running at login
+                        // becomes known, and without a transition recorded here the
+                        // fight card has nothing to read a fight's ritual state from.
+                        if char.char_id == self.live_char_id.map(|id| id).unwrap_or(0) {
+                            self.note_local_boost("Blood Ritual", had, None);
+                        }
                     }
                 }
                 // Re-derive the per-character flags from the recorded ids, so the

@@ -3020,7 +3020,13 @@ impl CombatHistoryPanel {
             ui.add_space(4.0);
 
             if self.show_performance {
-                self.render_my_performance(ui, ctx, &fight, section_divider_width(ui));
+                // One boss, one section: the whole card reads as a single rounded
+                // box, exactly like each collapsible section of a multi-boss run.
+                let width = section_divider_width(ui);
+                section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(width);
+                    self.render_my_performance(ui, ctx, &fight, width);
+                });
                 return;
             }
 
@@ -3474,10 +3480,11 @@ impl CombatHistoryPanel {
     ) {
         ui.add_space(10.0);
         section_header(ui, "Damage by ability").hover_tip(
-            "Only damage the game sent us in packets. Damage the client works out \
-                 itself -- novas, poisons, and other hits the server never reports -- \
-                 cannot be measured, so those abilities are listed with their \
-                 activations and no damage.",
+            "Damage the game reported while this ability was active. Some abilities' \
+                 damage is applied by the server and arrives in packets; others are \
+                 worked out on the client -- a spell's projectile volley, thrown \
+                 poisons, hex detonations -- and are never sent, so those rows stay \
+                 blank.",
         );
         ui.add_space(4.0);
         if fight.abilities.is_empty() {
@@ -3552,11 +3559,19 @@ impl CombatHistoryPanel {
                         ui.label(RichText::new(format!("{} packet hit(s)", r.hits)).small());
                     } else {
                         ui.label(RichText::new("-").color(Color32::GRAY));
-                        ui.label(
-                            RichText::new("no packet-borne damage (client-resolved effect)")
-                                .color(Color32::GRAY)
-                                .small(),
-                        );
+                        // Say which blank this is: an ability whose damage the
+                        // server never sends (poisons, hex detonations -- the ones
+                        // we model ourselves) versus one whose hits simply did not
+                        // land while the activation window was open.
+                        let client_computed = get_asset_manager()
+                            .ability_effects(r.item_id)
+                            .is_some_and(|e| e.deals_damage());
+                        let note = if client_computed {
+                            "the client computes this ability's damage, so the server never sends it"
+                        } else {
+                            "no server-reported damage landed while it was active"
+                        };
+                        ui.label(RichText::new(note).color(Color32::GRAY).small());
                     }
                     ui.end_row();
                 }
@@ -5154,7 +5169,13 @@ impl CombatHistoryPanel {
                     // A phase can be hidden from the roster list while the run
                     // still has a local row, so fall back to the run-wide view.
                     if let Some(aggregate) = self.aggregated_performance_fight(&enc) {
-                        self.render_my_performance(ui, ctx, &aggregate, section_divider_width(ui));
+                        // The fallback is the run shown as one section, so it gets
+                        // the same single rounded box a one-boss card does.
+                        let width = section_divider_width(ui);
+                        section_frame(ui).show(ui, |ui| {
+                            ui.set_min_width(width);
+                            self.render_my_performance(ui, ctx, &aggregate, width);
+                        });
                     } else {
                         ui.label(
                             RichText::new("No local-player row was recorded for this run.")

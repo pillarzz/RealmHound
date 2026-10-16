@@ -1342,27 +1342,29 @@ impl PacketProcessor {
         let Some(char_id) = self.live_char_id else {
             return;
         };
-        let (blood_ritual, crucible, pet_skin) = {
+        let (blood_ritual, crucible, pet_skin, pet_type) = {
             let cache = &self.account_data.characters;
             let Some(character) = cache.find_any_character(char_id) else {
                 return;
             };
-            // The pet's sprite: its skin, or its type where it has no skin -- the
-            // same choice ATTRIBUTES makes.
-            let pet_skin = character
+            // The pet ATTRIBUTES shows. Its type id is what the wire reports for a
+            // pet, so it is what tells the character's own pet in the world from
+            // everyone else's; the sprite to draw is its skin, or its type where it
+            // has none -- the same choice ATTRIBUTES makes.
+            let pet = character
                 .pet_instance_id
-                .and_then(|id| cache.resolve_pet_identity(id, character.seasonal))
-                .map(|pet| if pet.skin > 0 { pet.skin } else { pet.pet_type })
-                .unwrap_or(0);
+                .and_then(|id| cache.resolve_pet_identity(id, character.seasonal));
             (
                 cache.blood_ritual_for_char(char_id).is_some(),
                 character.crucible_active,
-                pet_skin,
+                pet.map(|p| if p.skin > 0 { p.skin } else { p.pet_type })
+                    .unwrap_or(0),
+                pet.map(|p| p.pet_type).unwrap_or(0),
             )
         };
         self.combat
             .tracker_mut()
-            .set_local_snapshot(blood_ritual, crucible, pet_skin);
+            .set_local_snapshot(blood_ritual, crucible, pet_skin, pet_type);
     }
 
     /// Push the live character's shot damage multipliers into the combat engine:

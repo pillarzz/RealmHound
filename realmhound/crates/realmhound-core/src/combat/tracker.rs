@@ -1017,6 +1017,9 @@ struct LocalSnapshot {
     /// The pet's sprite: its skin, or its type where it has no skin -- the same
     /// choice ATTRIBUTES makes. 0 when the character has no pet out.
     pet_skin: i32,
+    /// The pet's own type id, which is what the wire reports for a pet
+    /// (`StatType::PetType`): the identity a claim has to match. 0 when unknown.
+    pet_type: i32,
 }
 
 /// State of an in-progress boss fight, keyed by the boss object id.
@@ -2881,11 +2884,22 @@ impl CombatTracker {
     /// ritual switched on or off, the crucible marker, a different pet equipped --
     /// and every fight finalised afterwards is stamped with them (see
     /// [`Self::local_state_windows`]).
-    pub fn set_local_snapshot(&mut self, blood_ritual: bool, crucible: bool, pet_skin: i32) {
+    ///
+    /// `pet_skin` is the sprite to draw and `pet_type` the pet's own type id, which
+    /// is what the wire reports for a pet: the identity that decides which pet in
+    /// the world is this character's.
+    pub fn set_local_snapshot(
+        &mut self,
+        blood_ritual: bool,
+        crucible: bool,
+        pet_skin: i32,
+        pet_type: i32,
+    ) {
         self.local_snapshot = LocalSnapshot {
             blood_ritual,
             crucible,
             pet_skin: pet_skin.max(0),
+            pet_type: pet_type.max(0),
         };
     }
 
@@ -4900,12 +4914,33 @@ impl CombatTracker {
     /// Decoy cannot damage anything. Only a pet close enough to its owner to be
     /// the shooter counts, and the nearest wins (ties by lowest id).
     ///
-    /// It also has to be *the local player's* pet: see [`Self::pet_follows_local`].
-    /// In a group a teammate's pet stands next to the local player too, and
-    /// distance alone let it claim the local player's own unattributed packets --
-    /// which is how a fight whose only pet of theirs was a Decoy pet still ended
-    /// up with a pet row, credited from a teammate's Great Jelly standing nearby.
+    /// *Which* pet that is comes from the character cache -- the pet ATTRIBUTES
+    /// shows -- and not from distance. The wire reports every pet in the world with
+    /// its own type id, and the character's own pet has a known one, so only a pet
+    /// answering to that type can claim their damage: in a group a teammate's pet
+    /// stands right beside them, and distance alone credited 943 damage the server
+    /// reported to the local player to a teammate's Great Jelly, while their own pet
+    /// was a Blue Ant that cannot damage anything. When the character's own pet is
+    /// not in the world at all, nothing claims -- an unattributed packet is better
+    /// than a teammate's pet wearing their damage.
+    ///
+    /// A character whose pet the cache does not know falls back to the pet that
+    /// follows the local player (see [`Self::pet_follows_local`]).
     fn damage_capable_pet_near_local(&self) -> Option<i32> {
+        let mine = self.local_snapshot.pet_type;
+        if mine != 0 {
+            return self.nearest_damage_capable_pet(|_, o| o.pet_type == mine);
+        }
+        self.nearest_damage_capable_pet(|_, _| true)
+    }
+
+    /// The nearest pet within [`PET_ASSOC_MAX_DIST`] of the local player that can
+    /// deal damage, follows the local player, and passes `keep`; ties are broken by
+    /// the lowest object id.
+    fn nearest_damage_capable_pet(
+        &self,
+        keep: impl Fn(i32, &TrackedObject) -> bool,
+    ) -> Option<i32> {
         let local = self.objects.get(&self.local_object_id)?;
         let (lx, ly) = (local.last_x, local.last_y);
         let mut best: Option<(f32, i32)> = None;
@@ -4916,7 +4951,7 @@ impl CombatTracker {
             if !o.pet_abilities.iter().any(|&a| pet_ability_deals_damage(a)) {
                 continue;
             }
-            if !self.pet_follows_local(oid) {
+            if !keep(oid, o) || !self.pet_follows_local(oid) {
                 continue;
             }
             let dx = o.last_x - lx;
@@ -12608,6 +12643,57 @@ mod tests {
     }
 
     #[test]
+    fn only_the_pet_the_character_cache_names_can_claim_their_packets() {
+        // The pet ATTRIBUTES shows is the character's own, and the wire reports
+        // every pet in the world with its own type id, so the cache's type decides
+        // which one that is -- distance cannot, because in a group every pet stands
+        // near someone.
+        let mut t = pet_packet_tracker(&[], 0);
+        // 32548 is this character's pet (Blue Ant); 32645 is a teammate's (Great
+        // Jelly) standing nearer to the local player than their own pet is.
+        t.set_local_snapshot(false, false, 24_724, 32_548);
+        t.on_object_spawn(
+            901,
+            0x9999,
+            &status_at(
+                901,
+                0.5,
+                0.5,
+                vec![
+                    stat(StatType::PetType, 32_645),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        assert_eq!(
+            t.damage_capable_pet_near_local(),
+            None,
+            "a Great Jelly is not this character's Blue Ant"
+        );
+        // Their own pet out, and able to damage: it is the claimant.
+        t.on_object_spawn(
+            902,
+            0x9999,
+            &status_at(
+                902,
+                2.0,
+                2.0,
+                vec![
+                    stat(StatType::PetType, 32_548),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        assert_eq!(
+            t.damage_capable_pet_near_local(),
+            Some(902),
+            "the pet the cache names is the one that can claim"
+        );
+    }
+
+    #[test]
     fn an_electric_pet_is_a_candidate_only_while_it_is_out_and_in_range() {
         let mut t = pet_packet_tracker(&[406], 32643);
         assert_eq!(t.damage_capable_pet_near_local(), Some(900));
@@ -12630,7 +12716,7 @@ mod tests {
         // fight's own record at finalize, so switching the ritual off afterwards
         // cannot rewrite what the fight says it was fought under.
         let mut t = pet_packet_tracker(&[], 0);
-        t.set_local_snapshot(true, true, 0);
+        t.set_local_snapshot(true, true, 0, 0);
         t.on_damage(500, 1000, 280, 200);
         let fight = t.fights.remove(&500).expect("open fight");
         let done = t.finalize_fight(fight, 1_000).expect("finalize");
@@ -12640,7 +12726,7 @@ mod tests {
         assert!(was_on(&done, "Blood Ritual"));
         assert!(was_on(&done, "Crucible"));
 
-        t.set_local_snapshot(false, false, 0);
+        t.set_local_snapshot(false, false, 0, 0);
         assert!(
             was_on(&done, "Blood Ritual"),
             "a recorded fight does not follow a later switch-off"
@@ -12687,7 +12773,7 @@ mod tests {
         // from the account cache, and the fight's own row does the same, so the row
         // draws the pet and not a placeholder.
         let mut t = pet_packet_tracker(&[406, 407, 408], 32643);
-        t.set_local_snapshot(false, false, 12_345);
+        t.set_local_snapshot(false, false, 12_345, 0);
         t.on_damage(500, 1000, 280, 200);
         let fight = t.fights.remove(&500).expect("open fight");
         let done = t.finalize_fight(fight, 1_000).expect("finalize");

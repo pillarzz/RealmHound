@@ -510,6 +510,8 @@ fn section_frame(ui: &egui::Ui) -> egui::Frame {
 
 /// Horizontal gap between the Stats table's columns.
 const STATS_GRID_GAP: f32 = 16.0;
+/// Width of the Stats table's leading stat-icon cell.
+const STATS_ICON_CELL: f32 = 16.0;
 
 /// A PgUp / PgDn page delta in points for the visible height, or `None` when
 /// neither key was pressed this frame. The fight card pages through its own scroll

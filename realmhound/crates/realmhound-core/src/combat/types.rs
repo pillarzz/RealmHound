@@ -282,6 +282,10 @@ pub struct SummonContribution {
     pub pet_type: i32,
     /// True when the entity carried a pet stat, i.e. a pet rather than a summon.
     pub is_pet: bool,
+    /// The entity's own object type, so the row can be named and given a sprite
+    /// (`Summon Pocket Rat` is `0x4683`, say). 0 when it was never observed in the
+    /// object table, and in fights recorded before this was stored.
+    pub object_type: i32,
     pub damage: i64,
     pub hits: u64,
 }

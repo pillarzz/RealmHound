@@ -5119,9 +5119,10 @@ fn serialize_pet_abilities(abilities: &[i32]) -> String {
 }
 
 /// Serialize the per-summon breakdown as one compact line per summon:
-/// `object_id,pet_type,is_pet,damage,hits`, joined by `;`. Kept as text rather
-/// than JSON so a legacy value or a partial write can never fail to parse into
-/// the participant row.
+/// `object_id,pet_type,is_pet,damage,hits,object_type`, joined by `;`. Kept as
+/// text rather than JSON so a legacy value or a partial write can never fail to
+/// parse into the participant row. `object_type` is appended last so rows written
+/// before it existed still read: a short line leaves it 0.
 fn serialize_summons(summons: &[SummonContribution]) -> Option<String> {
     if summons.is_empty() {
         return None;
@@ -5131,8 +5132,8 @@ fn serialize_summons(summons: &[SummonContribution]) -> Option<String> {
             .iter()
             .map(|s| {
                 format!(
-                    "{},{},{},{},{}",
-                    s.object_id, s.pet_type, s.is_pet as i32, s.damage, s.hits
+                    "{},{},{},{},{},{}",
+                    s.object_id, s.pet_type, s.is_pet as i32, s.damage, s.hits, s.object_type
                 )
             })
             .collect::<Vec<_>>()
@@ -5155,15 +5156,62 @@ fn parse_summons(data: Option<&str>) -> Vec<SummonContribution> {
             let is_pet = parts.next()?.trim() != "0";
             let damage = parts.next()?.trim().parse::<i64>().unwrap_or(0);
             let hits = parts.next()?.trim().parse::<u64>().unwrap_or(0);
+            // Absent in rows written before the entity's own type was stored.
+            let object_type = parts
+                .next()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
             Some(SummonContribution {
                 object_id,
                 pet_type,
                 is_pet,
+                object_type,
                 damage,
                 hits,
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod summon_codec_tests {
+    use super::{parse_summons, serialize_summons};
+    use crate::combat::types::SummonContribution;
+
+    /// The entity's own object type rides along with the rest of the row, so the
+    /// UI can name and draw a summoned creature ("Summon Pocket Rat", 0x4683)
+    /// instead of labelling every row "Summon".
+    #[test]
+    fn the_object_type_round_trips() {
+        let summons = vec![SummonContribution {
+            object_id: 157,
+            pet_type: 0,
+            is_pet: false,
+            object_type: 0x4683,
+            damage: 1530,
+            hits: 45,
+        }];
+        let encoded = serialize_summons(&summons).expect("a non-empty list encodes");
+        assert_eq!(encoded, "157,0,0,1530,45,18051");
+        let decoded = parse_summons(Some(&encoded));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].object_type, 0x4683);
+        assert_eq!(decoded[0].damage, 1530);
+        assert_eq!(decoded[0].hits, 45);
+    }
+
+    /// Rows written before the type was stored are five fields wide and must keep
+    /// parsing: the missing sixth reads as 0, which is what the UI treats as "no
+    /// type to show" and falls back to the generic label.
+    #[test]
+    fn a_legacy_row_without_the_type_still_parses() {
+        let decoded = parse_summons(Some("157,12345,1,1530,45"));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].object_id, 157);
+        assert_eq!(decoded[0].pet_type, 12_345);
+        assert!(decoded[0].is_pet);
+        assert_eq!(decoded[0].object_type, 0);
+    }
 }
 
 /// Serialize the per-weapon breakdown as one compact line per weapon:

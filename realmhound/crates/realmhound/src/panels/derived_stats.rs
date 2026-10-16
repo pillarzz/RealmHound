@@ -1859,19 +1859,7 @@ fn render_bonuses(
                     ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
                 sr.draw_outlined_embedded_icon(ui, condition, rect);
             },
-            |ui| {
-                bonus_components_tooltip(ui, &damage_components);
-                // The sources compound rather than add up, so spell out the
-                // combined factor instead of letting the reader sum the rows.
-                ui.label(
-                    RichText::new(format!(
-                        "combined x{:.3} ({:+.1}%)",
-                        damage_mult, damage_pct
-                    ))
-                    .color(NOTE_COLOR)
-                    .size(11.0),
-                );
-            },
+            |ui| bonus_components_tooltip(ui, &damage_components),
         );
     }
 
@@ -1956,14 +1944,7 @@ fn render_bonuses(
                     ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
                 sr.draw_outlined_embedded_icon(ui, EmbeddedIcon::Bxp, rect);
             },
-            |ui| {
-                bonus_components_tooltip(ui, &[("crucible", bxp)]);
-                ui.label(
-                    RichText::new("Battle-pass XP from the season's Crucible definition.")
-                        .color(NOTE_COLOR)
-                        .size(11.0),
-                );
-            },
+            |ui| bonus_components_tooltip(ui, &[("crucible", bxp)]),
         );
     }
 }

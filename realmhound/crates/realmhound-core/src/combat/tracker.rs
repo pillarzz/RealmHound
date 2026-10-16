@@ -634,6 +634,10 @@ struct SummonAccum {
     /// Whether the entity carried a pet stat, i.e. it is a pet and not a
     /// summon spawned by an item or ability.
     is_pet: bool,
+    /// The entity's own object type, which names and draws the row when it is a
+    /// summon: a summoned creature's type is its identity, where a pet's is its
+    /// skin under `pet_type`. 0 until the entity is observed.
+    object_type: i32,
 }
 
 /// One boost-relevant stat/condition transition on the local player, in absolute
@@ -3241,13 +3245,13 @@ impl CombatTracker {
         // attributes it to the player) but not in the owner's per-hit average or
         // per-loadout buckets.
         let is_summon = shooter_id != local_id;
-        let (summon_pet_type, summon_is_pet) = if is_summon {
+        let (summon_pet_type, summon_is_pet, summon_object_type) = if is_summon {
             self.objects
                 .get(&shooter_id)
-                .map(|o| (o.pet_type, o.is_pet))
-                .unwrap_or((0, false))
+                .map(|o| (o.pet_type, o.is_pet, o.object_type))
+                .unwrap_or((0, false, 0))
         } else {
-            (0, false)
+            (0, false, 0)
         };
         let (name, object_type, equipment, enchants, skin_id, tex1, tex2) = self
             .objects
@@ -3328,6 +3332,9 @@ impl CombatTracker {
             entry.is_pet = entry.is_pet || summon_is_pet;
             if summon_pet_type != 0 {
                 entry.pet_type = summon_pet_type;
+            }
+            if summon_object_type != 0 {
+                entry.object_type = summon_object_type;
             }
         } else if let Some(item_id) = volley_item {
             // An ability volley's hit: the packet named the ability that fired it,
@@ -4291,6 +4298,7 @@ impl CombatTracker {
                         object_id,
                         pet_type: s.pet_type,
                         is_pet: s.is_pet,
+                        object_type: s.object_type,
                         damage: s.damage,
                         hits: s.hits,
                     })
@@ -8156,6 +8164,101 @@ mod tests {
         assert_eq!(p.summons[0].hits, 1);
         // The owner's own hits are all accounted for, so the row stays exact.
         assert_eq!(p.provenance, DamageProvenance::SelfComputed);
+    }
+
+    #[test]
+    fn summon_rows_carry_the_entitys_own_object_type() {
+        // A summoned creature's object type is its identity: it names the row and
+        // gives it a sprite ("Summon Pocket Rat" is 0x4683), where a pet is named
+        // by its skin under `pet_type`. The type comes from the spawned entity, so
+        // the row is right even before its first hit resolves.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        // Three summoned Pocket Rats, as the Pocket Rat consumable spawns them.
+        for id in [157, 158, 159] {
+            t.on_object_spawn(id, 0x4683, &status(id, vec![]), 0);
+        }
+
+        t.on_ally_shot(157, 1000, 5, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 5, 157, 1000, 10);
+        t.on_ally_shot(158, 1000, 6, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 6, 158, 1000, 11);
+        // A summon that was never seen spawning keeps a zero type, so the UI can
+        // still fall back to the generic label.
+        t.on_ally_shot(999, 1000, 7, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 7, 999, 1000, 12);
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let p = &done[0].participants[0];
+        assert_eq!(p.summons.len(), 3);
+        for s in &p.summons {
+            if s.object_id == 999 {
+                assert_eq!(s.object_type, 0, "an unseen entity has no type to show");
+                assert!(!s.is_pet);
+                continue;
+            }
+            assert_eq!(
+                s.object_type, 0x4683,
+                "object {} has the rat's type",
+                s.object_id
+            );
+            assert!(!s.is_pet);
+            assert_eq!(s.pet_type, 0, "a summon is not named by a pet skin");
+            assert_eq!(s.damage, 50);
+            assert_eq!(s.hits, 1);
+        }
+    }
+
+    #[test]
+    fn summon_pet_type_still_wins_for_pets() {
+        // A real pet is named by its skin: the type it carries is a pet skin id,
+        // which is what the UI draws, not the object type it was spawned as.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 12_000), stat(StatType::HP, 12_000)],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            200,
+            0x0321,
+            &status(200, vec![stat(StatType::PetType, 12_345), name_stat("Rat")]),
+            0,
+        );
+        t.on_ally_shot(200, 1000, 5, 1, 300, 0, 0);
+        t.on_local_hit(500, 5, 200, 1000, 10);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let s = &done[0].participants[0].summons[0];
+        assert_eq!(s.pet_type, 12_345);
+        assert!(s.is_pet);
+        assert_eq!(
+            s.object_type, 0x0321,
+            "the spawned type is kept alongside the skin"
+        );
     }
 
     #[test]

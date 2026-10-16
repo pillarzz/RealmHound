@@ -3864,16 +3864,39 @@ impl CombatHistoryPanel {
                     ui.label(RichText::new("Average").color(Color32::GRAY).small());
                     ui.end_row();
                     for s in &local.summons {
-                        let label = if s.is_pet {
-                            if s.pet_type != 0 {
-                                format!("Pet  (type 0x{:X})", s.pet_type)
+                        // Name and draw the entity from its own object type when it
+                        // has one: a summoned creature's type is its identity, so
+                        // "Summon Pocket Rat" is `0x4683` with that object's sprite.
+                        // Pets keep the skin (`pet_type`) and their own sprite path,
+                        // and rows recorded before the type was stored fall back to
+                        // the old generic label.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if s.is_pet {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(16.0),
+                                    egui::Sense::hover(),
+                                );
+                                if s.pet_type != 0 {
+                                    ctx.sprite_renderer
+                                        .draw_sprite_in_rect(ui, s.pet_type, rect);
+                                }
+                                ui.label("Pet");
+                            } else if s.object_type != 0 {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ctx.sprite_renderer
+                                    .draw_sprite_in_rect(ui, s.object_type, rect);
+                                let name = realmhound_core::assets::get_asset_manager()
+                                    .object_name(s.object_type)
+                                    .unwrap_or_else(|| format!("0x{:X}", s.object_type));
+                                ui.label(name);
                             } else {
-                                "Pet".to_string()
+                                ui.label("Summon");
                             }
-                        } else {
-                            "Summon".to_string()
-                        };
-                        ui.label(label);
+                        });
                         ui.label(s.hits.to_string());
                         ui.label(s.damage.max(0).to_string());
                         ui.label(if s.hits > 0 {

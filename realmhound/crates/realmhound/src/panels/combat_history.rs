@@ -408,7 +408,7 @@ fn summon_source_labels(
         if !names.iter().any(|n| n == &s.item_name) {
             names.push(s.item_name.clone());
         }
-        let mut line = match s.chance {
+        let line = match s.chance {
             c if c > 0.0 && c < 1.0 => format!(
                 "{} ({}, {:.0}% chance)",
                 s.item_name,

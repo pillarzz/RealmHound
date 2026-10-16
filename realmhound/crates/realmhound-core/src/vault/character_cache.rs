@@ -1469,16 +1469,31 @@ impl CharacterCache {
 
     /// Record the ritual the *live* status reports.
     ///
-    /// An empty value is ignored. The game re-sends a player's status on every
+    /// An empty value is ignored here. The game re-sends a player's status on every
     /// zone change with the `BloodRitual` stat left empty, and reading that as
     /// "no ritual" dropped the entry, so the pill, the attribute brackets and the
-    /// Bonuses line all flashed on every portal. A genuine deactivation shows up
-    /// as an absent tag in the character list, which the refresh clears.
+    /// Bonuses line all flashed on every portal. An empty value only means "none"
+    /// when it arrives as a *change* -- see [`Self::clear_live_blood_ritual`], which
+    /// the caller decides to call.
     pub fn set_live_blood_ritual(&mut self, char_id: Option<i32>, id: &str) -> bool {
         if id.trim().is_empty() {
             return false;
         }
         self.set_blood_ritual_for_char(char_id, id)
+    }
+
+    /// Clear the ritual held for a character because the live `BloodRitual` stat is
+    /// gone: the server reported it changed to empty, or an empty spawn was not
+    /// confirmed by the id that follows it when one is active.
+    ///
+    /// This is the counterpart to [`Self::set_live_blood_ritual`], which cannot
+    /// judge an empty value on its own: the stat rides in every zone-change
+    /// snapshot empty even while a ritual is active.
+    pub fn clear_live_blood_ritual(&mut self, char_id: Option<i32>) -> bool {
+        let Some(char_id) = char_id else {
+            return false;
+        };
+        self.set_blood_ritual_for_char(Some(char_id), "")
     }
 
     /// Record which Blood Ritual tier a character has active: `id` is the
@@ -3160,6 +3175,36 @@ mod tests {
         // A genuine removal arrives as an absent tag in the character list.
         assert!(cache.set_blood_ritual_for_char(Some(1), ""));
         assert!(cache.blood_ritual_for_char(1).is_none());
+    }
+
+    /// The caller decides when an empty live value means "none" (an empty stat
+    /// delta, or an empty zone-change snapshot the game never confirmed), and this
+    /// is the call it makes: it drops the entry and the character's flag.
+    #[test]
+    fn clear_live_blood_ritual_drops_the_entry_and_the_flag() {
+        let mut cache = CharacterCache::new();
+        cache.set_blood_ritual_defs(vec![ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24)]);
+        let mut c = CachedCharacter {
+            char_id: 2487,
+            ..Default::default()
+        };
+        c.blood_ritual_active = false;
+        cache.characters.push(c);
+        assert!(cache.set_live_blood_ritual(Some(2487), THIS_SEASONS_RITUAL));
+        assert!(cache.characters[0].blood_ritual_active);
+
+        assert!(cache.clear_live_blood_ritual(Some(2487)));
+        assert!(cache.blood_ritual_for_char(2487).is_none());
+        assert!(
+            !cache.characters[0].blood_ritual_active,
+            "the character flag follows the cleared entry"
+        );
+
+        // Nothing held: no change to report, and an unknown character is ignored
+        // rather than inventing an entry.
+        assert!(!cache.clear_live_blood_ritual(Some(2487)));
+        assert!(!cache.clear_live_blood_ritual(None));
+        assert!(!cache.clear_live_blood_ritual(Some(999)));
     }
 
     #[test]

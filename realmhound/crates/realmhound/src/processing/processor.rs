@@ -279,6 +279,12 @@ pub struct PacketProcessor {
     /// Currently playing character id (from CreateSuccess). Owned here so the
     /// character cache (in `account_data`) stays the single source of truth.
     live_char_id: Option<i32>,
+    /// Deadline (packet-clock ms) after which an unconfirmed empty `BloodRitual`
+    /// spawn snapshot clears the live character's ritual. The stat is re-sent
+    /// empty on every zone change while a ritual is active, so only silence after
+    /// the empty snapshot means the ritual was switched off. `None` when no ritual
+    /// question is open.
+    blood_ritual_clear_at: Option<i64>,
     /// Latest raw local-player stat values (id -> value), accumulated across the
     /// spawn `Update` (full snapshot) and `NewTick` deltas. Base character stats
     /// are derived from these (base = stat - boost) to keep the cached stats and
@@ -405,12 +411,17 @@ const REALM_JOIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(2)
 /// only a guard against unbounded growth on a connection that never verifies
 /// (e.g. a stuck mule); beyond it we stop buffering rather than leak memory.
 const PENDING_EVENT_CAP: usize = 4096;
-
 /// How long a tentative candidate may stay unverified before it is discarded.
 /// The identifying `Update` normally arrives within a second; a candidate that
 /// never identifies itself in this window is dropped so its buffered events are
 /// released and the main slot is freed for the next connection.
 const IDENTITY_TIMEOUT_MS: i64 = 60_000;
+
+/// How long after an empty `BloodRitual` spawn snapshot the game has to report the
+/// active id before the ritual is treated as switched off. Observed captures show
+/// the id arriving 4-118 ms after the empty spawn, so a deactivation is settled
+/// well inside this window (see `PacketProcessor::apply_blood_ritual_stat`).
+const BLOOD_RITUAL_SETTLE_MS: i64 = 400;
 
 impl PacketProcessor {
     /// Build a processor from flat-layout paths, degrading writer failures to
@@ -471,6 +482,7 @@ impl PacketProcessor {
             _test_account_root: None,
             settings,
             live_char_id: None,
+            blood_ritual_clear_at: None,
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -555,6 +567,7 @@ impl PacketProcessor {
             _test_account_root: None,
             settings,
             live_char_id: None,
+            blood_ritual_clear_at: None,
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -598,6 +611,7 @@ impl PacketProcessor {
             _test_account_root: Some(test_account_root),
             settings: Arc::new(RwLock::new(Settings::default())),
             live_char_id: None,
+            blood_ritual_clear_at: None,
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -921,36 +935,23 @@ impl PacketProcessor {
                 let mut challenge_changed = false;
                 for char in &data.characters {
                     let is_live = Some(char.char_id) == live_char_id;
-                    if !(is_live && char.blood_ritual_id.is_some()) {
-                        // Crucible is a seasonal challenge, so a non-seasonal character
-                        // cannot carry it. The character list's own CrucibleActive flag
-                        // cannot be trusted to say otherwise: it claimed crucible on most
-                        // of this account's non-seasonal characters, which is the very
-                        // staleness behind issue #66. The flag is therefore only ever
-                        // *set* by the live CRUCIBLE stat; all the list is used for is to
-                        // clear it where it contradicts the season, which also covers a
-                        // character that has rolled out of the season.
-                        let stale_crucible = !char.seasonal
-                            && self
-                                .account_data
-                                .characters
-                                .find_character(char.char_id)
-                                .is_some_and(|cached| cached.crucible_active);
-                        if stale_crucible {
-                            self.account_data
-                                .characters
-                                .update_crucible_status(char.char_id, false);
-                            challenge_changed = true;
-                        }
-                    }
+                    // The Crucible marker is never taken from this list, in either
+                    // direction: it is only ever *set* by the character's own live
+                    // CRUCIBLE stat, and it is cleared by that same stat reporting
+                    // false or by a new season's definitions (issue #63/#66). The
+                    // list's `CrucibleActive` flag is stale -- it claimed crucible on
+                    // most of this account's non-seasonal characters -- so the one
+                    // thing it must not do is revoke a marker the live stat set:
+                    // crucible is available to non-seasonal characters too, and
+                    // clearing on `!seasonal` wiped a real one on every Refresh.
+                    //
                     // The list is the server's own record of the ritual tag, so an
                     // absent one means the character has no ritual and any entry held
                     // for it is stale. It is authoritative for the characters that are
                     // not live; for the live character it may only *clear* them -- the
-                    // live `BloodRitual` stat is fresher for setting, but a
-                    // deactivation is never reported there (the stat is re-sent empty
-                    // on every zone change), so skipping the live character entirely
-                    // left a ritual switched off in-game stuck until logout. [#64]
+                    // live `BloodRitual` stat is fresher for setting, and a
+                    // deactivation there arrives as an empty delta or an unconfirmed
+                    // empty spawn, which this refresh usually confirms first.
                     if !(is_live && char.blood_ritual_id.is_some()) {
                         let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
                         challenge_changed |= self
@@ -1250,6 +1251,68 @@ impl PacketProcessor {
                     self.char_view_gen += 1;
                 }
             }
+        }
+    }
+
+    /// Fold the live character's `BloodRitual` stat into the character cache.
+    ///
+    /// The stat rides the player's own status as a string holding the active
+    /// tier's definition id. The two ways it arrives mean different things:
+    ///
+    /// - A **delta** (a `NewTick` status) is the server saying the stat changed, so
+    ///   an empty delta is a deactivation and the ritual is cleared at once.
+    /// - A **spawn** carries the character's whole stat set and is re-sent empty on
+    ///   every zone change *even while a ritual is active*, so an empty spawn only
+    ///   schedules a check: when one is active the game follows it with the real id
+    ///   within a few milliseconds, and only silence past the deadline means "none"
+    ///   (see [`Self::settle_blood_ritual`]).
+    fn apply_blood_ritual_stat(&mut self, id: &str, from_spawn: bool, now_ms: i64) {
+        if !id.trim().is_empty() {
+            // A live value answers the question an empty spawn asked.
+            self.blood_ritual_clear_at = None;
+            if self
+                .account_data
+                .characters
+                .set_live_blood_ritual(self.live_char_id, id)
+            {
+                self.sync_shot_damage_bonus();
+                self.account_data.mark_dirty();
+                self.char_view_gen += 1;
+            }
+            return;
+        }
+        if from_spawn {
+            self.blood_ritual_clear_at = Some(now_ms + BLOOD_RITUAL_SETTLE_MS);
+            return;
+        }
+        self.blood_ritual_clear_at = None;
+        self.clear_live_blood_ritual();
+    }
+
+    /// Resolve an empty `BloodRitual` spawn once it has settled: an active ritual is
+    /// always reported as an id right after the empty snapshot, so silence means it
+    /// was switched off (or never was on).
+    fn settle_blood_ritual(&mut self, now_ms: i64) {
+        let Some(deadline) = self.blood_ritual_clear_at else {
+            return;
+        };
+        if now_ms < deadline {
+            return;
+        }
+        self.blood_ritual_clear_at = None;
+        self.clear_live_blood_ritual();
+    }
+
+    /// Drop the live character's ritual and re-derive the shot multipliers from it.
+    fn clear_live_blood_ritual(&mut self) {
+        if self
+            .account_data
+            .characters
+            .clear_live_blood_ritual(self.live_char_id)
+        {
+            self.sync_shot_damage_bonus();
+            self.account_data.mark_dirty();
+            self.char_view_gen += 1;
         }
     }
 
@@ -2750,15 +2813,7 @@ impl PacketProcessor {
                         for stat in &obj.status.stats {
                             if stat.stat_type_id == 155 {
                                 let id = stat.string_stat_value.as_deref().unwrap_or("");
-                                if self
-                                    .account_data
-                                    .characters
-                                    .set_live_blood_ritual(self.live_char_id, id)
-                                {
-                                    self.sync_shot_damage_bonus();
-                                    self.account_data.mark_dirty();
-                                    self.char_view_gen += 1;
-                                }
+                                self.apply_blood_ritual_stat(id, true, time_ms as i64);
                             }
                         }
                     }
@@ -3036,6 +3091,9 @@ impl PacketProcessor {
                 // Keep the live character's alive fame current from the observed
                 // CurrFame, rather than only after a full account refresh.
                 self.sync_live_fame();
+                // An empty BloodRitual spawn snapshot is only conclusive once the
+                // window in which the game reports the active id has passed.
+                self.settle_blood_ritual(time_ms as i64);
 
                 // Update entity positions/stats for loot tracking
                 for status in &new_tick.statuses {
@@ -3051,15 +3109,7 @@ impl PacketProcessor {
                         for stat in &status.stats {
                             if stat.stat_type_id == 155 {
                                 let id = stat.string_stat_value.as_deref().unwrap_or("");
-                                if self
-                                    .account_data
-                                    .characters
-                                    .set_live_blood_ritual(self.live_char_id, id)
-                                {
-                                    self.sync_shot_damage_bonus();
-                                    self.account_data.mark_dirty();
-                                    self.char_view_gen += 1;
-                                }
+                                self.apply_blood_ritual_stat(id, false, time_ms as i64);
                             }
                         }
                     }
@@ -4998,15 +5048,14 @@ mod isolation_gate_tests {
         );
     }
 
-    /// A crucible flag carried over from last season is corrected by the character
-    /// list for characters that are not live, while the live character keeps the
-    /// value its own CRUCIBLE stat reported (issue #66). Crucible is seasonal-only,
-    /// and the character list's own flag is stale (it claims crucible on
-    /// non-seasonal characters -- issue #66), so the list never grants it. What the
-    /// list does do is let a character that is not seasonal lose a flag it could not
-    /// legitimately hold.
+    /// The Crucible marker comes from the live CRUCIBLE stat and from nowhere else:
+    /// the character list's own flag is stale (it claims crucible on non-seasonal
+    /// characters -- issue #66), and a Refresh must never revoke a marker the live
+    /// stat set. Crucible runs on non-seasonal characters too, so clearing on
+    /// `!seasonal` wiped a real marker every time the account data refreshed, which
+    /// is what made the Character card pill vanish on Refresh.
     #[test]
-    fn api_account_data_clears_crucible_from_non_seasonal_characters() {
+    fn api_account_data_keeps_a_live_crucible_marker_on_a_regular_character() {
         use realmhound_core::api::RealmCharacter;
         use realmhound_core::vault::CachedCharacter;
 
@@ -5016,7 +5065,7 @@ mod isolation_gate_tests {
         p.set_selected_scope(key, id.clone());
         p.account_data.characters.crucible_migrated = true;
 
-        // One wrongly-flagged regular character, and one legitimately seasonal.
+        // Both live-detected: one on a regular character, one seasonal.
         for char_id in [1, 2] {
             let mut c = CachedCharacter {
                 char_id,
@@ -5026,13 +5075,15 @@ mod isolation_gate_tests {
             p.account_data.characters.characters.push(c);
         }
 
+        // The list reports nothing about the crucible for either of them; its own
+        // flag (which it does carry) is not trusted in either direction.
         let data = realmhound_core::api::AccountData {
             account_id: Some("MAIN123".into()),
             characters: vec![
                 RealmCharacter {
                     char_id: 1,
                     seasonal: false,
-                    crucible_active: true,
+                    crucible_active: false,
                     ..Default::default()
                 },
                 RealmCharacter {
@@ -5047,12 +5098,12 @@ mod isolation_gate_tests {
         p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
 
         assert!(
-            !p.account_data
+            p.account_data
                 .characters
                 .find_character(1)
                 .unwrap()
                 .crucible_active,
-            "a non-seasonal character cannot be crucible"
+            "a Refresh keeps the marker the live stat reported, seasonal or not"
         );
         assert!(
             p.account_data
@@ -5061,6 +5112,107 @@ mod isolation_gate_tests {
                 .unwrap()
                 .crucible_active,
             "a seasonal character keeps the flag the live stat gave it"
+        );
+    }
+
+    /// The live `BloodRitual` stat is the only live source for the ritual, and the
+    /// two ways it arrives mean different things. A `NewTick` delta is the server
+    /// saying the stat changed, so an empty delta is a deactivation and the pill
+    /// must go immediately. A spawn snapshot is re-sent empty on *every* zone
+    /// change even while a ritual is active, and the game follows it with the real
+    /// id within milliseconds when one is: only silence past the settle window means
+    /// "none". Reading the empty spawn as a deactivation made the pill, the
+    /// attribute brackets and the Bonuses line flash on every portal (#64); ignoring
+    /// the empty delta left a ritual switched off in-game stuck until Refresh.
+    #[test]
+    fn blood_ritual_stat_deactivation_clears_and_zone_changes_do_not() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::vault::CachedCharacter;
+
+        const CURRENT: &str = "5027802235043840";
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        p.live_char_id = Some(2487);
+        p.account_data.characters.characters.push(CachedCharacter {
+            char_id: 2487,
+            ..Default::default()
+        });
+
+        // Ritual active, then a zone change: the spawn snapshot is empty, the id
+        // follows 80 ms later. The marker must survive both.
+        p.apply_blood_ritual_stat(CURRENT, false, 1_000);
+        assert!(p
+            .account_data
+            .characters
+            .blood_ritual_for_char(2487)
+            .is_some());
+        p.apply_blood_ritual_stat("", true, 2_000);
+        p.settle_blood_ritual(2_100);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_some(),
+            "an empty spawn inside the settle window is not a deactivation"
+        );
+        p.apply_blood_ritual_stat(CURRENT, false, 2_080);
+        p.settle_blood_ritual(9_999);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_some(),
+            "the id that follows the empty spawn cancels the pending clear"
+        );
+
+        // Switched off in game: the stat delta comes back empty.
+        p.apply_blood_ritual_stat("", false, 3_000);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_none(),
+            "an empty delta clears the ritual at once"
+        );
+        assert!(
+            !p.account_data
+                .characters
+                .find_character(2487)
+                .unwrap()
+                .blood_ritual_active,
+            "the character flag follows the cleared entry"
+        );
+
+        // And the unambiguous case: an empty spawn that is never confirmed.
+        p.apply_blood_ritual_stat(CURRENT, false, 4_000);
+        p.apply_blood_ritual_stat("", true, 5_000);
+        p.settle_blood_ritual(5_000);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_some(),
+            "still inside the window"
+        );
+        p.settle_blood_ritual(5_000 + 400);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_none(),
+            "an unconfirmed empty spawn clears once it has settled"
         );
     }
 

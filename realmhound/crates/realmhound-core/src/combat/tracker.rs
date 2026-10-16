@@ -154,17 +154,19 @@ const ABILITY_ATTRIBUTION_WINDOW_MS: i64 = 2_000;
 /// whose activations were up to 15s apart, while a pet out at the same time
 /// attacks on its own clock (an Electric pet landed all of its hits 4.5-6s after
 /// the last activation, and in a fight with no activations at all). Sage's
-/// Wakibiki's own tooltip states the matching lifetime -- "Lifetime: 6 seconds",
-/// "Cooldown: 1.5 seconds" -- which is why the window is the creature's life
-/// rather than an arbitrary grace period.
+/// Wakibiki's tooltip states the matching lifetime -- "Lifetime: 6 seconds",
+/// "Cooldown: 1.5 seconds" -- so the window is the creature's own life rather
+/// than an arbitrary grace period.
 const SUMMON_SPAWN_ATTRIBUTION_MS: i64 = 6_000;
-/// How far a summoned creature can be from a target and still have hit it. The
-/// spirit items state their reach in-game: Sage's Wakibiki "Slows within 3
-/// squares. ... deals 100 damage/sec within 3 squares", and a Kimono's spirits
-/// only hurt what they are standing next to. Squares are tiles, so this is 3
-/// tiles plus half a tile of slack for a creature whose last reported position
-/// predates a small drift.
-const SUMMON_ATTACK_MAX_DIST: f32 = 3.5;
+/// How far a summoned creature can be from a target and still be the one that hit
+/// it. Measured in game: a spirit reaches an enemy 5 tiles away and cannot reach
+/// one at 6. The item tooltip's "3 squares" is the radius of its *slow*, not of
+/// its zap. This is a disambiguator, not a hit model -- the packet already says
+/// how much damage landed -- so its only job is to pick between creatures of the
+/// player's that are out at the same moment (a Kimono and a Wakibiki spirit
+/// "synergize", so more than one can be alive at once). Being wrong here moves a
+/// hit between two of the player's own rows, never in or out of the total.
+const SUMMON_ATTACK_MAX_DIST: f32 = 5.0;
 /// How long a tracked summoned creature stays a candidate with no further sight
 /// of it. Bounds the map when a removal packet never arrives.
 const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;

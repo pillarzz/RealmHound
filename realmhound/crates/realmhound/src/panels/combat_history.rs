@@ -392,6 +392,83 @@ fn section_header(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
+/// The distinct items that can spawn a summoned creature, and the hover that lists
+/// them with how they spawn it.
+///
+/// Sources are deduplicated by name so an item and its `(SB)`/shiny variants read
+/// as one item (they spawn the same creature), which is what makes "from Sovereign
+/// Mace" possible instead of "from 2 items". Returns `(names, tooltip)`; both empty
+/// when no item declares the creature (a pet, or an entity the game spawns itself).
+fn summon_source_labels(
+    sources: &[realmhound_core::assets::SummonSource],
+) -> (Vec<String>, String) {
+    let mut names: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for s in sources {
+        if !names.iter().any(|n| n == &s.item_name) {
+            names.push(s.item_name.clone());
+        }
+        let mut line = match s.chance {
+            c if c > 0.0 && c < 1.0 => format!(
+                "{} ({}, {:.0}% chance)",
+                s.item_name,
+                s.trigger.label(),
+                c * 100.0
+            ),
+            _ => format!("{} ({})", s.item_name, s.trigger.label()),
+        };
+        if !lines.iter().any(|l| l == &line) {
+            lines.push(line);
+        }
+    }
+    let tooltip = if lines.is_empty() {
+        String::new()
+    } else if lines.len() == 1 {
+        format!("Summoned by {}", lines[0])
+    } else {
+        format!("Summoned by:\n  {}", lines.join("\n  "))
+    };
+    (names, tooltip)
+}
+
+/// One row per pet or summon *entity type*, summing the instances.
+///
+/// A Summoner mace spawns a fresh Bear on every use, so a long fight lists dozens
+/// of one-creature rows that say nothing extra: the split that matters is between
+/// entity types, not between instances of the same one. Rows are keyed by what
+/// names the creature -- its own object type for a summon, its skin for a pet --
+/// and rows recorded before the type was stored (all zero there) collapse into the
+/// single generic row they were already labelled with. Returns the rows by damage,
+/// highest first, matching the per-instance order they replace.
+fn group_summons(
+    summons: &[realmhound_core::combat::SummonContribution],
+) -> Vec<realmhound_core::combat::SummonContribution> {
+    let mut out: Vec<realmhound_core::combat::SummonContribution> = Vec::new();
+    for s in summons {
+        let key = if s.is_pet {
+            (true, s.pet_type)
+        } else {
+            (false, s.object_type)
+        };
+        match out.iter_mut().find(|g| {
+            let g_key = if g.is_pet {
+                (true, g.pet_type)
+            } else {
+                (false, g.object_type)
+            };
+            g_key == key
+        }) {
+            Some(g) => {
+                g.damage += s.damage;
+                g.hits += s.hits;
+            }
+            None => out.push(s.clone()),
+        }
+    }
+    out.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
+    out
+}
+
 /// A section divider of `width` points from the current left edge, in the same
 /// stroke as the card's other dividers.
 fn section_divider(ui: &mut egui::Ui, width: f32) {
@@ -3836,7 +3913,10 @@ impl CombatHistoryPanel {
         self.render_ability_section(ui, ctx, fight);
 
         ui.add_space(10.0);
-        section_header(ui, "Pets and summons");
+        section_header(ui, "Pets and summons").hover_tip(
+            "Pet and summon hits are credited to you by the game. They are listed here so the \
+             split is visible, and they are excluded from your weapon and ability damage.",
+        );
         ui.add_space(4.0);
         if local.summons.is_empty() {
             ui.label(
@@ -3844,16 +3924,6 @@ impl CombatHistoryPanel {
                     .color(Color32::GRAY),
             );
         } else {
-            ui.label(
-                RichText::new(
-                    "Pet and summon hits are credited to you (the game attributes them to the \
-                     owner); they are listed here so the split is visible, and they are excluded \
-                     from your own per-hit average and per-weapon figures.",
-                )
-                .color(Color32::GRAY)
-                .small(),
-            );
-            ui.add_space(4.0);
             egui::Grid::new("my_performance_pets")
                 .num_columns(4)
                 .spacing([18.0, 4.0])
@@ -3863,7 +3933,7 @@ impl CombatHistoryPanel {
                     ui.label(RichText::new("Damage").color(Color32::GRAY).small());
                     ui.label(RichText::new("Average").color(Color32::GRAY).small());
                     ui.end_row();
-                    for s in &local.summons {
+                    for s in &group_summons(&local.summons) {
                         // Name and draw the entity from its own object type when it
                         // has one: a summoned creature's type is its identity, so
                         // "Summon Pocket Rat" is `0x4683` with that object's sprite.
@@ -3889,10 +3959,31 @@ impl CombatHistoryPanel {
                                 );
                                 ctx.sprite_renderer
                                     .draw_sprite_in_rect(ui, s.object_type, rect);
-                                let name = realmhound_core::assets::get_asset_manager()
+                                let manager = realmhound_core::assets::get_asset_manager();
+                                let name = manager
                                     .object_name(s.object_type)
                                     .unwrap_or_else(|| format!("0x{:X}", s.object_type));
-                                ui.label(name);
+                                // Where the creature came from: the item that spawns
+                                // it, when its object type is in the summon index.
+                                let (sources, tooltip) =
+                                    summon_source_labels(&manager.summon_sources(s.object_type));
+                                let response = ui.label(name);
+                                if sources.len() == 1 {
+                                    ui.label(
+                                        RichText::new(format!("(from {})", sources[0]))
+                                            .color(Color32::GRAY)
+                                            .small(),
+                                    );
+                                } else if sources.len() > 1 {
+                                    ui.label(
+                                        RichText::new(format!("(from {} items)", sources.len()))
+                                            .color(Color32::GRAY)
+                                            .small(),
+                                    );
+                                }
+                                if !tooltip.is_empty() {
+                                    response.on_hover_text(tooltip);
+                                }
                             } else {
                                 ui.label("Summon");
                             }
@@ -5955,5 +6046,139 @@ mod tests {
         let candidates = [(0usize, 5i64, bag_ts), (1usize, 5i64, bag_ts)];
         let chosen = assign_drops_exclusive(&windows, &candidates);
         assert_eq!(chosen.get(&5), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod my_performance_summons_tests {
+    use super::{group_summons, summon_source_labels};
+    use realmhound_core::combat::SummonContribution;
+
+    fn summon(object_id: i32, object_type: i32, damage: i64, hits: u64) -> SummonContribution {
+        SummonContribution {
+            object_id,
+            pet_type: 0,
+            is_pet: false,
+            object_type,
+            damage,
+            hits,
+        }
+    }
+
+    fn pet(object_id: i32, pet_type: i32, damage: i64, hits: u64) -> SummonContribution {
+        SummonContribution {
+            object_id,
+            pet_type,
+            is_pet: true,
+            object_type: 0,
+            damage,
+            hits,
+        }
+    }
+
+    /// A Summoner mace spawns a fresh Bear per use, so the table must not list one
+    /// row per instance: the split that matters is between entity types.
+    #[test]
+    fn summons_group_by_entity_type_and_sum_their_instances() {
+        let rows = vec![
+            summon(157, 0x89b1, 3110, 8),
+            summon(158, 0x89b1, 2678, 7),
+            summon(159, 0x89b1, 1967, 5),
+            summon(160, 0x2222, 4530, 15),
+            summon(161, 0x2222, 4042, 14),
+            summon(162, 0x3333, 1110, 3),
+        ];
+        let grouped = group_summons(&rows);
+        assert_eq!(grouped.len(), 3, "three entity types");
+        // Highest combined damage first, matching the per-instance order.
+        assert_eq!(grouped[0].object_type, 0x2222);
+        assert_eq!(grouped[0].damage, 8572);
+        assert_eq!(grouped[0].hits, 29);
+        assert_eq!(grouped[1].object_type, 0x89b1);
+        assert_eq!(grouped[1].damage, 7755);
+        assert_eq!(grouped[1].hits, 20);
+        assert_eq!(grouped[2].object_type, 0x3333);
+        assert_eq!(grouped[2].damage, 1110);
+    }
+
+    /// Pets are named by their skin, so two pets of the same skin are one row, and
+    /// a pet never merges with a summon whose object type happens to be zero.
+    #[test]
+    fn pets_group_by_skin_and_stay_apart_from_unknown_summons() {
+        let rows = vec![
+            pet(201, 12_345, 300, 10),
+            pet(202, 12_345, 200, 5),
+            pet(203, 999, 50, 2),
+            summon(301, 0, 400, 8),
+            summon(302, 0, 100, 2),
+        ];
+        let grouped = group_summons(&rows);
+        assert_eq!(
+            grouped.len(),
+            3,
+            "skin 12345, skin 999, and the unknown summon"
+        );
+        assert_eq!(grouped[0].is_pet, true);
+        assert_eq!(grouped[0].pet_type, 12_345);
+        assert_eq!(grouped[0].damage, 500);
+        assert_eq!(grouped[0].hits, 15);
+        // Rows recorded before the type was stored carry 0 and collapse into the
+        // single generic row they were already labelled with.
+        let unknown = grouped.iter().find(|g| !g.is_pet).unwrap();
+        assert_eq!(unknown.object_type, 0);
+        assert_eq!(unknown.damage, 500);
+        assert_eq!(unknown.hits, 10);
+    }
+
+    /// One name covering several item types -- an item with its `(SB)` or shiny
+    /// variants -- reads as one source, which is what makes "from Sovereign Mace"
+    /// possible instead of "from 2 items".
+    #[test]
+    fn sources_deduplicate_by_item_name() {
+        let sources = vec![
+            realmhound_core::assets::SummonSource {
+                item_type: 0x3849,
+                item_name: "Sovereign Mace".into(),
+                trigger: realmhound_core::assets::SummonTrigger::Use,
+                chance: 1.0,
+            },
+            realmhound_core::assets::SummonSource {
+                item_type: 0x9581,
+                item_name: "Sovereign Mace".into(),
+                trigger: realmhound_core::assets::SummonTrigger::Use,
+                chance: 1.0,
+            },
+        ];
+        let (names, tooltip) = summon_source_labels(&sources);
+        assert_eq!(names, vec!["Sovereign Mace".to_string()]);
+        assert_eq!(tooltip, "Summoned by Sovereign Mace (on use)");
+
+        // A chance-based proc says so, and several unrelated items list.
+        let sources = vec![
+            realmhound_core::assets::SummonSource {
+                item_type: 0x6102,
+                item_name: "Soul's Guidance".into(),
+                trigger: realmhound_core::assets::SummonTrigger::OnShoot,
+                chance: 0.15,
+            },
+            realmhound_core::assets::SummonSource {
+                item_type: 0x8114,
+                item_name: "Yarn Ball".into(),
+                trigger: realmhound_core::assets::SummonTrigger::Use,
+                chance: 1.0,
+            },
+        ];
+        let (names, tooltip) = summon_source_labels(&sources);
+        assert_eq!(names.len(), 2);
+        assert!(
+            tooltip.contains("Soul's Guidance (on shoot, 15% chance)"),
+            "{tooltip}"
+        );
+        assert!(tooltip.contains("Yarn Ball (on use)"), "{tooltip}");
+
+        // Nothing declares the creature: no suffix, no hover.
+        let (names, tooltip) = summon_source_labels(&[]);
+        assert!(names.is_empty());
+        assert!(tooltip.is_empty());
     }
 }

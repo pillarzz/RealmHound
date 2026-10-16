@@ -2728,6 +2728,20 @@ impl AssetManager {
                     }
                 }
 
+                // Index which items spawn which summoned creatures, so a credited
+                // summon can be traced back to its source (Pocket Rat, Summoner
+                // maces, Flowering Kimono, ...). Reads the item files plus
+                // allies.xml, where the summoned entities themselves live.
+                let summon_paths: Vec<PathBuf> = ["equip.xml", "token.xml", "allies.xml"]
+                    .iter()
+                    .map(|name| assets_dir.join("xml").join(name))
+                    .filter(|path| path.exists())
+                    .collect();
+                match list.merge_summon_sources_xml(&summon_paths) {
+                    Ok(count) => tracing::info!("Indexed {} item -> summon source link(s)", count),
+                    Err(e) => tracing::warn!("Failed to index summon sources: {}", e),
+                }
+
                 // Merge cosmetic unlock targets: skin items (equipSkins.xml) and
                 // pet stones (pets.xml). Neither file is read above, and both
                 // map an unlocker item to a different cosmetic object, the same
@@ -2865,6 +2879,20 @@ impl AssetManager {
                 Some(name.to_string())
             }
         })
+    }
+
+    /// The items that spawn a given summoned creature, from their own
+    /// `<Activate>` / `On*Activate` summon effects (object_list's
+    /// `merge_summon_sources_xml`). Empty for pets and for creatures no item
+    /// declares; more than one entry when several items share a summon (base and
+    /// `(SB)` or shiny variants, or a generic creature several items raise).
+    pub fn summon_sources(&self, object_type: i32) -> Vec<super::object_list::SummonSource> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard
+            .as_ref()
+            .map(|list| list.summon_sources(object_type).to_vec())
+            .unwrap_or_default()
     }
 
     /// Parse a " xN" stack-count suffix from an item name.

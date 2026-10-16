@@ -103,6 +103,7 @@ pub use object_list::{
     RestoreEffect, ScalingStat, StatBoostEffect, TexInfo, TileAsset, TileList, TrapEffect,
     VampireBlastEffect, WeaponProc,
 };
+pub use object_list::{SummonSource, SummonTrigger};
 pub use realmeye_drops::{
     get_realmeye_drops, is_forge_crafted, is_legendary_fishing_rod,
     is_plagued_nest_beehemoth_quiver, is_soulful_affection, source_name_override, DropLocationType,

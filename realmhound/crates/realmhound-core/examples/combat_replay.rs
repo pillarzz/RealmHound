@@ -256,7 +256,15 @@ fn main() {
                         } else {
                             format!("summon 0x{:X}", s.object_type)
                         };
-                        format!("{who} dmg={} hits={}", s.damage, s.hits)
+                        let from = if s.source_item != 0 {
+                            let name = manager
+                                .object_name(s.source_item)
+                                .unwrap_or_else(|| format!("0x{:X}", s.source_item));
+                            format!(" from {name}")
+                        } else {
+                            String::new()
+                        };
+                        format!("{who}{from} dmg={} hits={}", s.damage, s.hits)
                     })
                     .collect();
                 println!(

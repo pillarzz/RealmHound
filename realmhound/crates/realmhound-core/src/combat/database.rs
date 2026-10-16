@@ -5119,10 +5119,11 @@ fn serialize_pet_abilities(abilities: &[i32]) -> String {
 }
 
 /// Serialize the per-summon breakdown as one compact line per summon:
-/// `object_id,pet_type,is_pet,damage,hits,object_type`, joined by `;`. Kept as
-/// text rather than JSON so a legacy value or a partial write can never fail to
-/// parse into the participant row. `object_type` is appended last so rows written
-/// before it existed still read: a short line leaves it 0.
+/// `object_id,pet_type,is_pet,damage,hits,object_type,source_item,source_enchants`,
+/// joined by `;` (enchants `:`-joined). Kept as text rather than JSON so a legacy
+/// value or a partial write can never fail to parse into the participant row.
+/// `object_type` and then the source are appended last so rows written before
+/// each existed still read: a short line leaves it 0.
 fn serialize_summons(summons: &[SummonContribution]) -> Option<String> {
     if summons.is_empty() {
         return None;
@@ -5132,8 +5133,19 @@ fn serialize_summons(summons: &[SummonContribution]) -> Option<String> {
             .iter()
             .map(|s| {
                 format!(
-                    "{},{},{},{},{},{}",
-                    s.object_id, s.pet_type, s.is_pet as i32, s.damage, s.hits, s.object_type
+                    "{},{},{},{},{},{},{},{}",
+                    s.object_id,
+                    s.pet_type,
+                    s.is_pet as i32,
+                    s.damage,
+                    s.hits,
+                    s.object_type,
+                    s.source_item,
+                    s.source_enchants
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(":")
                 )
             })
             .collect::<Vec<_>>()
@@ -5161,11 +5173,28 @@ fn parse_summons(data: Option<&str>) -> Vec<SummonContribution> {
                 .next()
                 .and_then(|v| v.trim().parse::<i32>().ok())
                 .unwrap_or(0);
+            // The item that created it, and its enchants (": "-free, `:` joined),
+            // absent in rows written before the source was resolved.
+            let source_item = parts
+                .next()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            let source_enchants = parts
+                .next()
+                .map(|v| {
+                    v.trim()
+                        .split(':')
+                        .filter_map(|e| e.trim().parse::<u16>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(SummonContribution {
                 object_id,
                 pet_type,
                 is_pet,
                 object_type,
+                source_item,
+                source_enchants,
                 damage,
                 hits,
             })
@@ -5180,22 +5209,27 @@ mod summon_codec_tests {
 
     /// The entity's own object type rides along with the rest of the row, so the
     /// UI can name and draw a summoned creature ("Summon Pocket Rat", 0x4683)
-    /// instead of labelling every row "Summon".
+    /// instead of labelling every row "Summon"; the item that created it rides
+    /// along too, so a row names one source rather than the catalog's list.
     #[test]
-    fn the_object_type_round_trips() {
+    fn the_object_type_and_source_round_trip() {
         let summons = vec![SummonContribution {
             object_id: 157,
             pet_type: 0,
             is_pet: false,
             object_type: 0x4683,
+            source_item: 0x3849,
+            source_enchants: vec![338, 1457],
             damage: 1530,
             hits: 45,
         }];
         let encoded = serialize_summons(&summons).expect("a non-empty list encodes");
-        assert_eq!(encoded, "157,0,0,1530,45,18051");
+        assert_eq!(encoded, "157,0,0,1530,45,18051,14409,338:1457");
         let decoded = parse_summons(Some(&encoded));
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].object_type, 0x4683);
+        assert_eq!(decoded[0].source_item, 0x3849);
+        assert_eq!(decoded[0].source_enchants, vec![338, 1457]);
         assert_eq!(decoded[0].damage, 1530);
         assert_eq!(decoded[0].hits, 45);
     }
@@ -5211,6 +5245,11 @@ mod summon_codec_tests {
         assert_eq!(decoded[0].pet_type, 12_345);
         assert!(decoded[0].is_pet);
         assert_eq!(decoded[0].object_type, 0);
+        // Six fields: the type is there but the source is not.
+        let typed = parse_summons(Some("157,0,0,1530,45,18051"));
+        assert_eq!(typed[0].object_type, 0x4683);
+        assert_eq!(typed[0].source_item, 0);
+        assert!(typed[0].source_enchants.is_empty());
     }
 }
 
@@ -5524,6 +5563,16 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                         existing.is_pet = existing.is_pet || s.is_pet;
                         if s.pet_type != 0 {
                             existing.pet_type = s.pet_type;
+                        }
+                        if s.object_type != 0 {
+                            existing.object_type = s.object_type;
+                        }
+                        // The item that created it does not change between phases.
+                        if s.source_item != 0 {
+                            existing.source_item = s.source_item;
+                            if !s.source_enchants.is_empty() {
+                                existing.source_enchants = s.source_enchants.clone();
+                            }
                         }
                     }
                     None => entry.rec.summons.push(s.clone()),

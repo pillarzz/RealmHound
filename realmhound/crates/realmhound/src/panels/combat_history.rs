@@ -431,33 +431,37 @@ fn summon_source_labels(
     (names, tooltip)
 }
 
-/// One row per pet or summon *entity type*, summing the instances.
+/// One row per pet or summon *entity type and source pair*, summing the instances.
 ///
 /// A Summoner mace spawns a fresh Bear on every use, so a long fight lists dozens
 /// of one-creature rows that say nothing extra: the split that matters is between
 /// entity types, not between instances of the same one. Rows are keyed by what
 /// names the creature -- its own object type for a summon, its skin for a pet --
-/// and rows recorded before the type was stored (all zero there) collapse into the
-/// single generic row they were already labelled with. Returns the rows by damage,
-/// highest first, matching the per-instance order they replace.
+/// *and* by the item that created it with its enchants, so one summon is never
+/// merged under two items (a `Summon Bear` row cannot end up claiming both a
+/// Sovereign Mace and its `(SB)` twin), while the same item used with different
+/// enchants shows as two rows. Rows recorded before a type or source was stored
+/// (all zero there) collapse into the single generic row they were already
+/// labelled with. Returns the rows by damage, highest first, matching the
+/// per-instance order they replace.
 fn group_summons(
     summons: &[realmhound_core::combat::SummonContribution],
 ) -> Vec<realmhound_core::combat::SummonContribution> {
+    /// What names a row: pets by skin, summons by creature type, each with the
+    /// item that created it.
+    fn key_of(
+        s: &realmhound_core::combat::SummonContribution,
+    ) -> (bool, i32, i32, Vec<u16>) {
+        if s.is_pet {
+            (true, s.pet_type, 0, Vec::new())
+        } else {
+            (false, s.object_type, s.source_item, s.source_enchants.clone())
+        }
+    }
     let mut out: Vec<realmhound_core::combat::SummonContribution> = Vec::new();
     for s in summons {
-        let key = if s.is_pet {
-            (true, s.pet_type)
-        } else {
-            (false, s.object_type)
-        };
-        match out.iter_mut().find(|g| {
-            let g_key = if g.is_pet {
-                (true, g.pet_type)
-            } else {
-                (false, g.object_type)
-            };
-            g_key == key
-        }) {
+        let key = key_of(s);
+        match out.iter_mut().find(|g| key_of(g) == key) {
             Some(g) => {
                 g.damage += s.damage;
                 g.hits += s.hits;
@@ -3963,12 +3967,37 @@ impl CombatHistoryPanel {
                                 let name = manager
                                     .object_name(s.object_type)
                                     .unwrap_or_else(|| format!("0x{:X}", s.object_type));
-                                // Where the creature came from: the item that spawns
-                                // it, when its object type is in the summon index.
+                                // Where the creature came from. The fight resolves
+                                // the item that actually created it from the
+                                // player's own loadout and activations, so the row
+                                // names one source and draws that item's sprite --
+                                // the catalog alone lists every item that *can*
+                                // spawn the creature, which reads as "from 2 items"
+                                // the moment an item has an `(SB)` or shiny twin.
                                 let (sources, tooltip) =
                                     summon_source_labels(&manager.summon_sources(s.object_type));
-                                let response = ui.label(name);
-                                if sources.len() == 1 {
+                                let mut response = ui.label(name);
+                                if s.source_item != 0 {
+                                    let enemy: Vec<i32> =
+                                        s.source_enchants.iter().map(|&e| e as i32).collect();
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    ctx.sprite_renderer
+                                        .render_item_sprite_with_enchants_native(
+                                            ui,
+                                            s.source_item,
+                                            &enemy,
+                                            16.0,
+                                        );
+                                    let item = manager
+                                        .object_name(s.source_item)
+                                        .unwrap_or_else(|| format!("0x{:X}", s.source_item));
+                                    let label = ui.label(
+                                        RichText::new(format!("(from {item})"))
+                                            .color(Color32::GRAY)
+                                            .small(),
+                                    );
+                                    response = response.union(label);
+                                } else if sources.len() == 1 {
                                     ui.label(
                                         RichText::new(format!("(from {})", sources[0]))
                                             .color(Color32::GRAY)
@@ -3982,8 +4011,9 @@ impl CombatHistoryPanel {
                                     );
                                 }
                                 if !tooltip.is_empty() {
-                                    response.on_hover_text(tooltip);
+                                    response = response.on_hover_text(tooltip);
                                 }
+                                let _ = response;
                             } else {
                                 ui.label("Summon");
                             }
@@ -6060,6 +6090,8 @@ mod my_performance_summons_tests {
             pet_type: 0,
             is_pet: false,
             object_type,
+            source_item: 0,
+            source_enchants: Vec::new(),
             damage,
             hits,
         }
@@ -6071,6 +6103,8 @@ mod my_performance_summons_tests {
             pet_type,
             is_pet: true,
             object_type: 0,
+            source_item: 0,
+            source_enchants: Vec::new(),
             damage,
             hits,
         }
@@ -6130,6 +6164,43 @@ mod my_performance_summons_tests {
         assert_eq!(unknown.hits, 10);
     }
 
+    /// One creature, two items: a `Summon Bear` resolved to the Sovereign Mace in
+    /// one phase and to its `(SB)` twin in another must not merge into a row that
+    /// claims both, and the same item with different enchants is two rows of its
+    /// own -- while the same item and enchants still collapse.
+    #[test]
+    fn summons_split_by_the_item_that_created_them() {
+        let mut first = summon(157, 0x89b1, 3110, 8);
+        first.source_item = 0x3849;
+        first.source_enchants = vec![338];
+        let mut second = summon(158, 0x89b1, 2678, 7);
+        second.source_item = 0x9581;
+        second.source_enchants = vec![338];
+        let mut third = summon(159, 0x89b1, 1967, 5);
+        third.source_item = 0x3849;
+        third.source_enchants = vec![];
+        let mut fourth = summon(160, 0x89b1, 900, 3);
+        fourth.source_item = 0x3849;
+        fourth.source_enchants = vec![338];
+        let grouped = group_summons(&[first, second, third, fourth]);
+        assert_eq!(grouped.len(), 3, "two items and two enchant sets");
+        // The mace with enchant 338 owns both of its instances.
+        let mace = grouped
+            .iter()
+            .find(|g| g.source_item == 0x3849 && g.source_enchants == vec![338])
+            .expect("the enchanted mace row");
+        assert_eq!(mace.damage, 4010);
+        assert_eq!(mace.hits, 11);
+        // The same item with no enchants is its own row.
+        assert!(grouped
+            .iter()
+            .any(|g| g.source_item == 0x3849 && g.source_enchants.is_empty() && g.hits == 5));
+        // The twin never absorbs the mace's damage, and vice versa.
+        assert!(grouped
+            .iter()
+            .any(|g| g.source_item == 0x9581 && g.damage == 2678));
+    }
+
     /// One name covering several item types -- an item with its `(SB)` or shiny
     /// variants -- reads as one source, which is what makes "from Sovereign Mace"
     /// possible instead of "from 2 items".
@@ -6142,6 +6213,7 @@ mod my_performance_summons_tests {
                 trigger: realmhound_core::assets::SummonTrigger::Use,
                 chance: 1.0,
                 deals_damage: true,
+                lifetime_ms: 0,
             },
             realmhound_core::assets::SummonSource {
                 item_type: 0x9581,
@@ -6149,6 +6221,7 @@ mod my_performance_summons_tests {
                 trigger: realmhound_core::assets::SummonTrigger::Use,
                 chance: 1.0,
                 deals_damage: true,
+                lifetime_ms: 0,
             },
         ];
         let (names, tooltip) = summon_source_labels(&sources);
@@ -6163,6 +6236,7 @@ mod my_performance_summons_tests {
                 trigger: realmhound_core::assets::SummonTrigger::OnShoot,
                 chance: 0.15,
                 deals_damage: false,
+                lifetime_ms: 0,
             },
             realmhound_core::assets::SummonSource {
                 item_type: 0x8114,
@@ -6170,6 +6244,7 @@ mod my_performance_summons_tests {
                 trigger: realmhound_core::assets::SummonTrigger::Use,
                 chance: 1.0,
                 deals_damage: false,
+                lifetime_ms: 0,
             },
         ];
         let (names, tooltip) = summon_source_labels(&sources);

@@ -661,6 +661,11 @@ struct SummonAccum {
     /// summon: a summoned creature's type is its identity, where a pet's is its
     /// skin under `pet_type`. 0 until the entity is observed.
     object_type: i32,
+    /// The item that created it and the enchants that item had, resolved from the
+    /// local player's loadout and activation log (see
+    /// [`CombatTracker::summon_source_item`]). 0 until resolved.
+    source_item: i32,
+    source_enchants: Vec<u16>,
 }
 
 /// One boost-relevant stat/condition transition on the local player, in absolute
@@ -691,6 +696,80 @@ struct LocalAbilityUse {
     /// activation time. `None` when the item declares no such effect, i.e. when a
     /// bulletless packet could not have come from it.
     server_effect_window_ms: Option<i64>,
+}
+
+/// One item in the local player's loadout that declares a summon of the creature
+/// being resolved.
+#[derive(Debug, Clone, Copy)]
+struct SummonCandidate {
+    /// Equipment slot it sits in, which is where its enchants are read from.
+    slot: usize,
+    item: i32,
+    trigger: SummonTrigger,
+    /// The spawning element's own `lifeTime`, 0 when it declares none.
+    lifetime_ms: i64,
+}
+
+/// Decide which of the local player's items created a summoned creature (see
+/// [`CombatTracker::summon_source_item`]), returning the item and the enchants it
+/// had.
+fn pick_summon_source(
+    candidates: &[SummonCandidate],
+    uses: &VecDeque<LocalAbilityUse>,
+    equipment_enchants: &[Vec<u16>],
+    at_ms: i64,
+) -> Option<(i32, Vec<u16>)> {
+    let mut best: Option<(i64, i32, Vec<u16>)> = None;
+    for &SummonCandidate {
+        slot,
+        item,
+        trigger,
+        lifetime_ms,
+    } in candidates
+    {
+        let lifetime = if lifetime_ms > 0 {
+            lifetime_ms
+        } else {
+            SUMMON_SPAWN_ATTRIBUTION_MS
+        };
+        let fired = uses
+            .iter()
+            .filter(|u| match trigger {
+                SummonTrigger::Use => u.item_id == item,
+                // An ability-activated summon is created by the *declaring* item
+                // (the Kimono), not by whichever ability happened to be pressed,
+                // so any activation dates it.
+                SummonTrigger::OnAbilityUse => true,
+                _ => false,
+            })
+            .filter(|u| u.time_ms <= at_ms && at_ms - u.time_ms <= lifetime)
+            .max_by_key(|u| u.time_ms);
+        let Some(use_) = fired else { continue };
+        let enchants = if use_.enchants.is_empty() {
+            equipment_enchants.get(slot).cloned().unwrap_or_default()
+        } else {
+            use_.enchants.clone()
+        };
+        if best.as_ref().map_or(true, |(at, _, _)| use_.time_ms > *at) {
+            best = Some((use_.time_ms, item, enchants));
+        }
+    }
+    if let Some((_, item, enchants)) = best {
+        return Some((item, enchants));
+    }
+    // Nothing in the log triggered it (a shoot-triggered summon, say): the one
+    // equipped item that declares the creature is the answer, and only when it is
+    // alone.
+    match candidates {
+        [only] => Some((
+            only.item,
+            equipment_enchants
+                .get(only.slot)
+                .cloned()
+                .unwrap_or_default(),
+        )),
+        _ => None,
+    }
 }
 
 /// Whether an activation's own declared server-applied effect could still be
@@ -1696,6 +1775,47 @@ impl CombatTracker {
                     .then(a.1.cmp(&b.1))
             })
             .map(|(_, id, object_type)| (id, object_type))
+    }
+
+    /// The item that created a summon of `creature_type`, with the enchants it had
+    /// at the time.
+    ///
+    /// A creature's catalog entry lists *every* item that can spawn it, so
+    /// `Summon Bear` names both `Sovereign Mace` and its `(SB)` twin and the row
+    /// reads "from 2 items" even though one mace was used. The player's own
+    /// equipment and activation log settle it:
+    ///
+    /// * an equipped item that declares the creature is a candidate, and the one
+    ///   whose trigger the log can still satisfy at `at_ms` wins -- a `Use` summon
+    ///   needs its own activation, an ability-activated one is created by *any*
+    ///   activation (the Kimono's spirits come from the Kimono, not from the
+    ///   ability that happened to be pressed), and each spawning element declares
+    ///   its creature's `lifeTime`, so a summon cast before the fight is still
+    ///   traceable;
+    /// * with nothing in the log, a candidate that is equipped now is the only
+    ///   other answer, and only when it is the single one.
+    fn summon_source_item(&self, creature_type: i32, at_ms: i64) -> Option<(i32, Vec<u16>)> {
+        let sources = get_asset_manager().summon_sources(creature_type);
+        if sources.is_empty() {
+            return None;
+        }
+        let local = self.objects.get(&self.local_object_id)?;
+        let mut candidates: Vec<SummonCandidate> = Vec::new();
+        for (slot, &item) in local.equipment.iter().enumerate() {
+            if item <= 0 {
+                continue;
+            }
+            let Some(source) = sources.iter().find(|s| s.item_type == item) else {
+                continue;
+            };
+            candidates.push(SummonCandidate {
+                slot,
+                item,
+                trigger: source.trigger,
+                lifetime_ms: source.lifetime_ms,
+            });
+        }
+        pick_summon_source(&candidates, &self.local_ability_uses, &local.equipment_enchants, at_ms)
     }
 
     /// Update an existing object's stats (from a `NewTick` status, which does not
@@ -3490,10 +3610,15 @@ impl CombatTracker {
         } else {
             (0, false, 0)
         };
+        // Resolved before the fight is borrowed mutably below.
+        let summon_source = if is_summon && !summon_is_pet {
+            self.summon_source_item(summon_object_type, time_ms)
+        } else {
+            None
+        };
         let (name, object_type, equipment, enchants, skin_id, tex1, tex2) = self
             .objects
-            .get(&local_id)
-            .map(|o| {
+            .get(&local_id)            .map(|o| {
                 (
                     o.name.clone(),
                     o.object_type,
@@ -3572,6 +3697,12 @@ impl CombatTracker {
             }
             if summon_object_type != 0 {
                 entry.object_type = summon_object_type;
+            }
+            if entry.source_item == 0 {
+                if let Some((item, enchants)) = summon_source {
+                    entry.source_item = item;
+                    entry.source_enchants = enchants;
+                }
             }
         } else if let Some(item_id) = volley_item {
             // An ability volley's hit: the packet named the ability that fired it,
@@ -4540,6 +4671,8 @@ impl CombatTracker {
                         pet_type: s.pet_type,
                         is_pet: s.is_pet,
                         object_type: s.object_type,
+                        source_item: s.source_item,
+                        source_enchants: s.source_enchants.clone(),
                         damage: s.damage,
                         hits: s.hits,
                     })
@@ -4811,6 +4944,17 @@ impl CombatTracker {
             }
             if object_type != 0 {
                 entry.object_type = object_type;
+            }
+            // The item behind the creature, resolved from the player's own
+            // loadout and activation log rather than from the catalog, which
+            // cannot tell an item from its `(SB)` twin.
+            if entry.source_item == 0 && !is_pet {
+                if let Some((item, enchants)) =
+                    self.summon_source_item(object_type, event.time_ms)
+                {
+                    entry.source_item = item;
+                    entry.source_enchants = enchants;
+                }
             }
         }
     }
@@ -12262,7 +12406,8 @@ mod tests {
     }
 
     #[test]
-    fn an_electric_pet_is_a_candidate_only_while_it_is_out_and_in_range() {        let mut t = pet_packet_tracker(&[406], 32643);
+    fn an_electric_pet_is_a_candidate_only_while_it_is_out_and_in_range() {
+        let mut t = pet_packet_tracker(&[406], 32643);
         assert_eq!(t.damage_capable_pet_near_local(), Some(900));
         // Out of range of its owner: it cannot be the shooter.
         t.on_object_status(900, &status_at(900, 40.0, 40.0, vec![]), 10);
@@ -12274,5 +12419,140 @@ mod tests {
             20,
         );
         assert_eq!(t.damage_capable_pet_near_local(), None);
+    }
+
+    fn ability_use_with(time_ms: i64, item_id: i32, enchants: &[u16]) -> LocalAbilityUse {
+        LocalAbilityUse {
+            time_ms,
+            item_id,
+            enchants: enchants.to_vec(),
+            server_effect_window_ms: None,
+        }
+    }
+
+    fn no_enchants() -> Vec<Vec<u16>> {
+        vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()]
+    }
+
+    #[test]
+    fn a_bear_is_credited_to_the_mace_that_was_used_not_to_its_twin() {
+        // Both a Sovereign Mace and its (SB) twin declare `Summon Bear`, so the
+        // catalog cannot tell them apart -- and the row used to read "from 2
+        // items". Only one of them was activated.
+        let mut uses = VecDeque::new();
+        uses.push_back(ability_use_with(1_000, 0x9581, &[338]));
+        let candidates = [
+            SummonCandidate {
+                slot: 1,
+                item: 0x3849,
+                trigger: SummonTrigger::Use,
+                lifetime_ms: 10_000,
+            },
+            SummonCandidate {
+                slot: 2,
+                item: 0x9581,
+                trigger: SummonTrigger::Use,
+                lifetime_ms: 10_000,
+            },
+        ];
+        let enchants = [Vec::new(), Vec::new(), vec![338], Vec::new()];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 2_000),
+            Some((0x9581, vec![338]))
+        );
+        // Past the bear's own declared 10s lifetime, that activation can no longer
+        // explain the creature, and two candidates means nothing is claimed.
+        assert_eq!(pick_summon_source(&candidates, &uses, &enchants, 20_000), None);
+    }
+
+    #[test]
+    fn an_ability_spawned_spirit_names_the_item_that_declares_it() {
+        // A Kimono's spirits are created by *any* ability activation, so the item
+        // credited is the Kimono itself, never the ability that was pressed.
+        let mut uses = VecDeque::new();
+        uses.push_back(ability_use_with(5_000, 999, &[]));
+        let candidates = [SummonCandidate {
+            slot: 2,
+            item: 0x4ff4,
+            trigger: SummonTrigger::OnAbilityUse,
+            lifetime_ms: 0,
+        }];
+        let enchants = [Vec::new(), Vec::new(), vec![6], Vec::new()];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 5_500),
+            Some((0x4ff4, vec![6])),
+            "the slot's own enchants stand in when the activation carries none"
+        );
+        // With no `lifeTime` declared, the shortest documented summon life bounds
+        // the *search*, but with only one item able to spawn the creature the
+        // answer is still unambiguous: nothing else could have made it.
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 12_000),
+            Some((0x4ff4, vec![6]))
+        );
+    }
+
+    #[test]
+    fn a_summon_cast_before_the_fight_still_names_its_item() {
+        // The activation log is a rolling session log, so a bear summoned before
+        // the fight started is still traceable to its mace.
+        let mut uses = VecDeque::new();
+        uses.push_back(ability_use_with(-4_000, 0x3849, &[]));
+        let candidates = [SummonCandidate {
+            slot: 1,
+            item: 0x3849,
+            trigger: SummonTrigger::Use,
+            lifetime_ms: 10_000,
+        }];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &no_enchants(), 1_000),
+            Some((0x3849, Vec::new()))
+        );
+        // Outside that lifetime the activation no longer counts, but the mace is
+        // still the only item that could have made this creature.
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &no_enchants(), 20_000),
+            Some((0x3849, Vec::new()))
+        );
+        // Two candidates and a stale activation: nothing is claimed rather than
+        // one of them guessed.
+        let twin = [
+            candidates[0],
+            SummonCandidate {
+                slot: 2,
+                item: 0x9581,
+                trigger: SummonTrigger::Use,
+                lifetime_ms: 10_000,
+            },
+        ];
+        assert_eq!(pick_summon_source(&twin, &uses, &no_enchants(), 20_000), None);
+    }
+
+    #[test]
+    fn a_shoot_spawned_summon_falls_back_to_the_single_equipped_item() {
+        // Nothing in the activation log triggers a shoot-summon: the one equipped
+        // item that declares it is the answer, and only when it is alone.
+        let uses = VecDeque::new();
+        let candidates = [SummonCandidate {
+            slot: 1,
+            item: 0x6102,
+            trigger: SummonTrigger::OnShoot,
+            lifetime_ms: 0,
+        }];
+        let enchants = vec![Vec::new(), vec![17], Vec::new(), Vec::new()];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 1_000),
+            Some((0x6102, vec![17]))
+        );
+        let two = [
+            candidates[0],
+            SummonCandidate {
+                slot: 2,
+                item: 0x3849,
+                trigger: SummonTrigger::OnShoot,
+                lifetime_ms: 0,
+            },
+        ];
+        assert_eq!(pick_summon_source(&two, &uses, &enchants, 1_000), None);
     }
 }

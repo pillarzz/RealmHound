@@ -841,6 +841,11 @@ pub struct SummonSource {
     /// unattributed packet total rather than landing on a row that cannot deal
     /// it.
     pub deals_damage: bool,
+    /// How long the summoned creature lives, from the spawning element's own
+    /// `lifeTime` (seconds): a Sovereign Mace's bear lives 10, a spirit 6. 0 when
+    /// the element does not say, in which case a caller falls back to the shortest
+    /// documented lifetime.
+    pub lifetime_ms: i64,
 }
 /// A summoned creature (`SpawnCreep`): spawns an entity that attacks enemies
 /// for its lifetime (Summoner maces, some UTs).
@@ -3034,8 +3039,10 @@ impl ObjectList {
             // object declares when it ends, so element order cannot matter.
             let mut mentions_damage = false;
             // Trigger, proc chance and the entity name of the activate element the
-            // reader is inside, whose text names the effect.
+            // reader is inside, whose text names the effect, plus that element's
+            // own `lifeTime` when it declares one.
             let mut pending: Option<(SummonTrigger, f32, String)> = None;
+            let mut pending_lifetime_ms = 0i64;
             // Item -> creature links found for the object being read, applied when
             // the object ends so a name that arrives later cannot be missed.
             let mut found: Vec<(i32, SummonSource)> = Vec::new();
@@ -3075,6 +3082,7 @@ impl ObjectList {
                                 if let Some(trigger) = SummonTrigger::from_element(name) {
                                     let mut chance = 1.0f32;
                                     let mut entity = String::new();
+                                    let mut lifetime_ms = 0i64;
                                     for attr in e.attributes().flatten() {
                                         match attr.key.as_ref() {
                                             b"proc" => {
@@ -3086,10 +3094,19 @@ impl ObjectList {
                                                 entity =
                                                     String::from_utf8_lossy(&attr.value).to_string()
                                             }
+                                            // `lifeTime` is in seconds and may be
+                                            // fractional ("10.0", "0.5").
+                                            b"lifeTime" => {
+                                                lifetime_ms = String::from_utf8_lossy(&attr.value)
+                                                    .parse::<f64>()
+                                                    .map(|s| (s * 1000.0).round() as i64)
+                                                    .unwrap_or(0)
+                                            }
                                             _ => {}
                                         }
                                     }
                                     pending = Some((trigger, chance, entity));
+                                    pending_lifetime_ms = lifetime_ms;
                                 }
                             }
                         }
@@ -3120,6 +3137,7 @@ impl ObjectList {
                                             trigger,
                                             chance,
                                             deals_damage: false,
+                                            lifetime_ms: pending_lifetime_ms,
                                         },
                                     ));
                                 }
@@ -3131,6 +3149,7 @@ impl ObjectList {
                         b"Object" => {
                             in_object = false;
                             pending = None;
+                            pending_lifetime_ms = 0;
                             if is_item {
                                 for (entity_type, mut source) in found.drain(..) {
                                     source.deals_damage = mentions_damage;

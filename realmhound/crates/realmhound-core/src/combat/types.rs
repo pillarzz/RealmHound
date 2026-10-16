@@ -286,6 +286,16 @@ pub struct SummonContribution {
     /// (`Summon Pocket Rat` is `0x4683`, say). 0 when it was never observed in the
     /// object table, and in fights recorded before this was stored.
     pub object_type: i32,
+    /// The item that created this summon, when the local player's own loadout and
+    /// activation log identify it: the mace in the ability slot, the Kimono in the
+    /// armor slot. A creature's catalog entry lists *every* item that can spawn it
+    /// -- `Summon Bear` names both `Sovereign Mace` and its `(SB)` twin -- so this
+    /// is what names the one row source instead of "from 2 items". 0 when nothing
+    /// settles it, and in fights recorded before it was stored.
+    pub source_item: i32,
+    /// The enchants that item had when it spawned the creature, so two uses of the
+    /// same item with different enchants stay separate rows.
+    pub source_enchants: Vec<u16>,
     pub damage: i64,
     pub hits: u64,
 }

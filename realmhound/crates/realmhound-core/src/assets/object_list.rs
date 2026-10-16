@@ -808,6 +808,12 @@ impl SummonTrigger {
             b"OnPlayerHitActivate" => Some(SummonTrigger::OnHitTaken),
             b"OnEnemyHitActivate" => Some(SummonTrigger::OnEnemyHit),
             b"OnDetonateHexActivate" => Some(SummonTrigger::OnHexDetonate),
+            // The `Add`-prefixed variants stack a summon rather than replacing it,
+            // which is the same trigger with a different bookkeeping rule.
+            b"AddOnPlayerAbilityActivate" => Some(SummonTrigger::OnAbilityUse),
+            b"AddOnPlayerShootActivate" => Some(SummonTrigger::OnShoot),
+            b"AddOnPlayerHitActivate" => Some(SummonTrigger::OnHitTaken),
+            b"AddOnEnemyHitActivate" => Some(SummonTrigger::OnEnemyHit),
             _ => None,
         }
     }
@@ -3610,7 +3616,7 @@ mod tests {
     <Class>Equipment</Class>
     <SlotType>8</SlotType>
     <Projectile></Projectile>
-    <OnPlayerShootActivate cooldown="0.4" objectId="Guided Forgotten Soul" proc="0.15">Pet</OnPlayerShootActivate>
+    <AddOnPlayerShootActivate cooldown="0.4" objectId="Guided Forgotten Soul" proc="0.15">Pet</AddOnPlayerShootActivate>
   </Object>
   <Object type="0xb2b" id="Bloodsucker Skull">
     <DisplayId>Bloodsucker Skull</DisplayId>

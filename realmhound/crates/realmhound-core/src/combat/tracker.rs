@@ -745,11 +745,11 @@ fn pick_summon_source(
             .filter(|u| u.time_ms <= at_ms && at_ms - u.time_ms <= lifetime)
             .max_by_key(|u| u.time_ms);
         let Some(use_) = fired else { continue };
-        let enchants = if use_.enchants.is_empty() {
-            equipment_enchants.get(slot).cloned().unwrap_or_default()
-        } else {
-            use_.enchants.clone()
-        };
+        // The enchants belong to the *declaring* item, which is the item whose
+        // slot is being read -- never to the ability that happened to be pressed
+        // (a Kimono's spirits come from an activation of something else entirely,
+        // and taking that item's enchants would split one Kimono across two rows).
+        let enchants = equipment_enchants.get(slot).cloned().unwrap_or_default();
         if best.as_ref().map_or(true, |(at, _, _)| use_.time_ms > *at) {
             best = Some((use_.time_ms, item, enchants));
         }
@@ -12481,7 +12481,16 @@ mod tests {
         assert_eq!(
             pick_summon_source(&candidates, &uses, &enchants, 5_500),
             Some((0x4ff4, vec![6])),
-            "the slot's own enchants stand in when the activation carries none"
+            "the declaring item's own enchants name the row, never the pressed ability's"
+        );
+        // Even when the activation carries enchants of its own, they belong to the
+        // ability that was pressed, not to the Kimono.
+        let mut other = VecDeque::new();
+        other.push_back(ability_use_with(5_000, 999, &[42, 43]));
+        assert_eq!(
+            pick_summon_source(&candidates, &other, &enchants, 5_500),
+            Some((0x4ff4, vec![6])),
+            "an unrelated ability's enchants must not split the Kimono's row"
         );
         // With no `lifeTime` declared, the shortest documented summon life bounds
         // the *search*, but with only one item able to spawn the creature the

@@ -2895,6 +2895,22 @@ impl AssetManager {
             .unwrap_or_default()
     }
 
+    /// The creatures an item spawns, with the trigger that spawns each (the
+    /// reverse of [`Self::summon_sources`]). Used to name the creature behind a
+    /// summon that was spawned by an ability activation, where no packet ever
+    /// names the creature itself.
+    pub fn summoned_by_item(
+        &self,
+        item_type: i32,
+    ) -> Vec<(i32, super::object_list::SummonSource)> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard
+            .as_ref()
+            .map(|list| list.summoned_by_item(item_type))
+            .unwrap_or_default()
+    }
+
     /// Parse a " xN" stack-count suffix from an item name.
     ///
     /// Returns `Some((base_name, count))` when the name ends with " x<digits>",

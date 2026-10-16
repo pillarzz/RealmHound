@@ -3135,6 +3135,25 @@ impl ObjectList {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// The reverse of [`Self::summon_sources`]: the creatures `item_type` spawns,
+    /// each with the entry describing how it does. Lets a summon be traced from an
+    /// item that is missing a shoot packet of its own -- a creature spawned by an
+    /// ability activation is named only by the item, never by the creature.
+    pub fn summoned_by_item(&self, item_type: i32) -> Vec<(i32, SummonSource)> {
+        let mut out: Vec<(i32, SummonSource)> = self
+            .summon_sources
+            .iter()
+            .flat_map(|(&creature, sources)| {
+                sources
+                    .iter()
+                    .filter(|s| s.item_type == item_type)
+                    .map(move |s| (creature, s.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(creature, _)| *creature);
+        out
+    }
 }
 
 /// Parse hex type string (e.g., "0xa00" -> 2560).

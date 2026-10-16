@@ -21,8 +21,10 @@ use std::collections::VecDeque;
 use crate::api::character::parse_enchant_ids;
 use crate::assets::get_asset_manager;
 use crate::assets::LethalStrikeParams;
+use crate::assets::SummonTrigger;
 use crate::loot::class_ids;
 use crate::protocol::data::{ObjectStatusData, StatType};
+use crate::stats::derived::pet_ability_deals_damage;
 
 use super::damage::{self, AttackerStats, Rng, DEFAULT_EXALT_BONUS};
 use super::types::{
@@ -146,6 +148,13 @@ pub fn stat_kind_for_boost_label(label: &str) -> Option<crate::assets::StatKind>
 /// packets inside it are credited to that activation. A heuristic -- the wire
 /// carries no effect id -- capped so overlapping activations cannot double-count.
 const ABILITY_ATTRIBUTION_WINDOW_MS: i64 = 2_000;
+/// How long after an activation an ability-spawned summon can still be landing
+/// hits. Measured on live captures: a Flowering Kimono's spirits put 123 of 125
+/// bulletless hits within 5s of one of the player's own activations, in a fight
+/// whose activations were up to 15s apart, while a pet out at the same time
+/// attacks on its own clock (an Electric pet landed all of its hits 4.5-6s after
+/// the last activation, and in a fight with no activations at all).
+const SUMMON_SPAWN_ATTRIBUTION_MS: i64 = 6_000;
 /// Cap on the rolling local-event logs the performance sections are rebuilt
 /// from. A long session keeps the most recent entries; the alternative (growing
 /// without bound) is worse than losing detail from very old fights.
@@ -670,6 +679,68 @@ struct LocalAbilityUse {
     server_effect_window_ms: Option<i64>,
 }
 
+/// Whether an activation's own declared server-applied effect could still be
+/// producing a bulletless `DamagePacket` at `time_ms`. The single definition of
+/// "this packet is already accounted for", shared by the ability-credit pass and
+/// the pet/summon attribution so an event can never be credited twice.
+fn activation_claims_packet(use_: &LocalAbilityUse, time_ms: i64) -> bool {
+    use_.server_effect_window_ms
+        .is_some_and(|window| time_ms >= use_.time_ms && time_ms <= use_.time_ms + window)
+}
+
+/// What produced one bulletless `DamagePacket` the server credited to the local
+/// player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketDamageSource {
+    /// A creature spawned by an activation of the player's loadout.
+    Summon { creature: i32 },
+    /// The damage-capable pet that was out when the packet landed.
+    Pet { pet_id: i32 },
+}
+
+/// Decide which pet or summon a packet-borne local damage event belongs to, or
+/// `None` when nothing explains it (the event then stays an unattributed
+/// `packet_damage` figure).
+///
+/// `spawns` are the summons the loadout can spawn, per
+/// [`CombatTracker::activation_spawned_summons_of_local_loadout`]; `uses` are the
+/// player's activations in the fight.
+fn packet_damage_source(
+    uses: &[&LocalAbilityUse],
+    spawns: &[(i32, Option<i32>)],
+    event: &LocalDamageEvent,
+) -> Option<PacketDamageSource> {
+    // An activation whose item declares a server-applied effect owns its packet,
+    // so it is never re-attributed to a pet or a summon sitting nearby.
+    if uses
+        .iter()
+        .any(|u| activation_claims_packet(u, event.time_ms))
+    {
+        return None;
+    }
+    let spawn = spawns
+        .iter()
+        .filter_map(|(creature, only_item)| {
+            let at = uses
+                .iter()
+                .filter(|u| only_item.map_or(true, |item| u.item_id == item))
+                .map(|u| u.time_ms)
+                .filter(|&t| {
+                    event.time_ms >= t && event.time_ms - t <= SUMMON_SPAWN_ATTRIBUTION_MS
+                })
+                .max();
+            at.map(|t| (t, *creature))
+        })
+        // Most recent activation wins; ties by lowest creature id so the choice
+        // cannot depend on iteration order.
+        .max_by_key(|&(at, creature)| (at, std::cmp::Reverse(creature)));
+    match (spawn, event.pet_id) {
+        (Some((_, creature)), _) => Some(PacketDamageSource::Summon { creature }),
+        (None, Some(pet_id)) => Some(PacketDamageSource::Pet { pet_id }),
+        (None, None) => None,
+    }
+}
+
 /// One packet-borne damage event the server credited to the local player. Only
 /// such damage is on the wire; the rest of the local player's damage is
 /// reconstructed from their own shot packets and has no server-side event.
@@ -677,6 +748,11 @@ struct LocalAbilityUse {
 struct LocalDamageEvent {
     time_ms: i64,
     damage: i64,
+    /// A pet of the local player that was out, in range and able to deal damage
+    /// when this landed (`None` otherwise). The packet names the *owner*, never
+    /// the shooter, so this observation is what separates a pet's server-credited
+    /// damage from any other bulletless damage the server credits to the player.
+    pet_id: Option<i32>,
 }
 /// One landed hit from a volley the server fired for the local player. The
 /// `ServerPlayerShoot` packet names the item that fired the bullet, so the hit
@@ -2282,6 +2358,7 @@ impl CombatTracker {
             self.local_damage_events.push_back(LocalDamageEvent {
                 time_ms,
                 damage: amount,
+                pet_id: self.damage_capable_pet_near_local(),
             });
         } else {
             let bucket = accum
@@ -2651,9 +2728,7 @@ impl CombatTracker {
             .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
         {
             let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
-                use_.server_effect_window_ms.is_some_and(|window| {
-                    event.time_ms >= use_.time_ms && event.time_ms <= use_.time_ms + window
-                })
+                activation_claims_packet(use_, event.time_ms)
             });
             if let Some((i, _)) = owner {
                 credited[i].0 += event.damage;
@@ -3831,6 +3906,10 @@ impl CombatTracker {
         // The local player joined after the fight began when the boss was already
         // damaged on first sight; ally damage dealt before then was never seen.
         let joined_late = fight.joined_late;
+        let fight_started_at = fight.started_at;
+        // Server-credited, bulletless damage first: a pet's or an ability-summon's
+        // hits have to reach their own rows before the participant is built.
+        self.attribute_owner_packet_damage(&mut fight, fight_started_at, time_ms);
         let mut participants: Vec<FightParticipant> = fight
             .attackers
             .iter()
@@ -4398,6 +4477,150 @@ impl CombatTracker {
             });
             used_pets.insert(pet_id);
             used_players.insert(player_id);
+        }
+    }
+
+    /// The damage-capable pet the local player has out, if any.
+    ///
+    /// A pet's hits are credited to its owner by the server and arrive as
+    /// bulletless `DamagePacket`s naming the player, so the pet's own presence is
+    /// the only handle on them. "Damage-capable" uses the ability ids `pets.xml`
+    /// declares (Attack Close/Mid/Far, Electric); heal, magic heal, Savage and
+    /// Decoy cannot damage anything. Only a pet close enough to its owner to be
+    /// the shooter counts, and the nearest wins (ties by lowest id).
+    fn damage_capable_pet_near_local(&self) -> Option<i32> {
+        let local = self.objects.get(&self.local_object_id)?;
+        let (lx, ly) = (local.last_x, local.last_y);
+        let mut best: Option<(f32, i32)> = None;
+        for (&oid, o) in &self.objects {
+            if !o.is_pet || o.pet_type == 0 {
+                continue;
+            }
+            if !o.pet_abilities.iter().any(|&a| pet_ability_deals_damage(a)) {
+                continue;
+            }
+            let dx = o.last_x - lx;
+            let dy = o.last_y - ly;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > PET_ASSOC_MAX_DIST {
+                continue;
+            }
+            if best.map_or(true, |(bd, bid)| dist < bd || (dist == bd && oid < bid)) {
+                best = Some((dist, oid));
+            }
+        }
+        best.map(|(_, oid)| oid)
+    }
+
+    /// The summons an activation of the local player's loadout can spawn, as
+    /// `(creature object type, the item whose own use spawns it or None when any
+    /// activation does)`.
+    ///
+    /// `Flowering Kimono` declares `OnPlayerAbilityActivate Pet` for its spirits:
+    /// any activation of any of the player's abilities spawns them. An item whose
+    /// summon is declared on its own `Use` is only spawned by its own activations,
+    /// so that distinction is kept.
+    fn activation_spawned_summons_of_local_loadout(&self) -> Vec<(i32, Option<i32>)> {
+        let Some(local) = self.objects.get(&self.local_object_id) else {
+            return Vec::new();
+        };
+        let manager = get_asset_manager();
+        let mut out: Vec<(i32, Option<i32>)> = Vec::new();
+        for &item in local.equipment.iter() {
+            if item <= 0 {
+                continue;
+            }
+            for (creature, source) in manager.summoned_by_item(item) {
+                let only_item = match source.trigger {
+                    SummonTrigger::OnAbilityUse => None,
+                    SummonTrigger::Use => Some(item),
+                    _ => continue,
+                };
+                if !out.contains(&(creature, only_item)) {
+                    out.push((creature, only_item));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Split the local player's bulletless `DamagePacket`s into the pet/summon
+    /// rows they came from, and only that much more -- what nothing explains stays
+    /// in `packet_damage` as an unattributed figure.
+    ///
+    /// The packet names the *owner*, never the shooter, so a source has to be
+    /// decided by elimination against what else could have produced the damage:
+    ///
+    /// * an activation whose item declares a server-applied damage effect already
+    ///   claims its own window (see [`Self::ability_activations_for`]), so those
+    ///   events are not candidates here and cannot be counted twice;
+    /// * of the rest, one landing within [`SUMMON_SPAWN_ATTRIBUTION_MS`] of an
+    ///   activation that can spawn the loadout's ability-summon belongs to that
+    ///   creature;
+    /// * otherwise one that landed while a damage-capable pet of the player was
+    ///   out and in range belongs to that pet.
+    ///
+    /// Both kinds are credited where a source-exact summon hit goes: inside the
+    /// owner's total, outside its weapon and ability buckets.
+    fn attribute_owner_packet_damage(
+        &self,
+        fight: &mut FightState,
+        started_at: i64,
+        ended_at: i64,
+    ) {
+        let local_id = self.local_object_id;
+        let events: Vec<LocalDamageEvent> = self
+            .local_damage_events
+            .iter()
+            .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
+            .copied()
+            .collect();
+        if events.is_empty() {
+            return;
+        }
+        let uses: Vec<&LocalAbilityUse> = self
+            .local_ability_uses
+            .iter()
+            .filter(|u| u.time_ms >= started_at && u.time_ms <= ended_at)
+            .collect();
+        let summons = self.activation_spawned_summons_of_local_loadout();
+        if summons.is_empty() && events.iter().all(|e| e.pet_id.is_none()) {
+            return;
+        }
+        let Some(accum) = fight.attackers.get_mut(&local_id) else {
+            return;
+        };
+        for event in events {
+            let Some(source) = packet_damage_source(&uses, &summons, &event) else {
+                continue;
+            };
+            // A creature the packet never names is keyed by the negative of its
+            // object type, which no live object id can collide with; the type
+            // itself is what names and draws the row.
+            let (key, is_pet, pet_type, object_type) = match source {
+                PacketDamageSource::Summon { creature } => (-creature, false, 0, creature),
+                PacketDamageSource::Pet { pet_id } => {
+                    let (pet_type, object_type) = self
+                        .objects
+                        .get(&pet_id)
+                        .map(|o| (o.pet_type, o.object_type))
+                        .unwrap_or((0, 0));
+                    (pet_id, true, pet_type, object_type)
+                }
+            };
+            accum.summon_damage += event.damage;
+            accum.summon_hits += 1;
+            let entry = accum.summons.entry(key).or_default();
+            entry.damage += event.damage;
+            entry.hits += 1;
+            entry.is_pet = entry.is_pet || is_pet;
+            if pet_type != 0 {
+                entry.pet_type = pet_type;
+            }
+            if object_type != 0 {
+                entry.object_type = object_type;
+            }
         }
     }
 
@@ -11565,5 +11788,169 @@ mod tests {
             "got {}",
             regular.boss_name
         );
+    }
+
+    fn local_damage_event(time_ms: i64, damage: i64, pet_id: Option<i32>) -> LocalDamageEvent {
+        LocalDamageEvent {
+            time_ms,
+            damage,
+            pet_id,
+        }
+    }
+
+    fn ability_use(time_ms: i64, item_id: i32, window_ms: Option<i64>) -> LocalAbilityUse {
+        LocalAbilityUse {
+            time_ms,
+            item_id,
+            enchants: Vec::new(),
+            server_effect_window_ms: window_ms,
+        }
+    }
+
+    /// A tracker holding one boss, the local player, and -- when `pet_type` is
+    /// non-zero -- a pet out next to the player with the given abilities.
+    fn pet_packet_tracker(pet_abilities: &[i32], pet_type: i32) -> CombatTracker {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_status(
+            1000,
+            &status_at(1000, 0.0, 0.0, vec![name_stat("You")]),
+            0,
+        );
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 16_000),
+                    stat(StatType::HP, 16_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        if pet_type != 0 {
+            let mut stats = vec![stat(StatType::PetType, pet_type)];
+            for (i, ability) in pet_abilities.iter().enumerate() {
+                let kind = [
+                    StatType::PetFirstAbilityType,
+                    StatType::PetSecondAbilityType,
+                    StatType::PetThirdAbilityType,
+                ][i];
+                stats.push(stat(kind, *ability));
+            }
+            t.on_object_spawn(900, 0x9999, &status_at(900, 1.0, 1.0, stats), 0);
+        }
+        t
+    }
+
+    fn local_row(done: &CompletedFight) -> &FightParticipant {
+        done.participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("the local player's row")
+    }
+
+    #[test]
+    fn activation_spawned_summon_claims_the_packets_that_follow_it() {
+        let use_ = ability_use(1_000, 999, None);
+        let uses = vec![&use_];
+        let spawns = [(0x500a, None)];
+        // Inside the spawn window the spirits own it, pet or no pet.
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &local_damage_event(3_000, 130, Some(42))),
+            Some(PacketDamageSource::Summon { creature: 0x500a })
+        );
+        // Past that window the pet is the only thing left that explains it.
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &local_damage_event(9_000, 130, Some(42))),
+            Some(PacketDamageSource::Pet { pet_id: 42 })
+        );
+        // Neither: the packet stays unattributed rather than being guessed at.
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &local_damage_event(9_000, 130, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_summon_declared_on_the_items_own_use_ignores_other_activations() {
+        let other = ability_use(1_000, 111, None);
+        let own = ability_use(2_000, 999, None);
+        let uses = vec![&other, &own];
+        let spawns = [(0x4683, Some(999))];
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &local_damage_event(1_500, 40, None)),
+            None,
+            "an unrelated activation cannot spawn this item's creature"
+        );
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &local_damage_event(2_500, 40, None)),
+            Some(PacketDamageSource::Summon { creature: 0x4683 })
+        );
+    }
+
+    #[test]
+    fn a_packet_an_activation_already_owns_is_never_handed_to_a_pet() {
+        // The item declares a server-applied effect, so its own window owns the
+        // packet (`ability_activations_for` credits it there). A pet out at the
+        // same moment must not be credited the same damage a second time.
+        let use_ = ability_use(1_000, 999, Some(2_000));
+        let uses = vec![&use_];
+        assert_eq!(
+            packet_damage_source(&uses, &[], &local_damage_event(1_500, 500, Some(42))),
+            None
+        );
+    }
+
+    #[test]
+    fn owner_credited_packet_damage_lands_on_the_pets_own_row() {
+        let mut t = pet_packet_tracker(&[406, 407, 408], 32643);
+        // The server credits the pet's hits to the player: attacker = the player.
+        t.on_damage(500, 1000, 280, 200);
+        t.on_damage(500, 1000, 280, 300);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!((me.summon_damage, me.summon_hits), (560, 2));
+        let row = me.summons.first().expect("a pet row");
+        assert!(row.is_pet);
+        assert_eq!(row.pet_type, 32643);
+        assert_eq!((row.damage, row.hits), (560, 2));
+        // The raw packet channel keeps its own tally.
+        assert_eq!((me.packet_damage, me.packet_hits), (560, 2));
+    }
+
+    #[test]
+    fn a_savage_only_pet_claims_nothing() {
+        // Heal, magic heal and Savage: the pet cannot deal damage at all, so the
+        // packets stay unattributed instead of being credited to it.
+        let mut t = pet_packet_tracker(&[408, 407, 409], 32625);
+        assert_eq!(t.damage_capable_pet_near_local(), None);
+        t.on_damage(500, 1000, 130, 200);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!((me.summon_damage, me.summon_hits), (0, 0));
+        assert!(me.summons.is_empty());
+        assert_eq!((me.packet_damage, me.packet_hits), (130, 1));
+    }
+
+    #[test]
+    fn an_electric_pet_is_a_candidate_only_while_it_is_out_and_in_range() {
+        let mut t = pet_packet_tracker(&[406], 32643);
+        assert_eq!(t.damage_capable_pet_near_local(), Some(900));
+        // Out of range of its owner: it cannot be the shooter.
+        t.on_object_status(900, &status_at(900, 40.0, 40.0, vec![]), 10);
+        assert_eq!(t.damage_capable_pet_near_local(), None);
+        // Back in range but with Savage instead of a damage ability.
+        t.on_object_status(
+            900,
+            &status_at(900, 1.0, 1.0, vec![stat(StatType::PetFirstAbilityType, 409)]),
+            20,
+        );
+        assert_eq!(t.damage_capable_pet_near_local(), None);
     }
 }

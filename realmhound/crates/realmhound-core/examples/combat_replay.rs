@@ -228,6 +228,32 @@ fn main() {
                 p.provenance,
                 if p.is_local { " (local)" } else { "" },
             );
+            if !p.summons.is_empty() {
+                let rows: Vec<String> = p
+                    .summons
+                    .iter()
+                    .map(|s| {
+                        let who = if s.is_pet {
+                            format!("pet 0x{:X}", s.pet_type)
+                        } else {
+                            format!("summon 0x{:X}", s.object_type)
+                        };
+                        format!("{who} dmg={} hits={}", s.damage, s.hits)
+                    })
+                    .collect();
+                println!(
+                    "          summon_damage={} summon_hits={} [{}]",
+                    p.summon_damage,
+                    p.summon_hits,
+                    rows.join(", ")
+                );
+            }
+            if p.packet_damage > 0 {
+                println!(
+                    "          packet_damage={} packet_hits={}",
+                    p.packet_damage, p.packet_hits
+                );
+            }
         }
     }
 }

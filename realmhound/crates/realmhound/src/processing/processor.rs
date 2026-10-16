@@ -957,22 +957,19 @@ impl PacketProcessor {
                     // empty spawn, which this refresh usually confirms first.
                     if !(is_live && char.blood_ritual_id.is_some()) {
                         let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
-                        let had = !ritual_id.trim().is_empty();
                         challenge_changed |= self
                             .account_data
                             .characters
                             .set_blood_ritual_for_char(Some(char.char_id), ritual_id);
-                        // The character list is how a ritual already running at login
-                        // becomes known, and without a transition recorded here the
-                        // fight card has nothing to read a fight's ritual state from.
-                        if char.char_id == self.live_char_id.map(|id| id).unwrap_or(0) {
-                            self.note_local_boost("Blood Ritual", had, None);
-                        }
                     }
                 }
                 // Re-derive the per-character flags from the recorded ids, so the
                 // new season's tiers govern a roster that was already cached.
                 challenge_changed |= self.account_data.characters.sync_blood_ritual_flags();
+                // The character list is how a ritual already running at login becomes
+                // known; push the roster's state once it has been folded in, so a
+                // fight fought under it carries it.
+                self.push_local_snapshot();
                 if challenge_changed {
                     self.account_data.mark_dirty();
                 }
@@ -1285,7 +1282,7 @@ impl PacketProcessor {
                 .characters
                 .set_live_blood_ritual(self.live_char_id, id)
             {
-                self.note_local_boost("Blood Ritual", true, Some(now_ms));
+                self.push_local_snapshot();
                 self.sync_shot_damage_bonus();
                 self.account_data.mark_dirty();
                 self.char_view_gen += 1;
@@ -1297,7 +1294,7 @@ impl PacketProcessor {
             return;
         }
         self.blood_ritual_clear_at = None;
-        self.clear_live_blood_ritual(now_ms);
+        self.clear_live_blood_ritual();
     }
 
     /// Resolve an empty `BloodRitual` spawn once it has settled: an active ritual is
@@ -1311,33 +1308,61 @@ impl PacketProcessor {
             return;
         }
         self.blood_ritual_clear_at = None;
-        self.clear_live_blood_ritual(now_ms);
+        self.clear_live_blood_ritual();
     }
 
     /// Drop the live character's ritual and re-derive the shot multipliers from it.
-    fn clear_live_blood_ritual(&mut self, now_ms: i64) {
+    fn clear_live_blood_ritual(&mut self) {
         if self
             .account_data
             .characters
             .clear_live_blood_ritual(self.live_char_id)
         {
-            self.note_local_boost("Blood Ritual", false, Some(now_ms));
+            self.push_local_snapshot();
             self.sync_shot_damage_bonus();
             self.account_data.mark_dirty();
             self.char_view_gen += 1;
         }
     }
-    /// Record a Blood Ritual / Crucible transition in the fight's boost log.
+    /// Push the live character's Blood Ritual, Crucible and pet into the combat
+    /// engine, so a fight finalised from here on can be stamped with the state it
+    /// was fought under.
     ///
-    /// Neither rides the wire as a numeric stat, so the combat engine cannot see
-    /// them the way it sees an Attack boost. Without this, a fight card derives its
-    /// stats from whatever the character's state is *when the card is read*, which
-    /// is how a fight fought with no ritual on showed a live Blood Ritual bonus.
-    fn note_local_boost(&mut self, label: &'static str, active: bool, now_ms: Option<i64>) {
-        if self.live_char_id.is_none() {
+    /// None of the three rides the wire as a numeric stat the engine can see: the
+    /// ritual arrives as a string stat, the crucible as a marker, and a pet's
+    /// identity (skin, and the name that goes with it) lives only in the account
+    /// cache -- which is exactly what the ATTRIBUTES panel reads. Pushing it here
+    /// on every change (and every tick, so nothing depends on a state change having
+    /// been observed through one particular packet) keeps the engine's copy
+    /// current; the fight's own record is what the card reads back, which is what
+    /// stops it following the character's state *now*. That was the bug: a fight
+    /// fought with a ritual on showed none, and switching a ritual off later
+    /// rewrote a fight that had been fought with it on.
+    fn push_local_snapshot(&mut self) {
+        let Some(char_id) = self.live_char_id else {
             return;
-        }
-        self.combat.tracker_mut().note_local_boost(label, active, now_ms);
+        };
+        let (blood_ritual, crucible, pet_skin) = {
+            let cache = &self.account_data.characters;
+            let Some(character) = cache.find_any_character(char_id) else {
+                return;
+            };
+            // The pet's sprite: its skin, or its type where it has no skin -- the
+            // same choice ATTRIBUTES makes.
+            let pet_skin = character
+                .pet_instance_id
+                .and_then(|id| cache.resolve_pet_identity(id, character.seasonal))
+                .map(|pet| if pet.skin > 0 { pet.skin } else { pet.pet_type })
+                .unwrap_or(0);
+            (
+                cache.blood_ritual_for_char(char_id).is_some(),
+                character.crucible_active,
+                pet_skin,
+            )
+        };
+        self.combat
+            .tracker_mut()
+            .set_local_snapshot(blood_ritual, crucible, pet_skin);
     }
 
     /// Push the live character's shot damage multipliers into the combat engine:
@@ -2167,7 +2192,8 @@ impl PacketProcessor {
                 self.account_data
                     .characters
                     .update_crucible_status(char_id, is_active);
-                self.note_local_boost("Crucible", is_active, None);                self.sync_shot_damage_bonus();
+                self.push_local_snapshot();
+                self.sync_shot_damage_bonus();
                 self.account_data.mark_dirty();
                 self.char_view_gen += 1;
             }
@@ -3118,6 +3144,9 @@ impl PacketProcessor {
                 // An empty BloodRitual spawn snapshot is only conclusive once the
                 // window in which the game reports the active id has passed.
                 self.settle_blood_ritual(time_ms as i64);
+                // Keep the engine's copy of the character's ritual, crucible and pet
+                // current, so the next fight finalised is stamped with them.
+                self.push_local_snapshot();
 
                 // Update entity positions/stats for loot tracking
                 for status in &new_tick.statuses {

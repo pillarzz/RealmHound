@@ -1001,6 +1001,24 @@ impl BoostSnapshot {
     }
 }
 
+/// The live character's state as the *character cache* reports it -- the same
+/// values the ATTRIBUTES panel reads.
+///
+/// Blood Ritual and the Crucible never reach the engine as numeric stats (the
+/// ritual is a string stat, the crucible a marker), and a pet's identity lives
+/// only in the account cache. The processor pushes them here, and every fight
+/// finalised from then on carries them in its own record, so the fight card
+/// shows the state the fight was fought under rather than whatever is true when
+/// the card is opened.
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalSnapshot {
+    blood_ritual: bool,
+    crucible: bool,
+    /// The pet's sprite: its skin, or its type where it has no skin -- the same
+    /// choice ATTRIBUTES makes. 0 when the character has no pet out.
+    pet_skin: i32,
+}
+
 /// State of an in-progress boss fight, keyed by the boss object id.
 #[derive(Debug, Clone)]
 struct FightState {
@@ -1240,6 +1258,9 @@ pub struct CombatTracker {
     /// every fight in the session (and multi-phase merges stay correct without
     /// any merge bookkeeping).
     local_stat_changes: VecDeque<LocalStatChange>,
+    /// The live character's Blood Ritual, Crucible and pet, pushed by the
+    /// processor from the character cache (see [`LocalSnapshot`]).
+    local_snapshot: LocalSnapshot,
     /// Rolling log of the local player's ability activations (absolute time),
     /// likewise sliced per fight at finalize.
     local_ability_uses: VecDeque<LocalAbilityUse>,
@@ -1389,6 +1410,7 @@ impl CombatTracker {
             pet_tracks: HashMap::new(),
             local_summons: HashMap::new(),
             local_stat_changes: VecDeque::new(),
+            local_snapshot: LocalSnapshot::default(),
             local_ability_uses: VecDeque::new(),
             local_damage_events: VecDeque::new(),
             local_volley_hits: VecDeque::new(),
@@ -2854,61 +2876,61 @@ impl CombatTracker {
         self.trim_local_event_logs();
     }
 
-    /// Record a state change the character cache knows directly rather than
-    /// through a numeric stat: a Blood Ritual or the seasonal Crucible being
-    /// switched on or off.
+    /// Record the live character's Blood Ritual, Crucible and pet as they stand
+    /// now. The processor calls this wherever the character cache changes -- a
+    /// ritual switched on or off, the crucible marker, a different pet equipped --
+    /// and every fight finalised afterwards is stamped with them (see
+    /// [`Self::local_state_windows`]).
+    pub fn set_local_snapshot(&mut self, blood_ritual: bool, crucible: bool, pet_skin: i32) {
+        self.local_snapshot = LocalSnapshot {
+            blood_ritual,
+            crucible,
+            pet_skin: pet_skin.max(0),
+        };
+    }
+
+    /// The windows a fight carries for a state the character cache reports rather
+    /// than a stat the engine watched: a ritual or crucible that was on while the
+    /// fight was fought is written as on for its whole length.
     ///
-    /// Both ride the wire as non-numeric stats (the ritual's id string, the
-    /// crucible marker), so they never appear in the numeric snapshot above. Logged
-    /// in the same rolling transition log, they let a fight be read back with the
-    /// state it was actually fought under -- the stats card otherwise shows
-    /// whatever the character's Blood Ritual and Crucible state is *now*, which is
-    /// how a fight fought without a ritual ended up displaying one.
-    pub fn note_local_boost(&mut self, label: &'static str, active: bool, time_ms: Option<i64>) {
-        let to = i32::from(active);
-        let from = self
-            .local_stat_changes
-            .iter()
-            .rev()
-            .find(|c| c.label == label)
-            .map(|c| c.to)
-            .unwrap_or(0);
-        if from == to {
-            return;
+    /// Writing it into the fight's own record is the point. Both live on the
+    /// character *now*, so a card that read them back from there -- or from the
+    /// transition log, which a later switch rewrites -- made a stored fight follow
+    /// every later toggle.
+    fn local_state_windows(&self, started_at: i64, ended_at: i64) -> Vec<BoostWindow> {
+        let mut out = Vec::new();
+        for (stat, active) in [
+            ("Blood Ritual", self.local_snapshot.blood_ritual),
+            ("Crucible", self.local_snapshot.crucible),
+        ] {
+            if !active {
+                continue;
+            }
+            out.push(BoostWindow {
+                start_offset_ms: 0,
+                end_offset_ms: (ended_at - started_at).max(0),
+                stat: stat.to_string(),
+                from: 0,
+                to: 1,
+                source: CHARACTER_STATE_SOURCE.to_string(),
+                source_item: None,
+            });
         }
-        let time_ms = time_ms.or_else(|| self.latest_known_time_ms()).unwrap_or(0);
-        self.local_stat_changes.push_back(LocalStatChange {
-            time_ms,
-            label,
-            from,
-            to,
-            source: if active {
-                CHARACTER_STATE_SOURCE.to_string()
-            } else {
-                "expired".to_string()
-            },
-            source_item: None,
-        });
-        self.trim_local_event_logs();
+        out
     }
 
-/// The newest time the tracker has seen. A state change the API reports (the
-    /// Crucible status) arrives with no packet to timestamp it, and it matters
-    /// only that it lands outside any fight still being fought.
-    fn latest_known_time_ms(&self) -> Option<i64> {
-        let seen = [
-            self.local_stat_changes.back().map(|c| c.time_ms),
-            self.local_ability_uses.back().map(|u| u.time_ms),
-            self.local_damage_events.back().map(|e| e.time_ms),
-            self.local_volley_hits.back().map(|h| h.time_ms),
-        ];
-        seen.into_iter()
-            .flatten()
-            .max()
-            .or_else(|| (self.last_shot_ms > 0).then_some(self.last_shot_ms))
+    /// The identity of a pet credited to the local player: the skin the character
+    /// cache reports, which is what ATTRIBUTES draws and names. The wire carries
+    /// the pet's *type* id, which is not a sprite, so it is only the fallback for
+    /// when no cache pet is known.
+    fn local_pet_identity(&self, wire_type: i32) -> i32 {
+        if self.local_snapshot.pet_skin > 0 {
+            self.local_snapshot.pet_skin
+        } else {
+            wire_type
+        }
     }
 
-    ///
     /// The wire never says what caused a change, so the tracker infers it and the
     /// UI labels it as an inference. An item use is only accepted as the cause when
     /// that item's own XML declares the effect: casting a spell is also a `UseItem`
@@ -3022,37 +3044,9 @@ impl CombatTracker {
             source_item: change.source_item,
         };
         // A buff already held when the fight starts has no transition inside it, so
-        // seed every label with its last change at or before the start: a Blood
-        // Ritual switched on at login is still on twenty minutes later, and the card
-        // has to see that rather than read the fight as unritualed.
-        for (i, change) in self.local_stat_changes.iter().enumerate() {
-            if change.time_ms > started_at || change.to <= change.from {
-                continue;
-            }
-            // Only a state the character cache reported (a ritual or crucible
-            // switch) is carried in. A stat's first reading is not a boost: VIT
-            // simply arriving at 75 would otherwise open a window on every fight.
-            if change.source != CHARACTER_STATE_SOURCE {
-                continue;
-            }
-            // Superseded by a later change of the same label before the fight?
-            if self
-                .local_stat_changes
-                .iter()
-                .skip(i + 1)
-                .any(|c| c.label == change.label && c.time_ms <= started_at)
-            {
-                continue;
-            }
-            let end = self
-                .local_stat_changes
-                .iter()
-                .skip(i + 1)
-                .find(|c| c.label == change.label && c.time_ms <= ended_at)
-                .map(|c| c.time_ms)
-                .unwrap_or(ended_at);
-            out.push(window(change, started_at, end));
-        }
+        // the fight's own record carries the state it was fought under instead --
+        // stamped at finalize (see `local_state_windows`), which survives a later
+        // switch-off where this log does not.
         for (i, change) in self.local_stat_changes.iter().enumerate() {
             if change.time_ms < started_at || change.time_ms > ended_at {
                 continue;
@@ -3696,7 +3690,24 @@ impl CombatTracker {
         let (summon_pet_type, summon_is_pet, summon_object_type) = if is_summon {
             self.objects
                 .get(&shooter_id)
-                .map(|o| (o.pet_type, o.is_pet, o.object_type))
+                .map(|o| {
+                    // A creature that merely carries pet-ish stats is not a pet: an
+                    // ability summon (a Summoner's bear, a Pocket Rat) can arrive with
+                    // a `PetName` and no pet type, and crediting its hits to a "pet"
+                    // with no identity hides which creature, and which item, made
+                    // them. An identity is what makes a pet a pet; everything else is
+                    // named and drawn by its own object type.
+                    let is_pet = o.is_pet && o.pet_type != 0;
+                    (
+                        if is_pet {
+                            self.local_pet_identity(o.pet_type)
+                        } else {
+                            0
+                        },
+                        is_pet,
+                        o.object_type,
+                    )
+                })
                 .unwrap_or((0, false, 0))
         } else {
             (0, false, 0)
@@ -4362,6 +4373,13 @@ impl CombatTracker {
         // Attach each participant's pet, matched by proximity votes.
         self.assign_pets(&mut participants);
 
+        // The stat/condition boosts the player was observed under, plus the state
+        // the character cache reports (see `local_state_windows`): both belong to
+        // the fight's own record, so nothing can rewrite them afterwards.
+        let mut boosts = self.boost_windows_for(fight.started_at, time_ms);
+        boosts.extend(self.local_state_windows(fight.started_at, time_ms));
+        boosts.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
+
         let cf = CompletedFight {
             started_at: fight.started_at,
             ended_at: time_ms,
@@ -4397,7 +4415,7 @@ impl CombatTracker {
             petless: self.mv_petless,
             spectral_hm,
             shatters_hm,
-            boosts: self.boost_windows_for(fight.started_at, time_ms),
+            boosts,
             abilities: self.ability_activations_for(fight.started_at, time_ms),
             participants,
         };
@@ -4852,8 +4870,15 @@ impl CombatTracker {
                 continue;
             };
             let track = &self.pet_tracks[&pet_id];
+            // The local player's pet carries its identity from the character cache
+            // instead of the type id the wire sent (see `local_pet_identity`).
+            let pet_type = if p.is_local {
+                self.local_pet_identity(track.pet_type)
+            } else {
+                track.pet_type
+            };
             p.pet = Some(PetInfo {
-                pet_type: track.pet_type,
+                pet_type,
                 abilities: track
                     .pet_abilities
                     .iter()
@@ -5016,10 +5041,12 @@ impl CombatTracker {
                     )
                 }
                 PacketDamageSource::Pet { pet_id } => {
+                    // Identified by the cache, like every other pet row credited to
+                    // the local player: the wire's type id is not a sprite.
                     let (pet_type, object_type) = self
                         .objects
                         .get(&pet_id)
-                        .map(|o| (o.pet_type, o.object_type))
+                        .map(|o| (self.local_pet_identity(o.pet_type), o.object_type))
                         .unwrap_or((0, 0));
                     (pet_id, true, pet_type, object_type)
                 }
@@ -5600,6 +5627,18 @@ mod tests {
         StatData {
             stat_type_id: StatType::Name as u8,
             stat_type: StatType::Name,
+            stat_value: 0,
+            string_stat_value: Some(name.to_string()),
+            stat_value_two: 0,
+        }
+    }
+
+    /// The stat an ability summon can carry with no pet type behind it, which is
+    /// what used to turn a Pocket Rat's hits into a nameless "Pet" row.
+    fn pet_name_stat(name: &str) -> StatData {
+        StatData {
+            stat_type_id: StatType::PetName as u8,
+            stat_type: StatType::PetName,
             stat_value: 0,
             string_stat_value: Some(name.to_string()),
             stat_value_two: 0,
@@ -12513,34 +12552,77 @@ mod tests {
     }
 
     #[test]
-    fn a_blood_ritual_switch_is_recorded_once_per_state_change() {
-        // The processor reports these from the character cache, not from a packet,
-        // so the tracker has to log them itself -- and a fight card reads the
-        // windows back to show the state the fight was fought under.
-        let mut t = CombatTracker::new();
-        t.note_local_boost("Blood Ritual", true, Some(1_000));
-        t.note_local_boost("Blood Ritual", true, Some(1_200));
-        assert_eq!(t.local_stat_changes.len(), 1, "no duplicate transition");
-        t.note_local_boost("Blood Ritual", false, Some(3_000));
-        assert_eq!(t.local_stat_changes.len(), 2);
-        // An API event carries no packet to date it: it lands on the newest time
-        // the tracker has seen.
-        t.note_local_boost("Crucible", true, None);
-        assert_eq!(t.local_stat_changes.back().unwrap().time_ms, 3_000);
+    fn a_fight_is_stamped_with_the_state_it_was_fought_under() {
+        // The processor pushes the character cache's state (the ritual and the
+        // crucible never reach the engine as numeric stats). It is written into the
+        // fight's own record at finalize, so switching the ritual off afterwards
+        // cannot rewrite what the fight says it was fought under.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.set_local_snapshot(true, true, 0);
+        t.on_damage(500, 1000, 280, 200);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let was_on = |f: &CompletedFight, label: &str| {
+            f.boosts.iter().any(|b| b.stat == label && b.to > b.from)
+        };
+        assert!(was_on(&done, "Blood Ritual"));
+        assert!(was_on(&done, "Crucible"));
 
-        let windows = t.boost_windows_for(500, 4_000);
-        // A window is opened for each transition, so the one that means "it was on"
-        // is the rising one -- the same test the fight card makes.
-        let on: Vec<_> = windows
-            .iter()
-            .filter(|w| w.stat == "Blood Ritual" && w.to > w.from)
-            .collect();
-        assert_eq!(on.len(), 1);
-        assert_eq!(
-            (on[0].start_offset_ms, on[0].end_offset_ms),
-            (500, 2_500),
-            "on at 1000, off at 3000, clipped to the fight"
+        t.set_local_snapshot(false, false, 0);
+        assert!(
+            was_on(&done, "Blood Ritual"),
+            "a recorded fight does not follow a later switch-off"
         );
+        assert!(was_on(&done, "Crucible"));
+
+        // A fight fought without them carries neither, so a row recorded before
+        // this was tracked reads as off rather than as a live value.
+        let mut off = pet_packet_tracker(&[], 0);
+        off.on_damage(500, 1000, 280, 200);
+        let fight = off.fights.remove(&500).expect("open fight");
+        let plain = off.finalize_fight(fight, 1_000).expect("finalize");
+        assert!(!was_on(&plain, "Blood Ritual"));
+        assert!(!was_on(&plain, "Crucible"));
+    }
+
+    #[test]
+    fn a_creature_that_only_carries_a_pet_name_is_not_a_pet() {
+        // A Pocket Rat arrives with a `PetName` and no pet type. Crediting its hits
+        // to a nameless "Pet" row hides both the creature and the item that made it,
+        // so pet-ness requires an identity -- and this row then shows the rat, from
+        // the rat.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(
+            700,
+            0x4683,
+            &status(700, vec![pet_name_stat("Pocket Rat")]),
+            0,
+        );
+        t.on_ally_shot(700, 1000, 5, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 5, 700, 1000, 10);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        let row = me.summons.first().expect("a row");
+        assert!(!row.is_pet, "a name with no pet type is a creature");
+        assert_eq!(row.object_type, 0x4683, "named and drawn by its own type");
+        assert_eq!(row.pet_type, 0, "no pet skin to draw");
+    }
+
+    #[test]
+    fn the_local_pets_row_carries_the_skin_the_cache_reports() {
+        // The wire's pet id is a *type*, not a sprite: ATTRIBUTES resolves the pet
+        // from the account cache, and the fight's own row does the same, so the row
+        // draws the pet and not a placeholder.
+        let mut t = pet_packet_tracker(&[406, 407, 408], 32643);
+        t.set_local_snapshot(false, false, 12_345);
+        t.on_damage(500, 1000, 280, 200);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        let row = me.summons.first().expect("a pet row");
+        assert!(row.is_pet);
+        assert_eq!(row.pet_type, 12_345, "the cache's skin, not the wire's type");
     }
 
     fn ability_use_with(time_ms: i64, item_id: i32, enchants: &[u16]) -> LocalAbilityUse {

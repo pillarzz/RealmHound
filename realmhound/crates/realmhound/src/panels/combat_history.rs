@@ -3232,9 +3232,10 @@ impl CombatHistoryPanel {
     /// source (base, gear + enchants, exaltations, crucible).
     ///
     /// The gear is the loadout recorded for the fight itself, so a later gear
-    /// swap cannot rewrite it. Maxed stats, exaltations and crucible buffs come
-    /// from the account cache, which reflects the present rather than the fight --
-    /// stated in the row note so the breakdown is not read as a historical fact.
+    /// swap cannot rewrite it, and so is the Blood Ritual and Crucible the fight
+    /// was fought under. Maxed stats and exaltations come from the account cache,
+    /// which reflects the present rather than the fight -- stated in the row note
+    /// so the breakdown is not read as a historical fact.
     fn render_stats_section(
         &self,
         ui: &mut egui::Ui,
@@ -3263,13 +3264,13 @@ impl CombatHistoryPanel {
             loadout.equipment = local.equipment.iter().map(|&slot| slot.max(0)).collect();
             loadout.enchants = local.equipment_enchants.to_vec();
         }
-        // Blood Ritual and Crucible come from the *fight's* own boost log, not from
-        // the character's state now: both are recorded live by the processor, and a
-        // fight fought with no ritual on has to read that way even if one is active
-        // when the card is opened. The definitions stay the character's (they are
-        // per-season/ritual values); only whether they applied is the fight's. A
-        // fight recorded before this was tracked has no window and so reads as off,
-        // like every other pre-tracking field.
+        // Blood Ritual and Crucible come from the *fight's* own record, not from
+        // the character's state now: the engine cannot see either as a numeric
+        // stat, so the processor pushes them from the account cache and every fight
+        // is stamped with what was true while it was fought. A fight recorded
+        // before that is unstamped and reads as off, like every other
+        // pre-tracking field -- rather than picking up whatever is active when the
+        // card happens to be opened.
         let was_on = |label: &str| {
             fight
                 .boosts
@@ -3279,9 +3280,14 @@ impl CombatHistoryPanel {
         if !was_on("Blood Ritual") {
             loadout.blood_ritual = None;
         }
-        if !was_on("Crucible") {
-            loadout.crucible = None;
-        }
+        // The crucible's definitions belong to the season, not to the character, so
+        // the marker's state *now* must not decide whether the fight was fought
+        // under them.
+        loadout.crucible = if was_on("Crucible") {
+            cache.active_crucible.clone()
+        } else {
+            None
+        };
         let derived = realmhound_core::stats::derived::derive(get_asset_manager(), &loadout);
 
         let attrs = &derived.attributes;
@@ -3993,34 +3999,36 @@ impl CombatHistoryPanel {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             if s.is_pet {
-                                // The pet's identity comes from the account cache, exactly as the
-                                // ATTRIBUTES panel shows it: its name, its skin's sprite, and its
-                                // abilities (name, fed power, dps) on hover. The wire only carries
-                                // the pet's type id, which is why this row used to read "Pet" over
-                                // a placeholder sprite.
+                                // The row carries the pet's skin, snapshotted at fight
+                                // time from the account cache -- the same value the
+                                // ATTRIBUTES panel draws and names. The wire's pet type id
+                                // is not a sprite, which is why this row used to show a
+                                // placeholder ("Pet" over a potion icon).
+                                let manager = realmhound_core::assets::get_asset_manager();
+                                let skin = s.pet_type;
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::Vec2::splat(16.0),
                                     egui::Sense::hover(),
                                 );
-                                let skin = derived
-                                    .as_ref()
-                                    .and_then(|d| d.pet_skin)
-                                    .or((s.pet_type != 0).then_some(s.pet_type));
-                                if let Some(skin) = skin {
+                                if skin != 0 {
                                     ctx.sprite_renderer.draw_sprite_in_rect(ui, skin, rect);
                                 }
-                                let name = derived
-                                    .as_ref()
-                                    .and_then(|d| d.pet_name.clone())
+                                let name = manager
+                                    .object_name(skin)
+                                    .filter(|n| !n.is_empty())
                                     .unwrap_or_else(|| "Pet".to_string());
-                                let response = if let Some(d) = derived.as_ref().filter(|d| !d.pet.is_empty()) {
+                                // The abilities on hover come from the cache now, so they
+                                // are offered only while it still holds this same pet.
+                                let known = derived
+                                    .as_ref()
+                                    .filter(|d| d.pet_skin == Some(skin) && !d.pet.is_empty());
+                                if let Some(d) = known {
                                     ui.label(name).on_hover_ui(|ui| {
                                         crate::panels::derived_stats::pet_abilities_tooltip(ui, &d.pet);
-                                    })
+                                    });
                                 } else {
-                                    ui.label(name)
-                                };
-                                let _ = response;
+                                    ui.label(name);
+                                }
                             } else if s.object_type != 0 {
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::Vec2::splat(16.0),

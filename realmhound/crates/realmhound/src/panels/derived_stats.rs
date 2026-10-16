@@ -132,6 +132,10 @@ pub struct BonusContext {
     pub weapon_dr_pct: f32,
     /// Exaltation Fast Learner XP bonus, in percent (0/5/10/15/20).
     pub fast_learner_xp_pct: f32,
+    /// Exaltation Mastery weapon-damage bonus, in percent (0/2.5/…/10). Multiplies
+    /// the weapon's rolled damage alongside the seasonal challenge multipliers, so
+    /// the Bonuses "Damage mult." row names it as a source.
+    pub mastery_dmg_pct: f32,
     /// Exaltation Armor Proficiency in-combat exit reduction, in seconds.
     pub armor_ic_secs: f32,
     /// The four equipped gear slots (weapon, ability, armor, ring) for the
@@ -171,6 +175,12 @@ pub fn build_context(
         .get(&(char.class_id as i32))
         .map(realmhound_core::stats::exalt_proficiency::fast_learner_xp_pct)
         .unwrap_or(0) as f32;
+    let mastery_dmg_pct = cache
+        .exaltation_stats
+        .get(&(char.class_id as i32))
+        .map(realmhound_core::stats::exalt_proficiency::mastery_dmg_tenths)
+        .unwrap_or(0) as f32
+        / 10.0;
     let armor_ic_secs = realmhound_core::stats::exalt_proficiency::armor_ic_tenths(
         &cache.exaltation_stats,
         char.class_id as i32,
@@ -188,6 +198,7 @@ pub fn build_context(
         is_live,
         weapon_dr_pct,
         fast_learner_xp_pct,
+        mastery_dmg_pct,
         armor_ic_secs,
         equipment: char.equipment.clone(),
         account_dust_boost,
@@ -1719,6 +1730,29 @@ fn bonus_row(
     });
 }
 
+/// The weapon-damage multiplier and the sources that make it up, in the order the
+/// Bonuses hover lists them: Exaltation Mastery, the Crucible's damage bonus and
+/// the active Blood Ritual tier. The three *compound* (the game scales the
+/// weapon's rolled range by all of them), so the returned total is their product,
+/// not their sum, and sources that contribute nothing are dropped.
+fn weapon_damage_multiplier(
+    mastery_pct: f32,
+    crucible_pct: f32,
+    ritual_pct: f32,
+) -> (f32, Vec<(&'static str, f32)>) {
+    let total =
+        (1.0 + mastery_pct / 100.0) * (1.0 + crucible_pct / 100.0) * (1.0 + ritual_pct / 100.0);
+    let sources: Vec<(&'static str, f32)> = [
+        ("mastery (exaltations)", mastery_pct),
+        ("crucible", crucible_pct),
+        ("blood ritual", ritual_pct),
+    ]
+    .into_iter()
+    .filter(|(_, pct)| pct.abs() > 0.001)
+    .collect();
+    (total, sources)
+}
+
 /// Bonuses: Loot Boost broken down by source (gear + exalts + crucible + active
 /// clover, shown as separate components since the exact in-game stacking formula
 /// is unknown), XP Boost, Dust Boost, and Battle-pass XP. Loot/XP/Dust rows are
@@ -1786,10 +1820,12 @@ fn render_bonuses(
         |ui| bonus_components_tooltip(ui, &xp_components),
     );
 
-    // Damage multiplier from the season's challenges: the Crucible's damage bonus
-    // and the Blood Ritual tier's bonus/penalty both multiply the weapon's rolled
-    // damage, so each is listed as its own component in the hover. Shown only
-    // while one of them is in play, since x1.00 is noise.
+    // Weapon-damage multiplier: everything the game multiplies the weapon's rolled
+    // range by before it rolls. Exaltation Mastery, the Crucible's damage bonus and
+    // the active Blood Ritual tier all compound, so the row shows the combined
+    // factor and the hover names every source, the way the damage rows in
+    // My Performance do. Shown only while something is actually in play, since
+    // x1.00 is noise.
     let crucible_dmg_pct = d
         .crucible
         .as_ref()
@@ -1800,17 +1836,10 @@ fn render_bonuses(
         .as_ref()
         .map(|r| r.damage_pct())
         .unwrap_or(0.0);
-    let damage_pct = crucible_dmg_pct + ritual_dmg_pct;
+    let (damage_mult, damage_components) =
+        weapon_damage_multiplier(ctx.mastery_dmg_pct, crucible_dmg_pct, ritual_dmg_pct);
+    let damage_pct = (damage_mult - 1.0) * 100.0;
     if damage_pct.abs() > 0.001 {
-        // Only the sources that actually contribute are listed -- a challenge
-        // granting no damage multiplier is noise in the hover, not a zero.
-        let damage_components: Vec<(&str, f32)> = [
-            ("blood ritual", ritual_dmg_pct),
-            ("crucible", crucible_dmg_pct),
-        ]
-        .into_iter()
-        .filter(|(_, pct)| pct.abs() > 0.001)
-        .collect();
         bonus_row(
             ui,
             "Damage mult.:",
@@ -1830,7 +1859,19 @@ fn render_bonuses(
                     ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
                 sr.draw_outlined_embedded_icon(ui, condition, rect);
             },
-            |ui| bonus_components_tooltip(ui, &damage_components),
+            |ui| {
+                bonus_components_tooltip(ui, &damage_components);
+                // The sources compound rather than add up, so spell out the
+                // combined factor instead of letting the reader sum the rows.
+                ui.label(
+                    RichText::new(format!(
+                        "combined x{:.3} ({:+.1}%)",
+                        damage_mult, damage_pct
+                    ))
+                    .color(NOTE_COLOR)
+                    .size(11.0),
+                );
+            },
         );
     }
 
@@ -1901,7 +1942,9 @@ fn render_bonuses(
             .request_repaint_after(std::time::Duration::from_secs(1));
     }
 
-    // Battle-pass XP (crucible bonus), with the embedded battle-pass sprite.
+    // Battle-pass XP: the active Crucible season's battle-pass bonus, with the
+    // embedded battle-pass sprite. The hover names the source, since the row's
+    // value on its own gives no clue where the bonus comes from.
     let bxp = d.crucible.as_ref().map(|c| c.bxp_pct).unwrap_or(0.0);
     if bxp != 0.0 {
         bonus_row(
@@ -1913,7 +1956,53 @@ fn render_bonuses(
                     ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
                 sr.draw_outlined_embedded_icon(ui, EmbeddedIcon::Bxp, rect);
             },
-            |_| {},
+            |ui| {
+                bonus_components_tooltip(ui, &[("crucible", bxp)]);
+                ui.label(
+                    RichText::new("Battle-pass XP from the season's Crucible definition.")
+                        .color(NOTE_COLOR)
+                        .size(11.0),
+                );
+            },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::weapon_damage_multiplier;
+
+    /// The Bonuses "Damage mult." row: Exaltation Mastery, the Crucible's damage
+    /// bonus and the active Blood Ritual tier compound, so a mastery-only
+    /// character sees a multiplier of its own and an active ritual multiplies it
+    /// rather than adding to it.
+    #[test]
+    fn damage_multiplier_compounds_mastery_with_the_seasonal_challenges() {
+        // A fully-exalted class (+10%) holding the season's tier-1 ritual (+24%),
+        // with a Crucible that grants no damage of its own: 1.10 x 1.24.
+        let (total, sources) = weapon_damage_multiplier(10.0, 0.0, 24.0);
+        assert!((total - 1.364).abs() < 1e-6, "{total}");
+        assert_eq!(
+            sources,
+            vec![("mastery (exaltations)", 10.0), ("blood ritual", 24.0)],
+            "the Crucible is dropped when it grants no damage"
+        );
+        // Multiplying is not adding: +34% would be the sum.
+        assert!((total - 1.0) * 100.0 > 34.0);
+
+        // A penalty tier reduces the multiplier below one, mastery included.
+        let (total, sources) = weapon_damage_multiplier(10.0, 0.0, -22.0);
+        assert!((total - 0.858).abs() < 1e-6, "{total}");
+        assert_eq!(sources.len(), 2);
+
+        // Nothing in play: neutral, and no sources to list.
+        let (total, sources) = weapon_damage_multiplier(0.0, 0.0, 0.0);
+        assert_eq!(total, 1.0);
+        assert!(sources.is_empty());
+
+        // Mastery alone still applies, and is named.
+        let (total, sources) = weapon_damage_multiplier(5.0, 0.0, 0.0);
+        assert!((total - 1.05).abs() < 1e-6, "{total}");
+        assert_eq!(sources, vec![("mastery (exaltations)", 5.0)]);
     }
 }

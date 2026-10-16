@@ -42,6 +42,7 @@ fn main() {
             assets_dir.display()
         );
     }
+    let manager = realmhound_core::assets::get_asset_manager();
 
     let raw = match read_capture(&path) {
         Ok(r) => r,
@@ -54,6 +55,9 @@ fn main() {
 
     let mut reassembler = TcpReassembler::new();
     let mut tracker = CombatTracker::new();
+    // Summon-source creature spawns seen, by object type: (count, first, last).
+    let mut summon_spawns: std::collections::HashMap<i32, (u32, i64, i64)> =
+        std::collections::HashMap::new();
 
     // Optional: the shot multipliers the client applies to its own weapon rolls
     // (exaltation mastery x the seasonal challenge multipliers). In the live app
@@ -96,6 +100,20 @@ fn main() {
                 }
                 Some(ParsedPacket::Update(u)) => {
                     for obj in &u.new_objects {
+                        // Creatures an item declares (a Kimono's spirits, a
+                        // Summoner mace's bear) are spawned as ordinary objects;
+                        // logging them shows whether RH ever saw the summon whose
+                        // damage reaches it only as an owner-credited packet.
+                        if !manager
+                            .summon_sources(obj.object_type as i32)
+                            .is_empty()
+                        {
+                            let entry = summon_spawns
+                                .entry(obj.object_type as i32)
+                                .or_insert((0u32, clock, clock));
+                            entry.0 += 1;
+                            entry.2 = clock;
+                        }
                         tracker.on_object_spawn(
                             obj.object_id(),
                             obj.object_type as i32,
@@ -254,6 +272,18 @@ fn main() {
                     p.packet_damage, p.packet_hits
                 );
             }
+        }
+    }
+
+    if !summon_spawns.is_empty() {
+        println!("\n=== summon-source creatures spawned (type: count, first..last clock) ===");
+        let mut rows: Vec<(i32, (u32, i64, i64))> = summon_spawns.into_iter().collect();
+        rows.sort_by_key(|&(_, (count, _, _))| std::cmp::Reverse(count));
+        for (obj_type, (count, first, last)) in rows {
+            let name = manager
+                .object_name(obj_type)
+                .unwrap_or_else(|| format!("0x{obj_type:X}"));
+            println!("   {name} (0x{obj_type:X}): {count} spawns, {first}..{last}ms");
         }
     }
 }

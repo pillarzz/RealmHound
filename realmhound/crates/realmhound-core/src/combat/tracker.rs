@@ -155,6 +155,15 @@ const ABILITY_ATTRIBUTION_WINDOW_MS: i64 = 2_000;
 /// attacks on its own clock (an Electric pet landed all of its hits 4.5-6s after
 /// the last activation, and in a fight with no activations at all).
 const SUMMON_SPAWN_ATTRIBUTION_MS: i64 = 6_000;
+/// How far a summoned creature can be from a target and still have hit it. The
+/// zap/melee reach of item summons is not in the XML RH has (a Kimono's spirits
+/// only damage what stands next to them, which their owner has to close on
+/// deliberately), so this is a generous bound whose only job is to stop a
+/// creature that stayed behind from claiming hits across the room.
+const SUMMON_ATTACK_MAX_DIST: f32 = 8.0;
+/// How long a tracked summoned creature stays a candidate with no further sight
+/// of it. Bounds the map when a removal packet never arrives.
+const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;
 /// Cap on the rolling local-event logs the performance sections are rebuilt
 /// from. A long session keeps the most recent entries; the alternative (growing
 /// without bound) is worse than losing detail from very old fights.
@@ -623,8 +632,7 @@ struct ParticipantAccum {
     /// Summon hits whose shoot packet was missed, so no base damage was known.
     unresolved_summon_hits: u64,
     /// Per-summon contribution, keyed by the summon/pet object id.
-    summons: HashMap<i32, SummonAccum>,
-    /// Damage the server itself attributed to this participant inside a local
+    summons: HashMap<i32, SummonAccum>,    /// Damage the server itself attributed to this participant inside a local
     /// damage packet: an ability/DoT/proc figure the client did not compute.
     /// Only ever non-zero for the local player (every remote row arrives solely
     /// this way). Deliberately kept out of `damage_by_equipment` so the weapon
@@ -693,7 +701,13 @@ fn activation_claims_packet(use_: &LocalAbilityUse, time_ms: i64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacketDamageSource {
     /// A creature spawned by an activation of the player's loadout.
-    Summon { creature: i32 },
+    Summon {
+        /// Its own object type, which names and draws the row.
+        creature: i32,
+        /// Its object id when it was seen in the world, so the row keys on the
+        /// real instance; `None` when only the timing window places it.
+        object_id: Option<i32>,
+    },
     /// The damage-capable pet that was out when the packet landed.
     Pet { pet_id: i32 },
 }
@@ -704,7 +718,16 @@ enum PacketDamageSource {
 ///
 /// `spawns` are the summons the loadout can spawn, per
 /// [`CombatTracker::activation_spawned_summons_of_local_loadout`]; `uses` are the
-/// player's activations in the fight.
+/// player's activations in the fight. Evidence wins in this order:
+///
+/// 1. a summoned creature seen in the world, alive and in reach of the target --
+///    the closest thing to a direct trace, since it is observed rather than
+///    inferred from timing;
+/// 2. a damage-capable pet that was out and in range;
+/// 3. an activation-created summon, when the creature itself was never seen (a
+///    missed spawn packet) and no pet could have been the shooter. A pet out at
+///    the same time takes precedence here, because a spammed ability makes the
+///    timing window nearly always true and it can no longer tell the two apart.
 fn packet_damage_source(
     uses: &[&LocalAbilityUse],
     spawns: &[(i32, Option<i32>)],
@@ -717,6 +740,15 @@ fn packet_damage_source(
         .any(|u| activation_claims_packet(u, event.time_ms))
     {
         return None;
+    }
+    if let Some((object_id, creature)) = event.summon {
+        return Some(PacketDamageSource::Summon {
+            creature,
+            object_id: Some(object_id),
+        });
+    }
+    if let Some(pet_id) = event.pet_id {
+        return Some(PacketDamageSource::Pet { pet_id });
     }
     let spawn = spawns
         .iter()
@@ -734,11 +766,20 @@ fn packet_damage_source(
         // Most recent activation wins; ties by lowest creature id so the choice
         // cannot depend on iteration order.
         .max_by_key(|&(at, creature)| (at, std::cmp::Reverse(creature)));
-    match (spawn, event.pet_id) {
-        (Some((_, creature)), _) => Some(PacketDamageSource::Summon { creature }),
-        (None, Some(pet_id)) => Some(PacketDamageSource::Pet { pet_id }),
-        (None, None) => None,
-    }
+    spawn.map(|(_, creature)| PacketDamageSource::Summon {
+        creature,
+        object_id: None,
+    })
+}
+
+/// A creature the local player's own item summons, seen in the world.
+#[derive(Debug, Clone, Copy)]
+struct LocalSummonEntity {
+    /// The creature's own object type, which names and draws its row.
+    object_type: i32,
+    last_seen_ms: i64,
+    x: f32,
+    y: f32,
 }
 
 /// One packet-borne damage event the server credited to the local player. Only
@@ -753,6 +794,10 @@ struct LocalDamageEvent {
     /// the shooter, so this observation is what separates a pet's server-credited
     /// damage from any other bulletless damage the server credits to the player.
     pet_id: Option<i32>,
+    /// A summoned creature of the local player's that was alive and within reach
+    /// of this packet's target when it landed, as `(object id, object type)`.
+    /// Seen in the world rather than inferred, so it outranks the timing window.
+    summon: Option<(i32, i32)>,
 }
 /// One landed hit from a volley the server fired for the local player. The
 /// `ServerPlayerShoot` packet names the item that fired the bullet, so the hit
@@ -1073,6 +1118,9 @@ pub struct CombatTracker {
     /// Per-instance pet -> owner proximity votes and pet identity.
     /// Keyed by pet object id; reset on map change / disconnect.
     pet_tracks: HashMap<i32, PetTrack>,
+    /// Summoned creatures of the local player's that are currently in the world,
+    /// keyed by object id (see [`CombatTracker::track_local_summon`]).
+    local_summons: HashMap<i32, LocalSummonEntity>,
     /// Rolling log of the local player's stat/condition transitions in absolute
     /// time. Sliced into per-fight boost windows at finalize, so one log serves
     /// every fight in the session (and multi-phase merges stay correct without
@@ -1225,6 +1273,7 @@ impl CombatTracker {
             pending_death_broadcasts: Vec::new(),
             local_departing: false,
             pet_tracks: HashMap::new(),
+            local_summons: HashMap::new(),
             local_stat_changes: VecDeque::new(),
             local_ability_uses: VecDeque::new(),
             local_damage_events: VecDeque::new(),
@@ -1404,6 +1453,7 @@ impl CombatTracker {
         self.pending_local_grave = None;
         self.remote_deaths.clear();
         self.pet_tracks.clear();
+        self.local_summons.clear();
         self.completed_boss_types.clear();
         self.completed_recorded_types.clear();
         self.reset_local_mitigation_windows();
@@ -1475,6 +1525,7 @@ impl CombatTracker {
         if entry.is_pet {
             self.record_pet_observation(object_id);
         }
+        self.track_local_summon(object_id, object_type, status.pos.x, status.pos.y, time_ms);
         let spawn_max_hp = self.objects.get(&object_id).map(|o| o.max_hp).unwrap_or(0);
         self.note_aux_instance(object_id, object_type, spawn_max_hp);
         // The Bridge Sentinel coming into view means the local player reached the
@@ -1543,6 +1594,76 @@ impl CombatTracker {
             }
             None => self.pending_mv_spirits += 1,
         }
+    }
+
+    /// Follow a spawned creature that one of the local player's items can summon.
+    ///
+    /// The wire never says who owns a summoned creature, so this keeps only the
+    /// ones that (a) have a type an equipped item of the player's declares a
+    /// summon for and (b) appeared next to the player. Its lifetime is then the
+    /// strongest evidence of whose hits are whose: a packet names the owner and
+    /// never the shooter, so a creature alive at that moment -- rather than a
+    /// 6s window after an activation -- is the closest thing to a direct trace.
+    fn track_local_summon(
+        &mut self,
+        object_id: i32,
+        object_type: i32,
+        x: f32,
+        y: f32,
+        time_ms: i64,
+    ) {
+        if object_id == self.local_object_id {
+            return;
+        }
+        let declared = self
+            .activation_spawned_summons_of_local_loadout()
+            .into_iter()
+            .any(|(creature, _)| creature == object_type);
+        if !declared {
+            return;
+        }
+        let Some(local) = self.objects.get(&self.local_object_id) else {
+            return;
+        };
+        let (dx, dy) = (x - local.last_x, y - local.last_y);
+        if dx * dx + dy * dy > PET_ASSOC_MAX_DIST * PET_ASSOC_MAX_DIST {
+            return;
+        }
+        self.local_summons.insert(
+            object_id,
+            LocalSummonEntity {
+                object_type,
+                last_seen_ms: time_ms,
+                x,
+                y,
+            },
+        );
+        // Bounded: a creature that never sends a removal is forgotten once it has
+        // not been seen for a while, so a long session cannot accumulate ids.
+        let cutoff = time_ms - LOCAL_SUMMON_MAX_AGE_MS;
+        self.local_summons
+            .retain(|&id, e| id == object_id || e.last_seen_ms >= cutoff);
+    }
+
+    /// The local player's summoned creature that could have shot `target_id`:
+    /// the nearest one seen recently enough to still be alive and within reach of
+    /// it. `None` when the player has none out.
+    fn local_summon_attacking(&self, target_id: i32) -> Option<(i32, i32)> {
+        let target = self.objects.get(&target_id)?;
+        let (tx, ty) = (target.last_x, target.last_y);
+        self.local_summons
+            .iter()
+            .filter_map(|(&id, e)| {
+                let (dx, dy) = (e.x - tx, e.y - ty);
+                let dist = (dx * dx + dy * dy).sqrt();
+                (dist <= SUMMON_ATTACK_MAX_DIST).then_some((dist, id, e.object_type))
+            })
+            .min_by(|a, b| {
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.1.cmp(&b.1))
+            })
+            .map(|(_, id, object_type)| (id, object_type))
     }
 
     /// Update an existing object's stats (from a `NewTick` status, which does not
@@ -1671,6 +1792,13 @@ impl CombatTracker {
             .unwrap_or(false)
         {
             self.record_pet_observation(object_id);
+        }
+        // A tracked summoned creature keeps its last-seen position and time, which
+        // is what decides whether it could have hit a target minutes later.
+        if let Some(entity) = self.local_summons.get_mut(&object_id) {
+            entity.last_seen_ms = time_ms;
+            entity.x = status.pos.x;
+            entity.y = status.pos.y;
         }
 
         // Local-player "close call" detection: count each time the
@@ -2067,6 +2195,7 @@ impl CombatTracker {
         // A removed object's id can be reused; drop any summon-ownership so a
         // later reuse of this id can't inherit a stale owner.
         self.summon_owners.remove(&object_id);
+        self.local_summons.remove(&object_id);
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
@@ -2359,6 +2488,7 @@ impl CombatTracker {
                 time_ms,
                 damage: amount,
                 pet_id: self.damage_capable_pet_near_local(),
+                summon: self.local_summon_attacking(target_id),
             });
         } else {
             let bucket = accum
@@ -4599,7 +4729,21 @@ impl CombatTracker {
             // object type, which no live object id can collide with; the type
             // itself is what names and draws the row.
             let (key, is_pet, pet_type, object_type) = match source {
-                PacketDamageSource::Summon { creature } => (-creature, false, 0, creature),
+                PacketDamageSource::Summon {
+                    creature,
+                    object_id,
+                } => {
+                    // A creature the packet never named, and never seen in the
+                    // world either, is keyed by the negative of its object type --
+                    // which no live object id can collide with. The type itself is
+                    // what names and draws the row either way.
+                    (
+                        object_id.unwrap_or(-creature),
+                        false,
+                        0,
+                        creature,
+                    )
+                }
                 PacketDamageSource::Pet { pet_id } => {
                     let (pet_type, object_type) = self
                         .objects
@@ -11795,6 +11939,21 @@ mod tests {
             time_ms,
             damage,
             pet_id,
+            summon: None,
+        }
+    }
+
+    fn local_damage_event_from_summon(
+        time_ms: i64,
+        damage: i64,
+        pet_id: Option<i32>,
+        summon: (i32, i32),
+    ) -> LocalDamageEvent {
+        LocalDamageEvent {
+            time_ms,
+            damage,
+            pet_id,
+            summon: Some(summon),
         }
     }
 
@@ -11854,24 +12013,64 @@ mod tests {
     }
 
     #[test]
-    fn activation_spawned_summon_claims_the_packets_that_follow_it() {
+    fn a_spawn_window_only_claims_what_a_pet_cannot_explain() {
         let use_ = ability_use(1_000, 999, None);
         let uses = vec![&use_];
         let spawns = [(0x500a, None)];
-        // Inside the spawn window the spirits own it, pet or no pet.
+        // A pet out at the same moment owns this one: a spammed ability keeps the
+        // window open almost always, so it can no longer tell the two apart, and
+        // the pet is the source that was actually observed.
         assert_eq!(
             packet_damage_source(&uses, &spawns, &local_damage_event(3_000, 130, Some(42))),
-            Some(PacketDamageSource::Summon { creature: 0x500a })
-        );
-        // Past that window the pet is the only thing left that explains it.
-        assert_eq!(
-            packet_damage_source(&uses, &spawns, &local_damage_event(9_000, 130, Some(42))),
             Some(PacketDamageSource::Pet { pet_id: 42 })
         );
-        // Neither: the packet stays unattributed rather than being guessed at.
+        // With no pet out the window is the only explanation left, and the row
+        // falls back to the creature's type since it was never seen.
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &local_damage_event(3_000, 130, None)),
+            Some(PacketDamageSource::Summon {
+                creature: 0x500a,
+                object_id: None,
+            })
+        );
+        // Past the window, with no pet and nothing seen: unattributed.
         assert_eq!(
             packet_damage_source(&uses, &spawns, &local_damage_event(9_000, 130, None)),
             None
+        );
+    }
+
+    #[test]
+    fn a_creature_seen_in_the_world_outranks_the_timing_window_and_the_pet() {
+        let use_ = ability_use(1_000, 999, None);
+        let uses = vec![&use_];
+        let spawns = [(0x500a, None)];
+        // Seen alive and in reach of the target: it is the shooter, and the row
+        // keys on the instance that was actually observed.
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &local_damage_event_from_summon(3_000, 130, Some(42), (777, 0x500a)),
+            ),
+            Some(PacketDamageSource::Summon {
+                creature: 0x500a,
+                object_id: Some(777),
+            })
+        );
+        // A spammed ability puts every packet inside the window, so a creature
+        // seen in the world is what keeps a pet's own hits off the summon's row --
+        // and out of the window's reach once it is gone.
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &local_damage_event_from_summon(4_000, 280, Some(42), (777, 0x500a)),
+            ),
+            Some(PacketDamageSource::Summon {
+                creature: 0x500a,
+                object_id: Some(777),
+            })
         );
     }
 
@@ -11888,7 +12087,10 @@ mod tests {
         );
         assert_eq!(
             packet_damage_source(&uses, &spawns, &local_damage_event(2_500, 40, None)),
-            Some(PacketDamageSource::Summon { creature: 0x4683 })
+            Some(PacketDamageSource::Summon {
+                creature: 0x4683,
+                object_id: None,
+            })
         );
     }
 
@@ -11939,8 +12141,43 @@ mod tests {
     }
 
     #[test]
-    fn an_electric_pet_is_a_candidate_only_while_it_is_out_and_in_range() {
-        let mut t = pet_packet_tracker(&[406], 32643);
+    fn a_creature_nothing_in_the_loadout_declares_is_never_tracked() {
+        // The loadout here declares nothing (no assets are loaded in a unit test),
+        // so a spawn that merely looks like a summon is left alone: attribution
+        // never guesses from a type it cannot place.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(900, 0x500a, &status_at(900, 1.0, 1.0, vec![]), 0);
+        assert!(t.local_summons.is_empty());
+        assert_eq!(t.local_summon_attacking(500), None);
+    }
+
+    #[test]
+    fn a_tracked_summon_claims_only_what_is_in_reach_and_forgets_despawns() {
+        let mut t = pet_packet_tracker(&[], 0);
+        t.local_summons.insert(
+            900,
+            LocalSummonEntity {
+                object_type: 0x500a,
+                last_seen_ms: 100,
+                x: 1.0,
+                y: 1.0,
+            },
+        );
+        // Seen on the boss: it can have hit it.
+        assert_eq!(t.local_summon_attacking(500), Some((900, 0x500a)));
+        // Walked away from the target it would have had to hit.
+        t.local_summons.get_mut(&900).unwrap().x = 40.0;
+        t.local_summons.get_mut(&900).unwrap().y = 40.0;
+        assert_eq!(t.local_summon_attacking(500), None);
+        // Back in reach, but despawned: no longer a candidate at all.
+        t.local_summons.get_mut(&900).unwrap().x = 1.0;
+        t.local_summons.get_mut(&900).unwrap().y = 1.0;
+        t.on_object_removed(900, 200);
+        assert_eq!(t.local_summon_attacking(500), None);
+    }
+
+    #[test]
+    fn an_electric_pet_is_a_candidate_only_while_it_is_out_and_in_range() {        let mut t = pet_packet_tracker(&[406], 32643);
         assert_eq!(t.damage_capable_pet_near_local(), Some(900));
         // Out of range of its owner: it cannot be the shooter.
         t.on_object_status(900, &status_at(900, 40.0, 40.0, vec![]), 10);

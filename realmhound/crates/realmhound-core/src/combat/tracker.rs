@@ -654,6 +654,12 @@ struct LocalAbilityUse {
     time_ms: i64,
     item_id: i32,
     enchants: Vec<u16>,
+    /// How long after this activation the item's own declared server-applied
+    /// effect can still be producing the bulletless `DamagePacket`s (see
+    /// [`AbilityEffects::server_applied_damage_window_ms`]), resolved once at
+    /// activation time. `None` when the item declares no such effect, i.e. when a
+    /// bulletless packet could not have come from it.
+    server_effect_window_ms: Option<i64>,
 }
 
 /// One packet-borne damage event the server credited to the local player. Only
@@ -662,6 +668,15 @@ struct LocalAbilityUse {
 #[derive(Debug, Clone, Copy)]
 struct LocalDamageEvent {
     time_ms: i64,
+    damage: i64,
+}
+/// One landed hit from a volley the server fired for the local player. The
+/// `ServerPlayerShoot` packet names the item that fired the bullet, so the hit
+/// (and its packet-borne damage) belongs to that item's own activation.
+#[derive(Debug, Clone, Copy)]
+struct LocalVolleyHit {
+    time_ms: i64,
+    item_id: i32,
     damage: i64,
 }
 
@@ -911,11 +926,13 @@ pub struct CombatTracker {
     pending_summon_shots: HashMap<(i32, i16), i32>,
     /// Pre-defense damage of the local player's OWN server-fired bullets (weapon
     /// procs, ability volleys/secondary shots) awaiting their `EnemyHit`, keyed
-    /// by bullet id. The value is `(damage, armor_piercing)`. These arrive via
-    /// `ServerPlayerShoot` with owner == local and are confirmed by an outgoing
-    /// `EnemyHit`; their damage is only in that packet. Kept disjoint from
-    /// `pending_shots` (newest registration owns an id). Cleared on map change.
-    pending_server_shots: HashMap<i16, (i32, bool)>,
+    /// by bullet id. The value is `(damage, armor_piercing, item_id)`, where the
+    /// item is the one the server named as the shot's source (a spell's volley
+    /// names the spell). These arrive via `ServerPlayerShoot` with owner == local
+    /// and are confirmed by an outgoing `EnemyHit`; their damage is only in that
+    /// packet. Kept disjoint from `pending_shots` (newest registration owns an
+    /// id). Cleared on map change.
+    pending_server_shots: HashMap<i16, (i32, bool, i32)>,
     /// Object ids of every player-class object seen in the current map instance.
     /// Used at finalize to prove a fight was effectively solo (no *other* player
     /// present) before crediting unattributed boss-HP loss to the local player.
@@ -976,6 +993,12 @@ pub struct CombatTracker {
     /// player. This is the only local damage that reaches the wire, so it is what
     /// ability activations can be credited from.
     local_damage_events: VecDeque<LocalDamageEvent>,
+    /// Rolling log of the local player's server-fired volley hits: the damage the
+    /// `ServerPlayerShoot` packet named, on the bullet's `EnemyHit`, together with
+    /// the item that packet said fired it. Unlike `local_damage_events` (which
+    /// carries no source), these are source-exact and are credited to that same
+    /// item's own activation.
+    local_volley_hits: VecDeque<LocalVolleyHit>,
     /// Last local `UseItem` (item id, time), used to propose a source for a stat
     /// change that follows it. `None` until the first use this session.
     last_local_use: Option<(i32, i64)>,
@@ -1112,6 +1135,7 @@ impl CombatTracker {
             local_stat_changes: VecDeque::new(),
             local_ability_uses: VecDeque::new(),
             local_damage_events: VecDeque::new(),
+            local_volley_hits: VecDeque::new(),
             last_local_use: None,
             last_shot_ms: 0,
             completed_boss_types: HashSet::new(),
@@ -2401,6 +2425,8 @@ impl CombatTracker {
                 time_ms,
                 item_id,
                 enchants,
+                server_effect_window_ms: get_asset_manager()
+                    .server_applied_damage_window_ms(item_id),
             });
             self.trim_local_event_logs();
         }
@@ -2527,6 +2553,9 @@ impl CombatTracker {
         while self.local_damage_events.len() > MAX_LOCAL_EVENT_LOG {
             self.local_damage_events.pop_front();
         }
+        while self.local_volley_hits.len() > MAX_LOCAL_EVENT_LOG {
+            self.local_volley_hits.pop_front();
+        }
     }
 
     /// Rebuild the local player's boost windows for one fight from the rolling
@@ -2560,21 +2589,64 @@ impl CombatTracker {
     }
 
     /// The local player's ability activations inside one fight, each credited the
-    /// packet-borne damage that arrived while its window was open. Local damage
-    /// packets are the only local damage on the wire, so a credited hit is a
-    /// figure the server itself reported; an activation with none belongs to an
-    /// effect the client resolves locally (see the UI note).
+    /// packet-borne damage that belongs to it. Damage is matched by **source**,
+    /// never by "whatever was used last":
+    ///
+    /// * a bulletless `DamagePacket` carries no ability id, so it is credited only
+    ///   to an activation of an item whose own XML declares a server-applied
+    ///   effect (`DamageNova` waves, a poison's ticks, a hex detonation) and only
+    ///   within that declared duration -- the mushroom a spray leaves behind
+    ///   cannot be blamed on the spell cast next;
+    /// * a volley the server fired for the player names its item in the
+    ///   `ServerPlayerShoot` packet, so its landed hits are credited to that
+    ///   item's own activation and to nothing else.
+    ///
+    /// An activation with no credited damage is an effect that never connected
+    /// (see the UI note); it is listed anyway so nothing is silently dropped.
     fn ability_activations_for(&self, started_at: i64, ended_at: i64) -> Vec<AbilityActivation> {
         let uses: Vec<&LocalAbilityUse> = self
             .local_ability_uses
             .iter()
             .filter(|u| u.time_ms >= started_at && u.time_ms <= ended_at)
             .collect();
+        // Credit every packet to the activation that can own it, so no packet is
+        // counted twice and none lands on an ability that could not have produced
+        // it.
+        let mut credited: Vec<(i64, u64)> = vec![(0, 0); uses.len()];
+        for event in self
+            .local_damage_events
+            .iter()
+            .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
+        {
+            let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
+                use_.server_effect_window_ms.is_some_and(|window| {
+                    event.time_ms >= use_.time_ms && event.time_ms <= use_.time_ms + window
+                })
+            });
+            if let Some((i, _)) = owner {
+                credited[i].0 += event.damage;
+                credited[i].1 += 1;
+            }
+        }
+        for hit in self
+            .local_volley_hits
+            .iter()
+            .filter(|h| h.time_ms >= started_at && h.time_ms <= ended_at)
+        {
+            let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
+                use_.item_id == hit.item_id
+                    && hit.time_ms >= use_.time_ms
+                    && hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
+            });
+            if let Some((i, _)) = owner {
+                credited[i].0 += hit.damage;
+                credited[i].1 += 1;
+            }
+        }
         let mut out = Vec::with_capacity(uses.len());
-        for use_ in &uses {
-            // The attribution window ends at the next activation or after the
-            // fixed window, whichever is sooner, so a packet can never be credited
-            // to two activations.
+        for (i, use_) in uses.iter().enumerate() {
+            // The activation window still bounds the *record*: it ends at the next
+            // activation or after the fixed window, whichever is sooner.
             let next = uses
                 .iter()
                 .map(|u| u.time_ms)
@@ -2584,18 +2656,13 @@ impl CombatTracker {
             let until = (use_.time_ms + ABILITY_ATTRIBUTION_WINDOW_MS)
                 .min(next)
                 .min(ended_at);
-            let (damage, hits) = self
-                .local_damage_events
-                .iter()
-                .filter(|e| e.time_ms >= use_.time_ms && e.time_ms <= until)
-                .fold((0i64, 0u64), |(d, h), e| (d + e.damage, h + 1));
             out.push(AbilityActivation {
                 item_id: use_.item_id,
                 enchants: use_.enchants.clone(),
                 start_offset_ms: (use_.time_ms - started_at).max(0),
                 window_ms: (until - use_.time_ms).max(0),
-                damage,
-                hits,
+                damage: credited[i].0,
+                hits: credited[i].1,
             });
         }
         out
@@ -2922,7 +2989,8 @@ impl CombatTracker {
                 self.pending_shots.remove(&bid);
                 match resolved {
                     Some(ap) => {
-                        self.pending_server_shots.insert(bid, (damage as i32, ap));
+                        self.pending_server_shots
+                            .insert(bid, (damage as i32, ap, container_type));
                     }
                     None => {
                         self.pending_server_shots.remove(&bid);
@@ -3022,6 +3090,9 @@ impl CombatTracker {
             .pending_shots
             .get(&bullet_id)
             .map(|shot| shot.shot_gear.clone());
+        // Set when this hit came from a volley the server fired for a local
+        // ability activation; its damage is that ability's, not the weapon's.
+        let mut volley_item: Option<i32> = None;
         let resolved = if shooter_id == self.local_object_id {
             // Weapon shot: damage was rolled from the map RNG at shoot time.
             let weapon_resolved = if self.self_damage_available {
@@ -3094,11 +3165,29 @@ impl CombatTracker {
             // ServerPlayerShoot packet; apply the target's live defense with the
             // projectile's armor-piercing flag. Ids are disjoint from
             // pending_shots, so this only resolves genuine server shots.
-            weapon_resolved.or_else(|| {
-                self.pending_server_shots
-                    .get(&bullet_id)
-                    .map(|&(base, ap)| damage::damage_with_defense(base, ap, defense, cond0, cond1))
-            })
+            match weapon_resolved {
+                Some(dmg) => Some(dmg),
+                None => {
+                    let volley = self.pending_server_shots.get(&bullet_id).copied();
+                    // The packet named the item that fired this bullet. When that
+                    // item is one the local player activated, the hit is that
+                    // ability's own damage (a spell volley), not the weapon's, so
+                    // it is credited to the ability row instead of the loadout
+                    // bucket (which stays self-computed weapon damage only).
+                    if let Some((_, _, item_id)) = volley {
+                        if self.local_ability_uses.iter().any(|u| {
+                            u.item_id == item_id
+                                && u.time_ms <= time_ms
+                                && time_ms - u.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
+                        }) {
+                            volley_item = Some(item_id);
+                        }
+                    }
+                    volley.map(|(base, ap, _)| {
+                        damage::damage_with_defense(base, ap, defense, cond0, cond1)
+                    })
+                }
+            }
         } else {
             // Summon shot: damage is the server-provided projectile value; apply
             // the target's defense. Summon projectiles are treated as non-armor-
@@ -3203,6 +3292,18 @@ impl CombatTracker {
             if summon_pet_type != 0 {
                 entry.pet_type = summon_pet_type;
             }
+        } else if let Some(item_id) = volley_item {
+            // An ability volley's hit: the packet named the ability that fired it,
+            // so the damage belongs to that ability's own activation. It stays out
+            // of the loadout bucket, which is the weapon breakdown and holds
+            // self-computed weapon damage only -- the same reason a local
+            // DamagePacket's figure is kept out of it.
+            self.local_volley_hits.push_back(LocalVolleyHit {
+                time_ms,
+                item_id,
+                damage: dmg,
+            });
+            self.trim_local_event_logs();
         } else {
             // Only the player's own hits are bucketed per loadout: the bucket is
             // what the gear breakdown reports, and pet damage is not a property of
@@ -7780,8 +7881,7 @@ mod tests {
         );
 
         t.on_use_item(999, 0.0, 0.0, 100);
-        // Damage the server itself attributed to the local player inside the
-        // activation window.
+        // Damage the server itself attributed to the local player afterwards.
         t.on_damage(500, 1000, 700, 120);
         // A second activation with no packet-borne damage in its window.
         t.on_use_item(999, 0.0, 0.0, 400);
@@ -7792,13 +7892,130 @@ mod tests {
         assert_eq!(acts[0].start_offset_ms, 100);
         assert_eq!(
             (acts[0].damage, acts[0].hits),
-            (700, 1),
-            "the packet inside the first window belongs to it"
+            (0, 0),
+            "an item that declares no server-applied effect is never credited a \
+             bulletless packet, however close the packet lands"
         );
         assert_eq!(
             (acts[1].damage, acts[1].hits),
             (0, 0),
             "an activation with no packet damage stays at zero, never borrowed"
+        );
+        // The packet is still the fight's own packet-borne figure.
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!((p.packet_damage, p.packet_hits), (700, 1));
+    }
+
+    #[test]
+    fn volley_hit_is_credited_to_the_ability_that_fired_it() {
+        // A spell's volley is fired by the server, and the ServerPlayerShoot
+        // packet names the item that fired it -- so its landed damage belongs to
+        // that ability's row, never to the weapon the player happened to hold.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 20),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![name_stat("You"), stat(StatType::Inventory1, 777)],
+            ),
+            10,
+        );
+        t.on_use_item(777, 0.0, 0.0, 100);
+        // The volley's per-bullet pre-defense damage, as on_ally_shot registers it
+        // for the local player's own server-fired bullets.
+        t.pending_server_shots.insert(5, (300, false, 777));
+        t.on_local_hit(500, 5, 1000, 1000, 150);
+
+        let acts = t.ability_activations_for(0, 1_000);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (280, 1),
+            "300 pre-defense, the target's 20 defense applied"
+        );
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!(p.damage, 280, "the hit still counts in the fight total");
+        assert!(
+            p.damage_by_equipment.is_empty(),
+            "a spell volley is not the weapon's self-computed damage"
+        );
+    }
+
+    #[test]
+    fn a_spray_nova_is_credited_by_its_declared_effect_window() {
+        // The mushroom a spray leaves behind pulses its nova for the effect's own
+        // declared life (4 waves 1.2s apart), so its packets stay with the spray
+        // even after the player has cast something else -- and a spell that
+        // declares no such effect never claims them.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() || am.server_applied_damage_window_ms(0x04b3).is_none() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        assert!(
+            am.server_applied_damage_window_ms(0x9443).is_none(),
+            "a BulletNova spell declares no server-applied effect of its own"
+        );
+
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        // The ability slot holds the spray, so its uses register as activations.
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![name_stat("You"), stat(StatType::Inventory1, 0x04b3)],
+            ),
+            10,
+        );
+        t.on_use_item(0x04b3, 0.0, 0.0, 1_000);
+        // Nova pulses 0.28s and 2.5s later (inside the mushroom's life)...
+        t.on_damage(500, 1000, 1_088, 1_280);
+        t.on_damage(500, 1000, 1_088, 3_500);
+        // ...and a third long after it expired, which no activation may claim.
+        t.on_damage(500, 1000, 1_088, 30_000);
+
+        let acts = t.ability_activations_for(0, 31_000);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (2_176, 2),
+            "the mushroom's waves stay with the spray that spawned it"
         );
     }
 
@@ -7907,7 +8124,7 @@ mod tests {
         // asset set, so register the pre-defense value directly, as the other local
         // shot tests do.
         t.on_ally_shot(1000, 0, 1, 1, 1000, 0, 0);
-        t.pending_server_shots.insert(1, (1000, false));
+        t.pending_server_shots.insert(1, (1000, false, 0));
         t.on_local_hit(500, 1, 1000, 1000, 10);
         // Pet: one shot with its packet (100) and one hit whose shot was missed.
         t.on_ally_shot(200, 1000, 5, 1, 100, 0, 0);
@@ -7979,7 +8196,7 @@ mod tests {
         // the solo HP-gap reconciliation (which has its own tests).
         t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
         // Registered by on_ally_shot for a local server bullet (base 300, non-AP).
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // shooter == local
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -8009,7 +8226,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, true)); // armor-piercing
+        t.pending_server_shots.insert(5, (300, true, 0)); // armor-piercing
         t.on_local_hit(500, 5, 1000, 1000, 10);
         assert_eq!(
             t.fights
@@ -8031,7 +8248,7 @@ mod tests {
         let mut t = CombatTracker::new();
         t.on_map_change("Realm", 1, 0);
         t.on_player_loaded(1000, 1);
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_shot(2824, 0, 5, 10, 0.0, 0.0, 0.0, 10); // reuse id 5
         assert!(
             !t.pending_server_shots.contains_key(&5),
@@ -8285,7 +8502,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -8350,7 +8567,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
                                                 // Last HP tick shows 100 (< 1% of 12000), then the object is removed.
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 100)]), 20);
@@ -8387,7 +8604,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1_000)]), 20); // ~8%
         let done: Vec<_> = t.on_object_removed(500, 30).into_iter().collect();
@@ -8494,7 +8711,7 @@ mod tests {
             5,
         );
         // Open the fight.
-        t.pending_server_shots.insert(1, (100, false));
+        t.pending_server_shots.insert(1, (100, false, 0));
         t.on_local_hit(500, 1, 1000, 1000, 10);
         // A VIT potion / VIT-buffing ability lands mid-fight; SPD does not move,
         // while a life treat raises Max HP.
@@ -8649,7 +8866,7 @@ mod tests {
         );
         // Another player object appears (records into seen_player_ids).
         t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -8690,7 +8907,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -8725,7 +8942,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 600)]), 15); // 5%
         let cf = t
@@ -8759,7 +8976,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);

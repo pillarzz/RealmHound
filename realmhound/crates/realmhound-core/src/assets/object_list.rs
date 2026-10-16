@@ -883,6 +883,37 @@ impl AbilityEffects {
     pub fn has_readout(&self) -> bool {
         self.deals_damage() || !self.effects.is_empty()
     }
+
+    /// How long after an activation this ability can still be the source of a
+    /// bulletless `DamagePacket`, or `None` when the ability declares no
+    /// server-applied damage at all -- in which case any packet credited to it
+    /// would be a misattribution.
+    ///
+    /// The wire carries no ability id, so this declared duration is the only
+    /// honest way to decide which activation owns a packet: a `DamageNova`
+    /// (Sporous Spray's mushroom, for one) runs `activation_count` waves `time`
+    /// seconds apart, and a poison ticks for its own duration.
+    pub fn server_applied_damage_window_ms(&self) -> Option<i64> {
+        /// Grace for network/packet latency beyond the last declared wave.
+        const GRACE_MS: i64 = 600;
+
+        let mut window: Option<i64> = None;
+        for effect in &self.effects {
+            let AbilityEffect::DamageNova(nova) = effect else {
+                continue;
+            };
+            let span = (nova.activation_count.max(1.0) * nova.time.max(0.0) * 1000.0) as i64;
+            window = Some(window.unwrap_or(0).max(span));
+        }
+        for grenade in &self.poison_grenades {
+            let span = (grenade.duration_s.max(0.0) * 1000.0) as i64;
+            window = Some(window.unwrap_or(0).max(span));
+        }
+        if self.detonate_hex.is_some() || !self.on_detonate_poison.is_empty() {
+            window = Some(window.unwrap_or(0));
+        }
+        window.map(|ms| ms + GRACE_MS)
+    }
 }
 
 /// Asset data for a game object (item, enemy, NPC, etc.).

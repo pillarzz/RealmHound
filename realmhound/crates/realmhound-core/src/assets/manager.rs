@@ -3728,6 +3728,16 @@ impl AssetManager {
             .and_then(|list| list.ability_effects(id).cloned())
     }
 
+    /// How long after its activation an ability can still own a bulletless
+    /// `DamagePacket`, from the effect it declares in equip.xml (`DamageNova`
+    /// waves, a poison's tick duration, a hex detonation). `None` when the item
+    /// declares no server-applied damage, i.e. when crediting it a packet would
+    /// be a guess.
+    pub fn server_applied_damage_window_ms(&self, id: i32) -> Option<i64> {
+        self.ability_effects(id)
+            .and_then(|effects| effects.server_applied_damage_window_ms())
+    }
+
     /// Native damaging procs (OnPlayerShootActivate/OnEnemyHitActivate) for a
     /// weapon item, cloned so the assets lock isn't held by the caller. Empty
     /// vec when the item is unknown or has no such procs.

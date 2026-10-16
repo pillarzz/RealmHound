@@ -3467,10 +3467,10 @@ impl CombatHistoryPanel {
     }
 
     /// Section E.2: the local player's ability activations, each credited the
-    /// damage the server itself reported while its window was open.
+    /// damage the game reported for it -- the volley the server fired for that
+    /// item, or the server-applied effect it declared (a nova, poison, hex).
     ///
-    /// Most ability damage is resolved client-side (poisons, novas, lightning and
-    /// friends never reach the wire), so those activations stay listed with no
+    /// An activation whose damage never reached the client stays listed with no
     /// damage instead of being dropped -- nothing is silently omitted.
     fn render_ability_section(
         &self,
@@ -3480,11 +3480,11 @@ impl CombatHistoryPanel {
     ) {
         ui.add_space(10.0);
         section_header(ui, "Damage by ability").hover_tip(
-            "Damage the game reported while this ability was active. Some abilities' \
-                 damage is applied by the server and arrives in packets; others are \
-                 worked out on the client -- a spell's projectile volley, thrown \
-                 poisons, hex detonations -- and are never sent, so those rows stay \
-                 blank.",
+            "Damage the game reported for this ability. The server sends the damage \
+             of the volleys it fires for you (a spell's bolts) and of the effects it \
+             applies for you (a mushroom's nova, thrown poison); each figure is \
+             credited to the activation it belongs to. An ability whose damage never \
+             reached the client stays blank.",
         );
         ui.add_space(4.0);
         if fight.abilities.is_empty() {
@@ -3559,17 +3559,17 @@ impl CombatHistoryPanel {
                         ui.label(RichText::new(format!("{} packet hit(s)", r.hits)).small());
                     } else {
                         ui.label(RichText::new("-").color(Color32::GRAY));
-                        // Say which blank this is: an ability whose damage the
-                        // server never sends (poisons, hex detonations -- the ones
-                        // we model ourselves) versus one whose hits simply did not
-                        // land while the activation window was open.
-                        let client_computed = get_asset_manager()
-                            .ability_effects(r.item_id)
-                            .is_some_and(|e| e.deals_damage());
-                        let note = if client_computed {
-                            "the client computes this ability's damage, so the server never sends it"
+                        // Say which blank this is: an ability whose declared
+                        // effect never connected (its damage is applied by the
+                        // server, so nothing means the nova/poison missed) versus
+                        // one whose shots the server reported no hit for.
+                        let server_applied = get_asset_manager()
+                            .server_applied_damage_window_ms(r.item_id)
+                            .is_some();
+                        let note = if server_applied {
+                            "the server-applied effect never connected"
                         } else {
-                            "no server-reported damage landed while it was active"
+                            "the server reported no hits from this ability's shots"
                         };
                         ui.label(RichText::new(note).color(Color32::GRAY).small());
                     }

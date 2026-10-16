@@ -418,10 +418,13 @@ const PENDING_EVENT_CAP: usize = 4096;
 const IDENTITY_TIMEOUT_MS: i64 = 60_000;
 
 /// How long after an empty `BloodRitual` spawn snapshot the game has to report the
-/// active id before the ritual is treated as switched off. Observed captures show
-/// the id arriving 4-118 ms after the empty spawn, so a deactivation is settled
-/// well inside this window (see `PacketProcessor::apply_blood_ritual_stat`).
-const BLOOD_RITUAL_SETTLE_MS: i64 = 400;
+/// active id before the ritual is treated as switched off. Captures show the id
+/// arriving 4-118 ms after the empty spawn, so a deactivation is settled well
+/// inside this window, and a slow map load cannot be mistaken for one (see
+/// `PacketProcessor::apply_blood_ritual_stat`). A switch-off made while standing
+/// still arrives as an empty *delta* and is applied at once, so this only governs
+/// the fallback path.
+const BLOOD_RITUAL_SETTLE_MS: i64 = 1_500;
 
 impl PacketProcessor {
     /// Build a processor from flat-layout paths, degrading writer failures to
@@ -5206,7 +5209,7 @@ mod isolation_gate_tests {
                 .is_some(),
             "still inside the window"
         );
-        p.settle_blood_ritual(5_000 + 400);
+        p.settle_blood_ritual(5_000 + 1_500);
         assert!(
             p.account_data
                 .characters

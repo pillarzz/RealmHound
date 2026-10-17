@@ -73,6 +73,21 @@ fn main() {
     }
     let mut finished: Vec<CompletedFight> = Vec::new();
 
+    // What the client saw around the damage only packets can explain. Several
+    // dungeons have mechanics that damage the boss *for* the player (Parasite
+    // Chambers' barrels, the Galleon's cannonballs): the server credits the pusher,
+    // so the hit arrives as a plain owner-credited `DamagePacket` with nothing else
+    // pointing at it. Logging the objects that appeared or vanished as each such
+    // packet landed is what names the source.
+    let mut local_object_id: i32 = 0;
+    let mut object_types: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    let mut recent_objects: std::collections::VecDeque<(i64, i32, i32, bool)> =
+        std::collections::VecDeque::new();
+    let mut credited: Vec<(i64, u16, u16, i32)> = Vec::new();
+    // Every object type seen, with a count and its first/last clock.
+    let mut seen_types: std::collections::HashMap<i32, (u32, i64, i64)> =
+        std::collections::HashMap::new();
+
     // Synthetic monotonic clock (ms). Real timestamps are per-packet but the
     // tracker only needs monotonic ordering + a coarse tick cadence.
     let mut clock: i64 = 0;
@@ -96,10 +111,18 @@ fn main() {
                     finished.extend(tracker.on_map_change(&name, m.fp, clock));
                 }
                 Some(ParsedPacket::CreateSuccess(c)) => {
+                    local_object_id = c.object_id;
                     tracker.on_player_loaded(c.object_id, c.char_id);
                 }
                 Some(ParsedPacket::Update(u)) => {
                     for obj in &u.new_objects {
+                        object_types.insert(obj.object_id(), obj.object_type as i32);
+                        let entry = seen_types
+                            .entry(obj.object_type as i32)
+                            .or_insert((0, clock, clock));
+                        entry.0 += 1;
+                        entry.2 = clock;
+                        recent_objects.push_back((clock, obj.object_type as i32, obj.object_id(), true));
                         // Creatures an item declares (a Kimono's spirits, a
                         // Summoner mace's bear) are spawned as ordinary objects;
                         // logging them shows whether RH ever saw the summon whose
@@ -122,9 +145,17 @@ fn main() {
                         );
                     }
                     for &object_id in &u.drops {
+                        let otype = object_types.remove(&object_id).unwrap_or(0);
+                        recent_objects.push_back((clock, otype, object_id, false));
                         if let Some(cf) = tracker.on_object_removed(object_id, clock) {
                             finished.push(cf);
                         }
+                    }
+                    while recent_objects
+                        .front()
+                        .is_some_and(|(t, ..)| clock - t > 2_000)
+                    {
+                        recent_objects.pop_front();
                     }
                 }
                 Some(ParsedPacket::NewTick(t)) => {
@@ -135,6 +166,9 @@ fn main() {
                     finished.extend(tracker.on_tick(clock));
                 }
                 Some(ParsedPacket::Damage(d)) if incoming => {
+                    if d.object_id == local_object_id && local_object_id != 0 {
+                        credited.push((clock, d.damage_amount, d.bullet_id, d.target_id));
+                    }
                     tracker.on_damage(d.target_id, d.object_id, d.damage_amount as i64, clock);
                 }
                 // Incoming summon/ally shots carry server-precomputed damage.
@@ -202,8 +236,101 @@ fn main() {
         }
     }
 
+    // Objects whose names look like a mechanic that damages the boss *for* the
+    // player (Parasite Chambers' barrels, the Galleon's cannons): if they are
+    // ordinary world objects, they are spawned with the map and show up here.
+    let mut mechanics: Vec<(i32, u32, i64, i64, String)> = seen_types
+        .iter()
+        .filter_map(|(&otype, &(count, first, last))| {
+            let name = manager.object_name(otype)?;
+            let lower = name.to_lowercase();
+            ["barrel", "cannon", "bomb", "gunpowder"]
+                .iter()
+                .any(|key| lower.contains(key))
+                .then_some((otype, count, first, last, name))
+        })
+        .collect();
+    mechanics.sort_by(|a, b| b.1.cmp(&a.1));
+    if !mechanics.is_empty() {
+        println!(
+            "\n=== objects that look like a boss-damaging mechanic ({} object types seen in total) ===",
+            seen_types.len()
+        );
+        for (otype, count, first, last, name) in &mechanics {
+            println!("     {name} (0x{otype:04X}) x{count}  first={first} last={last}");
+        }
+    }
+
     // Flush anything still in progress at end of capture.
     finished.extend(tracker.on_disconnect(now_ms()));
+
+    // The damage no row explains -- and what the client saw as it landed (see the
+    // note where `credited` is filled).
+    if !credited.is_empty() {
+        let total: i64 = credited.iter().map(|(_, amount, ..)| *amount as i64).sum();
+        println!(
+            "\n=== owner-credited damage packets: {} totalling {} ===",
+            credited.len(),
+            total
+        );
+        println!(
+            "     (the server attributed these to the local player with no shot, \
+             ability activation or creature of theirs behind them)"
+        );
+        let mut tally: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+        for (i, (clock, amount, bullet, target)) in credited.iter().enumerate() {
+            let mut types: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+            for (t, otype, _id, _spawned) in recent_objects.iter() {
+                if (t - clock).abs() <= 600 && *otype != 0 {
+                    types.insert(*otype);
+                }
+            }
+            for otype in &types {
+                *tally.entry(*otype).or_insert(0) += 1;
+            }
+            if i < 8 {
+                let names: Vec<String> = types
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{} (0x{:X})",
+                            manager
+                                .object_name(*t)
+                                .unwrap_or_else(|| "unnamed".to_string()),
+                            *t
+                        )
+                    })
+                    .collect();
+                println!(
+                    "     #{:<3} t={:<8} dmg={:<6} bullet={:<3} target={:<6} objects nearby: {}",
+                    i + 1,
+                    clock,
+                    amount,
+                    bullet,
+                    target,
+                    if names.is_empty() {
+                        "-".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+            }
+        }
+        let mut rows: Vec<(i32, u32)> = tally.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!("     objects seen within 600ms of a credited packet (by packet count):");
+        for (otype, count) in rows.iter().take(10) {
+            println!(
+                "       in {}/{} packets: {} (0x{:04X})",
+                count,
+                credited.len(),
+                manager
+                    .object_name(*otype)
+                    .unwrap_or_else(|| "unnamed".to_string()),
+                *otype
+            );
+        }
+    }
 
     println!("\n=== Reconstructed boss fights: {} ===", finished.len());
     for (i, f) in finished.iter().enumerate() {

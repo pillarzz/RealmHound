@@ -1555,7 +1555,7 @@ impl PacketProcessor {
                         Some(ParsedPacket::Hello(_) | ParsedPacket::Reconnect(_))
                     ) {
                         if let Some(rec) = self.recorder.as_mut() {
-                            rec.discard_pending();
+                            rec.discard_pending_flow(&raw_packet);
                         }
                     }
 

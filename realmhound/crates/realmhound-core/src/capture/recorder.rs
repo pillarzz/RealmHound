@@ -18,6 +18,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -42,7 +43,7 @@ pub fn captures_dir() -> PathBuf {
 /// The most recent frames are held back instead of being written straight away, so
 /// the caller can still drop them: whether a frame carries credentials is only known
 /// after its packet is parsed, which happens after the frame was handed over (see
-/// [`CaptureWriter::discard_pending`]).
+/// [`CaptureWriter::discard_pending_flow`]).
 pub struct CaptureWriter {
     inner: BufWriter<File>,
     count: u64,
@@ -70,7 +71,7 @@ impl CaptureWriter {
     }
 
     /// Append one raw packet frame. It is held for a few frames, so
-    /// [`Self::discard_pending`] can still drop it.
+    /// [`Self::discard_pending_flow`] can still drop it.
     pub fn write(&mut self, packet: &RawPacket) -> io::Result<()> {
         self.pending.push_back(packet.clone());
         while self.pending.len() > HELD_FRAMES {
@@ -81,16 +82,31 @@ impl CaptureWriter {
         Ok(())
     }
 
-    /// Drop the held frames instead of writing them.
+    /// Drop the held frames that belong to the same TCP flow as `handshake`.
     ///
     /// `Hello` (74) carries the session ticket in its `access_token`, and `Reconnect`
-    /// carries the next one. Captures are shared for debugging, and the packet cipher
+    /// carries the next one. Captures get shared for debugging, and the packet cipher
     /// is keyed by the packet tick rather than by a secret, so a ticket inside a
     /// capture is readable by anyone holding the file -- these frames never reach the
-    /// disk. Everything still held is dropped rather than only the frame that
-    /// completed reassembly, because the handshake bytes may be split across frames.
-    pub fn discard_pending(&mut self) {
-        self.pending.clear();
+    /// disk.
+    ///
+    /// Every held frame of that flow goes, not only the one that completed
+    /// reassembly, because the handshake bytes may be split across TCP segments.
+    /// Frames of other flows are kept: dropping them would leave a hole in a stream
+    /// that has nothing to do with the credentials.
+    pub fn discard_pending_flow(&mut self, handshake: &RawPacket) {
+        let Some((src_ip, src_port, dst_ip, dst_port)) = endpoints(handshake) else {
+            self.pending.clear();
+            return;
+        };
+        self.pending.retain(|packet| match endpoints(packet) {
+            Some((sip, sport, dip, dport)) => {
+                !(sip == src_ip && sport == src_port && dip == dst_ip && dport == dst_port)
+                    && !(sip == dst_ip && sport == dst_port && dip == src_ip && dport == src_port)
+            }
+            // Unparsable now, parsable later: keep it rather than guess.
+            None => true,
+        });
     }
 
     /// Write the frames held from earlier calls.
@@ -128,6 +144,17 @@ impl Drop for CaptureWriter {
     fn drop(&mut self) {
         let _ = self.flush();
     }
+}
+
+/// `(src_ip, src_port, dst_ip, dst_port)` of a captured frame, if it carries TCP.
+fn endpoints(packet: &RawPacket) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
+    let segment = crate::stream::parse_tcp_segment(packet)?;
+    Some((
+        segment.src_ip,
+        segment.src_port,
+        segment.dst_ip,
+        segment.dst_port,
+    ))
 }
 
 /// Read every frame from a `.rhcap` capture file into raw packets.
@@ -194,34 +221,47 @@ pub fn read_capture(path: &Path) -> io::Result<Vec<RawPacket>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_discarded_frame_never_reaches_the_file() {
-        // Handshake frames carry the session ticket; the caller only knows that after
-        // parsing, so the frames are still held here and can be dropped.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("redacted.rhcap");
-        let keep = |data: Vec<u8>| RawPacket {
+    /// A minimal IPv4/TCP frame for `port -> 2050`, carrying `payload`.
+    fn frame(port: u16, payload: &[u8]) -> RawPacket {
+        let mut data = Vec::new();
+        etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 2], 64)
+            .tcp(port, 2050, 1, 32768)
+            .ack(1)
+            .psh()
+            .write(&mut data, payload)
+            .unwrap();
+        RawPacket {
             timestamp: Utc::now(),
-            packet_format: PacketFormat::Ethernet,
+            packet_format: PacketFormat::RawIp,
             #[cfg(feature = "latency-diagnostics")]
             enqueued_at: None,
             data,
-        };
+        }
+    }
+
+    #[test]
+    fn a_discarded_frame_never_reaches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redacted.rhcap");
         {
             let mut w = CaptureWriter::create(&path).unwrap();
-            for byte in 1..=5u8 {
-                w.write(&keep(vec![byte])).unwrap();
-            }
-            // Frame 1 is already on disk; 2..=5 are still held.
-            w.discard_pending(); // drops the handshake frames
-            w.write(&keep(vec![6])).unwrap();
+            let hello = frame(45678, &[1]);
+            w.write(&hello).unwrap();
+            w.write(&frame(45678, &[2])).unwrap(); // held
+            w.write(&frame(45678, &[3])).unwrap(); // held
+            w.write(&frame(45679, &[9])).unwrap(); // held, other flow
+                                                   // The caller decided the frame was a handshake after parsing it: it takes
+                                                   // out every held frame of that flow, and leaves the other flow alone.
+            w.discard_pending_flow(&hello);
+            assert_eq!(w.count(), 0);
+            w.write(&frame(45678, &[4])).unwrap();
             w.flush().unwrap();
             assert_eq!(w.count(), 2);
         }
         let read = read_capture(&path).unwrap();
         assert_eq!(read.len(), 2);
-        assert_eq!(read[0].data, vec![1]);
-        assert_eq!(read[1].data, vec![6]);
+        assert_eq!(endpoints(&read[0]).map(|e| e.1), Some(45679));
+        assert_eq!(endpoints(&read[1]).map(|e| e.1), Some(45678));
     }
 
     #[test]

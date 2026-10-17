@@ -1355,7 +1355,10 @@ impl PacketProcessor {
                 .pet_instance_id
                 .and_then(|id| cache.resolve_pet_identity(id, character.seasonal));
             (
-                cache.blood_ritual_for_char(char_id).is_some(),
+                // The tier id, not just "on": the character's recorded tier is
+                // cleared when the ritual is switched off, so a fight keeps the id
+                // it was fought under and the card resolves the definition from it.
+                cache.blood_ritual_for_char(char_id).map(|tier| tier.id),
                 character.crucible_active,
                 pet.map(|p| if p.skin > 0 { p.skin } else { p.pet_type })
                     .unwrap_or(0),

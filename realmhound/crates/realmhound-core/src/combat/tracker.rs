@@ -1010,9 +1010,14 @@ impl BoostSnapshot {
 /// finalised from then on carries them in its own record, so the fight card
 /// shows the state the fight was fought under rather than whatever is true when
 /// the card is opened.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct LocalSnapshot {
-    blood_ritual: bool,
+    /// The Blood Ritual tier the character has on (its id -- the definition itself
+    /// is the season's, not the character's), or `None` when none is active. The
+    /// *id* is what a fight has to keep: a character's recorded tier is cleared the
+    /// moment the ritual is switched off, so a card that resolved it later showed a
+    /// fight fought under a ritual as having none.
+    blood_ritual: Option<String>,
     crucible: bool,
     /// The pet's sprite: its skin, or its type where it has no skin -- the same
     /// choice ATTRIBUTES makes. 0 when the character has no pet out.
@@ -2890,7 +2895,7 @@ impl CombatTracker {
     /// the world is this character's.
     pub fn set_local_snapshot(
         &mut self,
-        blood_ritual: bool,
+        blood_ritual: Option<String>,
         crucible: bool,
         pet_skin: i32,
         pet_type: i32,
@@ -2913,9 +2918,22 @@ impl CombatTracker {
     /// every later toggle.
     fn local_state_windows(&self, started_at: i64, ended_at: i64) -> Vec<BoostWindow> {
         let mut out = Vec::new();
-        for (stat, active) in [
-            ("Blood Ritual", self.local_snapshot.blood_ritual),
-            ("Crucible", self.local_snapshot.crucible),
+        // The ritual's window names the tier it was fought under, so the card can
+        // render the right definition without asking the character (which may have
+        // switched the ritual off since).
+        let ritual = self
+            .local_snapshot
+            .blood_ritual
+            .as_deref()
+            .map(|id| format!("{CHARACTER_STATE_SOURCE}:{id}"))
+            .unwrap_or_else(|| CHARACTER_STATE_SOURCE.to_string());
+        for (stat, source, active) in [
+            ("Blood Ritual", ritual, self.local_snapshot.blood_ritual.is_some()),
+            (
+                "Crucible",
+                CHARACTER_STATE_SOURCE.to_string(),
+                self.local_snapshot.crucible,
+            ),
         ] {
             if !active {
                 continue;
@@ -2926,7 +2944,7 @@ impl CombatTracker {
                 stat: stat.to_string(),
                 from: 0,
                 to: 1,
-                source: CHARACTER_STATE_SOURCE.to_string(),
+                source,
                 source_item: None,
             });
         }
@@ -12682,7 +12700,7 @@ mod tests {
         let mut t = pet_packet_tracker(&[], 0);
         // 32548 is this character's pet (Blue Ant); 32645 is a teammate's (Great
         // Jelly) standing nearer to the local player than their own pet is.
-        t.set_local_snapshot(false, false, 24_724, 32_548);
+        t.set_local_snapshot(None, false, 24_724, 32_548);
         t.on_object_spawn(
             901,
             0x9999,
@@ -12732,7 +12750,7 @@ mod tests {
         // pets: rows for a Battle God, a Poison Drake, a Great Jelly, none of them
         // the player's, on the player's own row.
         let mut t = pet_packet_tracker(&[], 0);
-        t.set_local_snapshot(false, false, 24_724, 32_548);
+        t.set_local_snapshot(None, false, 24_724, 32_548);
         t.on_object_spawn(
             700,
             0x9999,
@@ -12785,7 +12803,7 @@ mod tests {
         // fight's own record at finalize, so switching the ritual off afterwards
         // cannot rewrite what the fight says it was fought under.
         let mut t = pet_packet_tracker(&[], 0);
-        t.set_local_snapshot(true, true, 0, 0);
+        t.set_local_snapshot(Some("tier-a".to_string()), true, 0, 0);
         t.on_damage(500, 1000, 280, 200);
         let fight = t.fights.remove(&500).expect("open fight");
         let done = t.finalize_fight(fight, 1_000).expect("finalize");
@@ -12794,8 +12812,16 @@ mod tests {
         };
         assert!(was_on(&done, "Blood Ritual"));
         assert!(was_on(&done, "Crucible"));
+        assert_eq!(
+            done.boosts
+                .iter()
+                .find(|b| b.stat == "Blood Ritual")
+                .map(|b| b.source.as_str()),
+            Some("character state:tier-a"),
+            "the fight keeps the tier it was fought under"
+        );
 
-        t.set_local_snapshot(false, false, 0, 0);
+        t.set_local_snapshot(None, false, 0, 0);
         assert!(
             was_on(&done, "Blood Ritual"),
             "a recorded fight does not follow a later switch-off"
@@ -12842,7 +12868,7 @@ mod tests {
         // from the account cache, and the fight's own row does the same, so the row
         // draws the pet and not a placeholder.
         let mut t = pet_packet_tracker(&[406, 407, 408], 32643);
-        t.set_local_snapshot(false, false, 12_345, 0);
+        t.set_local_snapshot(None, false, 12_345, 0);
         t.on_damage(500, 1000, 280, 200);
         let fight = t.fights.remove(&500).expect("open fight");
         let done = t.finalize_fight(fight, 1_000).expect("finalize");

@@ -476,6 +476,17 @@ fn group_summons(
 /// The horizontal padding a card leaves inside its own outline, on every side.
 const CARD_PADDING: f32 = 6.0;
 
+/// The Blood Ritual tier a fight was fought under, from the id its own record
+/// carries (see `CombatTracker::local_state_windows`). A fight recorded before the
+/// tier was stored has the plain source and resolves to `None`.
+fn fight_ritual_id(boosts: &[BoostWindow]) -> Option<&str> {
+    boosts
+        .iter()
+        .find(|b| b.stat == "Blood Ritual" && b.to > b.from)?
+        .source
+        .strip_prefix("character state:")
+}
+
 /// A section divider: the empty row it occupies is allocated at `width` so the
 /// card keeps the width the stats table gives it, and where the rule goes is
 /// recorded for [`paint_divider_rows`] to draw once the card's own width is known.
@@ -3320,19 +3331,21 @@ impl CombatHistoryPanel {
         // before that is unstamped and reads as off, like every other
         // pre-tracking field -- rather than picking up whatever is active when the
         // card happens to be opened.
-        let was_on = |label: &str| {
-            fight
-                .boosts
-                .iter()
-                .any(|b| b.stat == label && b.to > b.from)
-        };
-        if !was_on("Blood Ritual") {
-            loadout.blood_ritual = None;
-        }
+        //
+        // The ritual's *tier* is part of that record: a character's recorded tier is
+        // cleared the moment the ritual is switched off, so resolving the tier here
+        // (as this used to, from the fight's on/off window alone) dropped the Blood
+        // Ritual from fights that had already been recorded, and re-adding it when
+        // the ritual was switched back on.
+        loadout.blood_ritual = fight_ritual_id(&fight.boosts).and_then(|id| cache.blood_ritual_def(id));
         // The crucible's definitions belong to the season, not to the character, so
         // the marker's state *now* must not decide whether the fight was fought
         // under them.
-        loadout.crucible = if was_on("Crucible") {
+        loadout.crucible = if fight
+            .boosts
+            .iter()
+            .any(|b| b.stat == "Crucible" && b.to > b.from)
+        {
             cache.active_crucible.clone()
         } else {
             None
@@ -5657,11 +5670,29 @@ fn assign_drops_exclusive(
 mod tests {
     use super::{
         assign_drops_exclusive, boost_source_with, boss_bar_label, boss_row_hp_label,
-        boss_row_stats_parts, condensed_boosts, dungeon_display_name, share_hp_pool,
+        boss_row_stats_parts, condensed_boosts, dungeon_display_name, fight_ritual_id,
+        share_hp_pool,
         spirit_total_label, BoostIcon, RunModes, SourceOracle,
     };
     use realmhound_core::assets::get_dungeon_portal_map;
     use realmhound_core::combat::BoostWindow;
+
+    #[test]
+    fn a_fight_names_the_ritual_tier_it_was_fought_under() {
+        // The tier is part of the fight's own record, so the card can render the
+        // ritual a fight was fought under even after the character has switched it
+        // off -- which clears the character's own recorded tier.
+        let with_tier = [boost("Blood Ritual", 0, 1, 0, 5_000, "character state:tier-a")];
+        assert_eq!(fight_ritual_id(&with_tier), Some("tier-a"));
+        // A fight recorded before the tier was stored carries the plain source, so
+        // the card shows no ritual rather than inventing one.
+        let legacy = [boost("Blood Ritual", 0, 1, 0, 5_000, "character state")];
+        assert_eq!(fight_ritual_id(&legacy), None);
+        // No window, or one that only fell: nothing was on.
+        assert_eq!(fight_ritual_id(&[]), None);
+        let falling = [boost("Blood Ritual", 1, 0, 0, 5_000, "expired")];
+        assert_eq!(fight_ritual_id(&falling), None);
+    }
 
     /// A rising boost window, the shape the tracker records for a buff landing.
     fn boost(stat: &str, from: i32, to: i32, start: i64, end: i64, source: &str) -> BoostWindow {

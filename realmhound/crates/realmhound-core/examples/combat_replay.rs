@@ -87,6 +87,18 @@ fn main() {
     // Every object type seen, with a count and its first/last clock.
     let mut seen_types: std::collections::HashMap<i32, (u32, i64, i64)> =
         std::collections::HashMap::new();
+    // Barrel-shaped objects: (clock, type, id, spawned, x, y). Positions come from
+    // the spawn packet, and a removal reuses the last position seen for the id, so a
+    // hit can be matched to the barrel that made it.
+    let mut barrels: Vec<(i64, i32, i32, bool, f32, f32)> = Vec::new();
+    let mut object_positions: std::collections::HashMap<i32, (f32, f32)> =
+        std::collections::HashMap::new();
+    let is_barrel = |name: &str| {
+        let lower = name.to_lowercase();
+        ["barrel", "cannon", "bomb", "gunpowder"]
+            .iter()
+            .any(|key| lower.contains(key))
+    };
 
     // Synthetic monotonic clock (ms). Real timestamps are per-packet but the
     // tracker only needs monotonic ordering + a coarse tick cadence.
@@ -117,6 +129,14 @@ fn main() {
                 Some(ParsedPacket::Update(u)) => {
                     for obj in &u.new_objects {
                         object_types.insert(obj.object_id(), obj.object_type as i32);
+                        let (px, py) = (obj.status.pos.x, obj.status.pos.y);
+                        object_positions.insert(obj.object_id(), (px, py));
+                        if manager
+                            .object_name(obj.object_type as i32)
+                            .is_some_and(|n| is_barrel(&n))
+                        {
+                            barrels.push((clock, obj.object_type as i32, obj.object_id(), true, px, py));
+                        }
                         let entry = seen_types
                             .entry(obj.object_type as i32)
                             .or_insert((0, clock, clock));
@@ -146,6 +166,10 @@ fn main() {
                     }
                     for &object_id in &u.drops {
                         let otype = object_types.remove(&object_id).unwrap_or(0);
+                        let (px, py) = object_positions.remove(&object_id).unwrap_or((0.0, 0.0));
+                        if manager.object_name(otype).is_some_and(|n| is_barrel(&n)) {
+                            barrels.push((clock, otype, object_id, false, px, py));
+                        }
                         recent_objects.push_back((clock, otype, object_id, false));
                         if let Some(cf) = tracker.on_object_removed(object_id, clock) {
                             finished.push(cf);
@@ -259,6 +283,61 @@ fn main() {
         for (otype, count, first, last, name) in &mechanics {
             println!("     {name} (0x{otype:04X}) x{count}  first={first} last={last}");
         }
+    }
+
+    // Does a barrel-scale hit land as a barrel moves or is consumed?
+    if !barrels.is_empty() {
+        let spawns = barrels.iter().filter(|(_, _, _, spawned, _, _)| *spawned).count();
+        println!(
+            "\n=== barrel-like objects: {} spawns, {} removals ===",
+            spawns,
+            barrels.len() - spawns
+        );
+        for (clock, otype, id, spawned, x, y) in barrels.iter().take(14) {
+            println!(
+                "     t={clock:<8} {} 0x{otype:04X} id={id:<8} pos=({x:.0}, {y:.0})",
+                if *spawned { "spawn " } else { "remove" }
+            );
+        }
+        let big: Vec<&(i64, u16, u16, i32)> = credited
+            .iter()
+            .filter(|(_, amount, ..)| *amount >= 700)
+            .collect();
+        let mut with_barrel = 0;
+        let mut shown = 0;
+        for (clock, amount, bullet, target) in big.iter() {
+            let nearest = barrels
+                .iter()
+                .map(|e| ((e.0 - clock).abs(), e))
+                .filter(|(d, _)| *d <= 2_000)
+                .min_by_key(|(d, _)| *d);
+            match nearest {
+                Some((delta, (t, otype, id, spawned, x, y))) => {
+                    with_barrel += 1;
+                    if shown < 12 {
+                        println!(
+                            "     packet t={clock:<8} dmg={amount:<6} bullet={bullet} -> {} 0x{otype:04X} id={id} delta={}ms pos=({x:.0}, {y:.0})",
+                            if *spawned { "spawn" } else { "remove" },
+                            t - clock,
+                        );
+                        shown += 1;
+                    }
+                }
+                None => {
+                    if shown < 12 {
+                        println!(
+                            "     packet t={clock:<8} dmg={amount:<6} bullet={bullet} target={target} -> no barrel within 2s"
+                        );
+                        shown += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "     barrel-scale packets (>=700): {} of which {} had a barrel event within 2s",
+            big.len(),
+            with_barrel
+        );
     }
 
     // Flush anything still in progress at end of capture.

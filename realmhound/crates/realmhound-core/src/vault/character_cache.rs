@@ -539,7 +539,8 @@ impl CachedCharacter {
     /// Per-stat detail for the character card's "stats maxed" section, in the
     /// in-game display order `[HP, MP, ATT, DEF, SPD, DEX, VIT, WIS]`. Each entry
     /// is `(label, current, cap, is_maxed)`. `cap - current` (clamped at 0) is
-    /// the number of stat potions still needed to max that stat.
+    /// the stat-point deficit. HP and MP potions each grant five points;
+    /// other stat potions grant one point.
     pub fn stat_details(&self) -> [(&'static str, i32, i32, bool); 8] {
         let caps = self.stat_caps();
         let flags = self.maxed_flags();
@@ -792,6 +793,75 @@ impl Default for CharacterCache {
 }
 
 impl CharacterCache {
+    /// Export only cached observations. A partial roster is never presented as complete.
+    pub fn roster_json(&self) -> Result<String, serde_json::Error> {
+        let assets = crate::assets::get_asset_manager();
+        let mut living: Vec<&CachedCharacter> = self.characters.iter().collect();
+        living.sort_by_key(|character| character.char_id);
+        let mut dead: Vec<&CachedCharacter> = self.dead_characters.iter().collect();
+        dead.sort_by_key(|character| character.char_id);
+        let item_values = |items: &[CharacterItem]| {
+            items
+                .iter()
+                .map(|item| {
+                    if item.is_empty() {
+                        return serde_json::Value::Null;
+                    }
+                    serde_json::json!({
+                        "name": assets.object_name(item.item_id),
+                        "item_id": item.item_id,
+                        "stack_count": item.stack_count,
+                        "enchants": item.enchant_ids.iter().map(|&id| serde_json::json!({
+                            "name": assets.enchant_name(id),
+                            "enchant_id": id,
+                        })).collect::<Vec<_>>(),
+                        "empty_enchant_slots": item.empty_enchant_slots,
+                        "locked_enchant_slots": item.locked_enchant_slots,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let character_value = |character: &CachedCharacter| {
+            let potions_to_max = character
+                .stat_details()
+                .into_iter()
+                .map(|(name, current, max, _)| {
+                    let deficit = max.saturating_sub(current).max(0);
+                    let needed = if name == "HP" || name == "MP" {
+                        deficit.saturating_add(4) / 5
+                    } else {
+                        deficit
+                    };
+                    (name.to_string(), serde_json::json!(needed))
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>();
+            serde_json::json!({
+                "character_id": character.char_id,
+                "class_id": character.class_id,
+                "class": character.class_name(),
+                "level": character.level,
+                "seasonal": character.seasonal,
+                "dead": character.is_dead,
+                "fame": character.fame,
+                "potions_to_max": potions_to_max,
+                "maxed_stats": character.maxed_count,
+                "equipment": item_values(&character.equipment),
+                "inventory": item_values(&character.inventory),
+                "backpack": item_values(&character.backpack),
+                "backpack_ext": item_values(&character.backpack_ext),
+                "belt": item_values(&character.belt),
+                "last_observed_live": character.last_live_update.map(chrono::DateTime::<chrono::Utc>::from),
+            })
+        };
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 3,
+            "complete_roster": false,
+            "completeness_note": "Only characters observed by RealmHound are included; absence is not evidence that a slot is empty.",
+            "cache_last_updated": self.last_updated.map(chrono::DateTime::<chrono::Utc>::from),
+            "living": living.into_iter().map(character_value).collect::<Vec<_>>(),
+            "graveyard": dead.into_iter().map(character_value).collect::<Vec<_>>(),
+        }))
+    }
     /// Current cache format version.
     pub const CURRENT_VERSION: u32 = 1;
 
@@ -1932,6 +2002,55 @@ impl CharacterCache {
         } else {
             &self.regular_pets
         }
+    }
+}
+
+#[cfg(test)]
+mod roster_export_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_classes_and_seasons_keep_distinct_ids() {
+        let mut cache = CharacterCache::new();
+        let mut regular = CachedCharacter {
+            char_id: 11,
+            class_id: 782,
+            ..Default::default()
+        };
+        let seasonal = CachedCharacter {
+            char_id: 12,
+            class_id: 782,
+            seasonal: true,
+            ..Default::default()
+        };
+        regular.level = 20;
+        regular.stats.max_hp = 692;
+        regular.stats.attack = 57;
+        regular.equipment = vec![
+            CharacterItem::empty(),
+            CharacterItem::with_enchants(12345, vec![101]),
+        ];
+        cache.characters = vec![seasonal, regular];
+        let json: serde_json::Value = serde_json::from_str(&cache.roster_json().unwrap()).unwrap();
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["complete_roster"], false);
+        assert_eq!(json["living"][0]["character_id"], 11);
+        assert_eq!(json["living"][1]["character_id"], 12);
+        assert_eq!(json["living"][0]["seasonal"], false);
+        assert_eq!(json["living"][1]["seasonal"], true);
+        assert_eq!(json["living"][0]["potions_to_max"]["HP"], 2);
+        assert_eq!(json["living"][0]["potions_to_max"]["ATT"], 3);
+        assert!(json["living"][0].get("stats").is_none());
+        assert!(json["living"][0]["equipment"][0].is_null());
+        assert_eq!(json["living"][0]["equipment"][1]["item_id"], 12345);
+        assert!(json["living"][0]["equipment"][1].get("name").is_some());
+        assert_eq!(
+            json["living"][0]["equipment"][1]["enchants"][0]["enchant_id"],
+            101
+        );
+        assert!(json["living"][0]["equipment"][1]["enchants"][0]
+            .get("name")
+            .is_some());
     }
 }
 

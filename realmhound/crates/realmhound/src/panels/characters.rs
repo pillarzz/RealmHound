@@ -400,6 +400,7 @@ fn block_category(block: usize) -> usize {
 pub struct CharactersPanel {
     /// Character cache (loaded from disk, updated from API/NEWTICK)
     cache: CharacterCache,
+    export_status: Option<String>,
     /// Current fetch state
     fetch_state: CharactersFetchState,
     /// Receiver for API results (returns AccountData which includes characters and exaltation stats)
@@ -519,6 +520,7 @@ impl CharactersPanel {
 
         Self {
             cache,
+            export_status: None,
             fetch_state: CharactersFetchState::Idle,
             api_result_rx: None,
             live_char_id: None,
@@ -1066,8 +1068,32 @@ impl CharactersPanel {
                 ui.separator();
                 // Search box (class / ID / label) with autocomplete.
                 self.render_search_box(ui, shadcn, sprite_renderer);
+                if ui.button("Export roster JSON").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("realmhound-roster.json")
+                        .add_filter("JSON", &["json"])
+                        .save_file()
+                    {
+                        self.export_status = Some(
+                            match self
+                                .cache
+                                .roster_json()
+                                .map_err(|error| error.to_string())
+                                .and_then(|json| {
+                                    std::fs::write(&path, json).map_err(|error| error.to_string())
+                                }) {
+                                Ok(()) => format!("Roster exported to {}", path.display()),
+                                Err(error) => format!("Roster export failed: {error}"),
+                            },
+                        );
+                    }
+                }
             });
         });
+
+        if let Some(status) = &self.export_status {
+            ui.label(status);
+        }
 
         if settings_changed {
             self.pending_edits

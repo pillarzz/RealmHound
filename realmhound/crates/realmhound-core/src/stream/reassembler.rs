@@ -338,6 +338,7 @@ impl TcpReassembler {
                     segment.sequence.wrapping_add(1),
                 );
                 conn_data.incoming_buffer.next_seq = segment.sequence.wrapping_add(1);
+                conn_data.incoming_buffer.waiting_for_start = false;
                 // Mark incoming cipher as synced since we caught the connection start
                 conn_data.incoming_aligner.mark_synced();
                 tracing::info!(
@@ -496,7 +497,10 @@ impl TcpReassembler {
         let mut incoming_buffer = StreamBuffer::new();
         let mut outgoing_buffer = StreamBuffer::new();
         incoming_buffer.next_seq = server_seq;
-        outgoing_buffer.next_seq = client_seq;
+        outgoing_buffer.next_seq = client_seq.wrapping_add(1);
+        // SYN fixes the first payload's position; a later segment may arrive
+        // first, but it must not be interpreted as a fresh packet header.
+        outgoing_buffer.waiting_for_start = false;
 
         // Use synced aligners since we caught the connection from the start
         let conn_data = ConnectionData {
@@ -621,6 +625,7 @@ impl TcpReassembler {
         };
 
         // Extract the complete packet
+        let tcp_sequence = buffer.next_seq.wrapping_sub(buffer.data.len() as u32);
         let mut packet_data: Vec<u8> = buffer.data.drain(..packet_size).collect();
 
         // Only decrypt the payload (bytes 5+), NOT the header
@@ -663,6 +668,7 @@ impl TcpReassembler {
             dst_ip,
             src_port,
             dst_port,
+            tcp_sequence,
         })
     }
 

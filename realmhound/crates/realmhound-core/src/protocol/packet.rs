@@ -64,6 +64,8 @@ pub struct Packet {
     pub src_port: u16,
     /// Destination port
     pub dst_port: u16,
+    /// TCP sequence number of the packet's first header byte.
+    pub tcp_sequence: u32,
 }
 
 impl Packet {

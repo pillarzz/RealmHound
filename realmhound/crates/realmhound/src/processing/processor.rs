@@ -708,7 +708,8 @@ impl PacketProcessor {
             capture_queue_drops: metrics.queue_drops,
             mission_view_gen: self.mission_tracker.generation(),
             loot_boost_secs: self.session.player.loot_boost_secs,
-            map_pauses_boost_timers: self.session.map.pauses_boost_timers(),
+            map_pauses_boost_timers: self.live_char_id.is_none()
+                || self.session.map.pauses_boost_timers(),
         }
     }
 
@@ -1499,7 +1500,10 @@ impl PacketProcessor {
         realmhound_core::prof_function!();
         for raw_packet in raw_packets {
             if let Some(rec) = self.recorder.as_mut() {
-                let _ = rec.write(&raw_packet);
+                if let Err(e) = rec.write(&raw_packet) {
+                    tracing::error!("[RECORD] Failed to write capture frame: {}", e);
+                    self.recorder = None;
+                }
             }
             // Parse TCP segment
             if let Some(segment) = parse_tcp_segment(&raw_packet) {
@@ -1558,6 +1562,11 @@ impl PacketProcessor {
                             segment.flags.rst
                         );
                         self.session.on_disconnect();
+                        self.live_char_id = None;
+                        self.live_stat_raw.clear();
+                        self.live_blood_ritual_observed.clear();
+                        self.blood_ritual_clear_at = None;
+                        self.char_view_gen += 1;
                         self.combat.on_disconnect(now_ms());
                         self.forward_dungeon_freeze();
                         self.realm_entered_at = None;
@@ -1572,26 +1581,14 @@ impl PacketProcessor {
                 let packets = self.reassembler.process_segment(&segment);
 
                 for packet in packets {
-                    // Parse packet for processing
-                    let parsed = parse_packet_for_processing(&packet);
-                    // The client's `Hello` carries `access_token` (the session
-                    // ticket) plus the platform and client tokens. Captures get
-                    // shared for debugging and the packet cipher is keyed by the
-                    // tick rather than by a secret, so that frame is dropped rather
-                    // than written. The server's `Reconnect` and `Hello` reply carry
-                    // the map key and the map id, not the ticket, so they are kept.
-                    if !packet.incoming && matches!(parsed.as_ref(), Some(ParsedPacket::Hello(_))) {
-                        if let Some(rec) = self.recorder.as_mut() {
-                            rec.discard_pending_flow(&raw_packet);
-                        }
-                    } else if parsed.is_some() {
-                        // A non-Hello packet on this flow proves the held outgoing
-                        // frames are not a Hello; commit them. Unknown packets stay
-                        // held until a later classification or the capture stops.
-                        if let Some(rec) = self.recorder.as_mut() {
-                            let _ = rec.release_pending_flow(&raw_packet);
+                    if let Some(rec) = self.recorder.as_mut() {
+                        if let Err(e) = rec.classify_packet(&packet) {
+                            tracing::error!("[RECORD] Failed to write classified frames: {}", e);
+                            self.recorder = None;
                         }
                     }
+                    // Parse packet for processing
+                    let parsed = parse_packet_for_processing(&packet);
 
                     if let Some(ref parsed) = parsed {
                         // Pre-routing: Hello multi-client isolation
@@ -1738,7 +1735,10 @@ impl PacketProcessor {
         if let Some(rec) = self.recorder.as_mut() {
             // Do not commit unresolved outgoing frames on a batch boundary: a
             // Hello can complete in the next batch.
-            let _ = rec.flush_buffered();
+            if let Err(e) = rec.flush_buffered() {
+                tracing::error!("[RECORD] Failed to flush capture: {}", e);
+                self.recorder = None;
+            }
         }
 
         // Keep mission tracking bound to the current main account so a mule's
@@ -4704,6 +4704,63 @@ mod isolation_gate_tests {
         p.session.connection.pending_account_verification = true;
         p.session.player.object_id = Some(1);
         p
+    }
+
+    fn disconnect_frame(port: u16, flags: u8) -> realmhound_core::capture::RawPacket {
+        let mut data = vec![0; 40];
+        data[0] = 0x45;
+        data[2..4].copy_from_slice(&40u16.to_be_bytes());
+        data[9] = 6;
+        data[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        data[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        data[20..22].copy_from_slice(&port.to_be_bytes());
+        data[22..24].copy_from_slice(&2050u16.to_be_bytes());
+        data[32] = 0x50;
+        data[33] = flags;
+        realmhound_core::capture::RawPacket {
+            timestamp: chrono::Utc::now(),
+            packet_format: realmhound_core::capture::PacketFormat::RawIp,
+            #[cfg(feature = "latency-diagnostics")]
+            enqueued_at: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn main_connection_disconnect_publishes_a_paused_non_live_character() {
+        for flags in [0x11, 0x14] {
+            let mut p = tentative_with_saved_main("MAIN123");
+            p.live_char_id = Some(7);
+            p.session.player.loot_boost_secs = Some(600);
+            p.session.map.name = Some("Mad Lab".to_string());
+            let generation = p.view_state().char_view_gen;
+            assert!(!p.view_state().map_pauses_boost_timers);
+
+            p.process_available(vec![disconnect_frame(1000, flags)]);
+
+            assert_eq!(p.live_char_id(), None);
+            assert!(p.view_state().char_view_gen > generation);
+            assert!(p.view_state().map_pauses_boost_timers);
+            assert_eq!(p.view_state().loot_boost_secs, None);
+            assert_eq!(
+                p.session.connection.main_account_status,
+                MainAccountStatus::Disconnected
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_connection_disconnect_keeps_the_live_countdown_running() {
+        let mut p = tentative_with_saved_main("MAIN123");
+        p.live_char_id = Some(7);
+        p.session.player.loot_boost_secs = Some(600);
+        p.session.map.name = Some("Mad Lab".to_string());
+
+        p.process_available(vec![disconnect_frame(1001, 0x11)]);
+
+        assert_eq!(p.live_char_id(), Some(7));
+        assert!(!p.view_state().map_pauses_boost_timers);
+        assert_eq!(p.view_state().loot_boost_secs, Some(600));
     }
 
     /// A tentative connection's location must be buffered, not leaked to the UI.

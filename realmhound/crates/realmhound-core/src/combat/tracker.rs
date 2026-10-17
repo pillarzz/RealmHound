@@ -1993,38 +1993,6 @@ impl CombatTracker {
         } else {
             0
         };
-        // Diagnostic: the Blood Ritual (stat 155) and Crucible (stat 128) markers
-        // are the only server signal for those challenges, and their meaning lives
-        // in the *string* field (the active definition's id), not the number. Kept
-        // at debug level: the processor consumes stat 155 for the live tier, and
-        // the whole-update dump stays available when a new marker needs decoding.
-        // Bounded to updates that mention either id, which are rare.
-        if status
-            .stats
-            .iter()
-            .any(|s| s.stat_type_id == 155 || s.stat_type_id == 128)
-        {
-            let dump: Vec<String> = status
-                .stats
-                .iter()
-                .map(|s| {
-                    let mut out = format!("{}={}", s.stat_type_id, s.stat_value);
-                    if let Some(v) = &s.string_stat_value {
-                        out.push_str(&format!(" str={v:?}"));
-                    }
-                    if s.stat_value_two != 0 {
-                        out.push_str(&format!(" v2={}", s.stat_value_two));
-                    }
-                    out
-                })
-                .collect();
-            tracing::debug!(
-                "challenge marker update (object {}, local={}): {}",
-                object_id,
-                object_id == self.local_object_id,
-                dump.join(", ")
-            );
-        }
         // Same idea for the boost log: the stats that a consumable, an ally's buff
         // or a status tick would move, snapshotted so the update can be diffed.
         let old_local_boost = if object_id == self.local_object_id && self.local_object_id != 0 {

@@ -15,7 +15,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 65;
+pub const SCHEMA_VERSION: i32 = 66;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -33,6 +33,13 @@ pub const LOOT_LINK_PRE_MS: i64 = 60_000;
 /// dropped offscreen only appear when the player later walks into the area, so
 /// this trailing window is generous.
 pub const LOOT_LINK_POST_MS: i64 = 600_000;
+
+// CROSS JOIN keeps SQLite from starting with every historical departure.
+const REMOTE_DEATH_CANDIDATES_SQL: &str =
+    "SELECT fp.id, fp.name FROM fights f INDEXED BY idx_fights_ended
+     CROSS JOIN fight_participants fp ON fp.fight_id = f.id
+     WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
+       AND f.started_at <= ?2 AND f.ended_at >= ?1";
 
 /// A stored fight row (header) as read back for the UI.
 #[derive(Debug, Clone)]
@@ -1622,6 +1629,12 @@ impl CombatDatabase {
             }
             self.conn.execute_batch("PRAGMA user_version = 65")?;
         }
+        if from_version < 66 {
+            self.conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_fights_ended ON fights(ended_at, started_at);
+                 PRAGMA user_version = 66;",
+            )?;
+        }
         Ok(())
     }
 
@@ -2803,6 +2816,7 @@ impl CombatDatabase {
             );
 
             CREATE INDEX IF NOT EXISTS idx_fights_started ON fights(started_at);
+            CREATE INDEX IF NOT EXISTS idx_fights_ended ON fights(ended_at, started_at);
             CREATE INDEX IF NOT EXISTS idx_fights_run ON fights(encounter_run_id);
             CREATE INDEX IF NOT EXISTS idx_fights_group ON fights(boss_group);
             CREATE INDEX IF NOT EXISTS idx_participants_fight ON fight_participants(fight_id);
@@ -2879,16 +2893,8 @@ impl CombatDatabase {
             let key = super::tracker::sanitize_player_name(&player).to_ascii_lowercase();
             let mut repaired_for_broadcast = 0usize;
             if !key.is_empty() {
-                // Candidate departures whose fight window contains the broadcast.
-                // The (end_status, grave_type, fight_id) index keeps this to the
-                // handful of nexused rows instead of scanning every participant.
                 let candidates: Vec<(i64, String)> = {
-                    let mut stmt = self.conn.prepare(
-                        "SELECT fp.id, fp.name FROM fight_participants fp
-                         JOIN fights f ON f.id = fp.fight_id
-                         WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
-                           AND f.started_at <= ?2 AND f.ended_at >= ?1",
-                    )?;
+                    let mut stmt = self.conn.prepare(REMOTE_DEATH_CANDIDATES_SQL)?;
                     let rows = stmt.query_map(
                         params![
                             occurred_at - super::tracker::GRAVE_MATCH_WINDOW_MS,
@@ -9693,6 +9699,70 @@ mod tests {
             .unwrap();
         assert_eq!(processed, 1, "an applied broadcast is retired");
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+    }
+
+    #[test]
+    fn death_broadcast_candidates_use_the_fight_time_index_first() {
+        let db = CombatDatabase::open_in_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {REMOTE_DEATH_CANDIDATES_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params![1_000_000, 1_030_000], |r| r.get(3))
+            .unwrap()
+            .collect::<SqlResult<_>>()
+            .unwrap();
+        assert!(plan[0].contains("idx_fights_ended"), "{plan:?}");
+        assert!(plan[0].contains("ended_at>?"), "{plan:?}");
+        assert!(
+            plan[1].contains("SEARCH fp") && plan[1].contains("fight_id=?"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn death_broadcast_repairs_long_fights_without_touching_old_departures() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut old = fight_with_players("Mad Lab", now - 86_400_000, &["Pillar"]);
+        old.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let old_id = db.insert_fight(&old).unwrap();
+        let mut recent = fight_with_players("Mad Lab", now - 3_600_000, &["Pillar"]);
+        recent.ended_at = now + 60_000;
+        recent.participants[0].end_status = ParticipantEndStatus::Nexused;
+        db.insert_fight(&recent).unwrap();
+        db.insert_death_broadcast("Pillar", "a Spider", now)
+            .unwrap();
+
+        assert_eq!(db.repair_remote_deaths().unwrap(), 1);
+        let status: String = db
+            .conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE fight_id = ?1",
+                params![old_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "nexused");
+    }
+
+    #[test]
+    fn death_broadcast_time_index_is_added_to_existing_databases() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        db.conn
+            .execute_batch("DROP INDEX idx_fights_ended; PRAGMA user_version = 65;")
+            .unwrap();
+        db.initialize(None).unwrap();
+        let index: String = db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE name = 'idx_fights_ended'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, "idx_fights_ended");
     }
 
     #[test]

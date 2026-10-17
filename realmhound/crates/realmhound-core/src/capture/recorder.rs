@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use super::{PacketFormat, RawPacket};
+use crate::protocol::{Packet, PacketType};
 
 const MAGIC: &[u8; 6] = b"RHCAP\x02";
 
@@ -40,18 +41,12 @@ pub fn captures_dir() -> PathBuf {
 
 /// Streaming writer for a `.rhcap` capture file.
 ///
-/// The most recent frames are held back instead of being written straight away, so
-/// the caller can still drop them: whether a frame carries credentials is only known
-/// after its packet is parsed, which happens after the frame was handed over (see
-/// [`CaptureWriter::discard_pending_flow`]).
+/// Outgoing payloads are held until [`Self::classify_packet`] identifies their
+/// reassembled TCP byte ranges as non-Hello traffic.
 pub struct CaptureWriter {
     inner: BufWriter<File>,
     count: u64,
-    /// Outgoing client-to-server frames not yet classified. Frames stay here
-    /// across processing batches until the reassembled packet is parsed: a Hello
-    /// split over several TCP segments (or several batches) is dropped as a
-    /// whole, and a non-Hello packet releases its flow's frames.
-    pending: HashMap<FlowKey, VecDeque<RawPacket>>,
+    flows: HashMap<FlowKey, RecordedFlow>,
     /// Frames dropped because a flow exceeded the held bound. A capture can have
     /// a hole here, but credential-bearing bytes are never written unclassified.
     dropped_frames: u64,
@@ -65,7 +60,33 @@ const GAME_SERVER_PORT: u16 = 2050;
 /// dropped (fail closed) rather than flushed unclassified.
 const MAX_PENDING_PER_FLOW: usize = 64;
 
+const MAX_SAFE_BYTES: u32 = 1024 * 1024;
+
 type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
+
+#[derive(Default)]
+struct RecordedFlow {
+    pending: VecDeque<(RawPacket, ByteRange)>,
+    safe: Option<ByteRange>,
+}
+
+#[derive(Clone, Copy)]
+struct ByteRange {
+    start: u32,
+    len: u32,
+}
+
+impl ByteRange {
+    fn contains(self, other: Self) -> bool {
+        let offset = other.start.wrapping_sub(self.start);
+        offset <= self.len && other.len <= self.len - offset
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.start.wrapping_sub(other.start) < other.len
+            || other.start.wrapping_sub(self.start) < self.len
+    }
+}
 
 impl CaptureWriter {
     /// Create a capture file at `path`, writing the magic header.
@@ -78,26 +99,51 @@ impl CaptureWriter {
         Ok(Self {
             inner,
             count: 0,
-            pending: HashMap::new(),
+            flows: HashMap::new(),
             dropped_frames: 0,
         })
     }
 
-    /// Append one raw packet frame. Outgoing client-to-server frames are held
-    /// (per flow) until [`Self::release_pending_flow`] confirms they are not part
-    /// of a Hello; server-to-client frames are written immediately.
+    /// Append a frame, holding outgoing payloads until their full TCP byte range
+    /// is classified. Retransmissions must satisfy the same check.
     pub fn write(&mut self, packet: &RawPacket) -> io::Result<()> {
-        let Some((sip, sport, dip, dport)) = endpoints(packet) else {
-            // Unparsable link-layer frames cannot carry a decoded Hello; write
-            // them as before.
+        let Some(segment) = crate::stream::parse_tcp_segment(packet) else {
             return self.write_frame(packet);
         };
-        if dport != GAME_SERVER_PORT {
+        let outgoing = segment.dst_port == GAME_SERVER_PORT;
+        let flow = if outgoing {
+            (
+                segment.src_ip,
+                segment.src_port,
+                segment.dst_ip,
+                segment.dst_port,
+            )
+        } else {
+            (
+                segment.dst_ip,
+                segment.dst_port,
+                segment.src_ip,
+                segment.src_port,
+            )
+        };
+        if segment.flags.syn || segment.flags.is_terminating() {
+            if let Some(old) = self.flows.remove(&flow) {
+                self.dropped_frames += old.pending.len() as u64;
+            }
+        }
+        if !outgoing || segment.payload.is_empty() {
             return self.write_frame(packet);
         }
-        let flow = (sip, sport, dip, dport);
-        let queue = self.pending.entry(flow).or_default();
-        queue.push_back(packet.clone());
+        let range = ByteRange {
+            start: segment.sequence.wrapping_add(u32::from(segment.flags.syn)),
+            len: segment.payload.len() as u32,
+        };
+        let state = self.flows.entry(flow).or_default();
+        if state.safe.is_some_and(|safe| safe.contains(range)) {
+            return self.write_frame(packet);
+        }
+        let queue = &mut state.pending;
+        queue.push_back((packet.clone(), range));
         if queue.len() > MAX_PENDING_PER_FLOW {
             let drop = queue.len() - MAX_PENDING_PER_FLOW;
             queue.drain(..drop);
@@ -112,49 +158,60 @@ impl CaptureWriter {
         Ok(())
     }
 
-    /// Commit the held frames for the flow `packet` belongs to.
-    ///
-    /// Called after the reassembled packet was parsed as anything other than an
-    /// outgoing Hello. Earlier unresolved packets on the same flow are earlier in
-    /// the TCP stream, so they cannot be the Hello either; releasing the whole
-    /// queue is safe.
-    pub fn release_pending_flow(&mut self, packet: &RawPacket) -> io::Result<()> {
-        let Some(key) = endpoints(packet) else {
+    /// Classify the exact bytes of a reassembled packet. The plaintext packet
+    /// header identifies Hello even if its decrypted payload cannot be parsed.
+    pub fn classify_packet(&mut self, packet: &Packet) -> io::Result<()> {
+        if packet.incoming {
             return Ok(());
+        }
+        let key = (
+            packet.src_ip,
+            packet.src_port,
+            packet.dst_ip,
+            packet.dst_port,
+        );
+        let state = self.flows.entry(key).or_default();
+        let range = ByteRange {
+            start: packet.tcp_sequence,
+            len: packet.header.size,
         };
-        if let Some(queue) = self.pending.remove(&key) {
-            for held in queue {
+        if packet.packet_type() == PacketType::Hello {
+            let before = state.pending.len();
+            state.pending.retain(|(_, held)| !range.overlaps(*held));
+            self.dropped_frames += (before - state.pending.len()) as u64;
+            state.safe = None;
+            return Ok(());
+        }
+
+        let mut safe = match state.safe {
+            Some(previous) if previous.start.wrapping_add(previous.len) == range.start => {
+                ByteRange {
+                    start: previous.start,
+                    len: previous.len + range.len,
+                }
+            }
+            _ => range,
+        };
+        // Keep a bounded recent window: old retransmissions may be dropped, but
+        // must never become trusted again after TCP sequence-number wraparound.
+        if safe.len > MAX_SAFE_BYTES {
+            safe.start = safe.start.wrapping_add(safe.len - MAX_SAFE_BYTES);
+            safe.len = MAX_SAFE_BYTES;
+        }
+        state.safe = Some(safe);
+        let mut pending = std::mem::take(&mut state.pending);
+        while let Some((held, range)) = pending.pop_front() {
+            if safe.contains(range) {
                 self.write_frame(&held)?;
+            } else {
+                self.flows
+                    .entry(key)
+                    .or_default()
+                    .pending
+                    .push_back((held, range));
             }
         }
         Ok(())
-    }
-
-    /// Drop the held frames that belong to the same TCP flow as `handshake`.
-    ///
-    /// The client's `Hello` (74) carries the session ticket in its `access_token`.
-    /// Captures get shared for debugging, and the packet cipher is keyed by the packet
-    /// tick rather than by a secret, so a ticket inside a capture is readable by anyone
-    /// holding the file -- these frames never reach the disk.
-    ///
-    /// Every held frame of that flow *and direction* goes, not only the one that
-    /// completed reassembly, because the handshake bytes may be split across TCP
-    /// segments. Two kinds of frame are deliberately kept:
-    /// - anything the server sent on that connection (its `Hello` reply, and the
-    ///   `MapInfo` whose `fp` seeds the damage model): the ticket only travels
-    ///   client to server, so those carry nothing worth hiding;
-    /// - frames of other connections: dropping them would leave a hole in a stream
-    ///   that has nothing to do with the credentials.
-    pub fn discard_pending_flow(&mut self, handshake: &RawPacket) {
-        let Some(key) = endpoints(handshake) else {
-            // Unknown framing: fail closed for everything still held.
-            self.dropped_frames += self.pending.values().map(VecDeque::len).sum::<usize>() as u64;
-            self.pending.clear();
-            return;
-        };
-        if let Some(queue) = self.pending.remove(&key) {
-            self.dropped_frames += queue.len() as u64;
-        }
     }
 
     fn write_frame(&mut self, packet: &RawPacket) -> io::Result<()> {
@@ -183,7 +240,11 @@ impl CaptureWriter {
     /// Finish the capture. Unresolved outgoing frames are dropped (fail closed),
     /// never written unclassified. Returns the number of frames lost this way.
     pub fn finish(&mut self) -> io::Result<u64> {
-        let unresolved = self.pending.values().map(VecDeque::len).sum::<usize>() as u64;
+        let unresolved = self
+            .flows
+            .values()
+            .map(|flow| flow.pending.len())
+            .sum::<usize>() as u64;
         if unresolved > 0 {
             tracing::warn!(
                 "[RECORD] Dropped {} unresolved outgoing frame(s) at capture stop \
@@ -191,7 +252,7 @@ impl CaptureWriter {
                 unresolved
             );
         }
-        self.pending.clear();
+        self.flows.clear();
         self.dropped_frames += unresolved;
         self.inner.flush()?;
         Ok(self.dropped_frames)
@@ -205,6 +266,7 @@ impl Drop for CaptureWriter {
 }
 
 /// `(src_ip, src_port, dst_ip, dst_port)` of a captured frame, if it carries TCP.
+#[cfg(test)]
 fn endpoints(packet: &RawPacket) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
     let segment = crate::stream::parse_tcp_segment(packet)?;
     Some((
@@ -278,12 +340,14 @@ pub fn read_capture(path: &Path) -> io::Result<Vec<RawPacket>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{RC4Cipher, OUTGOING_KEY};
+    use crate::stream::{parse_tcp_segment, TcpReassembler};
 
     /// A minimal IPv4/TCP frame for `port -> 2050`, carrying `payload`.
-    fn frame(port: u16, payload: &[u8]) -> RawPacket {
+    fn frame(port: u16, seq: u32, payload: &[u8]) -> RawPacket {
         let mut data = Vec::new();
         etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 2], 64)
-            .tcp(port, 2050, 1, 32768)
+            .tcp(port, 2050, seq, 32768)
             .ack(1)
             .psh()
             .write(&mut data, payload)
@@ -295,6 +359,33 @@ mod tests {
             enqueued_at: None,
             data,
         }
+    }
+
+    fn syn(port: u16) -> RawPacket {
+        syn_at(port, 0)
+    }
+
+    fn syn_at(port: u16, seq: u32) -> RawPacket {
+        let mut packet = frame(port, seq, &[]);
+        packet.data[33] = 0x02;
+        packet
+    }
+
+    fn wire_packet(kind: PacketType, payload: &[u8], cipher: &mut RC4Cipher) -> Vec<u8> {
+        let mut data = ((5 + payload.len()) as u32).to_be_bytes().to_vec();
+        data.push(kind as u8);
+        data.extend(cipher.apply_to_vec(payload));
+        data
+    }
+
+    fn record(writer: &mut CaptureWriter, reassembler: &mut TcpReassembler, raw: &RawPacket) {
+        writer.write(raw).unwrap();
+        if let Some(segment) = parse_tcp_segment(raw) {
+            for packet in reassembler.process_segment(&segment) {
+                writer.classify_packet(&packet).unwrap();
+            }
+        }
+        writer.flush_buffered().unwrap();
     }
 
     /// The server's side of the same connection: `2050 -> port`.
@@ -316,35 +407,30 @@ mod tests {
     }
 
     #[test]
-    fn a_discarded_frame_never_reaches_the_file() {
+    fn a_retransmitted_hello_never_reaches_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("redacted.rhcap");
-        {
-            let mut w = CaptureWriter::create(&path).unwrap();
-            let hello = frame(45678, &[1]);
-            w.write(&hello).unwrap();
-            w.write(&frame(45678, &[2])).unwrap(); // held
-            w.write(&frame(45678, &[3])).unwrap(); // held
-            w.write(&reply(45678, &[9])).unwrap(); // held, server -> client
-                                                   // The caller decided the frame was a handshake after parsing it: it takes
-                                                   // out every held frame sent on that connection in that direction, and
-                                                   // leaves the server's frames (MapInfo among them) alone.
-            w.discard_pending_flow(&hello);
-            assert_eq!(w.count(), 1, "the server's reply was written immediately");
-            let after = frame(45678, &[4]);
-            let other = frame(45679, &[8]);
-            w.write(&after).unwrap();
-            w.write(&other).unwrap(); // other connection
-            w.release_pending_flow(&after).unwrap();
-            w.release_pending_flow(&other).unwrap();
-            w.finish().unwrap();
-            assert_eq!(w.count(), 3);
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let mut reassembler = TcpReassembler::new();
+        let mut cipher = RC4Cipher::new(OUTGOING_KEY);
+        let hello = wire_packet(PacketType::Hello, b"synthetic ticket", &mut cipher);
+        let after_seq = 1 + hello.len() as u32;
+        let after = wire_packet(PacketType::PlayerText, b"\0\x01x", &mut cipher);
+        let hello = frame(45678, 1, &hello);
+        let after = frame(45678, after_seq, &after);
+        let server = reply(45678, &[9]);
+        let other = syn(45679);
+        let start = syn(45678);
+        for packet in [&start, &hello, &hello, &server, &other, &after] {
+            record(&mut w, &mut reassembler, packet);
         }
+        w.finish().unwrap();
         let read = read_capture(&path).unwrap();
-        assert_eq!(read.len(), 3);
-        assert_eq!(endpoints(&read[0]).map(|e| e.1), Some(2050)); // the server's frame
-        assert_eq!(endpoints(&read[1]).map(|e| e.1), Some(45678)); // after the Hello
-        assert_eq!(endpoints(&read[2]).map(|e| e.1), Some(45679)); // other connection
+        let expected = [start, server, other, after];
+        assert_eq!(
+            read.iter().map(|p| &p.data).collect::<Vec<_>>(),
+            expected.iter().map(|p| &p.data).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -352,36 +438,177 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("split.rhcap");
         let mut w = CaptureWriter::create(&path).unwrap();
-        let first = frame(45678, &[1]);
-        let second = frame(45678, &[2]);
-        w.write(&first).unwrap();
-        // End of one processing batch: the frame must remain held, not committed.
-        w.flush_buffered().unwrap();
-        assert_eq!(w.count(), 0);
-        w.write(&second).unwrap();
-        w.flush_buffered().unwrap();
-        assert_eq!(w.count(), 0);
-        // The reassembled Hello is classified in the next batch.
-        w.discard_pending_flow(&first);
+        let mut reassembler = TcpReassembler::new();
+        record(&mut w, &mut reassembler, &syn(45678));
+        let hello = wire_packet(
+            PacketType::Hello,
+            &[42; 80],
+            &mut RC4Cipher::new(OUTGOING_KEY),
+        );
+        for (index, chunk) in hello.chunks(3).enumerate() {
+            record(
+                &mut w,
+                &mut reassembler,
+                &frame(45678, 1 + index as u32 * 3, chunk),
+            );
+            assert_eq!(w.count(), 1, "only the SYN may be written");
+        }
         w.finish().unwrap();
-        assert_eq!(w.count(), 0);
-        assert!(read_capture(&path).unwrap().is_empty());
+        assert_eq!(read_capture(&path).unwrap().len(), 1);
     }
 
     #[test]
-    fn a_non_hello_packet_releases_the_holds_for_its_flow() {
+    fn an_out_of_order_hello_tail_is_not_mistaken_for_a_safe_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out-of-order.rhcap");
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let mut reassembler = TcpReassembler::new();
+        let mut cipher = RC4Cipher::new(OUTGOING_KEY);
+        let mut hello = wire_packet(PacketType::Hello, &[42; 20], &mut cipher);
+        let split = hello.len() - 5;
+        hello[split..].copy_from_slice(&[0, 0, 0, 5, PacketType::PlayerText as u8]);
+        record(&mut w, &mut reassembler, &syn(45678));
+
+        record(
+            &mut w,
+            &mut reassembler,
+            &frame(45678, 1 + split as u32, &hello[split..]),
+        );
+        assert_eq!(
+            w.count(),
+            1,
+            "the first TCP payload need not start the stream"
+        );
+        record(&mut w, &mut reassembler, &frame(45678, 1, &hello[..split]));
+        let after = wire_packet(PacketType::PlayerText, b"\0\x01x", &mut cipher);
+        let after = frame(45678, 1 + hello.len() as u32, &after);
+        record(&mut w, &mut reassembler, &after);
+        w.finish().unwrap();
+        let read = read_capture(&path).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1].data, after.data);
+    }
+
+    #[test]
+    fn a_non_hello_packet_releases_only_its_classified_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("release.rhcap");
         let mut w = CaptureWriter::create(&path).unwrap();
-        let first = frame(45678, &[1]);
-        let second = frame(45678, &[2]);
-        w.write(&first).unwrap();
-        w.write(&second).unwrap();
-        w.flush_buffered().unwrap();
-        assert_eq!(w.count(), 0);
-        w.release_pending_flow(&second).unwrap();
-        assert_eq!(w.count(), 2);
+        let mut reassembler = TcpReassembler::new();
+        let mut cipher = RC4Cipher::new(OUTGOING_KEY);
+        record(&mut w, &mut reassembler, &syn(45678));
+        let safe = wire_packet(PacketType::PlayerText, b"\0\x01x", &mut cipher);
+        let hello = wire_packet(PacketType::Hello, b"synthetic ticket", &mut cipher);
+        let mut combined = safe.clone();
+        combined.extend_from_slice(&hello[..3]);
+        record(&mut w, &mut reassembler, &frame(45678, 1, &combined));
+        assert_eq!(
+            w.count(),
+            1,
+            "a safe prefix must not release the following Hello"
+        );
+        record(
+            &mut w,
+            &mut reassembler,
+            &frame(45678, 1 + combined.len() as u32, &hello[3..]),
+        );
         w.finish().unwrap();
+        assert_eq!(read_capture(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn coalesced_non_hello_packets_release_the_whole_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coalesced.rhcap");
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let mut reassembler = TcpReassembler::new();
+        let mut cipher = RC4Cipher::new(OUTGOING_KEY);
+        record(&mut w, &mut reassembler, &syn(45678));
+        let mut data = wire_packet(PacketType::PlayerText, b"\0\x01x", &mut cipher);
+        data.extend(wire_packet(PacketType::PlayerText, b"\0\x01y", &mut cipher));
+        let safe = frame(45678, 1, &data);
+        record(&mut w, &mut reassembler, &safe);
+        record(&mut w, &mut reassembler, &safe);
+        w.finish().unwrap();
+        assert_eq!(read_capture(&path).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn split_hello_retransmission_is_rejected_across_sequence_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrap.rhcap");
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let mut reassembler = TcpReassembler::new();
+        let mut cipher = RC4Cipher::new(OUTGOING_KEY);
+        let seq = u32::MAX - 7;
+        record(
+            &mut w,
+            &mut reassembler,
+            &syn_at(45678, seq.wrapping_sub(1)),
+        );
+        let hello = wire_packet(PacketType::Hello, b"synthetic ticket", &mut cipher);
+        let first = frame(45678, seq, &hello[..7]);
+        let second = frame(45678, seq.wrapping_add(7), &hello[7..]);
+        let after = wire_packet(PacketType::PlayerText, b"\0\x01x", &mut cipher);
+        let after = frame(45678, seq.wrapping_add(hello.len() as u32), &after);
+        for packet in [&first, &second, &first, &second, &after] {
+            record(&mut w, &mut reassembler, packet);
+        }
+        w.finish().unwrap();
+        let read = read_capture(&path).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1].data, after.data);
+    }
+
+    #[test]
+    fn a_new_syn_invalidates_previously_safe_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reuse.rhcap");
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let mut reassembler = TcpReassembler::new();
+        let start = syn(45678);
+        record(&mut w, &mut reassembler, &start);
+        let safe = wire_packet(
+            PacketType::PlayerText,
+            &[1; 40],
+            &mut RC4Cipher::new(OUTGOING_KEY),
+        );
+        record(&mut w, &mut reassembler, &frame(45678, 1, &safe));
+        record(&mut w, &mut reassembler, &start);
+        let hello = wire_packet(
+            PacketType::Hello,
+            b"synthetic ticket",
+            &mut RC4Cipher::new(OUTGOING_KEY),
+        );
+        record(&mut w, &mut reassembler, &frame(45678, 1, &hello));
+        w.finish().unwrap();
+        assert_eq!(read_capture(&path).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_unresolved_flow_does_not_release_another_flows_hello() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flows.rhcap");
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let mut reassembler = TcpReassembler::new();
+        record(&mut w, &mut reassembler, &syn(45678));
+        record(&mut w, &mut reassembler, &syn(45679));
+        let hello = wire_packet(
+            PacketType::Hello,
+            b"synthetic ticket",
+            &mut RC4Cipher::new(OUTGOING_KEY),
+        );
+        record(&mut w, &mut reassembler, &frame(45678, 1, &hello[..3]));
+        let safe = wire_packet(
+            PacketType::PlayerText,
+            b"\0\x01x",
+            &mut RC4Cipher::new(OUTGOING_KEY),
+        );
+        record(&mut w, &mut reassembler, &frame(45679, 1, &safe));
+        assert_eq!(w.finish().unwrap(), 1);
+        let read = read_capture(&path).unwrap();
+        assert_eq!(read.len(), 3);
+        assert_eq!(endpoints(&read[2]).unwrap().1, 45679);
     }
 
     #[test]

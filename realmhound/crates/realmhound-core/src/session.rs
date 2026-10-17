@@ -121,6 +121,7 @@ impl PlayerState {
         self.is_seasonal = None;
         self.is_crucible = None;
         self.active_pet_instance_id = None;
+        self.loot_boost_secs = None;
     }
 }
 
@@ -537,6 +538,7 @@ mod tests {
         let mut session = GameSession::new();
         session.on_create_success(42, 100);
         session.player.is_seasonal = Some(false);
+        session.player.loot_boost_secs = Some(600);
         session.connection.main_account_status = MainAccountStatus::Connected;
         session.connection.main_connection = Some(ConnectionKey::new(
             "192.168.1.1".parse().unwrap(),
@@ -555,6 +557,7 @@ mod tests {
         assert_eq!(session.player.object_id, None);
         assert_eq!(session.player.char_id, None);
         assert_eq!(session.player.is_seasonal, None);
+        assert_eq!(session.player.loot_boost_secs, None);
     }
 
     #[test]

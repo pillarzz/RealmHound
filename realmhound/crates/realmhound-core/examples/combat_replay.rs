@@ -84,6 +84,11 @@ fn main() {
     let mut recent_objects: std::collections::VecDeque<(i64, i32, i32, bool)> =
         std::collections::VecDeque::new();
     let mut credited: Vec<(i64, u16, u16, i32)> = Vec::new();
+    // Handshakes carry credentials: Hello's key is the session ticket, and a
+    // Reconnect carries the next one. Counting them says whether a capture holds
+    // credentials at all -- which matters before one is shared for debugging.
+    let mut hello_packets: u32 = 0;
+    let mut reconnect_packets: u32 = 0;
     // Every object type seen, with a count and its first/last clock.
     let mut seen_types: std::collections::HashMap<i32, (u32, i64, i64)> =
         std::collections::HashMap::new();
@@ -264,6 +269,8 @@ fn main() {
                         clock,
                     );
                 }
+                Some(ParsedPacket::Hello(_)) => hello_packets += 1,
+                Some(ParsedPacket::Reconnect(_)) => reconnect_packets += 1,
                 _ => {}
             }
         }
@@ -354,6 +361,15 @@ fn main() {
 
     // Flush anything still in progress at end of capture.
     finished.extend(tracker.on_disconnect(now_ms()));
+
+    if hello_packets > 0 || reconnect_packets > 0 {
+        println!(
+            "\n=== handshakes in this capture: {} Hello (session ticket), {} Reconnect (next ticket) ===",
+            hello_packets, reconnect_packets
+        );
+    } else {
+        println!("\n=== handshakes in this capture: none (no Hello / Reconnect seen) ===");
+    }
 
     // The damage no row explains -- and what the client saw as it landed (see the
     // note where `credited` is filled).

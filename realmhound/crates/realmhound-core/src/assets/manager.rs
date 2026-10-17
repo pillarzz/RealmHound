@@ -1039,25 +1039,31 @@ pub fn encounter_alias_names_matching(text: &str) -> Vec<String> {
     out
 }
 
-/// The loot-correlation group containing `object_type` (which is included in the
-/// returned slice), or an empty slice when it has no known reskin siblings.
-pub fn boss_loot_family(object_type: i32) -> &'static [i32] {
-    BOSS_LOOT_CORRELATION_GROUPS
+/// The loot-correlation family containing `object_type` (which is always
+/// included), covering both the explicit [`BOSS_LOOT_CORRELATION_GROUPS`] and
+/// every seasonal reskin variant of the encounter.
+///
+/// Display normalisation can pick any variant of a seasonal reskin group, so
+/// correlation must cover the whole encounter family, not only the ids with a
+/// hand-written loot group (the two coincide for Janus but not for every reskin).
+pub fn boss_loot_family(object_type: i32) -> Vec<i32> {
+    let mut out = encounter_variant_types(object_type);
+    if let Some(group) = BOSS_LOOT_CORRELATION_GROUPS
         .iter()
         .find(|group| group.contains(&object_type))
-        .copied()
-        .unwrap_or(&[])
+    {
+        out.extend_from_slice(group);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Whether two object types are the same boss for loot/fight correlation:
-/// identical, or reskin siblings in the same [`BOSS_LOOT_CORRELATION_GROUPS`]
-/// group (e.g. Janus the Doorwarden and its Infested reskin).
+/// identical, or reskin siblings in the same encounter variant family (e.g.
+/// Janus the Doorwarden and its Infested reskin).
 pub fn same_boss_for_loot(a: i32, b: i32) -> bool {
-    if a == b {
-        return true;
-    }
-    let family = boss_loot_family(a);
-    !family.is_empty() && family.contains(&b)
+    a == b || boss_loot_family(a).contains(&b)
 }
 
 /// The Legacy Lair of Draconis `(dragon_type, chest_type)` pairs, for the combat
@@ -6113,13 +6119,19 @@ mod tests {
         // Classic Janus (Oryx's Castle) and the Season 31 "Infested" reskin are
         // separate object types; bags are attributed to 8200, so both must be in
         // the same correlation family for the fights to link.
-        assert_eq!(boss_loot_family(8200), &[8200, 46385]);
-        assert_eq!(boss_loot_family(46385), &[8200, 46385]);
+        assert_eq!(boss_loot_family(8200), vec![8200, 46385]);
+        assert_eq!(boss_loot_family(46385), vec![8200, 46385]);
         assert!(same_boss_for_loot(8200, 46385));
         assert!(same_boss_for_loot(46385, 8200));
         assert!(same_boss_for_loot(8200, 8200));
-        // A boss with no known reskin has no family and matches only itself.
-        assert!(boss_loot_family(47927).is_empty());
+        // Every seasonal reskin group is a loot family, not just Janus: the
+        // display variant may be a newer id while the bags are stored under the
+        // classic one (Sphinx 3412 / Withered Sphinx 22000).
+        assert!(boss_loot_family(22000).contains(&3412));
+        assert!(same_boss_for_loot(3412, 22000));
+        assert!(same_boss_for_loot(22000, 3412));
+        // A boss with no known reskin yields itself only and matches only itself.
+        assert_eq!(boss_loot_family(47927), vec![47927]);
         assert!(!same_boss_for_loot(8200, 47927));
     }
 

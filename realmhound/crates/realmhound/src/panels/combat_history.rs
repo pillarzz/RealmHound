@@ -1199,7 +1199,7 @@ impl CombatHistoryPanel {
                 .map(|t| realmhound_core::assets::boss_loot_family(*t))
                 .collect::<Vec<_>>()
             {
-                boss_types.extend_from_slice(family);
+                boss_types.extend(family);
             }
             boss_types.sort_unstable();
             boss_types.dedup();

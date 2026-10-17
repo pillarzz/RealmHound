@@ -1258,7 +1258,8 @@ impl CharacterCache {
                     cached.most_damage_taken = most;
                 }
                 cached.crucible_active = prev_crucible.get(&c.char_id).copied().unwrap_or(false);
-                // This refresh's value if it has one, otherwise what we last knew.
+                // This refresh's value if it reported one (including an explicit
+                // zero, which is authoritative expiry), otherwise what we last knew.
                 cached.loot_boost_secs = c
                     .loot_boost_secs
                     .or_else(|| prev_loot.get(&c.char_id).copied().flatten());
@@ -1457,7 +1458,20 @@ impl CharacterCache {
         &mut self,
         defs: Vec<crate::api::blood_ritual::BloodRitualDef>,
     ) -> bool {
-        if defs.is_empty() || self.blood_ritual_defs == defs {
+        if defs.is_empty() {
+            return false;
+        }
+        self.replace_blood_ritual_defs(defs)
+    }
+
+    /// Replace the ritual tiers even when the new feed is authoritatively empty.
+    /// `Some(empty)` from the feed clears every stale tier and resynchronizes the
+    /// per-character flags; a failed/unavailable feed never calls this.
+    pub fn replace_blood_ritual_defs(
+        &mut self,
+        defs: Vec<crate::api::blood_ritual::BloodRitualDef>,
+    ) -> bool {
+        if self.blood_ritual_defs == defs {
             return false;
         }
         self.blood_ritual_defs = defs;
@@ -2630,6 +2644,15 @@ mod tests {
             "cache JSON lost the loot timer"
         );
 
+        // An explicit zero is the server saying the boost expired; it must clear
+        // the cached value instead of falling back to the previous one.
+        let mut expired = RealmCharacter::default();
+        expired.char_id = 2537;
+        expired.loot_boost_secs = Some(0);
+        expired.loot_boost_reported = true;
+        cache.update_single_character(&expired);
+        assert_eq!(cache.find_character(2537).unwrap().loot_boost_secs, Some(0));
+
         // A cache written before the field existed still loads.
         let legacy = json.replace(",\"loot_boost_secs\":1200", "");
         let restored: CharacterCache = serde_json::from_str(&legacy).unwrap();
@@ -3147,6 +3170,18 @@ mod tests {
     /// is the value a character that has never taken this season's ritual keeps
     /// reporting, observed live on character 2228.
     const LAST_SEASONS_RITUAL: &str = "5704571108229120";
+
+    #[test]
+    fn an_authoritative_empty_ritual_feed_clears_stale_tiers() {
+        let mut cache = CharacterCache::new();
+        cache.set_blood_ritual_defs(vec![ritual_tier(THIS_SEASONS_RITUAL, 1, 0.8, 1.24)]);
+        assert!(cache.set_blood_ritual_for_char(Some(1), THIS_SEASONS_RITUAL));
+        assert!(cache.characters.iter().all(|c| !c.blood_ritual_active));
+
+        assert!(cache.replace_blood_ritual_defs(Vec::new()));
+        assert!(cache.blood_ritual_defs.is_empty());
+        assert!(cache.blood_ritual_for_char(1).is_none());
+    }
 
     #[test]
     fn blood_ritual_is_recorded_per_character() {

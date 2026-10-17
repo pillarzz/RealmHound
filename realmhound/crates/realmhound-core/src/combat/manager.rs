@@ -619,9 +619,6 @@ impl CombatManager {
             return;
         };
         let pending = self.tracker.take_pending_death_broadcasts();
-        if pending.is_empty() {
-            return;
-        }
         for broadcast in &pending {
             if let Err(e) =
                 db.insert_death_broadcast(&broadcast.player, &broadcast.killer, broadcast.time)
@@ -630,6 +627,8 @@ impl CombatManager {
                 return;
             }
         }
+        // Run even when this tick had no new broadcast: a previous session may
+        // have left unprocessed rows, and that is the bounded startup catch-up.
         match db.repair_remote_deaths() {
             Ok(0) => {}
             Ok(repaired) => tracing::info!(

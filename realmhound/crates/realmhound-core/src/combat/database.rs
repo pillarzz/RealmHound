@@ -15,7 +15,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 64;
+pub const SCHEMA_VERSION: i32 = 65;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -1593,6 +1593,35 @@ impl CombatDatabase {
             }
             self.conn.execute_batch("PRAGMA user_version = 64")?;
         }
+        if from_version < 65 {
+            // v64 -> v65: make death-broadcast repair incremental. Only rows this
+            // pass has not already applied (or given up on) are candidates, so a
+            // long-lived session no longer replays every historical broadcast on
+            // every tick. The status/grave index turns the candidate lookup into
+            // an index scan instead of a participant-table scan per broadcast.
+            if !self.column_exists("death_broadcasts", "processed")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE death_broadcasts ADD COLUMN processed INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_death_broadcasts_unprocessed
+                    ON death_broadcasts(processed, occurred_at);
+                "#,
+            )?;
+            // Very old test/legacy schemas predate `end_status`; the index is
+            // optional and must not block their migration.
+            if self.column_exists("fight_participants", "end_status")?
+                && self.column_exists("fight_participants", "grave_type")?
+            {
+                self.conn.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_participants_death_repair
+                        ON fight_participants(end_status, grave_type, fight_id);",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 65")?;
+        }
         Ok(())
     }
 
@@ -2769,7 +2798,8 @@ impl CombatDatabase {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 player TEXT NOT NULL,
                 killer TEXT NOT NULL DEFAULT '',
-                occurred_at INTEGER NOT NULL
+                occurred_at INTEGER NOT NULL,
+                processed INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_fights_started ON fights(started_at);
@@ -2777,6 +2807,10 @@ impl CombatDatabase {
             CREATE INDEX IF NOT EXISTS idx_fights_group ON fights(boss_group);
             CREATE INDEX IF NOT EXISTS idx_participants_fight ON fight_participants(fight_id);
             CREATE INDEX IF NOT EXISTS idx_death_broadcasts_time ON death_broadcasts(occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_death_broadcasts_unprocessed
+                ON death_broadcasts(processed, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_participants_death_repair
+                ON fight_participants(end_status, grave_type, fight_id);
             CREATE INDEX IF NOT EXISTS idx_encounter_runs_recent
                 ON encounter_runs(ended_at DESC, started_at DESC);
             "#,
@@ -2819,51 +2853,82 @@ impl CombatDatabase {
     /// the grave tier is left at 0, which the UI renders as the default
     /// gravestone. Idempotent: repaired rows no longer match.
     pub fn repair_remote_deaths(&mut self) -> SqlResult<usize> {
-        let broadcasts: Vec<(String, i64)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT player, occurred_at FROM death_broadcasts")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        /// How long a broadcast that matched nothing is retried. A fight is
+        /// normally written on the next tick after it ends; this window covers a
+        /// late finalize without replaying ancient history forever.
+        const CATCHUP_MS: i64 = 15 * 60 * 1000;
+        /// How many unprocessed broadcasts one pass may inspect. At startup a
+        /// backlog is drained in bounded batches instead of one unbounded scan.
+        const BATCH: i64 = 500;
+        /// Applied broadcasts are kept for diagnosis, then pruned.
+        const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let broadcasts: Vec<(i64, String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, player, occurred_at FROM death_broadcasts
+                 WHERE processed = 0
+                 ORDER BY occurred_at ASC, id ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             rows.collect::<SqlResult<Vec<_>>>()?
         };
-        if broadcasts.is_empty() {
-            return Ok(0);
-        }
 
-        let mut repaired = 0;
-        for (player, occurred_at) in broadcasts {
+        let mut repaired = 0usize;
+        for (id, player, occurred_at) in broadcasts {
             let key = super::tracker::sanitize_player_name(&player).to_ascii_lowercase();
-            if key.is_empty() {
-                continue;
-            }
-            // Candidate departures whose fight window contains the broadcast.
-            let candidates: Vec<(i64, String)> = {
-                let mut stmt = self.conn.prepare(
-                    "SELECT fp.id, fp.name FROM fight_participants fp
-                     JOIN fights f ON f.id = fp.fight_id
-                     WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
-                       AND f.started_at <= ?2 AND f.ended_at >= ?1",
-                )?;
-                let rows = stmt.query_map(
-                    params![
-                        occurred_at - super::tracker::GRAVE_MATCH_WINDOW_MS,
-                        occurred_at + super::tracker::GRAVE_MATCH_WINDOW_MS
-                    ],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                rows.collect::<SqlResult<Vec<_>>>()?
-            };
-            for (id, name) in candidates {
-                if super::tracker::sanitize_player_name(&name).to_ascii_lowercase() != key {
-                    continue;
+            let mut repaired_for_broadcast = 0usize;
+            if !key.is_empty() {
+                // Candidate departures whose fight window contains the broadcast.
+                // The (end_status, grave_type, fight_id) index keeps this to the
+                // handful of nexused rows instead of scanning every participant.
+                let candidates: Vec<(i64, String)> = {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT fp.id, fp.name FROM fight_participants fp
+                         JOIN fights f ON f.id = fp.fight_id
+                         WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
+                           AND f.started_at <= ?2 AND f.ended_at >= ?1",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![
+                            occurred_at - super::tracker::GRAVE_MATCH_WINDOW_MS,
+                            occurred_at + super::tracker::GRAVE_MATCH_WINDOW_MS
+                        ],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    rows.collect::<SqlResult<Vec<_>>>()?
+                };
+                for (participant_id, name) in candidates {
+                    if super::tracker::sanitize_player_name(&name).to_ascii_lowercase() != key {
+                        continue;
+                    }
+                    repaired_for_broadcast += self.conn.execute(
+                        "UPDATE fight_participants SET end_status = 'died'
+                         WHERE id = ?1 AND end_status = 'nexused'",
+                        params![participant_id],
+                    )?;
                 }
-                repaired += self.conn.execute(
-                    "UPDATE fight_participants SET end_status = 'died'
-                     WHERE id = ?1 AND end_status = 'nexused'",
+            }
+            repaired += repaired_for_broadcast;
+            // A successful repair closes the broadcast. A miss is retried for the
+            // catch-up window so a fight stored a few ticks later still gets it;
+            // after that it is retired so the unprocessed set stays bounded.
+            if repaired_for_broadcast > 0
+                || key.is_empty()
+                || now.saturating_sub(occurred_at) >= CATCHUP_MS
+            {
+                self.conn.execute(
+                    "UPDATE death_broadcasts SET processed = 1 WHERE id = ?1",
                     params![id],
                 )?;
             }
         }
+
+        // Bounded retention: the raw rows are for diagnosis, not a permanent log.
+        self.conn.execute(
+            "DELETE FROM death_broadcasts WHERE processed = 1 AND occurred_at < ?1",
+            params![now.saturating_sub(RETENTION_MS)],
+        )?;
         Ok(repaired)
     }
 
@@ -3539,17 +3604,18 @@ impl CombatDatabase {
             return Ok(false);
         }
         // Per participant across the whole card: (boss damage, took any positive
-        // damage, finished the fight everywhere, was ever hit, hits recorded).
-        // `any_taken_recorded` guards against legacy rows (recorded before
-        // damage-taken tracking) whose all-NULL values would otherwise read as a
-        // factual zero taken.
-        let mut acc: std::collections::HashMap<i32, (i64, bool, bool, bool, bool)> =
+        // damage, finished the fight everywhere, was ever hit, hits recorded,
+        // damage-taken provenance was partial). A partial provenance means an
+        // observed hit could not be valued, so a zero valued-hit count is not
+        // evidence the player was never hit.
+        let mut acc: std::collections::HashMap<i32, (i64, bool, bool, bool, bool, bool)> =
             std::collections::HashMap::new();
         let mut any_taken_recorded = false;
         for (fid, _) in &fights {
             let is_boss_fight = boss_ids.contains(fid);
             let mut stmt = self.conn.prepare(
-                "SELECT object_id, damage, damage_taken, end_status, damage_taken_hits
+                "SELECT object_id, damage, damage_taken, end_status, damage_taken_hits,
+                        damage_taken_provenance
                  FROM fight_participants WHERE fight_id = ?1",
             )?;
             let rows = stmt.query_map(params![fid], |r| {
@@ -3559,11 +3625,14 @@ impl CombatDatabase {
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             })?;
             for row in rows {
-                let (oid, damage, taken, status, hits_taken) = row?;
-                let e = acc.entry(oid).or_insert((0, false, true, false, false));
+                let (oid, damage, taken, status, hits_taken, taken_prov) = row?;
+                let e = acc
+                    .entry(oid)
+                    .or_insert((0, false, true, false, false, false));
                 if is_boss_fight {
                     e.0 += damage;
                 }
@@ -3582,6 +3651,11 @@ impl CombatDatabase {
                         e.3 = true;
                     }
                 }
+                if taken_prov.as_deref().map(DamageTakenProvenance::from_str)
+                    == Some(DamageTakenProvenance::Partial)
+                {
+                    e.5 = true;
+                }
             }
         }
         if !any_taken_recorded {
@@ -3590,12 +3664,15 @@ impl CombatDatabase {
         let threshold =
             (s.boss_max_hp as f64 * Self::FLAWLESS_MIN_BOSS_DAMAGE_FRACTION).ceil() as i64;
         Ok(acc.values().any(
-            |(boss_dmg, took_positive, finished, was_hit, hits_recorded)| {
+            |(boss_dmg, took_positive, finished, was_hit, hits_recorded, partial_taken)| {
                 *finished
                     && !*took_positive
                     // A recorded hit disqualifies; unknown hits (a card from before
-                    // hits-taken tracking) leave the damage-only reading.
+                    // hits-taken tracking) leave the damage-only reading. An
+                    // unmatched observed hit is a partial provenance, which
+                    // disqualifies even when no value could be resolved.
                     && !(*hits_recorded && *was_hit)
+                    && !*partial_taken
                     && *boss_dmg >= threshold
             },
         ))
@@ -4452,7 +4529,7 @@ impl CombatDatabase {
         // 8200 vs its Season 31 "Infested" reskin 46385), so match the whole
         // reskin family, not just the exact type.
         let mut types: Vec<i32> = vec![mob_type];
-        types.extend(crate::assets::boss_loot_family(mob_type).iter().copied());
+        types.extend(crate::assets::boss_loot_family(mob_type));
         types.sort_unstable();
         types.dedup();
 
@@ -6660,6 +6737,25 @@ mod tests {
         assert!(
             list[0].flawless,
             "a legacy card keeps the damage-only reading"
+        );
+    }
+
+    #[test]
+    fn flawless_marker_rejects_an_unmatched_observed_hit() {
+        // A hit that could not be valued still proves the player was hit. It
+        // records Partial provenance and zero valued hits; the marker must not
+        // read that as "never hit".
+        use crate::combat::types::DamageTakenProvenance;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut hit = flawless_part(600, "Alice", 40_000, Some(0), ParticipantEndStatus::Present);
+        hit.damage_taken_hits = Some(0);
+        hit.damage_taken_provenance = DamageTakenProvenance::Partial;
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![hit]))
+            .unwrap();
+        let list = db.list_fights(&FightQuery::default(), 10).unwrap();
+        assert!(
+            !list[0].flawless,
+            "an unmatched observed hit disqualifies even at zero taken"
         );
     }
 
@@ -9567,6 +9663,36 @@ mod tests {
             .unwrap();
         assert_eq!(bystander, "nexused");
         assert_eq!(db.repair_remote_deaths().unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn death_broadcast_waits_for_a_late_stored_fight_then_retires() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.insert_death_broadcast("Late", "Oryx the Mad God", now)
+            .unwrap();
+
+        // The fight has not been written yet: the broadcast must stay pending.
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+        let processed: i64 = db
+            .conn
+            .query_row("SELECT processed FROM death_broadcasts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(processed, 0, "a young miss is retried");
+
+        // The fight lands a moment later; the same broadcast repairs it.
+        let mut fight = fight_with_players("Oryx's Sanctuary", 1_000_000, &["Late"]);
+        fight.started_at = now - 5_000;
+        fight.ended_at = now + 5_000;
+        fight.participants[0].end_status = ParticipantEndStatus::Nexused;
+        db.insert_fight(&fight).unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 1);
+        let processed: i64 = db
+            .conn
+            .query_row("SELECT processed FROM death_broadcasts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(processed, 1, "an applied broadcast is retired");
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
     }
 
     #[test]

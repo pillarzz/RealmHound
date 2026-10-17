@@ -963,6 +963,12 @@ struct LocalObjectRemoval {
 struct LocalDamageEvent {
     time_ms: i64,
     damage: i64,
+    /// The fight this packet belongs to. The packet names only its target, so the
+    /// target has to be resolved to the same stable destination the fight uses:
+    /// a boss object id, a wandering/invulnerable boss type, or an aggregated aux
+    /// category. Without it, every overlapping fight would consume the same
+    /// events inside its time window.
+    destination: FightDestination,
     /// A pet of the local player that was out, in range and able to deal damage
     /// when this landed (`None` otherwise). The packet names the *owner*, never
     /// the shooter, so this observation is what separates a pet's server-credited
@@ -986,6 +992,34 @@ struct LocalVolleyHit {
     time_ms: i64,
     item_id: i32,
     damage: i64,
+    /// The fight the hit landed in, for the same reason as
+    /// [`LocalDamageEvent::destination`].
+    destination: FightDestination,
+}
+
+/// The stable identity of one fight's damage destination. A normal boss is its
+/// object id; a wandering / invulnerable-finish / Moonlight Village boss is keyed
+/// by type because it re-enters under new ids; an aggregated aux fight is keyed
+/// by its category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FightDestination {
+    Boss(i32),
+    BossType(i32),
+    Aux(&'static str),
+}
+
+impl FightDestination {
+    fn for_boss(object_type: i32, object_id: i32) -> Self {
+        let am = get_asset_manager();
+        if am.is_wandering_boss(object_type)
+            || crate::assets::is_invuln_finish_boss(object_type)
+            || crate::assets::is_mv_boss(object_type)
+        {
+            Self::BossType(object_type)
+        } else {
+            Self::Boss(object_id)
+        }
+    }
 }
 
 /// The local player's boost-relevant stats, snapshotted around one stat update
@@ -1097,6 +1131,8 @@ struct LocalSnapshot {
 struct FightState {
     boss_object_id: i32,
     boss_object_type: i32,
+    /// The stable damage destination this fight owns (see [`FightDestination`]).
+    destination: FightDestination,
     boss_max_hp: i32,
     boss_start_hp: i32,
     started_at: i64,
@@ -1617,6 +1653,7 @@ impl CombatTracker {
         self.pending_local_grave = None;
         self.remote_deaths.clear();
         self.pet_tracks.clear();
+        self.local_summons.clear();
         self.completed_boss_types.clear();
         self.completed_recorded_types.clear();
         self.reset_local_mitigation_windows();
@@ -1700,6 +1737,11 @@ impl CombatTracker {
         // A respawn of a previously-departed object cancels its pending departure
         // (it did not leave the fight after all).
         self.departures.remove(&object_id);
+        // An object id can be reused after a despawn. Drop any summon ownership or
+        // per-instance summon identity recorded for the old object so the new one
+        // cannot inherit it (a player-class spawn must never read as a summon).
+        self.local_summons.remove(&object_id);
+        self.summon_owners.remove(&object_id);
         // Moonlight Village completion marker: an invulnerable-finish boss's
         // progress bar filled and its loot dropped. Consolidate all
         // live and suspended fights of each cleared boss type into a single
@@ -2430,6 +2472,7 @@ impl CombatTracker {
             FightState {
                 boss_object_id: object_id,
                 boss_object_type: obj_type,
+                destination: FightDestination::for_boss(obj_type, object_id),
                 boss_max_hp: max_hp,
                 boss_start_hp: max_hp,
                 started_at: time_ms,
@@ -2737,6 +2780,14 @@ impl CombatTracker {
         } else {
             true
         };
+        let destination = match aux {
+            Some(aux) => FightDestination::Aux(aux.category),
+            None => self
+                .fights
+                .get(&target_id)
+                .map(|f| f.destination)
+                .expect("fight ensured"),
+        };
         let fight = match aux {
             Some(aux) => self.ensure_aux_fight(aux, time_ms),
             None => self.fights.get_mut(&target_id).expect("fight ensured"),
@@ -2777,6 +2828,7 @@ impl CombatTracker {
             self.local_damage_events.push_back(LocalDamageEvent {
                 time_ms,
                 damage: amount,
+                destination,
                 pet_id: self.damage_capable_pet_near_local(),
                 summon: self.local_summon_attacking(target_id, time_ms),
                 removal: self.object_removal_near(target_id, time_ms),
@@ -3274,7 +3326,12 @@ impl CombatTracker {
     ///
     /// An activation with no credited damage is an effect that never connected
     /// (see the UI note); it is listed anyway so nothing is silently dropped.
-    fn ability_activations_for(&self, started_at: i64, ended_at: i64) -> Vec<AbilityActivation> {
+    fn ability_activations_for(
+        &self,
+        started_at: i64,
+        ended_at: i64,
+        destination: FightDestination,
+    ) -> Vec<AbilityActivation> {
         let uses: Vec<&LocalAbilityUse> = self
             .local_ability_uses
             .iter()
@@ -3282,12 +3339,14 @@ impl CombatTracker {
             .collect();
         // Credit every packet to the activation that can own it, so no packet is
         // counted twice and none lands on an ability that could not have produced
-        // it.
+        // it. Packets are scoped to their destination first: overlapping fights
+        // share the same clock, not the same damage.
         let mut credited: Vec<(i64, u64)> = vec![(0, 0); uses.len()];
         for event in self
             .local_damage_events
             .iter()
             .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
+            .filter(|e| e.destination == destination)
         {
             let owner = uses
                 .iter()
@@ -3303,6 +3362,7 @@ impl CombatTracker {
             .local_volley_hits
             .iter()
             .filter(|h| h.time_ms >= started_at && h.time_ms <= ended_at)
+            .filter(|h| h.destination == destination)
         {
             let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
                 use_.item_id == hit.item_id
@@ -3948,6 +4008,14 @@ impl CombatTracker {
         } else {
             true
         };
+        let destination = match aux {
+            Some(aux) => FightDestination::Aux(aux.category),
+            None => self
+                .fights
+                .get(&target_id)
+                .map(|f| f.destination)
+                .expect("fight ensured"),
+        };
         let fight = match aux {
             Some(aux) => self.ensure_aux_fight(aux, time_ms),
             None => self.fights.get_mut(&target_id).expect("fight ensured"),
@@ -4021,6 +4089,7 @@ impl CombatTracker {
                 time_ms,
                 item_id,
                 damage: dmg,
+                destination,
             });
             self.trim_local_event_logs();
         } else {
@@ -4165,6 +4234,7 @@ impl CombatTracker {
             FightState {
                 boss_object_id: target_id,
                 boss_object_type: object_type,
+                destination: FightDestination::for_boss(object_type, target_id),
                 boss_max_hp: object_max_hp,
                 boss_start_hp: start_hp,
                 started_at: time_ms,
@@ -4228,6 +4298,7 @@ impl CombatTracker {
             .or_insert_with(|| FightState {
                 boss_object_id: 0,
                 boss_object_type: aux.repr_type,
+                destination: FightDestination::Aux(aux.category),
                 boss_max_hp: 0,
                 boss_start_hp: 0,
                 started_at: time_ms,
@@ -4507,9 +4578,15 @@ impl CombatTracker {
         // damaged on first sight; ally damage dealt before then was never seen.
         let joined_late = fight.joined_late;
         let fight_started_at = fight.started_at;
+        let fight_destination = fight.destination;
         // Server-credited, bulletless damage first: a pet's or an ability-summon's
         // hits have to reach their own rows before the participant is built.
-        self.attribute_owner_packet_damage(&mut fight, fight_started_at, time_ms);
+        self.attribute_owner_packet_damage(
+            &mut fight,
+            fight_started_at,
+            time_ms,
+            fight_destination,
+        );
         let mut participants: Vec<FightParticipant> = fight
             .attackers
             .iter()
@@ -4621,7 +4698,7 @@ impl CombatTracker {
             spectral_hm,
             shatters_hm,
             boosts,
-            abilities: self.ability_activations_for(fight.started_at, time_ms),
+            abilities: self.ability_activations_for(fight.started_at, time_ms, fight_destination),
             participants,
         };
 
@@ -5241,12 +5318,14 @@ impl CombatTracker {
         fight: &mut FightState,
         started_at: i64,
         ended_at: i64,
+        destination: FightDestination,
     ) {
         let local_id = self.local_object_id;
         let events: Vec<LocalDamageEvent> = self
             .local_damage_events
             .iter()
             .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
+            .filter(|e| e.destination == destination)
             .copied()
             .collect();
         if events.is_empty() {
@@ -6256,6 +6335,7 @@ mod tests {
         FightState {
             boss_object_id: 500,
             boss_object_type: 0x10E4,
+            destination: FightDestination::Boss(500),
             boss_max_hp: 300_000,
             boss_start_hp: 300_000,
             started_at,
@@ -8910,7 +8990,7 @@ mod tests {
         // A second activation with no packet-borne damage in its window.
         t.on_use_item(999, 0.0, 0.0, 400);
 
-        let acts = t.ability_activations_for(0, 1_000);
+        let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
         assert_eq!(acts.len(), 2);
         assert_eq!(acts[0].item_id, 999);
         assert_eq!(acts[0].start_offset_ms, 100);
@@ -8928,6 +9008,40 @@ mod tests {
         // The packet is still the fight's own packet-borne figure.
         let p = &t.fights.get(&500).unwrap().attackers[&1000];
         assert_eq!((p.packet_damage, p.packet_hits), (700, 1));
+    }
+
+    #[test]
+    fn ability_activations_ignore_packets_that_belong_to_another_fight() {
+        // Two bosses were damaged inside one activation window. The packet log is
+        // session-wide, so without a destination filter each fight's activation
+        // would be credited both packets (100 + 200).
+        let mut t = CombatTracker::new();
+        t.local_ability_uses
+            .push_back(ability_use(100, 999, Some(5_000)));
+        for (destination, damage) in [
+            (FightDestination::Boss(500), 100),
+            (FightDestination::Boss(501), 200),
+        ] {
+            t.local_damage_events.push_back(LocalDamageEvent {
+                time_ms: 200,
+                damage,
+                destination,
+                pet_id: None,
+                summon: None,
+                removal: None,
+            });
+            t.local_volley_hits.push_back(LocalVolleyHit {
+                time_ms: 200,
+                item_id: 999,
+                damage,
+                destination,
+            });
+        }
+
+        let a = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
+        let b = t.ability_activations_for(0, 1_000, FightDestination::Boss(501));
+        assert_eq!((a[0].damage, a[0].hits), (200, 2));
+        assert_eq!((b[0].damage, b[0].hits), (400, 2));
     }
 
     #[test]
@@ -8966,7 +9080,7 @@ mod tests {
         t.pending_server_shots.insert(5, (300, false, 777));
         t.on_local_hit(500, 5, 1000, 1000, 150);
 
-        let acts = t.ability_activations_for(0, 1_000);
+        let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
         assert_eq!(acts.len(), 1);
         assert_eq!(
             (acts[0].damage, acts[0].hits),
@@ -9034,7 +9148,7 @@ mod tests {
         // ...and a third long after it expired, which no activation may claim.
         t.on_damage(500, 1000, 1_088, 30_000);
 
-        let acts = t.ability_activations_for(0, 31_000);
+        let acts = t.ability_activations_for(0, 31_000, FightDestination::Boss(500));
         assert_eq!(acts.len(), 1);
         assert_eq!(
             (acts[0].damage, acts[0].hits),
@@ -12526,6 +12640,7 @@ mod tests {
         LocalDamageEvent {
             time_ms,
             damage,
+            destination: FightDestination::Boss(0),
             pet_id,
             summon: None,
             removal: None,
@@ -12541,6 +12656,7 @@ mod tests {
         LocalDamageEvent {
             time_ms,
             damage,
+            destination: FightDestination::Boss(0),
             pet_id,
             summon: Some(summon),
             removal: None,
@@ -12758,6 +12874,31 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn map_change_and_object_id_reuse_clear_local_summon_ownership() {
+        let summon = LocalSummonEntity {
+            object_type: 0x500a,
+            first_seen_ms: 10,
+            last_seen_ms: 10,
+            x: 1.0,
+            y: 1.0,
+        };
+        let mut t = CombatTracker::new();
+        t.local_summons.insert(900, summon);
+        t.summon_owners.insert(900, 1000);
+        t.on_map_change("Realm", 1, 0);
+        assert!(t.local_summons.is_empty(), "map change clears summons");
+        assert!(t.summon_owners.is_empty(), "map change clears ownership");
+
+        // A map-less session can still recycle an id: a player-class spawn must
+        // not keep the old summon's identity.
+        t.local_summons.insert(900, summon);
+        t.summon_owners.insert(900, 1000);
+        t.on_object_spawn(900, 0x0321, &status(900, vec![name_stat("Bob")]), 20);
+        assert!(!t.local_summons.contains_key(&900));
+        assert!(!t.summon_owners.contains_key(&900));
     }
 
     #[test]

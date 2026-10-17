@@ -326,12 +326,9 @@ pub fn parse_char_list(xml: &str) -> Result<Vec<RealmCharacter>, ParseError> {
                             "MpRegen" => char.wisdom = text.parse().unwrap_or(0),
                             "PCStats" => char.pc_stats_raw = text,
                             "LDTimer" => {
-                                char.loot_boost_secs = text
-                                    .trim()
-                                    .parse::<f64>()
-                                    .ok()
-                                    .map(|v| v.max(0.0) as u32)
-                                    .filter(|s| *s > 0);
+                                char.loot_boost_reported = true;
+                                char.loot_boost_secs =
+                                    text.trim().parse::<f64>().ok().map(|v| v.max(0.0) as u32);
                             }
                             _ => note_unmodelled_char_tag(&current_element),
                         }
@@ -556,12 +553,9 @@ pub fn parse_account_data(xml: &str) -> Result<AccountData, ParseError> {
                             "MpRegen" => char.wisdom = text.parse().unwrap_or(0),
                             "PCStats" => char.pc_stats_raw = text,
                             "LDTimer" => {
-                                char.loot_boost_secs = text
-                                    .trim()
-                                    .parse::<f64>()
-                                    .ok()
-                                    .map(|v| v.max(0.0) as u32)
-                                    .filter(|s| *s > 0);
+                                char.loot_boost_reported = true;
+                                char.loot_boost_secs =
+                                    text.trim().parse::<f64>().ok().map(|v| v.max(0.0) as u32);
                             }
                             _ => note_unmodelled_char_tag(&current_element),
                         }
@@ -808,8 +802,11 @@ mod tests {
 
         let chars = parse_char_list(xml).unwrap();
         assert_eq!(chars[0].loot_boost_secs, Some(3600));
-        assert_eq!(chars[1].loot_boost_secs, None);
-        assert_eq!(chars[2].loot_boost_secs, None);
+        assert!(chars[0].loot_boost_reported);
+        assert_eq!(chars[1].loot_boost_secs, Some(0), "explicit zero is expiry");
+        assert!(chars[1].loot_boost_reported);
+        assert_eq!(chars[2].loot_boost_secs, None, "absent tag is unknown");
+        assert!(!chars[2].loot_boost_reported);
     }
 
     #[test]

@@ -103,10 +103,25 @@ struct RawBonus {
 /// Malformed payloads and non-ritual entries are skipped, so this can be run over
 /// the whole feed alongside [`crate::api::crucible::parse_crucible_defs`].
 pub fn parse_blood_ritual_defs(jsons: &[String]) -> Vec<BloodRitualDef> {
+    parse_blood_ritual_defs_checked(jsons).unwrap_or_default()
+}
+
+/// Parse the ritual definitions, distinguishing an unavailable feed from a
+/// successfully read one that contains no rituals.
+///
+/// `None` means no payload could be read at all (unavailable/malformed): the
+/// caller must keep its previous definitions. `Some(vec![])` is authoritative:
+/// the feed was readable and defines no ritual tiers, so the caller may clear
+/// its stale definitions.
+pub fn parse_blood_ritual_defs_checked(jsons: &[String]) -> Option<Vec<BloodRitualDef>> {
     let mut out = Vec::new();
+    let mut parsed_any = false;
     for json in jsons {
         let env: Envelope = match serde_json::from_str(json) {
-            Ok(e) => e,
+            Ok(e) => {
+                parsed_any = true;
+                e
+            }
             Err(_) => continue,
         };
         for entry in env.array {
@@ -120,7 +135,7 @@ pub fn parse_blood_ritual_defs(jsons: &[String]) -> Vec<BloodRitualDef> {
             ));
         }
     }
-    out
+    parsed_any.then_some(out)
 }
 
 fn build_def(id: String, title: String, body: Body) -> BloodRitualDef {
@@ -205,6 +220,20 @@ mod tests {
     /// season cannot silently re-label them.
     fn paint(d: &BloodRitualDef) {
         assert!(d.has_effect());
+    }
+
+    #[test]
+    fn distinguishes_an_unavailable_feed_from_an_authoritative_empty_one() {
+        assert_eq!(parse_blood_ritual_defs_checked(&[]), None);
+        assert_eq!(
+            parse_blood_ritual_defs_checked(&["not json".to_string()]),
+            None
+        );
+        assert_eq!(
+            parse_blood_ritual_defs_checked(&["{}".to_string()]),
+            Some(Vec::new()),
+            "a readable feed with no tiers is authoritative"
+        );
     }
 
     #[test]

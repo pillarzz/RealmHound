@@ -850,6 +850,16 @@ impl CharactersPanel {
     /// stats from the snapshot, then recomputes tab counts. Does not mark the
     /// cache dirty (the processor owns persistence).
     pub fn sync_from(&mut self, cache: &CharacterCache, live_char_id: Option<i32>) {
+        // Commit the outgoing character's displayed countdown before the live id
+        // changes. Otherwise `loot_boost_remaining` stops subtracting elapsed time
+        // and the card snaps back to the server's last report (600 -> 570 -> 600).
+        if let Some(previous) = self.live_char_id.filter(|id| Some(*id) != live_char_id) {
+            if let Some(remaining) = self.loot_boost_remaining(previous) {
+                self.loot_boost_by_char.insert(previous, remaining);
+            }
+            self.loot_boost_at
+                .insert(previous, std::time::Instant::now());
+        }
         self.cache = cache.clone();
         self.exaltation_stats = cache.exaltation_stats.clone();
         self.live_char_id = live_char_id;
@@ -4381,6 +4391,35 @@ mod tests {
         panel.observe_live_loot_boost(Some(600), Some(2537), true);
 
         assert_eq!(panel.loot_boost_remaining(2537), Some(600));
+    }
+
+    /// Losing the live character must freeze the countdown where it stood; the
+    /// server's original report must not be resurrected.
+    #[test]
+    fn losing_the_live_character_commits_the_countdown() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+        panel.sync_from(&CharacterCache::default(), None);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+    }
+
+    /// Switching characters commits the outgoing one's value too.
+    #[test]
+    fn switching_characters_commits_the_outgoing_countdown() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+        panel.sync_from(&CharacterCache::default(), Some(2538));
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
     }
 
     /// Cards flow in rows, so every card in a row must share a top edge.

@@ -15,7 +15,7 @@
 //! `ts_nanos` is nanoseconds since the Unix epoch. `data` is the raw captured
 //! bytes (link-layer through TCP payload), identical to what capture delivers.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::Ipv4Addr;
@@ -47,13 +47,25 @@ pub fn captures_dir() -> PathBuf {
 pub struct CaptureWriter {
     inner: BufWriter<File>,
     count: u64,
-    pending: VecDeque<RawPacket>,
+    /// Outgoing client-to-server frames not yet classified. Frames stay here
+    /// across processing batches until the reassembled packet is parsed: a Hello
+    /// split over several TCP segments (or several batches) is dropped as a
+    /// whole, and a non-Hello packet releases its flow's frames.
+    pending: HashMap<FlowKey, VecDeque<RawPacket>>,
+    /// Frames dropped because a flow exceeded the held bound. A capture can have
+    /// a hole here, but credential-bearing bytes are never written unclassified.
+    dropped_frames: u64,
 }
 
-/// How many frames are held back before they are committed to the file. A handshake
-/// can span a couple of TCP segments, so the frame that completes reassembly is not
-/// necessarily the frame that started it.
-const HELD_FRAMES: usize = 4;
+/// The server's game port. Client-to-server frames on it are the only ones that
+/// can carry a Hello session ticket.
+const GAME_SERVER_PORT: u16 = 2050;
+
+/// Maximum unresolved outgoing frames held for one flow. A bounded overflow is
+/// dropped (fail closed) rather than flushed unclassified.
+const MAX_PENDING_PER_FLOW: usize = 64;
+
+type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
 
 impl CaptureWriter {
     /// Create a capture file at `path`, writing the magic header.
@@ -66,17 +78,53 @@ impl CaptureWriter {
         Ok(Self {
             inner,
             count: 0,
-            pending: VecDeque::with_capacity(HELD_FRAMES),
+            pending: HashMap::new(),
+            dropped_frames: 0,
         })
     }
 
-    /// Append one raw packet frame. It is held for a few frames, so
-    /// [`Self::discard_pending_flow`] can still drop it.
+    /// Append one raw packet frame. Outgoing client-to-server frames are held
+    /// (per flow) until [`Self::release_pending_flow`] confirms they are not part
+    /// of a Hello; server-to-client frames are written immediately.
     pub fn write(&mut self, packet: &RawPacket) -> io::Result<()> {
-        self.pending.push_back(packet.clone());
-        while self.pending.len() > HELD_FRAMES {
-            if let Some(packet) = self.pending.pop_front() {
-                self.write_frame(&packet)?;
+        let Some((sip, sport, dip, dport)) = endpoints(packet) else {
+            // Unparsable link-layer frames cannot carry a decoded Hello; write
+            // them as before.
+            return self.write_frame(packet);
+        };
+        if dport != GAME_SERVER_PORT {
+            return self.write_frame(packet);
+        }
+        let flow = (sip, sport, dip, dport);
+        let queue = self.pending.entry(flow).or_default();
+        queue.push_back(packet.clone());
+        if queue.len() > MAX_PENDING_PER_FLOW {
+            let drop = queue.len() - MAX_PENDING_PER_FLOW;
+            queue.drain(..drop);
+            self.dropped_frames += drop as u64;
+            tracing::warn!(
+                "[RECORD] Dropped {} unresolved outgoing frame(s) on a flow after \
+                 exceeding the {} frame hold bound",
+                drop,
+                MAX_PENDING_PER_FLOW
+            );
+        }
+        Ok(())
+    }
+
+    /// Commit the held frames for the flow `packet` belongs to.
+    ///
+    /// Called after the reassembled packet was parsed as anything other than an
+    /// outgoing Hello. Earlier unresolved packets on the same flow are earlier in
+    /// the TCP stream, so they cannot be the Hello either; releasing the whole
+    /// queue is safe.
+    pub fn release_pending_flow(&mut self, packet: &RawPacket) -> io::Result<()> {
+        let Some(key) = endpoints(packet) else {
+            return Ok(());
+        };
+        if let Some(queue) = self.pending.remove(&key) {
+            for held in queue {
+                self.write_frame(&held)?;
             }
         }
         Ok(())
@@ -98,25 +146,15 @@ impl CaptureWriter {
     /// - frames of other connections: dropping them would leave a hole in a stream
     ///   that has nothing to do with the credentials.
     pub fn discard_pending_flow(&mut self, handshake: &RawPacket) {
-        let Some((src_ip, src_port, dst_ip, dst_port)) = endpoints(handshake) else {
+        let Some(key) = endpoints(handshake) else {
+            // Unknown framing: fail closed for everything still held.
+            self.dropped_frames += self.pending.values().map(VecDeque::len).sum::<usize>() as u64;
             self.pending.clear();
             return;
         };
-        self.pending.retain(|packet| match endpoints(packet) {
-            Some((sip, sport, dip, dport)) => {
-                !(sip == src_ip && sport == src_port && dip == dst_ip && dport == dst_port)
-            }
-            // Unparsable now, parsable later: keep it rather than guess.
-            None => true,
-        });
-    }
-
-    /// Write the frames held from earlier calls.
-    fn write_pending(&mut self) -> io::Result<()> {
-        while let Some(packet) = self.pending.pop_front() {
-            self.write_frame(&packet)?;
+        if let Some(queue) = self.pending.remove(&key) {
+            self.dropped_frames += queue.len() as u64;
         }
-        Ok(())
     }
 
     fn write_frame(&mut self, packet: &RawPacket) -> io::Result<()> {
@@ -135,16 +173,34 @@ impl CaptureWriter {
         self.count
     }
 
-    /// Flush buffered bytes to disk, including the held frames.
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.write_pending()?;
+    /// Flush buffered bytes to disk without committing unresolved outgoing frames.
+    /// Safe to call at the end of every processing batch; unlike [`Self::finish`]
+    /// it keeps the held queues, so a Hello split across batches is still caught.
+    pub fn flush_buffered(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+
+    /// Finish the capture. Unresolved outgoing frames are dropped (fail closed),
+    /// never written unclassified. Returns the number of frames lost this way.
+    pub fn finish(&mut self) -> io::Result<u64> {
+        let unresolved = self.pending.values().map(VecDeque::len).sum::<usize>() as u64;
+        if unresolved > 0 {
+            tracing::warn!(
+                "[RECORD] Dropped {} unresolved outgoing frame(s) at capture stop \
+                 (fail closed)",
+                unresolved
+            );
+        }
+        self.pending.clear();
+        self.dropped_frames += unresolved;
+        self.inner.flush()?;
+        Ok(self.dropped_frames)
     }
 }
 
 impl Drop for CaptureWriter {
     fn drop(&mut self) {
-        let _ = self.flush();
+        let _ = self.finish();
     }
 }
 
@@ -274,10 +330,14 @@ mod tests {
                                                    // out every held frame sent on that connection in that direction, and
                                                    // leaves the server's frames (MapInfo among them) alone.
             w.discard_pending_flow(&hello);
-            assert_eq!(w.count(), 0);
-            w.write(&frame(45678, &[4])).unwrap();
-            w.write(&frame(45679, &[8])).unwrap(); // other connection
-            w.flush().unwrap();
+            assert_eq!(w.count(), 1, "the server's reply was written immediately");
+            let after = frame(45678, &[4]);
+            let other = frame(45679, &[8]);
+            w.write(&after).unwrap();
+            w.write(&other).unwrap(); // other connection
+            w.release_pending_flow(&after).unwrap();
+            w.release_pending_flow(&other).unwrap();
+            w.finish().unwrap();
             assert_eq!(w.count(), 3);
         }
         let read = read_capture(&path).unwrap();
@@ -285,6 +345,43 @@ mod tests {
         assert_eq!(endpoints(&read[0]).map(|e| e.1), Some(2050)); // the server's frame
         assert_eq!(endpoints(&read[1]).map(|e| e.1), Some(45678)); // after the Hello
         assert_eq!(endpoints(&read[2]).map(|e| e.1), Some(45679)); // other connection
+    }
+
+    #[test]
+    fn a_split_hello_is_held_across_batch_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("split.rhcap");
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let first = frame(45678, &[1]);
+        let second = frame(45678, &[2]);
+        w.write(&first).unwrap();
+        // End of one processing batch: the frame must remain held, not committed.
+        w.flush_buffered().unwrap();
+        assert_eq!(w.count(), 0);
+        w.write(&second).unwrap();
+        w.flush_buffered().unwrap();
+        assert_eq!(w.count(), 0);
+        // The reassembled Hello is classified in the next batch.
+        w.discard_pending_flow(&first);
+        w.finish().unwrap();
+        assert_eq!(w.count(), 0);
+        assert!(read_capture(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_non_hello_packet_releases_the_holds_for_its_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release.rhcap");
+        let mut w = CaptureWriter::create(&path).unwrap();
+        let first = frame(45678, &[1]);
+        let second = frame(45678, &[2]);
+        w.write(&first).unwrap();
+        w.write(&second).unwrap();
+        w.flush_buffered().unwrap();
+        assert_eq!(w.count(), 0);
+        w.release_pending_flow(&second).unwrap();
+        assert_eq!(w.count(), 2);
+        w.finish().unwrap();
     }
 
     #[test]
@@ -328,7 +425,7 @@ mod tests {
             for p in &original {
                 w.write(p).unwrap();
             }
-            w.flush().unwrap();
+            w.finish().unwrap();
             assert_eq!(w.count(), original.len() as u64);
         }
 

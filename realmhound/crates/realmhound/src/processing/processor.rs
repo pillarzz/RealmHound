@@ -285,6 +285,10 @@ pub struct PacketProcessor {
     /// the empty snapshot means the ritual was switched off. `None` when no ritual
     /// question is open.
     blood_ritual_clear_at: Option<i64>,
+    /// Characters whose current ritual came from the live `BloodRitual` stat (or
+    /// its live deactivation). An HTTP character-list refresh older than that
+    /// observation must not clear it, even when its payload has no ritual id.
+    live_blood_ritual_observed: std::collections::HashSet<i32>,
     /// Latest raw local-player stat values (id -> value), accumulated across the
     /// spawn `Update` (full snapshot) and `NewTick` deltas. Base character stats
     /// are derived from these (base = stat - boost) to keep the cached stats and
@@ -486,6 +490,7 @@ impl PacketProcessor {
             settings,
             live_char_id: None,
             blood_ritual_clear_at: None,
+            live_blood_ritual_observed: std::collections::HashSet::new(),
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -571,6 +576,7 @@ impl PacketProcessor {
             settings,
             live_char_id: None,
             blood_ritual_clear_at: None,
+            live_blood_ritual_observed: std::collections::HashSet::new(),
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -615,6 +621,7 @@ impl PacketProcessor {
             settings: Arc::new(RwLock::new(Settings::default())),
             live_char_id: None,
             blood_ritual_clear_at: None,
+            live_blood_ritual_observed: std::collections::HashSet::new(),
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -931,31 +938,26 @@ impl PacketProcessor {
                 }
                 // The character list reports each character's Blood Ritual, which is
                 // what makes the ritual known for characters that are not the live
-                // one (issue #64). The list can lag behind the live status, so it is
-                // applied only to characters that are not live: those have their own
-                // `BloodRitual` stat, which is fresher.
+                // one (issue #64). The list can lag behind the live status, so a
+                // live observation (set or cleared) takes precedence over it.
                 let live_char_id = self.live_char_id;
                 let mut challenge_changed = false;
                 for char in &data.characters {
                     let is_live = Some(char.char_id) == live_char_id;
                     // The Crucible marker is never taken from this list, in either
                     // direction: it is only ever *set* by the character's own live
-                    // CRUCIBLE stat, and it is cleared by that same stat reporting
-                    // false or by a new season's definitions (issue #63/#66). The
-                    // list's `CrucibleActive` flag is stale -- it claimed crucible on
-                    // most of this account's non-seasonal characters -- so the one
-                    // thing it must not do is revoke a marker the live stat set:
-                    // crucible is available to non-seasonal characters too, and
-                    // clearing on `!seasonal` wiped a real one on every Refresh.
+                    // CRUCIBLE stat, and cleared by that same stat or a new season's
+                    // definitions (issue #63/#66). The list's `CrucibleActive` flag
+                    // is stale, so preserving the live-detected value in
+                    // `update_from_api` is what matters here.
                     //
-                    // The list is the server's own record of the ritual tag, so an
-                    // absent one means the character has no ritual and any entry held
-                    // for it is stale. It is authoritative for the characters that are
-                    // not live; for the live character it may only *clear* them -- the
-                    // live `BloodRitual` stat is fresher for setting, and a
-                    // deactivation there arrives as an empty delta or an unconfirmed
-                    // empty spawn, which this refresh usually confirms first.
-                    if !(is_live && char.blood_ritual_id.is_some()) {
+                    // The live `BloodRitual` stat is fresher than any HTTP request
+                    // that started before it was observed. Give it precedence: do
+                    // not let an older list clear (or overwrite) it, including when
+                    // the list has no ritual id at all.
+                    let live_observed =
+                        is_live && self.live_blood_ritual_observed.contains(&char.char_id);
+                    if !(is_live && (char.blood_ritual_id.is_some() || live_observed)) {
                         let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
                         challenge_changed |= self
                             .account_data
@@ -1277,6 +1279,9 @@ impl PacketProcessor {
         if !id.trim().is_empty() {
             // A live value answers the question an empty spawn asked.
             self.blood_ritual_clear_at = None;
+            if let Some(char_id) = self.live_char_id {
+                self.live_blood_ritual_observed.insert(char_id);
+            }
             if self
                 .account_data
                 .characters
@@ -1313,6 +1318,9 @@ impl PacketProcessor {
 
     /// Drop the live character's ritual and re-derive the shot multipliers from it.
     fn clear_live_blood_ritual(&mut self) {
+        if let Some(char_id) = self.live_char_id {
+            self.live_blood_ritual_observed.insert(char_id);
+        }
         if self
             .account_data
             .characters
@@ -1556,6 +1564,13 @@ impl PacketProcessor {
                         if let Some(rec) = self.recorder.as_mut() {
                             rec.discard_pending_flow(&raw_packet);
                         }
+                    } else if parsed.is_some() {
+                        // A non-Hello packet on this flow proves the held outgoing
+                        // frames are not a Hello; commit them. Unknown packets stay
+                        // held until a later classification or the capture stops.
+                        if let Some(rec) = self.recorder.as_mut() {
+                            let _ = rec.release_pending_flow(&raw_packet);
+                        }
                     }
 
                     if let Some(ref parsed) = parsed {
@@ -1701,7 +1716,9 @@ impl PacketProcessor {
         }
 
         if let Some(rec) = self.recorder.as_mut() {
-            let _ = rec.flush();
+            // Do not commit unresolved outgoing frames on a batch boundary: a
+            // Hello can complete in the next batch.
+            let _ = rec.flush_buffered();
         }
 
         // Keep mission tracking bound to the current main account so a mule's
@@ -2235,7 +2252,7 @@ impl PacketProcessor {
                 if self
                     .account_data
                     .characters
-                    .set_blood_ritual_defs(defs.clone())
+                    .replace_blood_ritual_defs(defs.clone())
                 {
                     self.sync_shot_damage_bonus();
                     self.account_data.mark_dirty();
@@ -2392,6 +2409,7 @@ impl PacketProcessor {
 
                 // Mark as live character
                 self.live_char_id = Some(char_id);
+                self.live_blood_ritual_observed.clear();
                 // The combat engine reads the mastery/seasonal shot multipliers
                 // from the character data, so it needs them for this character.
                 self.sync_shot_damage_bonus();
@@ -5036,6 +5054,49 @@ mod isolation_gate_tests {
         assert!(
             p.account_data.characters.blood_ritual_for_char(1).is_none(),
             "the list clears a ritual the live character switched off"
+        );
+    }
+
+    /// An older HTTP refresh must not revoke a ritual the live stat observed
+    /// after the request started; the live stat is the fresher source.
+    #[test]
+    fn api_account_data_does_not_revoke_a_newer_live_blood_ritual() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::api::RealmCharacter;
+
+        const CURRENT: &str = "5027802235043840";
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        p.live_char_id = Some(1);
+        p.apply_blood_ritual_stat(CURRENT, false, 100);
+        assert!(p.account_data.characters.blood_ritual_for_char(1).is_some());
+
+        // The list response started before that activation and arrived after it.
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![RealmCharacter {
+                char_id: 1,
+                blood_ritual_id: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert!(
+            p.account_data.characters.blood_ritual_for_char(1).is_some(),
+            "a live observation outranks an older list refresh"
         );
     }
 

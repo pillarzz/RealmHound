@@ -51,26 +51,44 @@ where
     I: IntoIterator<Item = i32>,
 {
     let manager = crate::assets::get_asset_manager();
+    let mut tiers: Vec<LootBagType> = Vec::new();
     for id in item_ids {
         if id <= 0 {
             continue;
         }
-        if SHINY_PET_STONE_IDS.contains(&id) {
-            return Some(LootBagType::Gold);
-        }
-        if !manager.is_shiny(id) {
-            continue;
-        }
-        // `<BagType>` 4 = teal, 6 = white. Other tiers have no shiny
-        // notification. Equipment is enriched with `bag_type` from equip.xml at
-        // load time; items outside that merge report 0 and are ignored.
-        match manager.get_object(id).map(|asset| asset.bag_type) {
-            Some(4) => return Some(LootBagType::Teal),
-            Some(6) => return Some(LootBagType::White),
-            _ => {}
+        let tier = if SHINY_PET_STONE_IDS.contains(&id) {
+            Some(LootBagType::Gold)
+        } else if manager.is_shiny(id) {
+            // `<BagType>` 4 = teal, 6 = white. Other tiers have no shiny
+            // notification. Equipment is enriched with `bag_type` from equip.xml
+            // at load time; items outside that merge report 0 and are ignored.
+            match manager.get_object(id).map(|asset| asset.bag_type) {
+                Some(4) => Some(LootBagType::Teal),
+                Some(6) => Some(LootBagType::White),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(tier) = tier {
+            tiers.push(tier);
         }
     }
-    None
+    best_shiny_tier(tiers)
+}
+
+/// Choose the notification tier for a mixed bag deterministically: the highest
+/// tier wins, regardless of which item was encountered first.
+fn best_shiny_tier<I>(tiers: I) -> Option<LootBagType>
+where
+    I: IntoIterator<Item = LootBagType>,
+{
+    tiers
+        .into_iter()
+        .fold(None, |best: Option<LootBagType>, tier| match best {
+            Some(current) if current.rarity_rank() >= tier.rarity_rank() => Some(current),
+            _ => Some(tier),
+        })
 }
 
 /// Object type of Janus the Doorwarden (the Enemy the player fights).
@@ -1032,6 +1050,28 @@ mod beisa_tests {
         assert!(!beisa_engaged(&kills, 99));
         assert!(!beisa_engaged(&kills, 0));
         assert!(!beisa_engaged(&[], 42));
+    }
+
+    #[test]
+    fn shiny_notification_tier_is_order_independent() {
+        // A mixed bag notifies on its highest tier, not the first item in slot
+        // order. Teal(5) < Gold(7) < White(8) per `rarity_rank`.
+        assert_eq!(
+            best_shiny_tier([LootBagType::Teal, LootBagType::White]),
+            Some(LootBagType::White)
+        );
+        assert_eq!(
+            best_shiny_tier([LootBagType::White, LootBagType::Teal]),
+            Some(LootBagType::White)
+        );
+        assert_eq!(
+            best_shiny_tier([LootBagType::Gold, LootBagType::White, LootBagType::Teal]),
+            Some(LootBagType::White)
+        );
+        assert_eq!(
+            best_shiny_tier([LootBagType::Teal, LootBagType::Gold]),
+            Some(LootBagType::Gold)
+        );
     }
 
     #[test]

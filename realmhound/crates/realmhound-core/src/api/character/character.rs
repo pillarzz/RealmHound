@@ -402,9 +402,13 @@ pub struct RealmCharacter {
     /// Unique item info (item_id -> ordered list of base64 encoded data with enchantments)
     /// Multiple entries for the same item_id are stored in order of appearance.
     pub unique_item_info: HashMap<i32, Vec<String>>,
-    /// Remaining loot-drop-boost seconds for this character (`<LDTimer>`),
-    /// when a boost is active. `None`/`0` means no active boost.
+    /// Remaining loot-drop-boost seconds for this character (`<LDTimer>`).
+    /// `None` means the tag was absent (unknown); `Some(0)` is authoritative
+    /// expiry. [`Self::loot_boost_reported`] distinguishes those from a default.
     pub loot_boost_secs: Option<u32>,
+    /// Whether this fetch carried an `<LDTimer>` tag at all. A refresh that
+    /// omits it must not wipe the cached value, while an explicit zero must.
+    pub loot_boost_reported: bool,
 }
 
 impl Default for RealmCharacter {
@@ -441,6 +445,7 @@ impl Default for RealmCharacter {
             pet: None,
             unique_item_info: HashMap::new(),
             loot_boost_secs: None,
+            loot_boost_reported: false,
         }
     }
 }

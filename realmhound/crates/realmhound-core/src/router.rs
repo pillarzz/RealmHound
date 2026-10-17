@@ -715,12 +715,14 @@ impl PacketRouter {
                 // `modifierEvent` entries, which are deliberately ignored).
                 let defs = crate::api::crucible::parse_crucible_defs(&resp.crucible_jsons);
                 let rituals =
-                    crate::api::blood_ritual::parse_blood_ritual_defs(&resp.crucible_jsons);
+                    crate::api::blood_ritual::parse_blood_ritual_defs_checked(&resp.crucible_jsons);
                 let mut events = Vec::new();
                 if !defs.is_empty() {
                     events.push(GameEvent::CrucibleDefinitionsReceived(defs));
                 }
-                if !rituals.is_empty() {
+                if let Some(rituals) = rituals {
+                    // `Some` includes an authoritative empty feed, which clears
+                    // stale tiers; `None` means the payload was unavailable.
                     events.push(GameEvent::BloodRitualDefinitionsReceived(rituals));
                 }
                 RouteResult::Routed(events)

@@ -170,9 +170,32 @@ const SUMMON_ATTACK_MAX_DIST: f32 = 5.0;
 /// How long a tracked summoned creature stays a candidate with no further sight
 /// of it. Bounds the map when a removal packet never arrives.
 const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;
+/// Whether an object type is a mechanic that damages the boss *for* the player: a
+/// pushed barrel, a cannonball.
+///
+/// Curated, because nothing in the object data says "this damages the boss when
+/// pushed". The two Parasite Chambers barrels are pinned by id so the behaviour does
+/// not depend on the asset catalog being loaded, and names are matched as well so a
+/// reskin or a new barrel-like object works without a code change. Anything else
+/// leaving the world at the same tick as a hit -- a trap, a wall piece, a mob -- is
+/// not a source, however plausible the coincidence.
+fn is_boss_damaging_mechanic(object_type: i32) -> bool {
+    matches!(object_type, 0x0786 | 0x0796)
+        || get_asset_manager()
+            .object_name(object_type)
+            .map(|name| {
+                let lower = name.to_lowercase();
+                ["barrel", "cannon", "gunpowder"]
+                    .iter()
+                    .any(|key| lower.contains(key))
+            })
+            .unwrap_or(false)
+}
+
 /// How close in time an object's removal has to be to a packet for it to be the
-/// packet's source. Measured: same tick, so one tick of slack either way.
-const MECHANIC_REMOVAL_WINDOW_MS: i64 = 250;
+/// packet's source. Measured at the same tick on a barrel-only capture; the window is
+/// wider than one tick because a live tick can straddle the two packets.
+const MECHANIC_REMOVAL_WINDOW_MS: i64 = 800;
 /// How close an object has to leave the world, relative to the hit's target, to be
 /// that hit's source. A pushed barrel explodes at the boss; anything vanishing on
 /// the far side of the instance is not this packet's source.
@@ -1571,6 +1594,7 @@ impl CombatTracker {
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
         self.summon_owners.clear();
+        self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
         self.seen_player_ids.clear();
@@ -1620,6 +1644,7 @@ impl CombatTracker {
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
         self.summon_owners.clear();
+        self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
         self.seen_player_ids.clear();
@@ -2420,15 +2445,16 @@ impl CombatTracker {
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
-        // Remember what left the world: a hit nothing else explains is credited to
-        // the object that vanished as it landed (see [`LocalObjectRemoval`]). Bosses,
-        // pets and players are excluded -- their removals mean something else, and a
-        // boss's own death coincides with the fight's last hits.
+        // Remember what left the world, when it is the kind of object that damages the
+        // boss *for* the player (see [`is_boss_damaging_mechanic`]). Everything else is
+        // excluded -- a boss's own death, a pet, a player, a trap or a wall piece all
+        // leave the world too, and their removals mean something else.
         if let Some(obj) = &last {
             if !obj.is_pet
                 && !self.fights.contains_key(&object_id)
                 && crate::assets::aux_target_for_type(obj.object_type).is_none()
                 && !class_ids::is_player_class(obj.object_type)
+                && is_boss_damaging_mechanic(obj.object_type)
             {
                 self.object_removals.push_back(LocalObjectRemoval {
                     time_ms,
@@ -3018,9 +3044,9 @@ impl CombatTracker {
     /// Both sides of this were measured on a solo Nightmare Colony killed with
     /// barrels alone: all 105 hits the server credited to the player coincided with
     /// an `Explosive Barrel` removal, in the same tick, with no shot, activation or
-    /// creature of theirs behind the packet. The removal is therefore what names
-    /// those packets, and it is only consulted when nothing the player fired
-    /// explains one.
+    /// creature of theirs behind the packet. Only objects that are such a mechanic are
+    /// recorded at all (see [`is_boss_damaging_mechanic`]), so a trap or a wall piece
+    /// despawning at the same tick cannot claim the hit.
     fn object_removal_near(&self, target_id: i32, time_ms: i64) -> Option<i32> {
         let target = self.objects.get(&target_id)?;
         let (tx, ty) = (target.last_x, target.last_y);
@@ -12895,11 +12921,14 @@ mod tests {
         // A barrel pushed into the boss: the server credits the player, and the only
         // thing on the wire that names the source is the barrel leaving the world as
         // the hit lands (measured on a barrel-only Nightmare Colony: 105 of 105 hits,
-        // same tick).
+        // same tick, and the whole fight on one row).
         let mut t = pet_packet_tracker(&[], 0);
-        t.on_object_spawn(700, 0x0786, &status_at(700, 1.0, 1.0, vec![]), 0);
-        t.on_object_removed(700, 1_000);
-        t.on_damage(500, 1000, 1_006, 1_000);
+        for (i, at) in [400, 500, 600, 700].into_iter().enumerate() {
+            let id = 700 + i as i32;
+            t.on_object_spawn(id, 0x0786, &status_at(id, 1.0, 1.0, vec![]), 0);
+            t.on_object_removed(id, at);
+        }
+        t.on_damage(500, 1000, 1_006, 700);
         let fight = t.fights.remove(&500).expect("open fight");
         let done = t.finalize_fight(fight, 1_000).expect("finalize");
         let me = local_row(&done);
@@ -12911,14 +12940,53 @@ mod tests {
     }
 
     #[test]
-    fn a_removal_away_from_the_hit_explains_nothing() {
-        // The correlation is place-bound as well as tick-bound: an object leaving the
-        // world elsewhere is not this packet's source, and the damage stays
-        // unattributed rather than being credited to a bystander.
+    fn an_object_that_despawns_once_claims_nothing() {
+        // A boss room is full of things that despawn -- a trap, a wall piece, a mob --
+        // and one of them leaving the world as a barrel hit lands is not the barrel.
+        // Only an object that is such a mechanic is a source at all, so this hit stays
+        // unattributed rather than being credited to the nearest despawn.
         let mut t = pet_packet_tracker(&[], 0);
-        t.on_object_spawn(700, 0x0786, &status_at(700, 60.0, 60.0, vec![]), 0);
-        t.on_object_removed(700, 1_000);
-        t.on_damage(500, 1000, 1_006, 1_000);
+        t.on_object_spawn(700, 0x0813, &status_at(700, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(700, 700);
+        t.on_damage(500, 1000, 1_006, 700);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert!(me.summons.is_empty(), "a wall piece explains nothing");
+        assert_eq!((me.packet_damage, me.packet_hits), (1_006, 1));
+    }
+
+    #[test]
+    fn a_wall_piece_despawns_with_the_barrel_and_stays_out_of_it() {
+        // Both the barrel and a wall piece leave the world as the hit lands. The row
+        // is the barrel's -- the wall is not a mechanic that can damage the boss, so it
+        // never becomes a candidate, however close in time it went.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(800, 0x0813, &status_at(800, 2.0, 2.0, vec![]), 0);
+        t.on_object_removed(800, 500);
+        t.on_object_spawn(700, 0x0786, &status_at(700, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(700, 500);
+        t.on_damage(500, 1000, 1_088, 500);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!(me.summons.len(), 1, "one row, not one per despawn");
+        assert_eq!(me.summons[0].object_type, 0x0786);
+        assert_eq!((me.summons[0].damage, me.summons[0].hits), (1_088, 1));
+    }
+
+    #[test]
+    fn a_removal_away_from_the_hit_explains_nothing() {
+        // The correlation is place-bound as well as tick-bound: a barrel leaving the
+        // world on the far side of the instance is not this packet's source, and the
+        // damage stays unattributed rather than being credited to it.
+        let mut t = pet_packet_tracker(&[], 0);
+        for (i, at) in [400, 500, 600, 700].into_iter().enumerate() {
+            let id = 700 + i as i32;
+            t.on_object_spawn(id, 0x0786, &status_at(id, 60.0, 60.0, vec![]), 0);
+            t.on_object_removed(id, at);
+        }
+        t.on_damage(500, 1000, 1_006, 700);
         let fight = t.fights.remove(&500).expect("open fight");
         let done = t.finalize_fight(fight, 1_000).expect("finalize");
         let me = local_row(&done);

@@ -64,6 +64,13 @@ RealmHound on the second.
 4. Launch Realm of the Mad God and play normally
 5. RealmHound will display game data in real-time
 
+## Documentation
+
+- [Player damage sources: implementation status](https://pillarzz.github.io/RealmHound/research/damage-sources-status.html)
+  — interactive matrix of every effect that deals player damage, with its
+  theoretical-DPS and Combat History attribution status.
+  ([Markdown source](docs/research/damage-sources-status.md))
+
 ## Building from Source
 
 ### Prerequisites

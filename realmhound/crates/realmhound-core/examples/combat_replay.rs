@@ -135,22 +135,31 @@ fn main() {
                             .object_name(obj.object_type as i32)
                             .is_some_and(|n| is_barrel(&n))
                         {
-                            barrels.push((clock, obj.object_type as i32, obj.object_id(), true, px, py));
+                            barrels.push((
+                                clock,
+                                obj.object_type as i32,
+                                obj.object_id(),
+                                true,
+                                px,
+                                py,
+                            ));
                         }
                         let entry = seen_types
                             .entry(obj.object_type as i32)
                             .or_insert((0, clock, clock));
                         entry.0 += 1;
                         entry.2 = clock;
-                        recent_objects.push_back((clock, obj.object_type as i32, obj.object_id(), true));
+                        recent_objects.push_back((
+                            clock,
+                            obj.object_type as i32,
+                            obj.object_id(),
+                            true,
+                        ));
                         // Creatures an item declares (a Kimono's spirits, a
                         // Summoner mace's bear) are spawned as ordinary objects;
                         // logging them shows whether RH ever saw the summon whose
                         // damage reaches it only as an owner-credited packet.
-                        if !manager
-                            .summon_sources(obj.object_type as i32)
-                            .is_empty()
-                        {
+                        if !manager.summon_sources(obj.object_type as i32).is_empty() {
                             let entry = summon_spawns
                                 .entry(obj.object_type as i32)
                                 .or_insert((0u32, clock, clock));
@@ -287,7 +296,10 @@ fn main() {
 
     // Does a barrel-scale hit land as a barrel moves or is consumed?
     if !barrels.is_empty() {
-        let spawns = barrels.iter().filter(|(_, _, _, spawned, _, _)| *spawned).count();
+        let spawns = barrels
+            .iter()
+            .filter(|(_, _, _, spawned, _, _)| *spawned)
+            .count();
         println!(
             "\n=== barrel-like objects: {} spawns, {} removals ===",
             spawns,

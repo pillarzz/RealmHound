@@ -1565,10 +1565,7 @@ impl CharacterCache {
     /// The Blood Ritual tier definition behind an id from the definitions feed, or
     /// `None` when the feed does not carry it (an id from a season the feed has
     /// moved past, or one not delivered yet).
-    pub fn blood_ritual_def(
-        &self,
-        id: &str,
-    ) -> Option<crate::api::blood_ritual::BloodRitualDef> {
+    pub fn blood_ritual_def(&self, id: &str) -> Option<crate::api::blood_ritual::BloodRitualDef> {
         self.blood_ritual_defs.iter().find(|d| d.id == id).cloned()
     }
 

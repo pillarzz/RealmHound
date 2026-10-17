@@ -2910,10 +2910,7 @@ impl AssetManager {
     /// reverse of [`Self::summon_sources`]). Used to name the creature behind a
     /// summon that was spawned by an ability activation, where no packet ever
     /// names the creature itself.
-    pub fn summoned_by_item(
-        &self,
-        item_type: i32,
-    ) -> Vec<(i32, super::object_list::SummonSource)> {
+    pub fn summoned_by_item(&self, item_type: i32) -> Vec<(i32, super::object_list::SummonSource)> {
         self.try_load();
         let guard = self.objects.read().unwrap();
         guard

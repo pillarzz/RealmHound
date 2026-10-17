@@ -449,13 +449,16 @@ fn group_summons(
 ) -> Vec<realmhound_core::combat::SummonContribution> {
     /// What names a row: pets by skin, summons by creature type, each with the
     /// item that created it.
-    fn key_of(
-        s: &realmhound_core::combat::SummonContribution,
-    ) -> (bool, i32, i32, Vec<u16>) {
+    fn key_of(s: &realmhound_core::combat::SummonContribution) -> (bool, i32, i32, Vec<u16>) {
         if s.is_pet {
             (true, s.pet_type, 0, Vec::new())
         } else {
-            (false, s.object_type, s.source_item, s.source_enchants.clone())
+            (
+                false,
+                s.object_type,
+                s.source_item,
+                s.source_enchants.clone(),
+            )
         }
     }
     let mut out: Vec<realmhound_core::combat::SummonContribution> = Vec::new();
@@ -3337,7 +3340,8 @@ impl CombatHistoryPanel {
         // (as this used to, from the fight's on/off window alone) dropped the Blood
         // Ritual from fights that had already been recorded, and re-adding it when
         // the ritual was switched back on.
-        loadout.blood_ritual = fight_ritual_id(&fight.boosts).and_then(|id| cache.blood_ritual_def(id));
+        loadout.blood_ritual =
+            fight_ritual_id(&fight.boosts).and_then(|id| cache.blood_ritual_def(id));
         // The crucible's definitions belong to the season, not to the character, so
         // the marker's state *now* must not decide whether the fight was fought
         // under them.
@@ -3986,17 +3990,20 @@ impl CombatHistoryPanel {
         // panel shows them, since the wire carries only the pet's type id.
         let derived: Option<realmhound_core::stats::derived::DerivedStats> = {
             let cache = &ctx.account_data.characters;
-            cache.find_any_character(fight.local_char_id).map(|character| {
-                let mut loadout = crate::panels::derived_stats::build_loadout(character, cache);
-                if local.equipment.iter().any(|&slot| slot >= 0) {
-                    loadout.equipment = local.equipment.iter().map(|&slot| slot.max(0)).collect();
-                    loadout.enchants = local.equipment_enchants.to_vec();
-                }
-                realmhound_core::stats::derived::derive(
-                    realmhound_core::assets::get_asset_manager(),
-                    &loadout,
-                )
-            })
+            cache
+                .find_any_character(fight.local_char_id)
+                .map(|character| {
+                    let mut loadout = crate::panels::derived_stats::build_loadout(character, cache);
+                    if local.equipment.iter().any(|&slot| slot >= 0) {
+                        loadout.equipment =
+                            local.equipment.iter().map(|&slot| slot.max(0)).collect();
+                        loadout.enchants = local.equipment_enchants.to_vec();
+                    }
+                    realmhound_core::stats::derived::derive(
+                        realmhound_core::assets::get_asset_manager(),
+                        &loadout,
+                    )
+                })
         };
 
         let rank = fight
@@ -4090,7 +4097,9 @@ impl CombatHistoryPanel {
                                     .filter(|d| d.pet_skin == Some(skin) && !d.pet.is_empty());
                                 if let Some(d) = known {
                                     ui.label(name).on_hover_ui(|ui| {
-                                        crate::panels::derived_stats::pet_abilities_tooltip(ui, &d.pet);
+                                        crate::panels::derived_stats::pet_abilities_tooltip(
+                                            ui, &d.pet,
+                                        );
                                     });
                                 } else {
                                     ui.label(name);
@@ -4133,13 +4142,12 @@ impl CombatHistoryPanel {
                                     let enemy: Vec<i32> =
                                         s.source_enchants.iter().map(|&e| e as i32).collect();
                                     ui.spacing_mut().item_spacing.x = 2.0;
-                                    ctx.sprite_renderer
-                                        .render_item_sprite_with_enchants_native(
-                                            ui,
-                                            s.source_item,
-                                            &enemy,
-                                            16.0,
-                                        );
+                                    ctx.sprite_renderer.render_item_sprite_with_enchants_native(
+                                        ui,
+                                        s.source_item,
+                                        &enemy,
+                                        16.0,
+                                    );
                                     let item = manager
                                         .object_name(s.source_item)
                                         .unwrap_or_else(|| format!("0x{:X}", s.source_item));
@@ -5673,8 +5681,7 @@ mod tests {
     use super::{
         assign_drops_exclusive, boost_source_with, boss_bar_label, boss_row_hp_label,
         boss_row_stats_parts, condensed_boosts, dungeon_display_name, fight_ritual_id,
-        share_hp_pool,
-        spirit_total_label, BoostIcon, RunModes, SourceOracle,
+        share_hp_pool, spirit_total_label, BoostIcon, RunModes, SourceOracle,
     };
     use realmhound_core::assets::get_dungeon_portal_map;
     use realmhound_core::combat::BoostWindow;
@@ -5684,7 +5691,14 @@ mod tests {
         // The tier is part of the fight's own record, so the card can render the
         // ritual a fight was fought under even after the character has switched it
         // off -- which clears the character's own recorded tier.
-        let with_tier = [boost("Blood Ritual", 0, 1, 0, 5_000, "character state:tier-a")];
+        let with_tier = [boost(
+            "Blood Ritual",
+            0,
+            1,
+            0,
+            5_000,
+            "character state:tier-a",
+        )];
         assert_eq!(fight_ritual_id(&with_tier), Some("tier-a"));
         // A fight recorded before the tier was stored carries the plain source, so
         // the card shows no ritual rather than inventing one.

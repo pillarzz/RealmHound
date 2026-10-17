@@ -3188,8 +3188,7 @@ impl ObjectList {
                                     if let Some(name) = summoned_name.take() {
                                         self.summon_names.entry(entity_type).or_insert(name);
                                     }
-                                    let list =
-                                        self.summon_sources.entry(entity_type).or_default();
+                                    let list = self.summon_sources.entry(entity_type).or_default();
                                     if !list.contains(&source) {
                                         list.push(source);
                                         added += 1;
@@ -3276,11 +3275,13 @@ fn summon_name_from_text(description: &str) -> Option<String> {
     let rest = &rest[..stop];
     // Cut at the earliest clause boundary, so "Summon a Friendly Spirit which
     // slows..." yields the name and not the sentence.
-    let cut = [" which", " that", " who", " for", " to ", " and ", " when", " in ", " with"]
-        .iter()
-        .filter_map(|c| rest.find(c))
-        .min()
-        .unwrap_or(rest.len());
+    let cut = [
+        " which", " that", " who", " for", " to ", " and ", " when", " in ", " with",
+    ]
+    .iter()
+    .filter_map(|c| rest.find(c))
+    .min()
+    .unwrap_or(rest.len());
     let name = rest[..cut].trim();
     (!name.is_empty()).then(|| name.to_string())
 }

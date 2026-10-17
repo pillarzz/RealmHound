@@ -687,7 +687,8 @@ struct ParticipantAccum {
     /// Summon hits whose shoot packet was missed, so no base damage was known.
     unresolved_summon_hits: u64,
     /// Per-summon contribution, keyed by the summon/pet object id.
-    summons: HashMap<i32, SummonAccum>,    /// Damage the server itself attributed to this participant inside a local
+    summons: HashMap<i32, SummonAccum>,
+    /// Damage the server itself attributed to this participant inside a local
     /// damage packet: an ability/DoT/proc figure the client did not compute.
     /// Only ever non-zero for the local player (every remote row arrives solely
     /// this way). Deliberately kept out of `damage_by_equipment` so the weapon
@@ -895,9 +896,7 @@ fn packet_damage_source(
                 .iter()
                 .filter(|u| only_item.map_or(true, |item| u.item_id == item))
                 .map(|u| u.time_ms)
-                .filter(|&t| {
-                    event.time_ms >= t && event.time_ms - t <= SUMMON_SPAWN_ATTRIBUTION_MS
-                })
+                .filter(|&t| event.time_ms >= t && event.time_ms - t <= SUMMON_SPAWN_ATTRIBUTION_MS)
                 .max();
             at.map(|t| (t, creature))
         })
@@ -1923,7 +1922,12 @@ impl CombatTracker {
                 lifetime_ms: source.lifetime_ms,
             });
         }
-        pick_summon_source(&candidates, &self.local_ability_uses, &local.equipment_enchants, at_ms)
+        pick_summon_source(
+            &candidates,
+            &self.local_ability_uses,
+            &local.equipment_enchants,
+            at_ms,
+        )
     }
 
     /// Update an existing object's stats (from a `NewTick` status, which does not
@@ -3028,7 +3032,11 @@ impl CombatTracker {
             .map(|id| format!("{CHARACTER_STATE_SOURCE}:{id}"))
             .unwrap_or_else(|| CHARACTER_STATE_SOURCE.to_string());
         for (stat, source, active) in [
-            ("Blood Ritual", ritual, self.local_snapshot.blood_ritual.is_some()),
+            (
+                "Blood Ritual",
+                ritual,
+                self.local_snapshot.blood_ritual.is_some(),
+            ),
             (
                 "Crucible",
                 CHARACTER_STATE_SOURCE.to_string(),
@@ -3281,9 +3289,11 @@ impl CombatTracker {
             .iter()
             .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
         {
-            let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
-                activation_claims_packet(use_, event.time_ms)
-            });
+            let owner = uses
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, use_)| activation_claims_packet(use_, event.time_ms));
             if let Some((i, _)) = owner {
                 credited[i].0 += event.damage;
                 credited[i].1 += 1;
@@ -3914,7 +3924,8 @@ impl CombatTracker {
         };
         let (name, object_type, equipment, enchants, skin_id, tex1, tex2) = self
             .objects
-            .get(&local_id)            .map(|o| {
+            .get(&local_id)
+            .map(|o| {
                 (
                     o.name.clone(),
                     o.object_type,
@@ -5295,12 +5306,7 @@ impl CombatTracker {
                     // world either, is keyed by the negative of its object type --
                     // which no live object id can collide with. The type itself is
                     // what names and draws the row either way.
-                    (
-                        object_id.unwrap_or(-creature),
-                        false,
-                        0,
-                        creature,
-                    )
+                    (object_id.unwrap_or(-creature), false, 0, creature)
                 }
                 PacketDamageSource::Pet { pet_id } => {
                     // Identified by the cache, like every other pet row credited to
@@ -5329,8 +5335,7 @@ impl CombatTracker {
             // loadout and activation log rather than from the catalog, which
             // cannot tell an item from its `(SB)` twin.
             if entry.source_item == 0 && !is_pet {
-                if let Some((item, enchants)) =
-                    self.summon_source_item(object_type, event.time_ms)
+                if let Some((item, enchants)) = self.summon_source_item(object_type, event.time_ms)
                 {
                     entry.source_item = item;
                     entry.source_enchants = enchants;
@@ -12561,11 +12566,7 @@ mod tests {
         let mut t = CombatTracker::new();
         t.on_map_change("Sprite World", 1, 0);
         t.on_player_loaded(1000, 1);
-        t.on_object_status(
-            1000,
-            &status_at(1000, 0.0, 0.0, vec![name_stat("You")]),
-            0,
-        );
+        t.on_object_status(1000, &status_at(1000, 0.0, 0.0, vec![name_stat("You")]), 0);
         t.on_object_spawn(
             500,
             0x10E4,
@@ -12610,13 +12611,23 @@ mod tests {
         // window open almost always, so it can no longer tell the two apart, and
         // the pet is the source that was actually observed.
         assert_eq!(
-            packet_damage_source(&uses, &spawns, &no_creatures_seen(), &local_damage_event(3_000, 130, Some(42))),
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(3_000, 130, Some(42))
+            ),
             Some(PacketDamageSource::Pet { pet_id: 42 })
         );
         // With no pet out the window is the only explanation left, and the row
         // falls back to the creature's type since it was never seen.
         assert_eq!(
-            packet_damage_source(&uses, &spawns, &no_creatures_seen(), &local_damage_event(3_000, 130, None)),
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(3_000, 130, None)
+            ),
             Some(PacketDamageSource::Summon {
                 creature: 0x500a,
                 object_id: None,
@@ -12624,7 +12635,12 @@ mod tests {
         );
         // Past the window, with no pet and nothing seen: unattributed.
         assert_eq!(
-            packet_damage_source(&uses, &spawns, &no_creatures_seen(), &local_damage_event(9_000, 130, None)),
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(9_000, 130, None)
+            ),
             None
         );
     }
@@ -12703,12 +12719,22 @@ mod tests {
         let uses = vec![&other, &own];
         let spawns = [(0x4683, Some(999))];
         assert_eq!(
-            packet_damage_source(&uses, &spawns, &no_creatures_seen(), &local_damage_event(1_500, 40, None)),
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(1_500, 40, None)
+            ),
             None,
             "an unrelated activation cannot spawn this item's creature"
         );
         assert_eq!(
-            packet_damage_source(&uses, &spawns, &no_creatures_seen(), &local_damage_event(2_500, 40, None)),
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(2_500, 40, None)
+            ),
             Some(PacketDamageSource::Summon {
                 creature: 0x4683,
                 object_id: None,
@@ -12724,7 +12750,12 @@ mod tests {
         let use_ = ability_use(1_000, 999, Some(2_000));
         let uses = vec![&use_];
         assert_eq!(
-            packet_damage_source(&uses, &[], &no_creatures_seen(), &local_damage_event(1_500, 500, Some(42))),
+            packet_damage_source(
+                &uses,
+                &[],
+                &no_creatures_seen(),
+                &local_damage_event(1_500, 500, Some(42))
+            ),
             None
         );
     }
@@ -12986,7 +13017,10 @@ mod tests {
         let done = t.finalize_fight(fight, 1_000).expect("finalize");
         let me = local_row(&done);
         assert_eq!(me.summons.len(), 1, "one row for the mechanic");
-        assert_eq!(me.summons[0].object_type, 0x0786, "drawn by the type that renders");
+        assert_eq!(
+            me.summons[0].object_type, 0x0786,
+            "drawn by the type that renders"
+        );
         assert_eq!((me.summons[0].damage, me.summons[0].hits), (2_000, 2));
     }
 
@@ -13038,7 +13072,12 @@ mod tests {
         // Back in range but with Savage instead of a damage ability.
         t.on_object_status(
             900,
-            &status_at(900, 1.0, 1.0, vec![stat(StatType::PetFirstAbilityType, 409)]),
+            &status_at(
+                900,
+                1.0,
+                1.0,
+                vec![stat(StatType::PetFirstAbilityType, 409)],
+            ),
             20,
         );
         assert_eq!(t.damage_capable_pet_near_local(), None);
@@ -13123,7 +13162,10 @@ mod tests {
         let me = local_row(&done);
         let row = me.summons.first().expect("a pet row");
         assert!(row.is_pet);
-        assert_eq!(row.pet_type, 12_345, "the cache's skin, not the wire's type");
+        assert_eq!(
+            row.pet_type, 12_345,
+            "the cache's skin, not the wire's type"
+        );
     }
 
     fn ability_use_with(time_ms: i64, item_id: i32, enchants: &[u16]) -> LocalAbilityUse {
@@ -13167,7 +13209,10 @@ mod tests {
         );
         // Past the bear's own declared 10s lifetime, that activation can no longer
         // explain the creature, and two candidates means nothing is claimed.
-        assert_eq!(pick_summon_source(&candidates, &uses, &enchants, 20_000), None);
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 20_000),
+            None
+        );
     }
 
     #[test]
@@ -13239,7 +13284,10 @@ mod tests {
                 lifetime_ms: 10_000,
             },
         ];
-        assert_eq!(pick_summon_source(&twin, &uses, &no_enchants(), 20_000), None);
+        assert_eq!(
+            pick_summon_source(&twin, &uses, &no_enchants(), 20_000),
+            None
+        );
     }
 
     #[test]

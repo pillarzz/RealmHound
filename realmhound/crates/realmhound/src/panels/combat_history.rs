@@ -4033,14 +4033,16 @@ impl CombatHistoryPanel {
         self.render_ability_section(ui, ctx, fight);
 
         ui.add_space(10.0);
-        section_header(ui, "Pets and summons").hover_tip(
-            "Pet and summon hits are credited to you by the game. They are listed here so the \
-             split is visible, and they are excluded from your weapon and ability damage.",
+        section_header(ui, "Pets, Summons and other sources").hover_tip(
+            "Pet and summon hits are credited to you by the game, and so is damage from a \
+             dungeon mechanic that strikes the boss for you -- a Parasite Chambers barrel \
+             pushed into it, a Galleon cannonball. They are listed here so the split is \
+             visible, and they are excluded from your weapon and ability damage.",
         );
         ui.add_space(4.0);
         if local.summons.is_empty() {
             ui.label(
-                RichText::new("No pet or summon hits were recorded in this fight.")
+                RichText::new("No pet, summon or other source hits were recorded in this fight.")
                     .color(Color32::GRAY),
             );
         } else {

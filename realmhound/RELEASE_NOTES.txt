@@ -4,6 +4,7 @@
 - Your own weapon damage in a fight now includes your Class Mastery and the seasonal Crucible / Blood Ritual damage bonuses, so a fight you solo no longer under-reports the damage you did.
 - Pet and summon damage the game credits to you is now split out in My Performance: a pet's hits appear on the pet's own row, and damage from a creature an ability spawns (a Flowering Kimono's spirits, a Summoner mace's bear) appears on that creature's row with its sprite and the item it came from, instead of being left unattributed.
 - In a group fight, a teammate's pet standing beside you no longer claims your damage as its own; only a pet of your own can be credited with what the server reports to you.
+- Damage a dungeon mechanic deals to the boss for you is now listed: barrels pushed into a Parasite Chambers boss (or the Galleon's cannonballs) appear in "Pets, Summons and other sources" with the object's own name and sprite, instead of going unlisted.
 - Fixed the theoretical pet DPS readout: Savage was credited damage it does not deal, and the close / mid / far attack abilities were attributed to the wrong ones.
 - Fixed some bosses sometimes incorrectly marked as Escaped when they were actually completed.
 - Fight cards completed by a loot update now update in place instead of showing as Escaped until a reload.

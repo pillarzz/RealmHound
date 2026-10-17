@@ -170,6 +170,13 @@ const SUMMON_ATTACK_MAX_DIST: f32 = 5.0;
 /// How long a tracked summoned creature stays a candidate with no further sight
 /// of it. Bounds the map when a removal packet never arrives.
 const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;
+/// How close in time an object's removal has to be to a packet for it to be the
+/// packet's source. Measured: same tick, so one tick of slack either way.
+const MECHANIC_REMOVAL_WINDOW_MS: i64 = 250;
+/// How close an object has to leave the world, relative to the hit's target, to be
+/// that hit's source. A pushed barrel explodes at the boss; anything vanishing on
+/// the far side of the instance is not this packet's source.
+const MECHANIC_REMOVAL_MAX_DIST: f32 = 10.0;
 /// Source label for a transition the character cache reported directly rather
 /// than a numeric stat the wire moved: a Blood Ritual or Crucible switch. Only
 /// these are seeded into a fight's windows when they were already active before
@@ -899,6 +906,23 @@ struct LocalSummonEntity {
 /// One packet-borne damage event the server credited to the local player. Only
 /// such damage is on the wire; the rest of the local player's damage is
 /// reconstructed from their own shot packets and has no server-side event.
+/// An object that left the world, with where it was last seen and when.
+///
+/// A hit the engine cannot explain any other way is credited to the one that
+/// vanished as it landed: several dungeons damage the boss *for* the player through
+/// an object -- Parasite Chambers' barrels, the Galleon's cannonballs -- and the
+/// server credits the player who last touched it. Nothing else on the wire names
+/// the source, but the removal is tick-aligned with the packet (measured on a solo
+/// Nightmare Colony killed with barrels alone: all 105 hits coincided with an
+/// `Explosive Barrel` removal).
+#[derive(Debug, Clone, Copy)]
+struct LocalObjectRemoval {
+    time_ms: i64,
+    object_type: i32,
+    x: f32,
+    y: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LocalDamageEvent {
     time_ms: i64,
@@ -912,6 +936,11 @@ struct LocalDamageEvent {
     /// of this packet's target when it landed, as `(object id, object type)`.
     /// Seen in the world rather than inferred, so it outranks the timing window.
     summon: Option<(i32, i32)>,
+    /// The object type of something that left the world near the target as this
+    /// landed: the source of a mechanic that damages the boss for the player (see
+    /// [`LocalObjectRemoval`]). Last resort, only when nothing the player fired
+    /// explains the packet.
+    removal: Option<i32>,
 }
 /// One landed hit from a volley the server fired for the local player. The
 /// `ServerPlayerShoot` packet names the item that fired the bullet, so the hit
@@ -1269,6 +1298,10 @@ pub struct CombatTracker {
     /// The live character's Blood Ritual, Crucible and pet, pushed by the
     /// processor from the character cache (see [`LocalSnapshot`]).
     local_snapshot: LocalSnapshot,
+    /// Objects that left the world recently, so a packet nothing else explains can
+    /// be credited to the one that vanished as it landed (see
+    /// [`LocalObjectRemoval`]).
+    object_removals: VecDeque<LocalObjectRemoval>,
     /// Rolling log of the local player's ability activations (absolute time),
     /// likewise sliced per fight at finalize.
     local_ability_uses: VecDeque<LocalAbilityUse>,
@@ -1419,6 +1452,7 @@ impl CombatTracker {
             local_summons: HashMap::new(),
             local_stat_changes: VecDeque::new(),
             local_snapshot: LocalSnapshot::default(),
+            object_removals: VecDeque::new(),
             local_ability_uses: VecDeque::new(),
             local_damage_events: VecDeque::new(),
             local_volley_hits: VecDeque::new(),
@@ -2386,6 +2420,31 @@ impl CombatTracker {
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
+        // Remember what left the world: a hit nothing else explains is credited to
+        // the object that vanished as it landed (see [`LocalObjectRemoval`]). Bosses,
+        // pets and players are excluded -- their removals mean something else, and a
+        // boss's own death coincides with the fight's last hits.
+        if let Some(obj) = &last {
+            if !obj.is_pet
+                && !self.fights.contains_key(&object_id)
+                && crate::assets::aux_target_for_type(obj.object_type).is_none()
+                && !class_ids::is_player_class(obj.object_type)
+            {
+                self.object_removals.push_back(LocalObjectRemoval {
+                    time_ms,
+                    object_type: obj.object_type,
+                    x: obj.last_x,
+                    y: obj.last_y,
+                });
+                while self
+                    .object_removals
+                    .front()
+                    .is_some_and(|r| time_ms - r.time_ms > 2_000)
+                {
+                    self.object_removals.pop_front();
+                }
+            }
+        }
         // The Shatters' Stone Idol needs no removal handling: it patrols, chases
         // and wanders out of view in a regular run just as it does in hard mode,
         // so a removal -- however close to the local player it happens -- proves
@@ -2676,6 +2735,7 @@ impl CombatTracker {
                 damage: amount,
                 pet_id: self.damage_capable_pet_near_local(),
                 summon: self.local_summon_attacking(target_id, time_ms),
+                removal: self.object_removal_near(target_id, time_ms),
             });
         } else {
             let bucket = accum
@@ -2949,6 +3009,37 @@ impl CombatTracker {
             });
         }
         out
+    }
+
+    /// The object that vanished as a hit landed, if one did -- the source of a
+    /// mechanic that damages the boss *for* the player (a barrel pushed into it, a
+    /// cannonball fired at it).
+    ///
+    /// Both sides of this were measured on a solo Nightmare Colony killed with
+    /// barrels alone: all 105 hits the server credited to the player coincided with
+    /// an `Explosive Barrel` removal, in the same tick, with no shot, activation or
+    /// creature of theirs behind the packet. The removal is therefore what names
+    /// those packets, and it is only consulted when nothing the player fired
+    /// explains one.
+    fn object_removal_near(&self, target_id: i32, time_ms: i64) -> Option<i32> {
+        let target = self.objects.get(&target_id)?;
+        let (tx, ty) = (target.last_x, target.last_y);
+        let mut best: Option<(i64, i32)> = None;
+        for removal in &self.object_removals {
+            let dt = (removal.time_ms - time_ms).abs();
+            if dt > MECHANIC_REMOVAL_WINDOW_MS {
+                continue;
+            }
+            let dx = removal.x - tx;
+            let dy = removal.y - ty;
+            if (dx * dx + dy * dy).sqrt() > MECHANIC_REMOVAL_MAX_DIST {
+                continue;
+            }
+            if best.map_or(true, |(bd, _)| dt < bd) {
+                best = Some((dt, removal.object_type));
+            }
+        }
+        best.map(|(_, object_type)| object_type)
     }
 
     /// Whether the engine knows `shooter_id` as a creature of the local player's: a
@@ -5116,7 +5207,11 @@ impl CombatTracker {
             .filter(|u| u.time_ms >= started_at && u.time_ms <= ended_at)
             .collect();
         let summons = self.activation_spawned_summons_of_local_loadout();
-        if summons.is_empty() && events.iter().all(|e| e.pet_id.is_none()) {
+        if summons.is_empty()
+            && events
+                .iter()
+                .all(|e| e.pet_id.is_none() && e.removal.is_none())
+        {
             return;
         }
         // Creatures seen in the world during this fight, which outrank timing when
@@ -5132,8 +5227,21 @@ impl CombatTracker {
             return;
         };
         for event in events {
-            let Some(source) = packet_damage_source(&uses, &summons, &seen_creatures, &event) else {
-                continue;
+            let source = match packet_damage_source(&uses, &summons, &seen_creatures, &event) {
+                Some(source) => source,
+                // Nothing the player fired explains this packet. An object that left
+                // the world as it landed does: a mechanic that damages the boss for
+                // the player (see `object_removal_near`). Its row is drawn from the
+                // object's own type, so it reads and sprites as what it is. A packet
+                // carrying no damage names nothing -- it would only add empty rows for
+                // whatever else happened to despawn at that tick.
+                None => match event.removal.filter(|_| event.damage > 0) {
+                    Some(creature) => PacketDamageSource::Summon {
+                        creature,
+                        object_id: None,
+                    },
+                    None => continue,
+                },
             };
             // A creature the packet never names is keyed by the negative of its
             // object type, which no live object id can collide with; the type
@@ -12375,6 +12483,7 @@ mod tests {
             damage,
             pet_id,
             summon: None,
+            removal: None,
         }
     }
 
@@ -12389,6 +12498,7 @@ mod tests {
             damage,
             pet_id,
             summon: Some(summon),
+            removal: None,
         }
     }
 
@@ -12778,6 +12888,42 @@ mod tests {
         );
         assert_eq!((accum.summon_damage, accum.summon_hits), (0, 0));
         assert_eq!(accum.hits, 1, "it stays a hit of theirs");
+    }
+
+    #[test]
+    fn an_unexplained_packet_is_credited_to_the_object_that_vanished() {
+        // A barrel pushed into the boss: the server credits the player, and the only
+        // thing on the wire that names the source is the barrel leaving the world as
+        // the hit lands (measured on a barrel-only Nightmare Colony: 105 of 105 hits,
+        // same tick).
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(700, 0x0786, &status_at(700, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(700, 1_000);
+        t.on_damage(500, 1000, 1_006, 1_000);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        let row = me.summons.first().expect("a row for the barrel");
+        assert!(!row.is_pet);
+        assert_eq!(row.object_type, 0x0786, "named and drawn as the barrel");
+        assert_eq!((row.damage, row.hits), (1_006, 1));
+        assert_eq!((me.packet_damage, me.packet_hits), (1_006, 1));
+    }
+
+    #[test]
+    fn a_removal_away_from_the_hit_explains_nothing() {
+        // The correlation is place-bound as well as tick-bound: an object leaving the
+        // world elsewhere is not this packet's source, and the damage stays
+        // unattributed rather than being credited to a bystander.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(700, 0x0786, &status_at(700, 60.0, 60.0, vec![]), 0);
+        t.on_object_removed(700, 1_000);
+        t.on_damage(500, 1000, 1_006, 1_000);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert!(me.summons.is_empty(), "nothing explains this hit");
+        assert_eq!((me.packet_damage, me.packet_hits), (1_006, 1));
     }
 
     #[test]

@@ -125,6 +125,13 @@ fn main() {
                     } else {
                         m.display_name.clone()
                     };
+                    // `fp` is the map seed the damage model's RNG runs on, so it has
+                    // to survive into the capture for the replay to match the live
+                    // fight.
+                    println!(
+                        "map change: {name} (fp={}, {}x{}, clock={clock})",
+                        m.fp, m.width, m.height
+                    );
                     finished.extend(tracker.on_map_change(&name, m.fp, clock));
                 }
                 Some(ParsedPacket::CreateSuccess(c)) => {

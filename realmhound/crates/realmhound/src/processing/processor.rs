@@ -1546,14 +1546,13 @@ impl PacketProcessor {
                 for packet in packets {
                     // Parse packet for processing
                     let parsed = parse_packet_for_processing(&packet);
-                    // `Hello` carries the session ticket and `Reconnect` carries the
-                    // next one. Captures get shared for debugging, and the packet
-                    // cipher is keyed by the tick rather than by a secret, so neither
-                    // frame is written (see `CaptureWriter::discard_pending`).
-                    if matches!(
-                        parsed.as_ref(),
-                        Some(ParsedPacket::Hello(_) | ParsedPacket::Reconnect(_))
-                    ) {
+                    // The client's `Hello` carries `access_token` (the session
+                    // ticket) plus the platform and client tokens. Captures get
+                    // shared for debugging and the packet cipher is keyed by the
+                    // tick rather than by a secret, so that frame is dropped rather
+                    // than written. The server's `Reconnect` and `Hello` reply carry
+                    // the map key and the map id, not the ticket, so they are kept.
+                    if !packet.incoming && matches!(parsed.as_ref(), Some(ParsedPacket::Hello(_))) {
                         if let Some(rec) = self.recorder.as_mut() {
                             rec.discard_pending_flow(&raw_packet);
                         }

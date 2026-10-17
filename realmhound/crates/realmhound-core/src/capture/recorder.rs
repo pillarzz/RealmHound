@@ -84,16 +84,19 @@ impl CaptureWriter {
 
     /// Drop the held frames that belong to the same TCP flow as `handshake`.
     ///
-    /// `Hello` (74) carries the session ticket in its `access_token`, and `Reconnect`
-    /// carries the next one. Captures get shared for debugging, and the packet cipher
-    /// is keyed by the packet tick rather than by a secret, so a ticket inside a
-    /// capture is readable by anyone holding the file -- these frames never reach the
-    /// disk.
+    /// The client's `Hello` (74) carries the session ticket in its `access_token`.
+    /// Captures get shared for debugging, and the packet cipher is keyed by the packet
+    /// tick rather than by a secret, so a ticket inside a capture is readable by anyone
+    /// holding the file -- these frames never reach the disk.
     ///
-    /// Every held frame of that flow goes, not only the one that completed
-    /// reassembly, because the handshake bytes may be split across TCP segments.
-    /// Frames of other flows are kept: dropping them would leave a hole in a stream
-    /// that has nothing to do with the credentials.
+    /// Every held frame of that flow *and direction* goes, not only the one that
+    /// completed reassembly, because the handshake bytes may be split across TCP
+    /// segments. Two kinds of frame are deliberately kept:
+    /// - anything the server sent on that connection (its `Hello` reply, and the
+    ///   `MapInfo` whose `fp` seeds the damage model): the ticket only travels
+    ///   client to server, so those carry nothing worth hiding;
+    /// - frames of other connections: dropping them would leave a hole in a stream
+    ///   that has nothing to do with the credentials.
     pub fn discard_pending_flow(&mut self, handshake: &RawPacket) {
         let Some((src_ip, src_port, dst_ip, dst_port)) = endpoints(handshake) else {
             self.pending.clear();
@@ -102,7 +105,6 @@ impl CaptureWriter {
         self.pending.retain(|packet| match endpoints(packet) {
             Some((sip, sport, dip, dport)) => {
                 !(sip == src_ip && sport == src_port && dip == dst_ip && dport == dst_port)
-                    && !(sip == dst_ip && sport == dst_port && dip == src_ip && dport == src_port)
             }
             // Unparsable now, parsable later: keep it rather than guess.
             None => true,
@@ -239,6 +241,24 @@ mod tests {
         }
     }
 
+    /// The server's side of the same connection: `2050 -> port`.
+    fn reply(port: u16, payload: &[u8]) -> RawPacket {
+        let mut data = Vec::new();
+        etherparse::PacketBuilder::ipv4([198, 51, 100, 2], [192, 0, 2, 1], 64)
+            .tcp(2050, port, 32768, 1)
+            .ack(1)
+            .psh()
+            .write(&mut data, payload)
+            .unwrap();
+        RawPacket {
+            timestamp: Utc::now(),
+            packet_format: PacketFormat::RawIp,
+            #[cfg(feature = "latency-diagnostics")]
+            enqueued_at: None,
+            data,
+        }
+    }
+
     #[test]
     fn a_discarded_frame_never_reaches_the_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -249,19 +269,22 @@ mod tests {
             w.write(&hello).unwrap();
             w.write(&frame(45678, &[2])).unwrap(); // held
             w.write(&frame(45678, &[3])).unwrap(); // held
-            w.write(&frame(45679, &[9])).unwrap(); // held, other flow
+            w.write(&reply(45678, &[9])).unwrap(); // held, server -> client
                                                    // The caller decided the frame was a handshake after parsing it: it takes
-                                                   // out every held frame of that flow, and leaves the other flow alone.
+                                                   // out every held frame sent on that connection in that direction, and
+                                                   // leaves the server's frames (MapInfo among them) alone.
             w.discard_pending_flow(&hello);
             assert_eq!(w.count(), 0);
             w.write(&frame(45678, &[4])).unwrap();
+            w.write(&frame(45679, &[8])).unwrap(); // other connection
             w.flush().unwrap();
-            assert_eq!(w.count(), 2);
+            assert_eq!(w.count(), 3);
         }
         let read = read_capture(&path).unwrap();
-        assert_eq!(read.len(), 2);
-        assert_eq!(endpoints(&read[0]).map(|e| e.1), Some(45679));
-        assert_eq!(endpoints(&read[1]).map(|e| e.1), Some(45678));
+        assert_eq!(read.len(), 3);
+        assert_eq!(endpoints(&read[0]).map(|e| e.1), Some(2050)); // the server's frame
+        assert_eq!(endpoints(&read[1]).map(|e| e.1), Some(45678)); // after the Hello
+        assert_eq!(endpoints(&read[2]).map(|e| e.1), Some(45679)); // other connection
     }
 
     #[test]

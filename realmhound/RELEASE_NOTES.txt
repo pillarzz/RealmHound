@@ -33,7 +33,7 @@
 - New OWNED pill on item tooltips for blueprints, character skins, emotes and pet skins.
 
 # Fixes
-- Packet captures (`.rhcap`) no longer record the connection handshake: the `Hello` and `Reconnect` frames carry your session ticket, and a capture is readable by anyone holding the file, so both are dropped before they reach the disk.
+- Packet captures (`.rhcap`) no longer record the client's `Hello` frame: it carries your session ticket, and a capture is readable by anyone holding the file, so it is dropped before it reaches the disk. The server's frames are kept, so a capture still replays.
 - Fixed gift-chest live updates in the Vault.
 - The Season 31 shinies are wired into their dungeon collections.
 - Weapon fire-rate enchantments now count toward the theoretical DPS readout.

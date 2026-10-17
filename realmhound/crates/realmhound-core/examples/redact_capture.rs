@@ -1,21 +1,28 @@
-//! Strip the connection handshake out of `.rhcap` captures.
+//! Strip the session ticket out of old `.rhcap` captures.
 //!
-//! `Hello` (74) carries the session ticket in its `access_token`, and `Reconnect`
-//! carries the next one. The packet cipher is keyed by the packet tick rather than
-//! by a secret, so a ticket inside a capture is readable by anyone holding the file.
-//! The recorder drops both frames before they reach the disk nowadays; this rewrites
-//! captures recorded before that fix so they can still be shared for debugging.
+//! The client's `Hello` (74) carries the ticket in its `access_token`. The packet
+//! cipher is keyed by the packet tick rather than by a secret, so a ticket inside a
+//! capture is readable by anyone holding the file. The recorder drops that frame
+//! before it reaches the disk nowadays; this rewrites captures recorded before that
+//! fix so they can still be shared for debugging.
+//!
+//! Only frames the client sent are candidates: the server's `Hello` reply and its
+//! `Reconnect` carry the map key and map id, and the `MapInfo` frames that follow
+//! carry the map seed all the damage and replay maths is built on, so none of them
+//! are touched.
 //!
 //! The frames are located by replaying the capture through the exact TCP reassembler
 //! and parser used live, so this sees the same packets the recorder does. A hit drops
-//! the frame that completed the handshake plus the three before it, because a
-//! handshake can span TCP segments and only the assembled packet identifies it.
+//! the frame that completed the handshake plus the three before it *on the same
+//! connection and direction*, because a handshake can span TCP segments and only the
+//! assembled packet identifies it.
 //!
 //! Usage:
 //!   cargo run -p realmhound-core --example redact_capture -- <file-or-dir> [--dry-run]
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use realmhound_core::capture::{read_capture, CaptureWriter, RawPacket};
@@ -25,8 +32,21 @@ use realmhound_core::stream::{parse_tcp_segment, TcpReassembler};
 /// Frames to drop *before* a handshake frame, so a split handshake is covered.
 const LOOKBACK_FRAMES: usize = 3;
 
-/// Indexes of the frames that carry a `Hello` or `Reconnect`.
-fn handshake_frames(raw: &[RawPacket]) -> Vec<usize> {
+/// `(src_ip, src_port, dst_ip, dst_port)`: a connection and which way it is going.
+type Direction = (Ipv4Addr, u16, Ipv4Addr, u16);
+
+fn direction(packet: &RawPacket) -> Option<Direction> {
+    let segment = parse_tcp_segment(packet)?;
+    Some((
+        segment.src_ip,
+        segment.src_port,
+        segment.dst_ip,
+        segment.dst_port,
+    ))
+}
+
+/// `(frame index, direction)` of each frame carrying a client `Hello`.
+fn handshake_frames(raw: &[RawPacket]) -> Vec<(usize, Direction)> {
     let mut reassembler = TcpReassembler::new();
     let mut hits = Vec::new();
     for (index, rp) in raw.iter().enumerate() {
@@ -34,11 +54,16 @@ fn handshake_frames(raw: &[RawPacket]) -> Vec<usize> {
             continue;
         };
         for packet in reassembler.process_segment(&segment) {
+            if packet.incoming {
+                continue;
+            }
             if matches!(
                 parse_packet(packet.packet_type(), &packet.payload),
-                Some(ParsedPacket::Hello(_) | ParsedPacket::Reconnect(_))
+                Some(ParsedPacket::Hello(_))
             ) {
-                hits.push(index);
+                if let Some(direction) = direction(rp) {
+                    hits.push((index, direction));
+                }
             }
         }
     }
@@ -105,9 +130,13 @@ fn redact(path: &Path, dry_run: bool) -> Outcome {
     // "handshakes" that are really packets decoded against the wrong tick -- chasing
     // those would eat session data.
     let mut drop: BTreeSet<usize> = BTreeSet::new();
-    for hit in hits {
-        for index in hit.saturating_sub(LOOKBACK_FRAMES)..=hit {
-            drop.insert(index);
+    for (hit, hit_direction) in &hits {
+        for index in hit.saturating_sub(LOOKBACK_FRAMES)..=*hit {
+            // Only the client's own direction: the server's frames on the same
+            // connection carry the map key, the map id and the map seed.
+            if direction(&frames[index]).as_ref() == Some(hit_direction) {
+                drop.insert(index);
+            }
         }
     }
     let before = frames.len();

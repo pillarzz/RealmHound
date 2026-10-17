@@ -161,7 +161,7 @@ fn redact(path: &Path, dry_run: bool) -> Outcome {
                 break;
             }
         }
-        if let Err(e) = writer.flush() {
+        if let Err(e) = writer.flush_buffered() {
             error = Some(format!("flush: {e}"));
         }
         match error {

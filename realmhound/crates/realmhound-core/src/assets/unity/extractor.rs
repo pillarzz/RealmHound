@@ -237,6 +237,11 @@ impl Default for UnityExtractor {
 pub fn find_resources_assets() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
+    #[cfg(target_os = "linux")]
+    {
+        candidates.extend(super::steam::discover_resources_assets());
+    }
+
     #[cfg(target_os = "windows")]
     {
         // New location: AppData\Local (game moved here in a recent update)

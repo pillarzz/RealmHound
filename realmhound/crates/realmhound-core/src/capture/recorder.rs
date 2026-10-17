@@ -114,6 +114,8 @@ pub fn read_capture(path: &Path) -> io::Result<Vec<RawPacket>> {
                 1 => PacketFormat::RawIp,
                 2 => PacketFormat::Loopback,
                 3 => PacketFormat::LoopbackNetwork,
+                4 => PacketFormat::LinuxSll,
+                5 => PacketFormat::LinuxSll2,
                 value => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -179,6 +181,20 @@ mod tests {
                 #[cfg(feature = "latency-diagnostics")]
                 enqueued_at: None,
                 data: vec![0; 40],
+            },
+            RawPacket {
+                timestamp: Utc::now(),
+                packet_format: PacketFormat::LinuxSll,
+                #[cfg(feature = "latency-diagnostics")]
+                enqueued_at: None,
+                data: vec![0; 16],
+            },
+            RawPacket {
+                timestamp: Utc::now(),
+                packet_format: PacketFormat::LinuxSll2,
+                #[cfg(feature = "latency-diagnostics")]
+                enqueued_at: None,
+                data: vec![0; 20],
             },
         ];
 

@@ -5,6 +5,8 @@
 
 pub mod error;
 pub mod interface;
+#[cfg(target_os = "linux")]
+pub mod linux_helper;
 pub mod recorder;
 pub mod sniffer;
 

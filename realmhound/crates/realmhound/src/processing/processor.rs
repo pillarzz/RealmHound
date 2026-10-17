@@ -3130,7 +3130,16 @@ impl PacketProcessor {
 /// Parse a captured packet into a typed `ParsedPacket`, logging unparsed
 /// incoming packets at trace level so nothing is silently dropped.
 fn parse_packet_for_processing(packet: &Packet) -> Option<ParsedPacket> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static UNKNOWN_IDS: AtomicU64 = AtomicU64::new(0);
+    static PARSE_FAILURES: AtomicU64 = AtomicU64::new(0);
     let packet_type = packet.packet_type();
+    if packet_type == realmhound_core::protocol::PacketType::Unknown {
+        let count = UNKNOWN_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count.is_multiple_of(100) {
+            tracing::warn!("Observed {count} framed packets with unknown protocol IDs; the game protocol may have changed");
+        }
+    }
     if packet_type != realmhound_core::protocol::PacketType::Unknown
         && packet.incoming != packet_type.is_incoming()
     {
@@ -3172,13 +3181,10 @@ fn parse_packet_for_processing(packet: &Packet) -> Option<ParsedPacket> {
                 );
             }
             None => {
-                tracing::debug!(
-                    "[PARSE] id={} ({}) parse failed (len={}, consumed={})",
-                    packet.header.raw_id,
-                    packet.type_name(),
-                    packet.payload.len(),
-                    result.bytes_consumed,
-                );
+                let count = PARSE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                if count == 1 || count.is_multiple_of(100) {
+                    tracing::warn!("{count} framed packets could not be decoded; check game/protocol version and capture gaps");
+                }
             }
         }
     }

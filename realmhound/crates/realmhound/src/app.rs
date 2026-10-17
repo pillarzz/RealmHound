@@ -1986,6 +1986,7 @@ impl RealmHoundApp {
         let shadcn = self.shadcn.clone();
         let mut open = self.modals.show_about;
         let mut open_changelog = false;
+        #[cfg_attr(target_os = "linux", allow(unused_mut))]
         let mut open_update_details = false;
 
         egui::Area::new(egui::Id::new("about_dialog_host"))
@@ -2093,112 +2094,127 @@ impl RealmHoundApp {
                         shadcn.separator(ui);
                         ui.add_space(6.0);
 
-                        use realmhound_core::update::UpdateState;
-                        match self.update_checker.state() {
-                            UpdateState::Unknown => {
-                                if shadcn.btn(ui, "Check for Updates").clicked() {
-                                    self.update_checker.force_check();
-                                }
-                            }
-                            UpdateState::Checking => {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("Checking for updates...");
-                                });
-                            }
-                            UpdateState::UpToDate => {
-                                ui.label(
-                                    RichText::new("You're up to date!")
-                                        .color(Color32::from_rgb(100, 200, 100)),
-                                );
-                                ui.add_space(4.0);
-                                if shadcn.btn(ui, "Check again").clicked() {
-                                    self.update_checker.force_check();
-                                }
-                            }
-                            UpdateState::UpdateAvailable {
-                                manifest,
-                                new_releases,
-                            } => {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Update available: v{}",
-                                        manifest.latest_version
-                                    ))
-                                    .color(Color32::from_rgb(255, 200, 100)),
-                                );
-                                ui.add_space(4.0);
-
-                                // Show brief changelog summary
-                                if !new_releases.is_empty() {
-                                    if let Some(latest) = new_releases.first() {
-                                        for change in latest.changes.iter().take(3) {
-                                            ui.label(format!("  • {}", change));
-                                        }
-                                        if latest.changes.len() > 3 || new_releases.len() > 1 {
-                                            if ui.small_button("See all changes...").clicked() {
-                                                open_update_details = true;
-                                            }
-                                        }
+                        #[cfg(target_os = "linux")]
+                        ui.label(
+                            "Linux releases are installed through your package or source build.",
+                        );
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            use realmhound_core::update::UpdateState;
+                            match self.update_checker.state() {
+                                UpdateState::Unknown => {
+                                    if shadcn.btn(ui, "Check for Updates").clicked() {
+                                        self.update_checker.force_check();
                                     }
+                                }
+                                UpdateState::Checking => {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Checking for updates...");
+                                    });
+                                }
+                                UpdateState::UpToDate => {
+                                    ui.label(
+                                        RichText::new("You're up to date!")
+                                            .color(Color32::from_rgb(100, 200, 100)),
+                                    );
                                     ui.add_space(4.0);
+                                    if shadcn.btn(ui, "Check again").clicked() {
+                                        self.update_checker.force_check();
+                                    }
                                 }
+                                UpdateState::UpdateAvailable {
+                                    manifest,
+                                    new_releases,
+                                } => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Update available: v{}",
+                                            manifest.latest_version
+                                        ))
+                                        .color(Color32::from_rgb(255, 200, 100)),
+                                    );
+                                    ui.add_space(4.0);
 
-                                use realmhound_core::update::SelfUpdateState;
-                                match self.self_updater.state() {
-                                    SelfUpdateState::Idle => {
-                                        if shadcn
-                                            .btn(
-                                                ui,
-                                                format!("⬇ Update to v{}", manifest.latest_version),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.self_updater.start_download(
-                                                manifest.artifact_for_this_platform(),
-                                            );
-                                        }
-                                    }
-                                    SelfUpdateState::Downloading(progress) => {
-                                        ui.horizontal(|ui| {
-                                            ui.spinner();
-                                            if let Some(total) = progress.total {
-                                                let pct = (progress.downloaded as f32
-                                                    / total as f32
-                                                    * 100.0)
-                                                    as u32;
-                                                ui.label(format!("Downloading... {}%", pct));
-                                            } else {
-                                                ui.label("Downloading...");
+                                    // Show brief changelog summary
+                                    if !new_releases.is_empty() {
+                                        if let Some(latest) = new_releases.first() {
+                                            for change in latest.changes.iter().take(3) {
+                                                ui.label(format!("  • {}", change));
                                             }
-                                        });
-                                    }
-                                    SelfUpdateState::ReadyToApply => {
-                                        if shadcn.btn(ui, "✓ Restart to apply update").clicked() {
-                                            self.pending_relaunch = Some(RelaunchReason::Updated);
+                                            if latest.changes.len() > 3 || new_releases.len() > 1 {
+                                                if ui.small_button("See all changes...").clicked() {
+                                                    open_update_details = true;
+                                                }
+                                            }
                                         }
+                                        ui.add_space(4.0);
                                     }
-                                    SelfUpdateState::Failed(msg) => {
-                                        ui.label(
-                                            RichText::new(format!("Update failed: {}", msg))
-                                                .color(Color32::from_rgb(200, 100, 100))
-                                                .small(),
-                                        );
-                                        if shadcn.btn(ui, "Retry").clicked() {
-                                            self.self_updater.reset();
+
+                                    use realmhound_core::update::SelfUpdateState;
+                                    match self.self_updater.state() {
+                                        SelfUpdateState::Idle => {
+                                            if shadcn
+                                                .btn(
+                                                    ui,
+                                                    format!(
+                                                        "⬇ Update to v{}",
+                                                        manifest.latest_version
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.self_updater.start_download(
+                                                    manifest.artifact_for_this_platform(),
+                                                );
+                                            }
+                                        }
+                                        SelfUpdateState::Downloading(progress) => {
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                if let Some(total) = progress.total {
+                                                    let pct = (progress.downloaded as f32
+                                                        / total as f32
+                                                        * 100.0)
+                                                        as u32;
+                                                    ui.label(format!("Downloading... {}%", pct));
+                                                } else {
+                                                    ui.label("Downloading...");
+                                                }
+                                            });
+                                        }
+                                        SelfUpdateState::ReadyToApply => {
+                                            if shadcn.btn(ui, "✓ Restart to apply update").clicked()
+                                            {
+                                                self.pending_relaunch =
+                                                    Some(RelaunchReason::Updated);
+                                            }
+                                        }
+                                        SelfUpdateState::Failed(msg) => {
+                                            ui.label(
+                                                RichText::new(format!("Update failed: {}", msg))
+                                                    .color(Color32::from_rgb(200, 100, 100))
+                                                    .small(),
+                                            );
+                                            if shadcn.btn(ui, "Retry").clicked() {
+                                                self.self_updater.reset();
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            UpdateState::Error(err) => {
-                                ui.label(
-                                    RichText::new(format!("Update check failed: {}", err.message))
+                                UpdateState::Error(err) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Update check failed: {}",
+                                            err.message
+                                        ))
                                         .color(Color32::from_rgb(200, 150, 100))
                                         .small(),
-                                );
-                                ui.add_space(4.0);
-                                if shadcn.btn(ui, "Retry").clicked() {
-                                    self.update_checker.force_check();
+                                    );
+                                    ui.add_space(4.0);
+                                    if shadcn.btn(ui, "Retry").clicked() {
+                                        self.update_checker.force_check();
+                                    }
                                 }
                             }
                         }
@@ -9437,6 +9453,27 @@ impl RealmHoundApp {
 
     /// Render the status bar.
     fn render_status_bar(&self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(error) = self.capture.last_error() {
+                ui.colored_label(egui::Color32::RED, format!("Capture error: {error}"));
+                ui.separator();
+            } else if self.capture.is_capturing() {
+                let count = self.capture.packet_count();
+                let message = if !crate::linux_status::game_process_present() {
+                    "Game not running".to_string()
+                } else if count == 0 {
+                    "Game running; waiting for port 2050 traffic".to_string()
+                } else {
+                    format!("Captured {count} packets; connection status at right")
+                };
+                ui.label(message);
+                ui.separator();
+            } else {
+                ui.colored_label(egui::Color32::YELLOW, "Capture stopped; restart RealmHound");
+                ui.separator();
+            }
+        }
         ui.horizontal(|ui| {
             // The party leader crown and party status indicator are part of the
             // moderation tools, so they only appear when those are enabled.
@@ -9623,6 +9660,7 @@ impl eframe::App for RealmHoundApp {
         self.update_window_state(ctx);
 
         // Update checker (runs on startup and every 2 hours)
+        #[cfg(not(target_os = "linux"))]
         self.update_checker.update();
 
         // Clear season/battlepass end dates once their reset instant passes.

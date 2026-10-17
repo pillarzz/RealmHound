@@ -192,6 +192,20 @@ fn is_boss_damaging_mechanic(object_type: i32) -> bool {
             .unwrap_or(false)
 }
 
+/// The object type a mechanic's row is named and drawn by.
+///
+/// The boss room has two barrels and the game gives them different object types
+/// (`0x0786` and `0x0796`); only one of them has a texture in the sprite atlas, so
+/// reporting them as they are showed the same name twice, once without a sprite. They
+/// are one mechanic, so they are one row -- count and total damage together, drawn by
+/// the type that renders.
+fn mechanic_row_type(object_type: i32) -> i32 {
+    match object_type {
+        0x0796 => 0x0786,
+        other => other,
+    }
+}
+
 /// How close in time an object's removal has to be to a packet for it to be the
 /// packet's source. Measured at the same tick on a barrel-only capture; the window is
 /// wider than one tick because a live tick can straddle the two packets.
@@ -2458,7 +2472,7 @@ impl CombatTracker {
             {
                 self.object_removals.push_back(LocalObjectRemoval {
                     time_ms,
-                    object_type: obj.object_type,
+                    object_type: mechanic_row_type(obj.object_type),
                     x: obj.last_x,
                     y: obj.last_y,
                 });
@@ -12954,6 +12968,26 @@ mod tests {
         let me = local_row(&done);
         assert!(me.summons.is_empty(), "a wall piece explains nothing");
         assert_eq!((me.packet_damage, me.packet_hits), (1_006, 1));
+    }
+
+    #[test]
+    fn both_barrel_types_report_as_the_one_that_draws() {
+        // The room has two barrels and the game gives them different object types;
+        // only one has a texture in the atlas, so reporting them separately showed the
+        // same name twice, once without a sprite. One mechanic, one row.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(700, 0x0786, &status_at(700, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(700, 500);
+        t.on_damage(500, 1000, 1_100, 500);
+        t.on_object_spawn(701, 0x0796, &status_at(701, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(701, 700);
+        t.on_damage(500, 1000, 900, 700);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!(me.summons.len(), 1, "one row for the mechanic");
+        assert_eq!(me.summons[0].object_type, 0x0786, "drawn by the type that renders");
+        assert_eq!((me.summons[0].damage, me.summons[0].hits), (2_000, 2));
     }
 
     #[test]

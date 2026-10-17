@@ -590,9 +590,9 @@ pub fn custom_sounds_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("RealmHound").join("sounds").join("custom"))
 }
 
-/// Maximum custom sound file size (2 MB). Prevents large files from causing
+/// Maximum custom sound file size (15 MiB). Prevents large files from causing
 /// allocation issues on every play.
-pub const MAX_CUSTOM_SOUND_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_CUSTOM_SOUND_BYTES: u64 = 15 * 1024 * 1024;
 
 /// Resolve the full path for a custom sound file (if configured and file exists).
 pub fn resolve_custom_sound(settings: &SoundSettings, sound: SoundType) -> Option<PathBuf> {

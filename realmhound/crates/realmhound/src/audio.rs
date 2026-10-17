@@ -262,8 +262,8 @@ fn run(
 
     // Last time each resolved sound type was played, for coalescing.
     let mut last_played: HashMap<SoundType, Instant> = HashMap::new();
-    // Last time each realm-event custom key played, for coalescing.
-    let mut last_event: HashMap<String, Instant> = HashMap::new();
+    // Discovered instances coalesce independently while sharing a sound file.
+    let mut last_event: HashMap<(String, Option<i32>), Instant> = HashMap::new();
     #[cfg(feature = "latency-diagnostics")]
     let mut stale_drops = StaleDropDiagnostics::default();
     #[cfg(feature = "latency-diagnostics")]
@@ -374,11 +374,11 @@ fn run(
             AudioCommand::PlayEvent {
                 sound,
                 custom_key,
+                instance_id,
                 volume,
             } => {
                 // Resolve the per-boss custom override and current master, then
-                // play at the per-event volume scaled by master. Coalesced on
-                // the custom key so repeated identical calls don't stack.
+                // play at the per-event volume scaled by master.
                 let (master, custom_path) = settings
                     .read()
                     .map(|s| {
@@ -389,13 +389,13 @@ fn run(
                     })
                     .unwrap_or((1.0, None));
                 let now = Instant::now();
-                if let Some(prev) = last_event.get(&custom_key) {
-                    if now.duration_since(*prev) < COALESCE_WINDOW {
-                        tracing::trace!("[AUDIO] coalescing duplicate event {}", custom_key);
-                        continue;
-                    }
+                let key = (custom_key, instance_id);
+                last_event.retain(|_, at| now.duration_since(*at) < COALESCE_WINDOW);
+                if last_event.contains_key(&key) {
+                    tracing::trace!("[AUDIO] coalescing duplicate event {}", key.0);
+                    continue;
                 }
-                last_event.insert(custom_key, now);
+                last_event.insert(key, now);
                 engine.play_at(
                     sound,
                     custom_path,
@@ -481,6 +481,7 @@ mod tests {
             cmd: AudioCommand::PlayEvent {
                 sound: crate::sound::EventSound::Veteran,
                 custom_key: "private-custom-key".to_string(),
+                instance_id: None,
                 volume: 1.0,
             },
             sent: SystemTime::now(),

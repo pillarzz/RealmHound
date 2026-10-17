@@ -29,6 +29,7 @@ use realmhound_core::{
     GameEvent, GameSession, PacketRouter, RouteResult, Settings,
 };
 
+use super::realm_discovery::RealmDiscovery;
 use crate::panels::chat::{ChatMessage, ChatType};
 use crate::processing::mission_tracker::{MissionTracker, MissionView};
 use crate::sound::SoundType;
@@ -357,6 +358,7 @@ pub struct PacketProcessor {
     /// the latch (no duplicate tower notification), while entering a different
     /// realm re-arms it.
     keyper_realm: Option<String>,
+    realm_discovery: RealmDiscovery,
 
     /// Events buffered while the current connection is a tentative (unverified)
     /// main and a saved main account already exists. RotMG opens a fresh socket
@@ -506,6 +508,7 @@ impl PacketProcessor {
             realm_entered_at: None,
             keyper_towers_announced: false,
             keyper_realm: None,
+            realm_discovery: RealmDiscovery::default(),
             pending_events: Vec::new(),
             monument_poppers: [None, None, None],
             mission_tracker: MissionTracker::new(),
@@ -592,6 +595,7 @@ impl PacketProcessor {
             realm_entered_at: None,
             keyper_towers_announced: false,
             keyper_realm: None,
+            realm_discovery: RealmDiscovery::default(),
             pending_events: Vec::new(),
             monument_poppers: [None, None, None],
             mission_tracker: MissionTracker::new(),
@@ -637,6 +641,7 @@ impl PacketProcessor {
             realm_entered_at: None,
             keyper_towers_announced: false,
             keyper_realm: None,
+            realm_discovery: RealmDiscovery::default(),
             pending_events: Vec::new(),
             monument_poppers: [None, None, None],
             mission_tracker: MissionTracker::new(),
@@ -790,9 +795,17 @@ impl PacketProcessor {
 
     /// Reset session + reassembler state for a fresh capture.
     pub fn on_capture_start(&mut self) {
+        let reset = self.realm_discovery.reset(false);
+        self.emit(UiPayload::RealmDiscovery(reset));
         self.session.reset_for_capture();
         self.reassembler.clear();
         self.start_recorder_if_enabled();
+    }
+
+    /// Forget realm instances when capture stops.
+    pub fn on_capture_stop(&mut self) {
+        let reset = self.realm_discovery.reset(false);
+        self.emit(UiPayload::RealmDiscovery(reset));
     }
 
     /// Start a raw-packet recorder when `REALMHOUND_RECORD` is set. The value may
@@ -1475,6 +1488,11 @@ impl PacketProcessor {
     // Pipeline
     // -----------------------------------------------------------------------
 
+    /// Whether lifecycle updates are waiting to be forwarded without packets.
+    pub fn has_pending_updates(&self) -> bool {
+        !self.updates.is_empty()
+    }
+
     /// Process a batch of raw captured packets, returning the ordered updates
     /// the UI should apply.
     pub fn process_available(&mut self, raw_packets: Vec<RawPacket>) -> Vec<UiUpdate> {
@@ -1543,6 +1561,8 @@ impl PacketProcessor {
                         self.combat.on_disconnect(now_ms());
                         self.forward_dungeon_freeze();
                         self.realm_entered_at = None;
+                        let reset = self.realm_discovery.reset(false);
+                        self.emit(UiPayload::RealmDiscovery(reset));
                         self.pending_events.clear();
                         self.pending_credential = None;
                     }
@@ -1848,6 +1868,7 @@ impl PacketProcessor {
             self.emit(UiPayload::Audio(AudioCommand::PlayEvent {
                 sound: crate::enchant_sound::ENCHANT_SOUND,
                 custom_key: trigger.custom_key,
+                instance_id: None,
                 volume: trigger.volume,
             }));
         }
@@ -2131,6 +2152,9 @@ impl PacketProcessor {
         // The App applies this to quest / party / live_feed / vault via their
         // existing `handle_event`. Chat and characters are resolved here.
         self.emit(UiPayload::Broadcast(event.clone()));
+        for update in self.realm_discovery.on_event(&event) {
+            self.emit(UiPayload::RealmDiscovery(update));
+        }
 
         // --- Phase 2: model-side orchestration ---
         match event {
@@ -2563,6 +2587,13 @@ impl PacketProcessor {
                 }
             }
             GameEvent::TextReceived(ref text) => {
+                let is_crystal =
+                    text.recipient.is_empty() && text.name.contains("Mysterious Crystal");
+                if is_crystal {
+                    if let Some(update) = self.realm_discovery.crystal_message(text.object_id) {
+                        self.emit(UiPayload::RealmDiscovery(update));
+                    }
+                }
                 // Detect realm-close / lag-warning before from_text_packet filters them out.
                 if text.name.contains("Oryx the Mad God") {
                     let raw = &text.text;
@@ -2646,7 +2677,7 @@ impl PacketProcessor {
                             .realm_entered_at
                             .map(|t| t.elapsed() < REALM_JOIN_SETTLE)
                             .unwrap_or(false);
-                        if !in_join_settle {
+                        if !in_join_settle && !is_crystal {
                             self.emit(UiPayload::BossCall {
                                 boss_id,
                                 text: chat_msg.text.clone(),
@@ -3963,6 +3994,7 @@ mod live_pet_tests {
 mod join_gate_tests {
     use super::{PacketProcessor, REALM_JOIN_SETTLE};
     use crate::processing::contract::UiPayload;
+    use crate::processing::realm_discovery::DiscoveryEvent;
     use realmhound_core::assets::get_asset_manager;
     use realmhound_core::protocol::TextPacket;
     use realmhound_core::vault::AccountData;
@@ -4029,6 +4061,35 @@ mod join_gate_tests {
             processor.realm_entered_at.is_some(),
             "realm entry arms the gate"
         );
+        let crystal = GameEvent::TextReceived(TextPacket {
+            name: "#Mysterious Crystal".to_string(),
+            object_id: 123,
+            num_stars: 0,
+            bubble_time: 3,
+            recipient: String::new(),
+            text: "Help me...".to_string(),
+            clean_text: String::new(),
+            is_supporter: false,
+            star_background: 0,
+        });
+        processor.dispatch_event(crystal.clone());
+        processor.dispatch_event(crystal);
+        let notifications: Vec<bool> = processor
+            .updates
+            .iter()
+            .filter_map(|update| match &update.payload {
+                UiPayload::RealmDiscovery(DiscoveryEvent::CrystalMessage { notify, .. }) => {
+                    Some(*notify)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notifications,
+            vec![true, false],
+            "join-time Crystal discovery is retained and notifies only once"
+        );
+        assert_eq!(boss_calls(&processor), 0);
         processor.dispatch_event(map_changed(0));
         assert!(
             processor.realm_entered_at.is_none(),

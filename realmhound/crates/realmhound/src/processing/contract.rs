@@ -61,6 +61,8 @@ pub enum UiPayload {
     Chat(ChatMessage),
     /// An encounter/boss callout for the live feed.
     BossCall { boss_id: i32, text: String },
+    /// Instance-scoped Crystal/Jailer discovery updates.
+    RealmDiscovery(super::realm_discovery::DiscoveryEvent),
 
     /// A Keyper seasonal-event cue for the live feed. `towers` = true when a
     /// crystal-tower wave appeared, false when The Keyper boss spawned. Carries
@@ -176,6 +178,9 @@ pub enum AudioCommand {
     PlayEvent {
         sound: EventSound,
         custom_key: String,
+        /// Distinguishes discovered objects sharing one configured sound.
+        /// None retains coalescing by the custom-sound key alone.
+        instance_id: Option<i32>,
         volume: f32,
     },
     /// Set the output volume (Session 2 audio thread).

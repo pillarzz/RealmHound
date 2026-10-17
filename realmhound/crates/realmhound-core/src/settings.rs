@@ -1,7 +1,9 @@
 //! User settings persistence.
 //!
 //! This module handles loading and saving user preferences to disk.
-//! Settings are stored in JSON format at `%LOCALAPPDATA%\RealmHound\settings.json`.
+//! Settings are stored as JSON at `settings.json` under the storage root --
+//! `%LOCALAPPDATA%\RealmHound` on Windows, `~/Library/Application
+//! Support/RealmHound` on macOS, `~/.local/share/RealmHound` on Linux.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

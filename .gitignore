@@ -44,4 +44,5 @@ realmhound/crates/realmhound/assets/sounds/events/veteran.mp3
 
 # Scraper cache (large, regeneratable)
 tools/realmeye-scraper/.cache/
+tools/macos/build-universal.sh
 __pycache__/

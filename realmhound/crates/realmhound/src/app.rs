@@ -138,7 +138,23 @@ fn open_in_file_explorer(path: &std::path::Path) {
 }
 
 #[cfg(not(windows))]
-fn open_in_file_explorer(_path: &std::path::Path) {}
+fn open_in_file_explorer(path: &std::path::Path) {
+    // `open` on macOS and `xdg-open` on every other Unix desktop are the
+    // standard "hand this to the user's file manager" entry points, and both
+    // return immediately rather than blocking on the spawned browser.
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
+    if let Err(error) = std::process::Command::new(opener).arg(path).spawn() {
+        tracing::warn!(
+            "[UI] Could not open {} with {opener}: {error}",
+            path.display()
+        );
+    }
+}
 
 /// Roman-numeral label (I-IV) for an enchantment tier number 1-4.
 fn roman_tier(tier: u8) -> &'static str {
@@ -1482,17 +1498,24 @@ impl RealmHoundApp {
     /// Surface a fatal relaunch failure and quit; the worker is already stopped.
     fn abort_relaunch(&self, reason: &str) {
         tracing::error!("[RELAUNCH] aborted: {reason}");
+        let message = format!("Restart failed and RealmHound must close:\n\n{reason}");
         #[cfg(windows)]
         {
             use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
             let title: Vec<u16> = "RealmHound\0".encode_utf16().collect();
-            let msg: Vec<u16> = format!("Restart failed and RealmHound must close:\n\n{reason}\0")
-                .encode_utf16()
-                .collect();
+            let msg: Vec<u16> = format!("{message}\0").encode_utf16().collect();
             unsafe {
                 MessageBoxW(0, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
             }
         }
+        // The window is already gone by this point, so without a dialog the exit
+        // would look like a silent crash.
+        #[cfg(not(windows))]
+        rfd::MessageDialog::new()
+            .set_title("RealmHound")
+            .set_description(&message)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
         std::process::exit(1);
     }
 
@@ -1597,12 +1620,9 @@ impl RealmHoundApp {
             match write {
                 crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
                 crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
-                    // Only drop the callout this panel copied. If the clipboard
-                    // holds anything else, the user copied something in the
-                    // meantime and it stays untouched.
-                    if crate::clipboard::still_holds(&copied) {
-                        ctx.copy_text(String::new());
-                    }
+                    // Checked and cleared in one clipboard session, so anything
+                    // the user copies meanwhile cannot be caught in between.
+                    crate::clipboard::clear_if_ours(&copied);
                 }
             }
         }
@@ -1641,7 +1661,34 @@ impl RealmHoundApp {
             }
             UiPayload::BossCall { boss_id, text } => {
                 let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                self.maybe_play_realm_event(boss_id, &text, should_sound);
+                self.maybe_play_realm_event(boss_id, &text, should_sound, None);
+            }
+            UiPayload::RealmDiscovery(event) => {
+                use crate::processing::realm_discovery::{
+                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE,
+                };
+
+                let notification = match &event {
+                    DiscoveryEvent::Discovered {
+                        object_id,
+                        object_type: JAILER_TYPE,
+                        notify,
+                        ..
+                    } => Some((JAILER_TYPE, "Spectral Jailer", *notify, Some(*object_id))),
+                    DiscoveryEvent::Discovered {
+                        object_type: CRYSTAL_TYPE,
+                        notify,
+                        ..
+                    }
+                    | DiscoveryEvent::CrystalMessage { notify, .. } => {
+                        Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify, None))
+                    }
+                    _ => None,
+                };
+                self.live_feed_panel.apply_realm_discovery(event);
+                if let Some((boss_id, name, notify, instance_id)) = notification {
+                    self.maybe_play_realm_event(boss_id, name, notify, instance_id);
+                }
             }
             UiPayload::KeyperEvent { towers } => {
                 use realmhound_core::keyper::{KEYPER_BOSS_ID, KEYPER_TOWER_SPRITE_ID};
@@ -1656,7 +1703,7 @@ impl RealmHoundApp {
                 let should_sound = self
                     .live_feed_panel
                     .push_boss_call(boss_id, name.to_string());
-                self.maybe_play_realm_event(boss_id, name, should_sound);
+                self.maybe_play_realm_event(boss_id, name, should_sound, None);
             }
             UiPayload::RealmClosed => {
                 use crate::panels::live_feed::WarningSeverity;
@@ -1893,7 +1940,7 @@ impl RealmHoundApp {
             .and_then(|conn| crate::client_process::connection_process_start_unix(&conn))
             .filter(|&s| s > 0)
             .or_else(|| {
-                crate::client_process::earliest_rotmg_client_start_unix().filter(|&s| s > 0)
+                crate::client_process::earliest_rotmg_client_start_unix().confirmed_start()
             });
         let Some(start) = start else {
             return;
@@ -2124,8 +2171,7 @@ impl RealmHoundApp {
                                             .clicked()
                                         {
                                             self.self_updater.start_download(
-                                                manifest.download_url.clone(),
-                                                manifest.sha256.clone(),
+                                                manifest.artifact_for_this_platform(),
                                             );
                                         }
                                     }
@@ -5699,6 +5745,7 @@ impl RealmHoundApp {
                     self.audio_tx.send(AudioCommand::PlayEvent {
                         sound: ENCHANT_SOUND,
                         custom_key: format!("enchant:{}:default", prefix),
+                        instance_id: None,
                         volume: section.default_volume,
                     });
                 }
@@ -5809,6 +5856,7 @@ impl RealmHoundApp {
                             self.audio_tx.send(AudioCommand::PlayEvent {
                                 sound: ENCHANT_SOUND,
                                 custom_key: key.clone(),
+                                instance_id: None,
                                 volume: entry.volume,
                             });
                         }
@@ -6381,6 +6429,7 @@ impl RealmHoundApp {
                     self.audio_tx.send(AudioCommand::PlayEvent {
                         sound: default_sound,
                         custom_key: format!("event:{}:default", prefix),
+                        instance_id: None,
                         volume: section.default_volume,
                     });
                 }
@@ -6459,6 +6508,7 @@ impl RealmHoundApp {
                             self.audio_tx.send(AudioCommand::PlayEvent {
                                 sound: default_sound,
                                 custom_key: key.clone(),
+                                instance_id: None,
                                 volume: ov.volume,
                             });
                         }
@@ -6587,6 +6637,7 @@ impl RealmHoundApp {
                         self.audio_tx.send(AudioCommand::PlayEvent {
                             sound,
                             custom_key: key.to_string(),
+                            instance_id: None,
                             volume: *volume,
                         });
                     }
@@ -6611,7 +6662,13 @@ impl RealmHoundApp {
 
     /// Play a realm-event notification sound for a Live Feed boss call, if the
     /// matching section is enabled (see [`crate::realm_event_sound`]).
-    fn maybe_play_realm_event(&self, boss_id: i32, text: &str, should_sound: bool) {
+    fn maybe_play_realm_event(
+        &self,
+        boss_id: i32,
+        text: &str,
+        should_sound: bool,
+        instance_id: Option<i32>,
+    ) {
         let (events, custom_sounds, log_events) = match self.settings.read() {
             Ok(s) => (
                 s.sound.realm_events.clone(),
@@ -6636,6 +6693,7 @@ impl RealmHoundApp {
                 self.audio_tx.send(AudioCommand::PlayEvent {
                     sound: t.sound,
                     custom_key: t.custom_key,
+                    instance_id,
                     volume: t.volume,
                 });
             }
@@ -6793,7 +6851,7 @@ impl RealmHoundApp {
     /// Render the `📂` button that opens a file dialog to choose a custom sound,
     /// copies it into the custom-sounds directory, and records both the on-disk
     /// filename and the original display name. Returns `true` when a file was
-    /// chosen.
+    /// successfully imported.
     fn render_custom_sound_picker(
         &self,
         ui: &mut egui::Ui,
@@ -6811,15 +6869,35 @@ impl RealmHoundApp {
                 .add_filter("Audio", &["wav", "mp3", "ogg", "flac"])
                 .pick_file()
             {
-                // Reject files larger than 2 MB
-                let too_large = fs::metadata(&picked)
-                    .map(|m| m.len() > crate::sound::MAX_CUSTOM_SOUND_BYTES)
-                    .unwrap_or(true);
-                if too_large {
+                let metadata = match fs::metadata(&picked) {
+                    Ok(metadata) => metadata,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[SOUND] Failed to inspect custom sound {}: {}",
+                            picked.display(),
+                            e
+                        );
+                        rfd::MessageDialog::new()
+                            .set_title("Cannot import custom sound")
+                            .set_description(format!("Could not read the selected file: {}", e))
+                            .set_level(rfd::MessageLevel::Error)
+                            .show();
+                        return false;
+                    }
+                };
+                if metadata.len() > crate::sound::MAX_CUSTOM_SOUND_BYTES {
                     tracing::warn!(
                         "[SOUND] Rejected custom sound (too large): {}",
                         picked.display()
                     );
+                    rfd::MessageDialog::new()
+                        .set_title("Custom sound is too large")
+                        .set_description(format!(
+                            "Choose a sound file that is {} MiB or smaller.",
+                            crate::sound::MAX_CUSTOM_SOUND_BYTES / (1024 * 1024)
+                        ))
+                        .set_level(rfd::MessageLevel::Warning)
+                        .show();
                 } else if let Some(dir) = custom_sounds_dir() {
                     if let Err(e) = fs::create_dir_all(&dir) {
                         tracing::warn!("[SOUND] Failed to create custom sounds dir: {}", e);
@@ -9592,7 +9670,7 @@ impl RealmHoundApp {
                 }
                 AppAction::PushBossCall { boss_id, text } => {
                     let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                    self.maybe_play_realm_event(boss_id, &text, should_sound);
+                    self.maybe_play_realm_event(boss_id, &text, should_sound, None);
                 }
                 AppAction::CharacterCacheChanged => {
                     // The processor owns the canonical character cache now; this

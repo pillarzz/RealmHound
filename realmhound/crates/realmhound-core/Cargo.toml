@@ -60,6 +60,10 @@ puffin = { version = "0.20", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Threading"] }
 
+# Signal-based process liveness polling, standing in for WaitForSingleObject.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Enable puffin profiling scopes in the packet pipeline.
 profiling = ["dep:puffin"]

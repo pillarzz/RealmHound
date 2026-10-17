@@ -90,7 +90,7 @@ fn icon_ref(boss_id: i32) -> String {
 ///
 /// `display_name` is the callout name as parsed by the chat layer; `boss_id` is
 /// the spawn id. `should_sound` is the upstream gate result (false when the Live
-/// Feed dedup or Crystal pin suppressed this callout) so the outcome column can
+/// Feed dedup suppressed this callout) so the outcome column can
 /// distinguish a real playback from a suppressed one. `events`/`custom_sounds`
 /// describe the current configuration so the outcome column can report the
 /// resolved sound and whether a custom file backs it.
@@ -134,8 +134,8 @@ pub fn log_boss_call(
         (None, Some(reason)) => format!("SILENT: {}", reason.as_str()),
         (None, None) => "SILENT: unknown".to_string(),
     };
-    // `should_sound` is false when an upstream layer (the Live Feed dedup, or the
-    // Crystal pin) suppressed this callout. Record that truthfully so the log
+    // `should_sound` is false when an upstream layer (the Live Feed dedup)
+    // suppressed this callout. Record that truthfully so the log
     // isn't misread as "played" for a call that never reached the speakers.
     let outcome = if !should_sound {
         format!("SUPPRESSED: dedup (would {})", resolved)

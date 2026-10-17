@@ -89,6 +89,10 @@ impl RotmgApiClient {
     pub fn with_diagnostics(access_token: String, diagnostics_dir: Option<PathBuf>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            // A 307/308 redirect would replay the authenticated POST, including
+            // its access token, to the redirect target. API requests must stay
+            // on the configured RotMG host.
+            .redirect(reqwest::redirect::Policy::none())
             // Force HTTP/1.1 to match the reference client's behavior
             .http1_only()
             // Add a User-Agent to look more like a normal HTTP client
@@ -300,6 +304,33 @@ fn sanitize_endpoint(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_client_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://example.invalid/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let client = RotmgApiClient::new("synthetic-secret".to_string());
+        let response = client
+            .client
+            .post(format!("http://{address}/"))
+            .body("accessToken=synthetic-secret")
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.join().unwrap();
+    }
 
     #[test]
     fn transport_errors_discard_url_and_source() {

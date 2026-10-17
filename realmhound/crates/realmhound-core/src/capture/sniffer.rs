@@ -75,6 +75,27 @@ pub struct Sniffer {
     packet_format: PacketFormat,
 }
 
+/// Map a failure to open a capture device.
+///
+/// Windows surfaces a missing or admin-restricted Npcap from `Device::list`, so
+/// a failure here really is about this one adapter. Elsewhere the kernel
+/// capture devices are root-only by default and *every* interface fails here
+/// instead, which is a setup problem rather than a bad adapter.
+fn classify_open_error(name: &str, error: pcap::Error) -> CaptureError {
+    #[cfg(not(windows))]
+    {
+        let text = error.to_string().to_ascii_lowercase();
+        if text.contains("permission") || text.contains("operation not permitted") {
+            return CaptureError::NpcapNotInstalled;
+        }
+    }
+
+    CaptureError::InterfaceOpenFailed {
+        name: name.to_string(),
+        reason: error.to_string(),
+    }
+}
+
 impl Sniffer {
     /// Create a new sniffer on the specified interface.
     ///
@@ -92,10 +113,7 @@ impl Sniffer {
             .buffer_size(config.buffer_size)
             .promisc(config.promiscuous)
             .open()
-            .map_err(|e| CaptureError::InterfaceOpenFailed {
-                name: interface.name.clone(),
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| classify_open_error(&interface.name, e))?;
 
         let linktype = capture.get_datalink();
         let packet_format = PacketFormat::from_linktype(linktype)?;
@@ -166,7 +184,7 @@ impl Sniffer {
 
 /// Log pcap drop statistics when new drops are observed.
 ///
-/// Captures dropped by the kernel (npcap) buffer cause TCP stream gaps that
+/// Packets dropped by the kernel capture buffer cause TCP stream gaps that
 /// desync the cipher, so surfacing them helps diagnose flaky captures.
 fn log_capture_stats(
     sniffer: &mut Sniffer,
@@ -179,7 +197,7 @@ fn log_capture_stats(
         if stats.dropped > *last_dropped || stats.if_dropped > *last_if_dropped {
             tracing::warn!(
                 "Capture drops detected: {} kernel-dropped, {} iface-dropped, {} received \
-                 (npcap buffer may be too small or consumer too slow)",
+                 (the kernel capture buffer may be too small or the consumer too slow)",
                 stats.dropped,
                 stats.if_dropped,
                 stats.received
@@ -245,7 +263,7 @@ struct PacketQueue {
 ///
 /// Pushing never blocks: when the queue is full the *oldest* packet is evicted
 /// and counted, so the capture thread can keep draining pcap (blocking it would
-/// stall npcap and cause kernel-buffer drops). Cloning registers an additional
+/// stall libpcap and cause kernel-buffer drops). Cloning registers an additional
 /// producer; the queue is considered closed once all senders have been dropped.
 pub struct PacketSender {
     queue: Arc<PacketQueue>,
@@ -443,8 +461,9 @@ pub fn start_capture(
     let handle = CaptureHandle::new();
     let stop_flag = handle.stop_flag.clone();
 
-    // Bounded, drop-oldest queue: the capture thread never blocks (so npcap
-    // doesn't drop), but worst-case memory stays bounded if the GUI stalls.
+    // Bounded, drop-oldest queue: the capture thread never blocks (so the kernel
+    // capture buffer doesn't drop), but worst-case memory stays bounded if the
+    // GUI stalls.
     let (tx, rx) = packet_channel(DEFAULT_QUEUE_CAPACITY);
 
     // Spawn capture thread
@@ -530,6 +549,9 @@ pub fn start_capture_auto_detect(
 
     // Validate every interface's format before any thread can select a winner.
     let mut sniffers = Vec::new();
+    // Remembered so a machine that simply isn't set up for capture reports the
+    // fix instead of a bare "no interfaces found".
+    let mut setup_error = None;
 
     for interface in interfaces {
         // Windows VPN and loopback capture devices need not advertise an active IPv4 address.
@@ -551,12 +573,15 @@ pub fn start_capture_auto_detect(
                     interface.display_name(),
                     e
                 );
+                if matches!(e, CaptureError::NpcapNotInstalled) {
+                    setup_error = Some(e);
+                }
             }
         }
     }
 
     if sniffers.is_empty() {
-        return Err(CaptureError::NoInterfaces);
+        return Err(setup_error.unwrap_or(CaptureError::NoInterfaces));
     }
 
     let count = sniffers.len();

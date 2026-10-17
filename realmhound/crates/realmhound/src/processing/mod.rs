@@ -9,6 +9,7 @@
 pub mod contract;
 pub mod mission_tracker;
 pub mod processor;
+pub mod realm_discovery;
 pub mod ui_channel;
 pub mod worker;
 

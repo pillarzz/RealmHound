@@ -12,6 +12,7 @@ use realmhound_core::assets::{
 };
 use realmhound_core::settings::RealmEventSounds;
 
+use crate::processing::realm_discovery::JAILER_TYPE;
 use crate::sound::EventSound;
 
 /// A catalog-backed realm-event section.
@@ -69,6 +70,16 @@ pub fn section_catalog(kind: SectionKind) -> Vec<CatalogEntry> {
                 // it from the sound list (Combat History still tracks it).
                 entry_boss_id(e) != Some(20799) && !n.contains("calbrik")
             });
+            if !entries
+                .iter()
+                .any(|entry| entry_boss_id(entry) == Some(JAILER_TYPE))
+            {
+                entries.push(CatalogEntry {
+                    sprite_ids: vec![JAILER_TYPE],
+                    name: "Spectral Jailer".to_string(),
+                });
+                entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
         }
         SectionKind::Adept => {
             entries.retain(|e| {
@@ -398,10 +409,15 @@ mod tests {
     use super::*;
     use realmhound_core::settings::{EventMode, EventOverride, EventSection};
 
+    use crate::processing::realm_discovery::CRYSTAL_TYPE;
+
     fn sets() -> EventSets {
         EventSets {
-            veteran: [100, 101].into_iter().map(|id| (id, id)).collect(),
-            adept: [200].into_iter().map(|id| (id, id)).collect(),
+            veteran: [100, 101, JAILER_TYPE]
+                .into_iter()
+                .map(|id| (id, id))
+                .collect(),
+            adept: [200, CRYSTAL_TYPE].into_iter().map(|id| (id, id)).collect(),
             seasonal: [300].into_iter().map(|id| (id, id)).collect(),
             calbrik: Some(900),
             ufo: Some(901),
@@ -420,23 +436,38 @@ mod tests {
 
     #[test]
     fn veteran_boss_uses_section_default() {
-        let t = resolve(&events(), 100, "Lost Sentry", &sets()).unwrap();
-        assert_eq!(t.sound, EventSound::Veteran);
-        assert_eq!(t.volume, 0.5);
-        assert_eq!(t.custom_key, "event:veteran:default:100");
+        assert_eq!(
+            section_catalog(SectionKind::Veteran)
+                .iter()
+                .filter(|entry| entry_boss_id(entry) == Some(JAILER_TYPE))
+                .count(),
+            1
+        );
+        assert_eq!(
+            EventSets::from_assets().veteran.get(&JAILER_TYPE),
+            Some(&JAILER_TYPE)
+        );
+        for (boss_id, name) in [(100, "Lost Sentry"), (JAILER_TYPE, "Spectral Jailer")] {
+            let t = resolve(&events(), boss_id, name, &sets()).unwrap();
+            assert_eq!(t.sound, EventSound::Veteran);
+            assert_eq!(t.volume, 0.5);
+            assert_eq!(t.custom_key, format!("event:veteran:default:{boss_id}"));
+        }
     }
 
     #[test]
     fn override_wins_over_default() {
         let mut e = events();
-        e.veteran.overrides.push(EventOverride {
-            boss_id: 100,
-            name: "Lost Sentry".into(),
-            volume: 0.9,
-        });
-        let t = resolve(&e, 100, "Lost Sentry", &sets()).unwrap();
-        assert_eq!(t.volume, 0.9);
-        assert_eq!(t.custom_key, "event:veteran:100");
+        for (boss_id, name) in [(100, "Lost Sentry"), (JAILER_TYPE, "Spectral Jailer")] {
+            e.veteran.overrides.push(EventOverride {
+                boss_id,
+                name: name.into(),
+                volume: 0.9,
+            });
+            let t = resolve(&e, boss_id, name, &sets()).unwrap();
+            assert_eq!(t.volume, 0.9);
+            assert_eq!(t.custom_key, format!("event:veteran:{boss_id}"));
+        }
     }
 
     #[test]
@@ -464,6 +495,7 @@ mod tests {
         let mut e = events();
         e.veteran.mode = EventMode::None;
         assert!(resolve(&e, 100, "Lost Sentry", &sets()).is_none());
+        assert!(resolve(&e, JAILER_TYPE, "Spectral Jailer", &sets()).is_none());
     }
 
     #[test]
@@ -472,6 +504,7 @@ mod tests {
         e.veteran.mode = EventMode::Selected;
         // Nothing selected yet: the in-category boss is silent.
         assert!(resolve(&e, 100, "Lost Sentry", &sets()).is_none());
+        assert!(resolve(&e, JAILER_TYPE, "Spectral Jailer", &sets()).is_none());
         // Select boss 100: now it plays (default sound unless a custom file is set).
         e.veteran.overrides.push(EventOverride {
             boss_id: 100,
@@ -484,6 +517,26 @@ mod tests {
         assert_eq!(t.custom_key, "event:veteran:100");
         // A different in-category boss that is not selected stays silent.
         assert!(resolve(&e, 101, "Other", &sets()).is_none());
+        e.veteran.overrides.push(EventOverride {
+            boss_id: JAILER_TYPE,
+            name: "Spectral Jailer".into(),
+            volume: 0.8,
+        });
+        let t = resolve(&e, JAILER_TYPE, "Spectral Jailer", &sets()).unwrap();
+        assert_eq!(t.sound, EventSound::Veteran);
+        assert_eq!(t.volume, 0.8);
+        assert_eq!(t.custom_key, format!("event:veteran:{JAILER_TYPE}"));
+        e.adept.mode = EventMode::Selected;
+        assert!(resolve(&e, CRYSTAL_TYPE, "Mysterious Crystal", &sets()).is_none());
+        e.adept.overrides.push(EventOverride {
+            boss_id: CRYSTAL_TYPE,
+            name: "Mysterious Crystal".into(),
+            volume: 0.29,
+        });
+        let t = resolve(&e, CRYSTAL_TYPE, "Mysterious Crystal", &sets()).unwrap();
+        assert_eq!(t.sound, EventSound::Adept);
+        assert_eq!(t.volume, 0.29);
+        assert_eq!(t.custom_key, format!("event:adept:{CRYSTAL_TYPE}"));
     }
 
     #[test]

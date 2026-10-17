@@ -42,6 +42,7 @@ const EVENT_SHORT_NAMES: &[(&str, &str)] = &[
     ("UFO",                            "UFO"),
     ("Mammoth Rat",                    "rat boss"),
     ("Mysterious Crystal",             "cry"),
+    ("Spectral Jailer",                "jailer"),
     ("Grand Sphinx",                   "sphinx"),
     ("Jade and Garnet Statues",        "statues"),
     ("Legion General",                 "general"),

@@ -90,7 +90,9 @@ pub struct StorageRoot {
 }
 
 impl StorageRoot {
-    /// Resolve the default `%LOCALAPPDATA%\RealmHound` storage root.
+    /// Resolve the default per-user storage root: `%LOCALAPPDATA%\RealmHound`
+    /// on Windows, `~/Library/Application Support/RealmHound` on macOS, and
+    /// `$XDG_DATA_HOME/RealmHound` (`~/.local/share/RealmHound`) on Linux.
     pub fn default_local() -> Result<Self, StorageError> {
         static DEFAULT_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
         let path = DEFAULT_ROOT

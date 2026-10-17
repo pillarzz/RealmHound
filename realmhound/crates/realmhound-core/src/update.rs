@@ -29,7 +29,52 @@ pub struct VersionManifest {
     /// SHA-256 hex digest of the exe at download_url
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Zipped macOS `RealmHound.app` bundle for this release.
+    ///
+    /// Absent from manifests published before macOS builds existed, which is
+    /// what lets an older client keep reading this document unchanged.
+    #[serde(default)]
+    pub macos_download_url: Option<String>,
+    /// SHA-256 hex digest of the archive at `macos_download_url`.
+    #[serde(default)]
+    pub macos_sha256: Option<String>,
     pub releases: Vec<Release>,
+}
+
+/// A release artifact this platform can actually install: the Windows
+/// executable, or the macOS `.app` bundle as a zip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformArtifact {
+    pub download_url: String,
+    pub sha256: Option<String>,
+}
+
+impl VersionManifest {
+    /// The artifact for the platform this build runs on, or `None` when the
+    /// release published nothing this platform can run.
+    ///
+    /// `download_url` is the Windows executable: it predates any other target
+    /// and is left unqualified so older clients keep resolving it.
+    pub fn artifact_for_this_platform(&self) -> Option<PlatformArtifact> {
+        #[cfg(windows)]
+        {
+            Some(PlatformArtifact {
+                download_url: self.download_url.clone(),
+                sha256: self.sha256.clone(),
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Some(PlatformArtifact {
+                download_url: self.macos_download_url.clone()?,
+                sha256: self.macos_sha256.clone(),
+            })
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            None
+        }
+    }
 }
 
 /// A single release entry in the manifest
@@ -391,8 +436,23 @@ impl SelfUpdater {
     }
 
     /// Start downloading the update in a background thread.
-    pub fn start_download(&self, download_url: String, expected_sha256: Option<String>) {
-        let expected_sha256 = match expected_sha256 {
+    ///
+    /// The manifest is vetted on every platform so a malformed or unsigned
+    /// entry is reported the same way everywhere. A platform the release
+    /// published no binary for is told so rather than being handed one the
+    /// kernel cannot run; the update *check* is separate and still reports that
+    /// a newer version exists.
+    pub fn start_download(&self, artifact: Option<PlatformArtifact>) {
+        let Some(artifact) = artifact else {
+            *self.state.lock().unwrap() = SelfUpdateState::Failed(format!(
+                "This release does not publish a {} build. Pull the latest \
+                 source and rebuild to update.",
+                std::env::consts::OS
+            ));
+            return;
+        };
+        let download_url = artifact.download_url;
+        let expected_sha256 = match artifact.sha256 {
             Some(value)
                 if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
             {
@@ -412,6 +472,16 @@ impl SelfUpdater {
 
         let state = Arc::clone(&self.state);
         let new_exe_path = Arc::clone(&self.new_exe_path);
+
+        // macOS ships only the .app bundle, so a loose or unwritable install
+        // has nothing it can swap itself into. Checked after the manifest so a
+        // malformed entry is still reported the same way everywhere, but before
+        // the download.
+        #[cfg(target_os = "macos")]
+        if let Some(blocker) = bundle_update_blocker() {
+            *state.lock().unwrap() = SelfUpdateState::Failed(blocker);
+            return;
+        }
 
         *state.lock().unwrap() = SelfUpdateState::Downloading(DownloadProgress {
             downloaded: 0,
@@ -441,7 +511,14 @@ impl SelfUpdater {
             .unwrap()
             .clone()
             .ok_or_else(|| "No downloaded update to apply".to_string())?;
-        stage_executable_swap(&new_path)
+        #[cfg(target_os = "macos")]
+        {
+            stage_bundle_swap(&new_path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            stage_executable_swap(&new_path)
+        }
     }
 
     /// Reset state back to idle (e.g. after a failure the user dismisses).
@@ -460,7 +537,126 @@ impl Default for SelfUpdater {
 /// Maximum allowed download size (100 MB) to prevent unbounded memory usage.
 const MAX_DOWNLOAD_SIZE: u64 = 100 * 1024 * 1024;
 
-/// Download the update exe to a temp file next to the current exe.
+/// A sibling of `path` with `suffix` appended to the whole file name.
+///
+/// Appending rather than replacing the extension keeps `RealmHound.exe.old` on
+/// Windows while giving the extensionless macOS binary `RealmHound.old` instead
+/// of a misleading `.exe.old`.
+fn sibling_with_suffix(path: &std::path::Path, suffix: &str) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    Some(path.with_file_name(format!("{name}{suffix}")))
+}
+
+/// The bundle directory name macOS releases ship, and the executable inside it.
+#[cfg(target_os = "macos")]
+const BUNDLE_NAME: &str = "RealmHound.app";
+#[cfg(target_os = "macos")]
+const BUNDLE_EXE: &str = "Contents/MacOS/RealmHound";
+
+/// The `.app` that `exe` runs from, i.e. `<bundle>/Contents/MacOS/<exe>`.
+/// `None` when the executable is not inside a bundle at all.
+#[cfg(target_os = "macos")]
+fn bundle_root_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let macos_dir = exe.parent()?;
+    let contents = macos_dir.parent()?;
+    let bundle = contents.parent()?;
+    (macos_dir.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then(|| bundle.to_path_buf())
+}
+
+/// The installed `RealmHound.app` this process is running from, if any.
+#[cfg(target_os = "macos")]
+pub fn installed_bundle() -> Option<std::path::PathBuf> {
+    bundle_root_of(&std::env::current_exe().ok()?)
+}
+
+/// Why this install cannot replace itself, if it cannot.
+///
+/// Checked before downloading, so the user is told what to fix instead of
+/// spending a download on an update that could never be applied.
+#[cfg(target_os = "macos")]
+fn bundle_update_blocker() -> Option<String> {
+    let Some(bundle) = installed_bundle() else {
+        return Some(
+            "RealmHound can only update itself when run from RealmHound.app. \
+             Download the latest release and replace your copy."
+                .to_string(),
+        );
+    };
+    // Gatekeeper runs a quarantined bundle from a read-only copy at a random
+    // path, so the bundle we can see is not the one the user installed.
+    if bundle
+        .components()
+        .any(|part| part.as_os_str() == "AppTranslocation")
+    {
+        return Some(
+            "macOS is running RealmHound from a temporary read-only copy. Move \
+             RealmHound.app to Applications and open it from there."
+                .to_string(),
+        );
+    }
+    let parent = bundle.parent()?;
+    if !can_write_in(parent) {
+        return Some(format!(
+            "RealmHound.app is in {}, which this account cannot write to. Move \
+             it somewhere you can write to, or update it manually.",
+            parent.display()
+        ));
+    }
+    None
+}
+
+/// Whether this process can create files in `dir`. Probing is the only reliable
+/// answer on macOS, where ACLs and SIP both override the mode bits.
+#[cfg(target_os = "macos")]
+fn can_write_in(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".realmhound-update-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Phrase a filesystem failure during the swap so the user can act on it.
+#[cfg(target_os = "macos")]
+fn swap_error(path: &std::path::Path, error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => format!(
+            "No permission to replace {}. Move RealmHound.app somewhere you can \
+             write to, or update it manually.",
+            path.display()
+        ),
+        std::io::ErrorKind::NotFound => format!(
+            "{} is no longer where RealmHound expected it. Update it manually.",
+            path.display()
+        ),
+        _ => format!("Could not replace {}: {}", path.display(), error),
+    }
+}
+
+/// Where the downloaded artifact is written.
+///
+/// Beside the running executable, except for a macOS bundle install: writing
+/// inside `RealmHound.app` would leave debris in a bundle we are about to
+/// replace wholesale, so the archive lands beside it.
+fn download_path() -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = installed_bundle() {
+        return sibling_with_suffix(&bundle, ".new.zip")
+            .ok_or_else(|| "Cannot determine download path".to_string());
+    }
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Cannot determine current exe path: {}", e))?;
+    sibling_with_suffix(&current_exe, ".new")
+        .ok_or_else(|| "Cannot determine download path".to_string())
+}
+
+/// Download the update binary to a temp file next to the current one.
 fn download_update(
     url: &str,
     expected_sha256: &str,
@@ -469,13 +665,7 @@ fn download_update(
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Cannot determine current exe path: {}", e))?;
-    let exe_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Cannot determine exe directory".to_string())?;
-
-    let new_path = exe_dir.join("RealmHound.exe.new");
+    let new_path = download_path()?;
 
     info!("Downloading update from {} to {:?}", url, new_path);
 
@@ -552,6 +742,14 @@ fn download_update(
     }
     info!("SHA-256 verified: {}", actual);
 
+    // A downloaded file is not executable on Unix until it is marked so.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&new_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Failed to mark update executable: {}", e))?;
+    }
+
     info!("Download complete: {} bytes", downloaded);
     Ok(new_path)
 }
@@ -565,6 +763,10 @@ pub struct StagedSwap {
     old_path: std::path::PathBuf,
     /// Where the downloaded exe originally sat; rollback moves it back here.
     new_exe_path: std::path::PathBuf,
+    /// Set when a whole `.app` was swapped rather than a bare executable;
+    /// `current_exe` then points at the executable inside the new bundle.
+    #[cfg(target_os = "macos")]
+    bundle: Option<std::path::PathBuf>,
 }
 
 impl StagedSwap {
@@ -574,13 +776,15 @@ impl StagedSwap {
     }
 }
 
-/// Swap the running exe with the new one, leaving the process running.
-/// On Windows: rename current -> .old, rename .new -> current. On the second
-/// rename failing, the first is rolled back before returning the error.
+/// Swap the running binary with the new one, leaving the process running.
+/// Rename current -> .old, rename .new -> current. On the second rename
+/// failing, the first is rolled back before returning the error. Both Windows
+/// and Unix allow renaming the image of a running process.
 pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwap, String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Cannot determine current exe path: {}", e))?;
-    let old_path = current_exe.with_extension("exe.old");
+    let old_path = sibling_with_suffix(&current_exe, ".old")
+        .ok_or_else(|| "Cannot determine backup path".to_string())?;
 
     info!("Applying update: swapping {:?}", current_exe);
 
@@ -590,7 +794,7 @@ pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwa
             .map_err(|e| format!("Cannot remove old backup ({}): {}", old_path.display(), e))?;
     }
 
-    // Rename running exe to .old (Windows allows renaming a running exe)
+    // Rename the running binary aside
     std::fs::rename(&current_exe, &old_path)
         .map_err(|e| format!("Failed to rename current exe to .old: {}", e))?;
 
@@ -605,12 +809,117 @@ pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwa
         current_exe,
         old_path,
         new_exe_path: new_exe_path.to_path_buf(),
+        #[cfg(target_os = "macos")]
+        bundle: None,
     })
+}
+
+/// Replace the installed `RealmHound.app` with the downloaded one.
+///
+/// A bundle update has to move the whole directory: overwriting only
+/// `Contents/MacOS/RealmHound` would leave the previous release's `Info.plist`
+/// and signature material in place. `ditto` keeps the permissions, symlinks and
+/// ad-hoc signature that a plain unzip would drop.
+#[cfg(target_os = "macos")]
+pub fn stage_bundle_swap(archive: &std::path::Path) -> Result<StagedSwap, String> {
+    let bundle = installed_bundle().ok_or_else(|| {
+        "RealmHound is not running from RealmHound.app, so it cannot replace itself.".to_string()
+    })?;
+    stage_bundle_swap_at(archive, &bundle)
+}
+
+/// Swap an explicit bundle, so a test never touches the real installation.
+#[cfg(target_os = "macos")]
+fn stage_bundle_swap_at(
+    archive: &std::path::Path,
+    bundle: &std::path::Path,
+) -> Result<StagedSwap, String> {
+    let staging = sibling_with_suffix(bundle, ".new")
+        .ok_or_else(|| "Cannot determine staging path".to_string())?;
+    let old_path = sibling_with_suffix(bundle, ".old")
+        .ok_or_else(|| "Cannot determine backup path".to_string())?;
+
+    // Everything below extracts and renames inside this directory, so check it
+    // once here rather than letting ditto or rename report a bare errno.
+    let parent = bundle.parent().unwrap_or(bundle);
+    if !parent.exists() {
+        return Err(swap_error(
+            bundle,
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+    }
+    if !can_write_in(parent) {
+        return Err(swap_error(
+            bundle,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+    }
+
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| swap_error(&staging, &e))?;
+    }
+    extract_archive(archive, &staging)?;
+
+    // Only swap once the replacement is known to be a runnable bundle, so a
+    // truncated or restructured archive cannot strand the install.
+    let extracted = staging.join(BUNDLE_NAME);
+    if !extracted.join(BUNDLE_EXE).exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!(
+            "The downloaded archive does not contain {}/{}",
+            BUNDLE_NAME, BUNDLE_EXE
+        ));
+    }
+
+    if old_path.exists() {
+        std::fs::remove_dir_all(&old_path).map_err(|e| swap_error(&old_path, &e))?;
+    }
+
+    info!("Applying update: swapping {:?}", bundle);
+
+    std::fs::rename(bundle, &old_path).map_err(|e| swap_error(bundle, &e))?;
+
+    if let Err(e) = std::fs::rename(&extracted, bundle) {
+        let _ = std::fs::rename(&old_path, bundle);
+        return Err(swap_error(bundle, &e));
+    }
+
+    Ok(StagedSwap {
+        current_exe: bundle.join(BUNDLE_EXE),
+        old_path,
+        new_exe_path: extracted,
+        bundle: Some(bundle.to_path_buf()),
+    })
+}
+
+/// Unpack `archive` into `into`, which `ditto` creates.
+///
+/// The archive's SHA-256 is verified during download, before anything here is
+/// asked to read it.
+#[cfg(target_os = "macos")]
+fn extract_archive(archive: &std::path::Path, into: &std::path::Path) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/ditto")
+        .arg("-x")
+        .arg("-k")
+        .arg(archive)
+        .arg(into)
+        .status()
+        .map_err(|e| format!("Could not run ditto: {}", e))?;
+    if !status.success() {
+        return Err(format!("Could not extract the update archive ({})", status));
+    }
+    Ok(())
 }
 
 /// Undo a staged swap after a failed relaunch: move the new exe back out and
 /// restore the original so the running process's on-disk image is intact.
 pub fn rollback_executable_swap(staged: &StagedSwap) {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = &staged.bundle {
+        let _ = std::fs::rename(bundle, &staged.new_exe_path);
+        let _ = std::fs::rename(&staged.old_path, bundle);
+        return;
+    }
     let _ = std::fs::rename(&staged.current_exe, &staged.new_exe_path);
     let _ = std::fs::rename(&staged.old_path, &staged.current_exe);
 }
@@ -618,8 +927,28 @@ pub fn rollback_executable_swap(staged: &StagedSwap) {
 /// Clean up leftover .old file from a previous update.
 /// Call this on app startup.
 pub fn cleanup_old_exe() {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = installed_bundle() {
+        for suffix in [".old", ".new"] {
+            let Some(path) = sibling_with_suffix(&bundle, suffix) else {
+                continue;
+            };
+            if path.exists() {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => info!("Cleaned up {:?}", path),
+                    Err(e) => debug!("Could not clean up {:?}: {}", path, e),
+                }
+            }
+        }
+        if let Some(archive) = sibling_with_suffix(&bundle, ".new.zip") {
+            let _ = std::fs::remove_file(archive);
+        }
+        return;
+    }
     if let Ok(current_exe) = std::env::current_exe() {
-        let old_path = current_exe.with_extension("exe.old");
+        let Some(old_path) = sibling_with_suffix(&current_exe, ".old") else {
+            return;
+        };
         if old_path.exists() {
             match std::fs::remove_file(&old_path) {
                 Ok(()) => info!("Cleaned up old exe: {:?}", old_path),
@@ -632,6 +961,80 @@ pub fn cleanup_old_exe() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manifest in the shape published before macOS builds existed.
+    const LEGACY_MANIFEST: &str = r#"{
+        "latest_version": "0.21.1",
+        "download_url": "https://example.invalid/RealmHound.exe",
+        "sha256": "aa",
+        "releases": []
+    }"#;
+
+    #[test]
+    fn a_manifest_without_macos_fields_still_parses() {
+        // Every published manifest predates those fields, so dropping this
+        // compatibility would break the update check for every client.
+        let manifest: VersionManifest =
+            serde_json::from_str(LEGACY_MANIFEST).expect("legacy manifest parses");
+        assert_eq!(manifest.latest_version, "0.21.1");
+        assert_eq!(manifest.macos_download_url, None);
+        assert_eq!(manifest.macos_sha256, None);
+    }
+
+    #[test]
+    fn each_platform_resolves_only_a_binary_it_can_run() {
+        let manifest: VersionManifest = serde_json::from_str(
+            r#"{
+                "latest_version": "0.21.1",
+                "download_url": "https://example.invalid/RealmHound.exe",
+                "sha256": "ab",
+                "macos_download_url": "https://example.invalid/RealmHound-macos-app.zip",
+                "macos_sha256": "cd",
+                "releases": []
+            }"#,
+        )
+        .expect("manifest parses");
+
+        let artifact = manifest.artifact_for_this_platform();
+        if cfg!(windows) {
+            let artifact = artifact.expect("windows publishes an executable");
+            assert!(artifact.download_url.ends_with(".exe"));
+            assert_eq!(artifact.sha256.as_deref(), Some("ab"));
+        } else if cfg!(target_os = "macos") {
+            let artifact = artifact.expect("macOS publishes a bundle");
+            assert!(artifact.download_url.ends_with("-macos-app.zip"));
+            assert_eq!(artifact.sha256.as_deref(), Some("cd"));
+        } else {
+            assert_eq!(artifact, None, "no binary is published for this platform");
+        }
+    }
+
+    #[test]
+    fn macos_resolves_nothing_when_the_release_published_no_macos_binary() {
+        let manifest: VersionManifest =
+            serde_json::from_str(LEGACY_MANIFEST).expect("legacy manifest parses");
+        // The Windows executable must never be offered to another platform.
+        #[cfg(not(windows))]
+        assert_eq!(manifest.artifact_for_this_platform(), None);
+        #[cfg(windows)]
+        assert!(manifest.artifact_for_this_platform().is_some());
+    }
+
+    #[test]
+    fn backup_and_download_names_append_rather_than_replace_the_extension() {
+        // `with_extension` would turn the extensionless macOS binary into
+        // "RealmHound.exe.old", and must leave the Windows name untouched.
+        let windows = std::path::Path::new("/opt/RealmHound.exe");
+        assert_eq!(
+            sibling_with_suffix(windows, ".old").unwrap(),
+            std::path::Path::new("/opt/RealmHound.exe.old")
+        );
+        let unix = std::path::Path::new("/opt/RealmHound");
+        assert_eq!(
+            sibling_with_suffix(unix, ".new").unwrap(),
+            std::path::Path::new("/opt/RealmHound.new")
+        );
+    }
 
     #[test]
     fn test_compare_versions() {
@@ -648,6 +1051,8 @@ mod tests {
             latest_version: "0.5.0".to_string(),
             download_url: "http://example.com".to_string(),
             sha256: None,
+            macos_download_url: None,
+            macos_sha256: None,
             releases: vec![
                 Release {
                     version: "0.5.0".to_string(),
@@ -699,7 +1104,10 @@ mod tests {
     fn test_missing_checksum_blocks_download() {
         let updater = SelfUpdater::new();
 
-        updater.start_download("http://example.com".to_string(), None);
+        updater.start_download(Some(PlatformArtifact {
+            download_url: "http://example.com".to_string(),
+            sha256: None,
+        }));
 
         assert!(matches!(
             updater.state(),
@@ -711,11 +1119,203 @@ mod tests {
     fn test_invalid_checksum_blocks_download() {
         let updater = SelfUpdater::new();
 
-        updater.start_download("http://example.com".to_string(), Some("g".repeat(64)));
+        updater.start_download(Some(PlatformArtifact {
+            download_url: "http://example.com".to_string(),
+            sha256: Some("g".repeat(64)),
+        }));
 
         assert!(matches!(
             updater.state(),
             SelfUpdateState::Failed(message) if message == "Update manifest has an invalid SHA-256"
         ));
+    }
+
+    #[test]
+    fn a_platform_without_a_published_binary_is_told_so() {
+        let updater = SelfUpdater::new();
+
+        updater.start_download(None);
+
+        assert!(matches!(
+            updater.state(),
+            SelfUpdateState::Failed(message) if message.contains("does not publish")
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_an_executable_inside_a_bundle_resolves_to_one() {
+        use std::path::Path;
+
+        assert_eq!(
+            bundle_root_of(Path::new(
+                "/Applications/RealmHound.app/Contents/MacOS/RealmHound"
+            )),
+            Some(Path::new("/Applications/RealmHound.app").to_path_buf())
+        );
+        // A loose binary or a cargo build is not a bundle install and must
+        // never be swapped as one.
+        assert_eq!(bundle_root_of(Path::new("/usr/local/bin/RealmHound")), None);
+        assert_eq!(
+            bundle_root_of(Path::new("/src/target/release/RealmHound")),
+            None
+        );
+        assert_eq!(
+            bundle_root_of(Path::new(
+                "/Applications/Other.app/Contents/Helpers/RealmHound"
+            )),
+            None
+        );
+    }
+
+    /// Zip `bundle` the way the release workflow does.
+    #[cfg(target_os = "macos")]
+    fn zip_bundle(bundle: &std::path::Path, archive: &std::path::Path) {
+        assert!(std::process::Command::new("/usr/bin/ditto")
+            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+            .arg(bundle)
+            .arg(archive)
+            .status()
+            .expect("ditto")
+            .success());
+    }
+
+    /// A read-only install directory must be reported as something the user can
+    /// fix, not as a raw errno.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unwritable_install_is_explained_rather_than_attempted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp.path().join("Applications");
+        std::fs::create_dir(&install_dir).expect("mkdir");
+
+        let installed = install_dir.join(BUNDLE_NAME);
+        std::fs::create_dir_all(installed.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(installed.join(BUNDLE_EXE), b"old exe").expect("write exe");
+
+        let source = temp.path().join("source").join(BUNDLE_NAME);
+        std::fs::create_dir_all(source.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(source.join(BUNDLE_EXE), b"new exe").expect("write exe");
+        let archive = temp.path().join("update.zip");
+        zip_bundle(&source, &archive);
+
+        assert!(can_write_in(&install_dir), "writable before the chmod");
+        std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        assert!(
+            !can_write_in(&install_dir),
+            "a read-only directory must not look writable"
+        );
+
+        let error = stage_bundle_swap_at(&archive, &installed)
+            .map(|_| ())
+            .expect_err("swap must fail");
+        assert!(
+            error.contains("No permission to replace"),
+            "unhelpful error: {error}"
+        );
+        assert!(
+            !error.contains("os error"),
+            "raw errno leaked to the user: {error}"
+        );
+
+        // Leave the directory writable so the temp dir can be torn down.
+        std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        assert_eq!(
+            std::fs::read(installed.join(BUNDLE_EXE)).expect("exe"),
+            b"old exe",
+            "the install must survive a refused update"
+        );
+    }
+
+    /// A bundle that vanished between the check and the swap.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_missing_install_is_explained_rather_than_reported_as_an_errno() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        let source = temp.path().join("source").join(BUNDLE_NAME);
+        std::fs::create_dir_all(source.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(source.join(BUNDLE_EXE), b"new exe").expect("write exe");
+        let archive = temp.path().join("update.zip");
+        zip_bundle(&source, &archive);
+
+        let absent = temp.path().join("gone").join(BUNDLE_NAME);
+        let error = stage_bundle_swap_at(&archive, &absent)
+            .map(|_| ())
+            .expect_err("swap must fail");
+        assert!(!error.contains("os error"), "raw errno leaked: {error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bundle_update_replaces_the_whole_app() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        // An "installed" bundle carrying metadata from the previous release.
+        let installed = root.join(BUNDLE_NAME);
+        std::fs::create_dir_all(installed.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(installed.join(BUNDLE_EXE), b"old exe").expect("write exe");
+        std::fs::write(installed.join("Contents/Info.plist"), b"old plist").expect("write plist");
+
+        let source = root.join("source").join(BUNDLE_NAME);
+        std::fs::create_dir_all(source.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(source.join(BUNDLE_EXE), b"new exe").expect("write exe");
+        std::fs::write(source.join("Contents/Info.plist"), b"new plist").expect("write plist");
+        let archive = root.join("update.zip");
+        zip_bundle(&source, &archive);
+
+        let staged = stage_bundle_swap_at(&archive, &installed).expect("bundle swap");
+
+        assert_eq!(
+            std::fs::read(installed.join(BUNDLE_EXE)).expect("exe"),
+            b"new exe"
+        );
+        // The point of a whole-bundle update: no metadata survives from the
+        // previous release alongside the new executable.
+        assert_eq!(
+            std::fs::read(installed.join("Contents/Info.plist")).expect("plist"),
+            b"new plist"
+        );
+        assert_eq!(staged.exe_path(), installed.join(BUNDLE_EXE));
+
+        rollback_executable_swap(&staged);
+        assert_eq!(
+            std::fs::read(installed.join(BUNDLE_EXE)).expect("exe"),
+            b"old exe",
+            "a failed relaunch must put the previous bundle back"
+        );
+        assert_eq!(
+            std::fs::read(installed.join("Contents/Info.plist")).expect("plist"),
+            b"old plist"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bundle_update_refuses_an_archive_without_an_executable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+
+        let installed = root.join(BUNDLE_NAME);
+        std::fs::create_dir_all(installed.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(installed.join(BUNDLE_EXE), b"old exe").expect("write exe");
+
+        // Shaped like a bundle but with nothing to run.
+        let source = root.join("source").join(BUNDLE_NAME);
+        std::fs::create_dir_all(source.join("Contents/MacOS")).expect("mkdir");
+        let archive = root.join("update.zip");
+        zip_bundle(&source, &archive);
+
+        assert!(stage_bundle_swap_at(&archive, &installed).is_err());
+        assert_eq!(
+            std::fs::read(installed.join(BUNDLE_EXE)).expect("exe"),
+            b"old exe",
+            "the install must be left alone when the archive is unusable"
+        );
     }
 }

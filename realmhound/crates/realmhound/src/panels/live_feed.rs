@@ -17,6 +17,9 @@ use realmhound_core::{
 use crate::panels::chat::ChatType;
 use crate::panels::loot_filters::{render_filter_bar, LootFilters, PropertyFilters};
 use crate::panels::{AppAction, Panel, PanelContext};
+use crate::processing::realm_discovery::{
+    DiscoveryEvent, ABSENCE_TIMEOUT, CRYSTAL_TYPE, JAILER_TYPE,
+};
 use crate::rendering::emotes::{self, EmoteSegment, EMOTE_PADDING};
 use crate::rendering::{EmbeddedIcon, ModTierIcon, SpriteRenderer};
 use crate::shadcn_ui::Shadcn;
@@ -24,6 +27,9 @@ use crate::tab_icons::{TabIconSprite, TAB_ICON_SIZE};
 
 /// Maximum number of entries to keep in the feed.
 const MAX_FEED_ENTRIES: usize = 100;
+const INACTIVE_CALLOUT_TEXT: Color32 = Color32::from_gray(120);
+const INACTIVE_CALLOUT_SPRITE: Color32 = Color32::from_gray(110);
+const CRYSTAL_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Which hover tooltip a pinned warning row shows. The season row gets a rich
 /// icon + colour-coded breakdown of the end-of-season storage transfer rules;
@@ -44,7 +50,7 @@ const DUNGEON_JOIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(
 /// Fast, repeatable encounters (e.g. Skull Shrine) legitimately respawn within a
 /// minute, so a long window would swallow genuine new spawns -- each distinct
 /// spawn must notify. The Mysterious Crystal's multi-line flavor text is handled
-/// separately via its pinned row (see `update_crystal_pin`).
+/// separately via its realm-scoped discovery entry.
 const BOSS_CALL_DEDUP_WINDOW: chrono::Duration = chrono::Duration::seconds(5);
 
 /// Feature flag: Enable active encounters display at top of live feed.
@@ -196,6 +202,41 @@ pub struct BossCallEntry {
     /// wave spawned in the same realm). Expired entries fade out and are no
     /// longer copyable, like expired dungeons.
     pub expired: bool,
+    discovery: Option<DiscoveryEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveryEntry {
+    scope: u64,
+    object_id: Option<i32>,
+    packet_seen: bool,
+    defeated: bool,
+    absent_since: Option<std::time::Instant>,
+    last_message: Option<std::time::Instant>,
+    stopped_elapsed: Option<std::time::Duration>,
+}
+
+impl DiscoveryEntry {
+    fn stale_at(&self) -> Option<std::time::Instant> {
+        if self.packet_seen {
+            self.absent_since.map(|at| at + ABSENCE_TIMEOUT)
+        } else {
+            self.last_message.map(|at| at + CRYSTAL_STALE_AFTER)
+        }
+    }
+
+    fn message_elapsed(&self) -> Option<std::time::Duration> {
+        self.stopped_elapsed
+            .or_else(|| self.last_message.map(|at| at.elapsed()))
+    }
+
+    fn stop_timer(&mut self, at: std::time::Instant) {
+        if self.stopped_elapsed.is_none() {
+            self.stopped_elapsed = self
+                .last_message
+                .map(|last_message| at.saturating_duration_since(last_message));
+        }
+    }
 }
 
 impl BossCallEntry {
@@ -213,6 +254,7 @@ impl BossCallEntry {
             server_name,
             realm_name,
             expired: false,
+            discovery: None,
         }
     }
 }
@@ -1109,34 +1151,8 @@ pub struct LiveFeedPanel {
     battlepass_reset: Option<DateTime<Utc>>,
     /// Pending actions to be picked up by `show()` and returned to the app.
     pending_actions: Vec<super::AppAction>,
-    /// Active Crystal Prisoner pin: the Mysterious Crystal setpiece re-announces
-    /// itself (~every 2 min) while alive. Instead of a scrolling entry we pin a
-    /// single row and show how long ago it last spoke. `None` until a Crystal
-    /// callout is witnessed in the current realm.
-    crystal_pin: Option<CrystalPin>,
+    discovery_scope: u64,
 }
-
-/// A pinned Mysterious Crystal callout, kept until the player unpins it or it
-/// expires (see [`CRYSTAL_STALE_AFTER`] / [`CRYSTAL_REMOVE_AFTER_STALE`]).
-#[derive(Debug, Clone)]
-struct CrystalPin {
-    /// When the Crystal last announced itself (drives the live "Ns ago" timer).
-    last_spoke: std::time::Instant,
-    /// Wall-clock time of the last callout, preserved so the pin can be turned
-    /// into a normal Live Feed entry (on unpin / expiry) with its real time.
-    last_spoke_at: DateTime<Local>,
-    /// Boss object id for the sprite.
-    boss_id: i32,
-    server_name: Option<String>,
-    realm_name: Option<String>,
-}
-
-/// After this long with no Crystal callout, the pinned Crystal icon is dimmed --
-/// it may have been killed.
-const CRYSTAL_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
-/// Once a pin has been stale (dimmed) for this much longer with no callout, it
-/// is auto-removed and folded into the scrolling feed as a normal entry.
-const CRYSTAL_REMOVE_AFTER_STALE: std::time::Duration = std::time::Duration::from_secs(180);
 
 impl Default for LiveFeedPanel {
     fn default() -> Self {
@@ -1233,7 +1249,7 @@ impl LiveFeedPanel {
             season_reset: None,
             battlepass_reset: None,
             pending_actions: Vec::new(),
-            crystal_pin: None,
+            discovery_scope: 0,
         }
     }
 
@@ -1883,7 +1899,9 @@ impl LiveFeedPanel {
         self.nexus_parent_dungeon = false;
         self.castle_timer_expires_at = None;
         self.realm_closed = false;
-        self.crystal_pin = None;
+        self.apply_realm_discovery(DiscoveryEvent::Reset {
+            at: std::time::Instant::now(),
+        });
     }
 
     /// Get the realm score as a percentage (0-100), or None if no score.
@@ -2046,6 +2064,141 @@ impl LiveFeedPanel {
 
     // === End Realm Status Bar Methods ===
 
+    /// Apply a realm-entity discovery to the feed.
+    pub fn apply_realm_discovery(&mut self, event: DiscoveryEvent) {
+        match event {
+            DiscoveryEvent::Reset { at } => {
+                for entry in &mut self.entries {
+                    if let FeedEntry::BossCall(boss) = entry {
+                        if let Some(discovery) = &mut boss.discovery {
+                            discovery.stop_timer(at);
+                        }
+                    }
+                }
+                self.discovery_scope = self.discovery_scope.wrapping_add(1);
+            }
+            DiscoveryEvent::Discovered {
+                object_id,
+                object_type,
+                notify: _,
+                timestamp,
+            } => {
+                self.push_discovery_entry(
+                    Some(object_id),
+                    object_type,
+                    timestamp,
+                    None,
+                    true,
+                    None,
+                );
+            }
+            DiscoveryEvent::CrystalMessage {
+                object_id,
+                notify: _,
+                at,
+                timestamp,
+                packet_seen,
+                absent_since,
+            } => {
+                self.push_discovery_entry(
+                    object_id,
+                    CRYSTAL_TYPE,
+                    timestamp,
+                    Some(at),
+                    packet_seen,
+                    absent_since,
+                );
+            }
+            DiscoveryEvent::Removed { object_id, at } => {
+                for entry in &mut self.entries {
+                    if let FeedEntry::BossCall(boss) = entry {
+                        if let Some(discovery) = &mut boss.discovery {
+                            if discovery.scope == self.discovery_scope
+                                && discovery.object_id == Some(object_id)
+                            {
+                                discovery.absent_since = Some(at);
+                            }
+                        }
+                    }
+                }
+            }
+            DiscoveryEvent::Defeated { object_id, at } => {
+                for entry in &mut self.entries {
+                    if let FeedEntry::BossCall(boss) = entry {
+                        if let Some(discovery) = &mut boss.discovery {
+                            if discovery.scope == self.discovery_scope
+                                && discovery.object_id == Some(object_id)
+                            {
+                                discovery.defeated = true;
+                                discovery.stop_timer(at);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_discovery_entry(
+        &mut self,
+        object_id: Option<i32>,
+        object_type: i32,
+        timestamp: DateTime<Local>,
+        message_at: Option<std::time::Instant>,
+        packet_seen: bool,
+        absent_since: Option<std::time::Instant>,
+    ) -> bool {
+        let existing = self.entries.iter().position(|entry| {
+            matches!(entry, FeedEntry::BossCall(boss)
+                if boss.boss_id == object_type
+                    && boss.discovery.as_ref().is_some_and(|d|
+                        d.scope == self.discovery_scope
+                            && (object_type == CRYSTAL_TYPE || d.object_id == object_id)))
+        });
+        let mut boss = if let Some(index) = existing {
+            let Some(FeedEntry::BossCall(boss)) = self.entries.remove(index) else {
+                return false;
+            };
+            boss
+        } else {
+            let name = match object_type {
+                CRYSTAL_TYPE => "Mysterious Crystal",
+                JAILER_TYPE => "Spectral Jailer",
+                _ => return false,
+            };
+            let mut boss = BossCallEntry::new(
+                object_type,
+                name.to_string(),
+                self.server_name.clone(),
+                self.realm_name.clone(),
+            );
+            boss.discovery = Some(DiscoveryEntry {
+                scope: self.discovery_scope,
+                object_id,
+                packet_seen,
+                defeated: false,
+                absent_since,
+                last_message: None,
+                stopped_elapsed: None,
+            });
+            boss
+        };
+        if let Some(discovery) = &mut boss.discovery {
+            discovery.object_id = object_id.or(discovery.object_id);
+            if packet_seen {
+                discovery.packet_seen = true;
+                discovery.absent_since = absent_since;
+            }
+            if let Some(at) = message_at {
+                discovery.last_message = Some(at);
+                discovery.stopped_elapsed = None;
+            }
+        }
+        boss.timestamp = timestamp;
+        self.push_entry(FeedEntry::BossCall(boss));
+        existing.is_none()
+    }
+
     /// Push a new entry to the feed.
     /// Automatically evicts oldest entries if the feed exceeds MAX_FEED_ENTRIES.
     pub fn push_entry(&mut self, entry: FeedEntry) {
@@ -2103,22 +2256,27 @@ impl LiveFeedPanel {
     ///
     /// Captures current server and realm name for historical reference.
     ///
-    /// The Mysterious Crystal setpiece is special-cased into a pinned row (see
-    /// [`Self::update_crystal_pin`]) and sounds only on its first callout per
-    /// realm. For every other boss, repeated callouts for the same boss in the
+    /// Mysterious Crystal messages share one discovery entry per realm scope.
+    /// For every other boss, repeated callouts for the same boss in the
     /// same realm within `BOSS_CALL_DEDUP_WINDOW` are suppressed (one Live Feed
     /// entry, one sound).
     pub fn push_boss_call(&mut self, boss_id: i32, boss_name: String) -> bool {
-        if Self::is_crystal_call(&boss_name) {
-            return self.update_crystal_pin(boss_id);
+        if boss_id == CRYSTAL_TYPE || boss_name.contains("Mysterious Crystal") {
+            return self.push_discovery_entry(
+                None,
+                CRYSTAL_TYPE,
+                Local::now(),
+                Some(std::time::Instant::now()),
+                false,
+                None,
+            );
         }
         let now = Local::now();
         for entry in &self.entries {
             if let FeedEntry::BossCall(existing) = entry {
-                // Entries are newest-first, so once a callout is older than the
-                // window every earlier callout is too.
+                // Queued discoveries can predate neighboring UI-created rows.
                 if now.signed_duration_since(existing.timestamp) > BOSS_CALL_DEDUP_WINDOW {
-                    break;
+                    continue;
                 }
                 // Scope dedup to the current realm so an identical boss in a
                 // different realm entered within the window still notifies.
@@ -2153,44 +2311,6 @@ impl LiveFeedPanel {
     /// Subsequent waves in the same realm supersede earlier ones.
     fn is_alien_wave(boss_name: &str) -> bool {
         boss_name.starts_with("Alien Invasion") && boss_name.contains("Wave")
-    }
-
-    /// Whether a boss callout is the Mysterious Crystal / Crystal Prisoner
-    /// setpiece (routed to the pinned row instead of the scrolling feed).
-    fn is_crystal_call(boss_name: &str) -> bool {
-        boss_name.contains("Mysterious Crystal") || boss_name.contains("Crystal Prisoner")
-    }
-
-    /// Refresh (or create) the pinned Crystal Prisoner row for the current
-    /// realm. Returns `true` only on the first callout in a given realm, so the
-    /// sound plays once per realm and repeat announcements only reset the timer.
-    fn update_crystal_pin(&mut self, boss_id: i32) -> bool {
-        let same_realm = self
-            .crystal_pin
-            .as_ref()
-            .map(|p| p.realm_name == self.realm_name && p.server_name == self.server_name)
-            .unwrap_or(false);
-        self.crystal_pin = Some(CrystalPin {
-            last_spoke: std::time::Instant::now(),
-            last_spoke_at: Local::now(),
-            boss_id,
-            server_name: self.server_name.clone(),
-            realm_name: self.realm_name.clone(),
-        });
-        !same_realm
-    }
-
-    /// Convert the current Crystal pin into a normal, scrolling Live Feed entry
-    /// (used on unpin and on auto-expiry) so the sighting isn't lost.
-    fn fold_crystal_pin_into_feed(&mut self, pin: &CrystalPin) {
-        let mut entry = BossCallEntry::new(
-            pin.boss_id,
-            "Mysterious Crystal".to_string(),
-            pin.server_name.clone(),
-            pin.realm_name.clone(),
-        );
-        entry.timestamp = pin.last_spoke_at;
-        self.push_entry(FeedEntry::BossCall(entry));
     }
 
     /// Push a kick alert entry.
@@ -2634,7 +2754,6 @@ impl LiveFeedPanel {
     /// Clear all entries from the feed.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.crystal_pin = None;
     }
 
     /// Add an active encounter (realm boss/event in view).
@@ -3120,13 +3239,6 @@ impl LiveFeedPanel {
         // remain visible even with no feed entries.
         self.render_pinned_warnings(ui, sprite_renderer, shadcn);
 
-        // Pinned Crystal Prisoner callout (Mysterious Crystal setpiece). Gated
-        // by the "Realm event bosses" toggle like other boss callouts; its
-        // lifecycle is timestamp-based, so it re-evaluates correctly when shown.
-        if self.show_boss_calls {
-            self.render_crystal_pin(ui, sprite_renderer, shadcn);
-        }
-
         // Every Live Feed notification category disabled and nothing visible:
         // explain that it's a settings choice rather than showing the generic
         // "No activity yet". Guarded on `visible_count == 0` so always-pass
@@ -3204,7 +3316,6 @@ impl LiveFeedPanel {
             let mut warning_to_copy: Option<String> = None;
             let mut who_names_to_copy: Option<Vec<String>> = None;
             let mut callout_to_copy: Option<String> = None;
-
             for entry in self.entries.iter() {
                 if !self.entry_passes_filter(entry) {
                     continue;
@@ -3356,8 +3467,20 @@ impl LiveFeedPanel {
         });
     }
 
+    fn callout_row_clicked(ui: &Ui, response: &egui::Response, active: bool) -> bool {
+        if active && response.hovered() {
+            ui.painter().rect_filled(
+                response.rect,
+                4.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        active && response.clicked()
+    }
+
     /// Render a boss callout entry.
-    /// Returns true if left-click copy was triggered.
+    /// Returns true if clicked.
     fn render_boss_entry(
         &self,
         ui: &mut Ui,
@@ -3367,35 +3490,38 @@ impl LiveFeedPanel {
         let sprite_size = 36.0;
         let outline_width = 2.0;
         let total_size = sprite_size + outline_width * 2.0;
-        let mut clicked = false;
         let expired = boss.expired;
-        let expired_grey = Color32::from_gray(120);
+        let discovery_elapsed = boss
+            .discovery
+            .as_ref()
+            .and_then(DiscoveryEntry::message_elapsed);
+        let now = std::time::Instant::now();
+        let stale_at = boss.discovery.as_ref().and_then(DiscoveryEntry::stale_at);
+        let previous_map = boss
+            .discovery
+            .as_ref()
+            .is_some_and(|d| d.scope != self.discovery_scope);
+        let defeated = boss.discovery.as_ref().is_some_and(|d| d.defeated);
+        let dimmed = expired || previous_map || defeated || stale_at.is_some_and(|at| now >= at);
+        if !dimmed {
+            if let Some(at) = stale_at {
+                ui.ctx()
+                    .request_repaint_after(at.saturating_duration_since(now));
+            }
+        }
+        let callout_active = !dimmed;
+        let expired_grey = INACTIVE_CALLOUT_TEXT;
 
-        // Allocate the entire row. Expired callouts can't be copied, so they
-        // only sense hover (for the explanatory tooltip).
         let row_height = total_size + 4.0;
         let (row_rect, row_response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), row_height),
-            if expired {
-                egui::Sense::hover()
-            } else {
+            if callout_active {
                 egui::Sense::click()
+            } else {
+                egui::Sense::hover()
             },
         );
-
-        // Highlight on hover
-        if !expired && row_response.hovered() {
-            ui.painter().rect_filled(
-                row_rect,
-                4.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 15),
-            );
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-
-        if row_response.clicked() {
-            clicked = true;
-        }
+        let clicked = Self::callout_row_clicked(ui, &row_response, callout_active);
 
         // Layout content manually within the allocated rect
         let mut x = row_rect.left() + 10.0;
@@ -3403,7 +3529,7 @@ impl LiveFeedPanel {
 
         // Timestamp (same style as loot entries)
         let time_str = Self::format_timestamp(boss.timestamp);
-        let time_color = if expired { expired_grey } else { Color32::GRAY };
+        let time_color = Color32::GRAY;
         let time_galley =
             ui.painter()
                 .layout_no_wrap(time_str, egui::FontId::monospace(12.0), time_color);
@@ -3420,9 +3546,8 @@ impl LiveFeedPanel {
             egui::vec2(total_size, total_size),
         );
 
-        // Draw white square outline (greyed once expired)
-        let outline_color = if expired {
-            expired_grey
+        let outline_color = if dimmed {
+            Color32::TRANSPARENT
         } else {
             Color32::WHITE
         };
@@ -3438,12 +3563,12 @@ impl LiveFeedPanel {
             sprite_rect.min + egui::vec2(outline_width, outline_width),
             egui::vec2(sprite_size, sprite_size),
         );
-        if expired {
-            sprite_renderer.draw_sprite_in_rect_tinted(
+        if dimmed {
+            sprite_renderer.draw_outlined_sprite_in_rect_tinted(
                 ui,
                 boss.boss_id,
                 inner_sprite_rect,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 90),
+                INACTIVE_CALLOUT_SPRITE,
             );
         } else {
             sprite_renderer.draw_sprite_in_rect(ui, boss.boss_id, inner_sprite_rect);
@@ -3451,7 +3576,7 @@ impl LiveFeedPanel {
         x += total_size + 6.0;
 
         // Boss name
-        let name_color = if expired {
+        let name_color = if dimmed {
             expired_grey
         } else {
             Color32::from_rgb(255, 255, 100)
@@ -3476,7 +3601,7 @@ impl LiveFeedPanel {
 
         if !location_parts.is_empty() {
             let location_text = format!("| {}", location_parts.join(" "));
-            let loc_color = if expired {
+            let loc_color = if dimmed {
                 expired_grey
             } else {
                 Color32::from_rgb(150, 150, 150)
@@ -3488,15 +3613,38 @@ impl LiveFeedPanel {
             );
             ui.painter().galley(
                 egui::pos2(x, center_y - location_galley.rect.height() / 2.0),
-                location_galley,
+                location_galley.clone(),
                 loc_color,
             );
+            x += location_galley.rect.width() + 8.0;
+        }
+
+        if let Some(elapsed) = discovery_elapsed {
+            let stopped = boss
+                .discovery
+                .as_ref()
+                .is_some_and(|d| d.stopped_elapsed.is_some());
+            ui.painter().text(
+                egui::pos2(x, center_y),
+                egui::Align2::LEFT_CENTER,
+                format!(
+                    "{} ago{}",
+                    Self::format_ago(elapsed),
+                    if stopped { " (stopped)" } else { "" }
+                ),
+                egui::FontId::monospace(12.0),
+                if dimmed { expired_grey } else { Color32::GRAY },
+            );
+            if !stopped {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs(1));
+            }
         }
 
         // Clipboard callout preview, right-aligned green text (mirrors dungeon
         // entries). Shown only while the callout is still copyable; expired
         // callouts can no longer be posted so the preview is omitted.
-        if !expired {
+        if callout_active {
             let callout_color = Color32::from_rgb(150, 230, 150);
             let preview = self.assemble_callout(
                 &self.build_event_body(boss),
@@ -3513,9 +3661,19 @@ impl LiveFeedPanel {
             );
         }
 
-        // Tooltip: live callouts are copyable; expired ones explain why not.
+        // Inactive rows retain an explanatory tooltip without a copy action.
         if expired {
             row_response.hover_tip("Expired -- a newer wave has spawned in this realm");
+        } else if dimmed {
+            row_response.hover_tip(if defeated {
+                "Instance was defeated"
+            } else if previous_map {
+                "No longer tracking this map"
+            } else if boss.discovery.as_ref().is_some_and(|d| !d.packet_seen) {
+                "Crystal information is stale: no realm-wide message for 5 minutes"
+            } else {
+                "Instance has not been reported by the server for 30 seconds"
+            });
         } else {
             row_response.hover_tip("Click to copy callout");
         }
@@ -3536,244 +3694,6 @@ impl LiveFeedPanel {
         } else {
             format!("{}s", secs)
         }
-    }
-
-    /// Render the pinned Mysterious Crystal row (Crystal setpiece).
-    /// Shows a live "last spoke Ns ago" timer, dimming the icon once the Crystal
-    /// has been silent longer than [`CRYSTAL_STALE_AFTER`] (likely killed).
-    fn render_crystal_pin(
-        &mut self,
-        ui: &mut Ui,
-        sprite_renderer: &mut SpriteRenderer,
-        shadcn: &Shadcn,
-    ) {
-        // Snapshot everything we need up front so we can freely mutate
-        // `self.crystal_pin` afterwards (auto-expiry / unpin).
-        let Some((elapsed, boss_id, server_name, realm_name)) =
-            self.crystal_pin.as_ref().map(|p| {
-                (
-                    p.last_spoke.elapsed(),
-                    p.boss_id,
-                    p.server_name.clone(),
-                    p.realm_name.clone(),
-                )
-            })
-        else {
-            return;
-        };
-
-        // Auto-expire: once stale for CRYSTAL_REMOVE_AFTER_STALE longer, fold the
-        // sighting into the scrolling feed and drop the pin.
-        if elapsed > CRYSTAL_STALE_AFTER + CRYSTAL_REMOVE_AFTER_STALE {
-            if let Some(pin) = self.crystal_pin.take() {
-                self.fold_crystal_pin_into_feed(&pin);
-            }
-            return;
-        }
-
-        let stale = elapsed > CRYSTAL_STALE_AFTER;
-
-        let sprite_size = 36.0;
-        let outline_width = 2.0;
-        let total_size = sprite_size + outline_width * 2.0;
-        let row_height = total_size + 4.0;
-        let accent = Color32::from_rgb(120, 210, 235);
-
-        ui.add_space(3.0);
-        shadcn.full_width_separator(ui);
-        ui.add_space(3.0);
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), row_height),
-            egui::Sense::click(),
-        );
-
-        // Clickable body: highlight + pointer cursor so it reads as copy-able.
-        if response.hovered() {
-            ui.painter().rect_filled(
-                rect,
-                4.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-            );
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-
-        let center_y = rect.center().y;
-        let mut x = rect.left() + 6.0;
-
-        // Pin glyph in the top-left corner -- click to unpin (keeps the sighting
-        // in the scrolling feed like any other callout).
-        let pin_size = 20.0;
-        let pin_rect =
-            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(pin_size, pin_size));
-        let pin_resp = ui.interact(
-            pin_rect,
-            response.id.with("crystal_unpin"),
-            egui::Sense::click(),
-        );
-        let pin_hovered = pin_resp.hovered();
-        if pin_hovered {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        ui.painter().text(
-            pin_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "📌",
-            egui::FontId::proportional(15.0),
-            if pin_hovered {
-                Color32::WHITE
-            } else {
-                Color32::from_rgb(170, 170, 170)
-            },
-        );
-        pin_resp
-            .clone()
-            .on_hover_text("Unpin -- keep this sighting in the Live Feed log");
-        if pin_resp.clicked() {
-            if let Some(pin) = self.crystal_pin.take() {
-                self.fold_crystal_pin_into_feed(&pin);
-            }
-            return;
-        }
-        x += pin_size + 4.0;
-
-        // Crystal sprite with a white outline (dimmed when stale).
-        let sprite_rect = egui::Rect::from_center_size(
-            egui::pos2(x + total_size / 2.0, center_y),
-            egui::vec2(total_size, total_size),
-        );
-        let outline_color = if stale {
-            Color32::from_rgb(110, 110, 110)
-        } else {
-            Color32::WHITE
-        };
-        ui.painter().rect_stroke(
-            sprite_rect,
-            0.0,
-            egui::Stroke::new(outline_width, outline_color),
-            egui::StrokeKind::Outside,
-        );
-        let inner_sprite_rect = egui::Rect::from_min_size(
-            sprite_rect.min + egui::vec2(outline_width, outline_width),
-            egui::vec2(sprite_size, sprite_size),
-        );
-        if stale {
-            sprite_renderer.draw_sprite_in_rect_tinted(
-                ui,
-                boss_id,
-                inner_sprite_rect,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 90),
-            );
-        } else {
-            sprite_renderer.draw_sprite_in_rect(ui, boss_id, inner_sprite_rect);
-        }
-        x += total_size + 8.0;
-
-        // Name.
-        let name_color = if stale {
-            Color32::from_rgb(150, 150, 150)
-        } else {
-            accent
-        };
-        let name_galley = ui.painter().layout_no_wrap(
-            "Mysterious Crystal".to_string(),
-            egui::FontId::proportional(18.0),
-            name_color,
-        );
-        ui.painter().galley(
-            egui::pos2(x, center_y - name_galley.rect.height() / 2.0),
-            name_galley.clone(),
-            name_color,
-        );
-        x += name_galley.rect.width() + 8.0;
-
-        // Location: | server realm
-        let location_parts: Vec<&str> = [server_name.as_deref(), realm_name.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect();
-        if !location_parts.is_empty() {
-            let location_text = format!("| {}", location_parts.join(" "));
-            let loc_galley = ui.painter().layout_no_wrap(
-                location_text,
-                egui::FontId::proportional(14.0),
-                Color32::from_rgb(150, 150, 150),
-            );
-            ui.painter().galley(
-                egui::pos2(x, center_y - loc_galley.rect.height() / 2.0),
-                loc_galley.clone(),
-                Color32::from_rgb(150, 150, 150),
-            );
-            x += loc_galley.rect.width() + 10.0;
-        }
-
-        // Live "last spoke Ns ago" timer, inline after the location.
-        let ago_color = if stale {
-            Color32::from_rgb(120, 120, 120)
-        } else {
-            Color32::from_rgb(180, 180, 180)
-        };
-        let ago_text = format!("{} ago", Self::format_ago(elapsed));
-        ui.painter().text(
-            egui::pos2(x, center_y),
-            egui::Align2::LEFT_CENTER,
-            ago_text,
-            egui::FontId::proportional(14.0),
-            ago_color,
-        );
-
-        // Assemble the same `/p cry j` callout the folded feed entry produces,
-        // used both for the green preview and the click-to-copy action.
-        let entry = BossCallEntry::new(
-            boss_id,
-            "Mysterious Crystal".to_string(),
-            server_name.clone(),
-            realm_name.clone(),
-        );
-        let callout = self.assemble_callout(
-            &self.build_event_body(&entry),
-            server_name.as_deref(),
-            realm_name.as_deref(),
-            self.event_join_position,
-        );
-
-        // Right-aligned green callout preview, mirroring boss-call feed entries
-        // so the pin reads as copy-able and shows exactly what will be copied.
-        let preview_color = if stale {
-            Color32::from_rgb(110, 150, 110)
-        } else {
-            Color32::from_rgb(150, 230, 150)
-        };
-        ui.painter().text(
-            egui::pos2(rect.right() - 10.0, center_y),
-            egui::Align2::RIGHT_CENTER,
-            format!("\u{1F4CB} {}", callout),
-            egui::FontId::monospace(12.0),
-            preview_color,
-        );
-
-        // Click the row body (the pin glyph handles its own click above and
-        // returns early) to copy the Crystal callout.
-        if response.clicked() {
-            Self::copy_to_clipboard(ui.ctx(), &callout);
-            self.set_status(&format!("Copied: {}", callout));
-        }
-
-        if stale {
-            response.hover_tip(
-                "Crystal was likely killed: its callout was heard last more than 5 minutes ago.\nClick to copy the /p callout.",
-            );
-        } else {
-            response.hover_tip(
-                "Mysterious Crystal is alive (announces itself about every 2 minutes).\nClick to copy the /p callout.",
-            );
-        }
-
-        ui.add_space(3.0);
-        shadcn.full_width_separator(ui);
-
-        // Keep the elapsed timer ticking live while the pin is visible.
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_secs(1));
     }
 
     /// honoring the event name style, upcoming toggle, and user overrides. The
@@ -4877,7 +4797,7 @@ impl LiveFeedPanel {
         };
         // Expired rows grey out every text element; active rows keep white name
         // and reward text.
-        let expired_grey = Color32::from_gray(120);
+        let expired_grey = INACTIVE_CALLOUT_TEXT;
         let name_color = if expired {
             expired_grey
         } else {
@@ -4896,7 +4816,7 @@ impl LiveFeedPanel {
         } else {
             egui::Sense::hover()
         };
-        let (rect, mut response) =
+        let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), row_height), sense);
         ui.painter().rect_filled(rect, 4.0, bg);
         ui.painter().rect_stroke(
@@ -4916,17 +4836,7 @@ impl LiveFeedPanel {
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // Click-to-copy affordance (same behavior as boss/realm events): a
-        // subtle highlight + pointing-hand cursor on hover when there's a
-        // callout still within its join window.
-        if callout_active && response.hovered() {
-            ui.painter().rect_filled(
-                rect,
-                4.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 15),
-            );
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
+        let clicked = Self::callout_row_clicked(ui, &response, callout_active);
 
         // The left block (timestamp, portal, name, grade, timer) sits on the
         // row's vertical center. The right block stacks reward stats above the
@@ -4961,7 +4871,7 @@ impl LiveFeedPanel {
                 egui::vec2(icon_size, icon_size),
             );
             let tint = if expired {
-                Color32::from_gray(110)
+                INACTIVE_CALLOUT_SPRITE
             } else {
                 Color32::WHITE
             };
@@ -5127,15 +5037,15 @@ impl LiveFeedPanel {
         // Hover tooltip: copy hint when the callout is still copyable (same as
         // boss/realm events), else a bonus summary.
         if callout_active {
-            response = response.hover_tip("Click to copy callout");
+            response.hover_tip("Click to copy callout");
         } else if let Some(tooltip) = Self::dungeon_bonus_tooltip(dungeon) {
-            response = response.hover_tip(tooltip);
+            response.hover_tip(tooltip);
         }
 
         ui.add_space(4.0);
 
         // Copy the callout when the row is clicked (only while still joinable).
-        if callout_active && response.clicked() {
+        if clicked {
             dungeon.callout.as_ref().map(|body| {
                 self.assemble_callout(
                     body,
@@ -6461,73 +6371,179 @@ mod tests {
     }
 
     #[test]
-    fn crystal_first_callout_sounds_then_pins_without_feed_entry() {
+    fn crystal_first_callout_uses_one_entry() {
         let mut panel = LiveFeedPanel::new();
         panel.realm_name = Some("Mesa".to_string());
-        // First Sweet Treasure callout: sounds and creates the pin.
         assert!(panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
-        assert!(panel.crystal_pin.is_some());
-        // Repeat announcements refresh the timer but must not re-sound.
         for _ in 0..5 {
             assert!(!panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
         }
-        // The Crystal is pinned, never added to the scrolling feed.
-        assert_eq!(boss_call_count(&panel), 0);
+        assert_eq!(boss_call_count(&panel), 1);
+        let at = std::time::Instant::now() - CRYSTAL_STALE_AFTER;
+        let timestamp = Local::now() - chrono::Duration::minutes(5);
+        panel.apply_realm_discovery(DiscoveryEvent::CrystalMessage {
+            object_id: Some(123),
+            notify: false,
+            at,
+            timestamp,
+            packet_seen: false,
+            absent_since: None,
+        });
+        let FeedEntry::BossCall(boss) = &panel.entries[0] else {
+            panic!("expected Crystal entry");
+        };
+        let discovery = boss.discovery.as_ref().unwrap();
+        assert!(!discovery.packet_seen);
+        assert_eq!(discovery.object_id, Some(123));
+        assert_eq!(boss.timestamp, timestamp);
+        assert_eq!(discovery.stale_at(), Some(at + CRYSTAL_STALE_AFTER));
+        assert!(discovery.stale_at().unwrap() <= std::time::Instant::now());
+        assert_eq!(boss_call_count(&panel), 1);
     }
 
     #[test]
     fn crystal_re_sounds_in_a_new_realm() {
+        use crate::processing::realm_discovery::RealmDiscovery;
+        use realmhound_core::protocol::data::{ObjectData, ObjectStatusData, WorldPosData};
+        use realmhound_core::protocol::packets::UpdatePacket;
+
         let mut panel = LiveFeedPanel::new();
+        let mut tracker = RealmDiscovery::default();
+        panel.apply_realm_discovery(tracker.reset(true));
         panel.realm_name = Some("Mesa".to_string());
-        assert!(panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
-        // A different realm is a fresh sighting -> sound again.
+        let message = tracker.crystal_message(-1).unwrap();
+        assert!(matches!(
+            &message,
+            DiscoveryEvent::CrystalMessage { notify: true, .. }
+        ));
+        panel.apply_realm_discovery(message);
+        assert!(matches!(
+            tracker.crystal_message(-1),
+            Some(DiscoveryEvent::CrystalMessage { notify: false, .. })
+        ));
+
+        let update = realmhound_core::GameEvent::UpdateReceived(
+            UpdatePacket {
+                pos: WorldPosData { x: 0.0, y: 0.0 },
+                level_type: 0,
+                tiles: Vec::new(),
+                new_objects: vec![ObjectData {
+                    object_type: u16::try_from(CRYSTAL_TYPE).unwrap(),
+                    status: ObjectStatusData {
+                        object_id: 123,
+                        pos: WorldPosData { x: 0.0, y: 0.0 },
+                        stats: Vec::new(),
+                    },
+                }],
+                drops: Vec::new(),
+            },
+            0,
+        );
+        let events = tracker.on_event(&update);
+        assert!(matches!(
+            events.as_slice(),
+            [DiscoveryEvent::Discovered { notify: false, .. }]
+        ));
+        for event in events {
+            panel.apply_realm_discovery(event);
+        }
+        assert_eq!(boss_call_count(&panel), 1);
+
+        panel.apply_realm_discovery(tracker.reset(true));
         panel.realm_name = Some("Ocean".to_string());
-        assert!(panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
+        let events = tracker.on_event(&update);
+        assert!(matches!(
+            events.as_slice(),
+            [DiscoveryEvent::Discovered { notify: true, .. }]
+        ));
+        for event in events {
+            panel.apply_realm_discovery(event);
+        }
+        assert!(tracker.on_event(&update).is_empty());
+        assert!(matches!(
+            tracker.crystal_message(123),
+            Some(DiscoveryEvent::CrystalMessage { notify: false, .. })
+        ));
+        assert_eq!(boss_call_count(&panel), 2);
     }
 
     #[test]
-    fn crystal_pin_survives_leaving_the_realm() {
+    fn crystal_packet_tracking_overrides_message_staleness() {
         let mut panel = LiveFeedPanel::new();
         panel.realm_name = Some("Mesa".to_string());
         assert!(panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
-        assert!(panel.crystal_pin.is_some());
-        // Leaving to the Nexus must NOT drop the pin -- the player keeps the
-        // knowledge that a Crystal was heard.
-        panel.update_location("Nexus", "Nexus", 0, 0);
-        assert!(panel.crystal_pin.is_some());
-        // Diving into a dungeon from a different realm also keeps it.
-        panel.update_location("Spider Den", "NexusPortal.Ocean", 0, 0);
-        assert!(panel.crystal_pin.is_some());
+        let at = std::time::Instant::now() - CRYSTAL_STALE_AFTER;
+        if let FeedEntry::BossCall(boss) = &mut panel.entries[0] {
+            boss.discovery.as_mut().unwrap().last_message = Some(at);
+        }
+        let timestamp = Local::now() - chrono::Duration::seconds(10);
+        panel.apply_realm_discovery(DiscoveryEvent::Discovered {
+            object_id: 123,
+            object_type: CRYSTAL_TYPE,
+            notify: true,
+            timestamp,
+        });
+        let FeedEntry::BossCall(boss) = &panel.entries[0] else {
+            panic!("expected Crystal entry");
+        };
+        let discovery = boss.discovery.as_ref().unwrap();
+        assert!(discovery.packet_seen);
+        assert_eq!(discovery.last_message, Some(at));
+        assert_eq!(discovery.object_id, Some(123));
+        assert_eq!(discovery.stale_at(), None);
+        assert_eq!(boss.timestamp, timestamp);
+
+        let removed_at = std::time::Instant::now() - ABSENCE_TIMEOUT;
+        panel.apply_realm_discovery(DiscoveryEvent::Removed {
+            object_id: 123,
+            at: removed_at,
+        });
+        let message_at = std::time::Instant::now();
+        panel.apply_realm_discovery(DiscoveryEvent::CrystalMessage {
+            object_id: Some(123),
+            notify: false,
+            at: message_at,
+            timestamp: Local::now(),
+            packet_seen: true,
+            absent_since: Some(removed_at),
+        });
+        assert!(!panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
+        let FeedEntry::BossCall(boss) = &panel.entries[0] else {
+            panic!("expected Crystal entry");
+        };
+        let discovery = boss.discovery.as_ref().unwrap();
+        assert!(discovery.packet_seen);
+        assert_eq!(discovery.absent_since, Some(removed_at));
+        assert!(discovery.stale_at().unwrap() <= std::time::Instant::now());
+        assert!(discovery.last_message.unwrap() >= message_at);
+        assert!(discovery.stopped_elapsed.is_none());
+
+        panel.apply_realm_discovery(DiscoveryEvent::Discovered {
+            object_id: 123,
+            object_type: CRYSTAL_TYPE,
+            notify: true,
+            timestamp: Local::now(),
+        });
+        let FeedEntry::BossCall(boss) = &panel.entries[0] else {
+            panic!("expected Crystal entry");
+        };
+        let discovery = boss.discovery.as_ref().unwrap();
+        assert_eq!(discovery.stale_at(), None);
+        assert_eq!(boss_call_count(&panel), 1);
     }
 
     #[test]
-    fn crystal_pin_cleared_on_disconnect() {
+    fn crystal_deactivates_on_disconnect() {
         let mut panel = LiveFeedPanel::new();
         panel.realm_name = Some("Mesa".to_string());
         assert!(panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
         panel.clear_realm_state();
-        assert!(panel.crystal_pin.is_none());
-    }
-
-    #[test]
-    fn unpinning_folds_crystal_into_the_feed_with_its_real_time() {
-        let mut panel = LiveFeedPanel::new();
-        panel.realm_name = Some("Mesa".to_string());
-        assert!(panel.push_boss_call(2471, "Mysterious Crystal".to_string()));
-        let pin = panel.crystal_pin.take().expect("pin exists");
-        let at = pin.last_spoke_at;
-        panel.fold_crystal_pin_into_feed(&pin);
-        assert_eq!(boss_call_count(&panel), 1);
-        let entry = panel
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                FeedEntry::BossCall(b) => Some(b),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(entry.boss_name, "Mysterious Crystal");
-        assert_eq!(entry.timestamp, at);
+        let FeedEntry::BossCall(boss) = &panel.entries[0] else {
+            panic!("expected Crystal entry");
+        };
+        let discovery = boss.discovery.as_ref().unwrap();
+        assert_ne!(discovery.scope, panel.discovery_scope);
+        assert!(discovery.stopped_elapsed.is_some());
     }
 
     #[test]
@@ -6587,10 +6603,20 @@ mod tests {
         assert!(panel.push_boss_call(22128, "Beer God".to_string()));
         assert!(!panel.push_boss_call(22128, "Beer God".to_string()));
         assert_eq!(boss_call_count(&panel), 1);
+        panel.apply_realm_discovery(DiscoveryEvent::CrystalMessage {
+            object_id: Some(123),
+            notify: true,
+            at: std::time::Instant::now() - std::time::Duration::from_secs(6),
+            timestamp: Local::now() - BOSS_CALL_DEDUP_WINDOW - chrono::Duration::seconds(1),
+            packet_seen: false,
+            absent_since: None,
+        });
+        assert!(!panel.push_boss_call(22128, "Beer God".to_string()));
+        assert_eq!(boss_call_count(&panel), 2);
         // Same boss in a different realm is a new sighting.
         panel.realm_name = Some("Ocean".to_string());
         assert!(panel.push_boss_call(22128, "Beer God".to_string()));
-        assert_eq!(boss_call_count(&panel), 2);
+        assert_eq!(boss_call_count(&panel), 3);
     }
 
     #[test]

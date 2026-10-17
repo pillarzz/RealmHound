@@ -413,6 +413,7 @@ impl Worker {
             let mut queue_remaining = 0usize;
             #[cfg(feature = "latency-diagnostics")]
             let mut capture_queue_drops = self.capture_drops.total();
+            let mut capture_closed = false;
             let packets = match self.receiver.as_ref() {
                 Some(rx) => {
                     #[cfg(feature = "latency-diagnostics")]
@@ -425,6 +426,7 @@ impl Worker {
                     }
                     if result.closed {
                         tracing::warn!("[WORKER] capture source closed; awaiting restart");
+                        capture_closed = true;
                         #[cfg(feature = "latency-diagnostics")]
                         {
                             capture_queue_drops = self.capture_drops.finish_source(rx.dropped());
@@ -468,7 +470,7 @@ impl Worker {
             // 3. Run the pipeline and dispatch the resulting updates.
             let missions_changed = self.processor.expire_mission_cooldowns();
             let identity_changed = self.processor.tick_identity();
-            if !packets.is_empty() {
+            if !packets.is_empty() || capture_closed || self.processor.has_pending_updates() {
                 // Inject queue-drop count into capture metrics.
                 if let Some(rx) = &self.receiver {
                     self.processor.update_queue_drops(rx.dropped());
@@ -476,7 +478,11 @@ impl Worker {
 
                 #[cfg(feature = "latency-diagnostics")]
                 let process_started = Instant::now();
-                let updates = self.processor.process_available(packets);
+                let mut updates = self.processor.process_available(packets);
+                if capture_closed {
+                    self.processor.on_capture_stop();
+                    updates.extend(self.processor.process_available(Vec::new()));
+                }
                 #[cfg(feature = "latency-diagnostics")]
                 {
                     segments.process = process_started.elapsed();
@@ -878,6 +884,7 @@ impl Worker {
                 self.ctx.request_repaint();
             }
             ControlMsg::StopCapture => {
+                self.processor.on_capture_stop();
                 #[cfg(feature = "latency-diagnostics")]
                 if let Some(receiver) = self.receiver.take() {
                     self.capture_drops.finish_source(receiver.dropped());
@@ -979,6 +986,7 @@ fn payload_relevant(payload: &UiPayload, active: ActiveTab) -> bool {
         UiPayload::SetVaultActivePet { .. } => matches!(active, Vault | PetYard),
 
         UiPayload::BossCall { .. }
+        | UiPayload::RealmDiscovery(_)
         | UiPayload::KeyperEvent { .. }
         | UiPayload::SetServerName(_)
         | UiPayload::AddEncounter { .. }

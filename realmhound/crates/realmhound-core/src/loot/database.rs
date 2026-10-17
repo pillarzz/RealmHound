@@ -60,6 +60,12 @@ pub struct LootDropRecord {
     pub bag_type: i32,
     /// Mob type ID that dropped the bag
     pub mob_type: i32,
+    /// Object type whose current name and sprite represent the source in the UI:
+    /// one variant per encounter (the one dropped most recently), so a history
+    /// that spans a seasonal reskin reads and draws uniformly. Equal to
+    /// `mob_type` for a source with no reskin. Kept separate so combat
+    /// correlation and filtering keep using the stored id.
+    pub display_object_type: i32,
     /// Mob name (resolved from ID)
     pub mob_name: String,
     /// Items in the bag
@@ -2146,6 +2152,7 @@ impl LootDatabase {
             .query_map([limit], Self::row_to_drop)?
             .collect::<SqlResult<Vec<_>>>()?;
 
+        let drops = self.apply_display_variants(drops)?;
         self.load_items_for_drops(drops)
     }
 
@@ -2269,9 +2276,19 @@ impl LootDatabase {
         // Track parameter index (starts at 3 since ?1 and ?2 are start/end)
         let mut param_idx = 3;
 
-        if filters.mob_type.is_some() {
-            sql.push_str(&format!(" AND {}mob_type = ?{}", col_prefix, param_idx));
-            param_idx += 1;
+        // Filter the whole encounter, not just the selected variant, so a reskin
+        // source's drops recorded under the base id surface too (and vice versa).
+        let mob_variants = filters.mob_type.map(crate::assets::encounter_variant_types);
+        if let Some(variants) = &mob_variants {
+            let placeholders: Vec<String> = (0..variants.len())
+                .map(|i| format!("?{}", param_idx + i))
+                .collect();
+            sql.push_str(&format!(
+                " AND {}mob_type IN ({})",
+                col_prefix,
+                placeholders.join(", ")
+            ));
+            param_idx += variants.len();
         }
         if filters.dungeon.is_some() {
             sql.push_str(&format!(" AND {}dungeon = ?{}", col_prefix, param_idx));
@@ -2286,13 +2303,22 @@ impl LootDatabase {
             param_idx += 1;
         }
 
-        // Free-text search across mob name, dungeon, and item name.
+        // Free-text search across mob name, dungeon, and item name. A reskinned
+        // encounter matches by either of its names.
         let search_like = filters
             .search_text
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| format!("%{}%", s));
+        let alias_likes: Vec<String> = filters
+            .search_text
+            .as_deref()
+            .map(crate::assets::encounter_alias_names_matching)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| format!("%{}%", n))
+            .collect();
         if search_like.is_some() {
             // Qualify the outer drops id so it isn't shadowed by loot_items.id
             // inside the correlated EXISTS subquery.
@@ -2301,14 +2327,22 @@ impl LootDatabase {
             } else {
                 "loot_drops.id"
             };
-            sql.push_str(&format!(
-                " AND ({p}mob_name LIKE ?{i} OR {p}dungeon LIKE ?{i} \
-                 OR EXISTS (SELECT 1 FROM loot_items li WHERE li.drop_id = {d} AND li.item_name LIKE ?{i}))",
-                p = col_prefix,
-                d = drop_id_ref,
-                i = param_idx
+            let p = col_prefix;
+            let mut idx = param_idx;
+            let mut name_parts = vec![format!("{p}mob_name LIKE ?{idx}")];
+            idx += 1;
+            for _ in &alias_likes {
+                name_parts.push(format!("{p}mob_name LIKE ?{idx}"));
+                idx += 1;
+            }
+            name_parts.push(format!("{p}dungeon LIKE ?{idx}"));
+            idx += 1;
+            name_parts.push(format!(
+                "EXISTS (SELECT 1 FROM loot_items li WHERE li.drop_id = {drop_id_ref} AND li.item_name LIKE ?{idx})"
             ));
-            param_idx += 1;
+            idx += 1;
+            param_idx = idx;
+            sql.push_str(&format!(" AND ({})", name_parts.join(" OR ")));
         }
 
         // Add bag type filter with IN clause.
@@ -2345,8 +2379,10 @@ impl LootDatabase {
         params.push(Box::new(start));
         params.push(Box::new(end));
 
-        if let Some(mob) = filters.mob_type {
-            params.push(Box::new(mob));
+        if let Some(variants) = &mob_variants {
+            for &v in variants {
+                params.push(Box::new(v));
+            }
         }
         if let Some(ref dung) = filters.dungeon {
             params.push(Box::new(dung.clone()));
@@ -2358,6 +2394,11 @@ impl LootDatabase {
             params.push(Box::new(item));
         }
         if let Some(ref like) = search_like {
+            params.push(Box::new(like.clone()));
+            for alias in &alias_likes {
+                params.push(Box::new(alias.clone()));
+            }
+            params.push(Box::new(like.clone()));
             params.push(Box::new(like.clone()));
         }
         if let Some(ref bag_types) = filters.bag_types {
@@ -2375,6 +2416,7 @@ impl LootDatabase {
             .query_map(param_refs.as_slice(), Self::row_to_drop)?
             .collect::<SqlResult<Vec<_>>>()?;
 
+        let drops = self.apply_display_variants(drops)?;
         self.load_items_for_drops(drops)
     }
 
@@ -2407,9 +2449,18 @@ impl LootDatabase {
         // Track parameter index (starts at 3 since ?1 and ?2 are start/end)
         let mut param_idx = 3;
 
-        if filters.mob_type.is_some() {
-            sql.push_str(&format!(" AND {}mob_type = ?{}", col_prefix, param_idx));
-            param_idx += 1;
+        // Match the whole encounter (all reskin variants), as in get_drops_filtered.
+        let mob_variants = filters.mob_type.map(crate::assets::encounter_variant_types);
+        if let Some(variants) = &mob_variants {
+            let placeholders: Vec<String> = (0..variants.len())
+                .map(|i| format!("?{}", param_idx + i))
+                .collect();
+            sql.push_str(&format!(
+                " AND {}mob_type IN ({})",
+                col_prefix,
+                placeholders.join(", ")
+            ));
+            param_idx += variants.len();
         }
         if filters.dungeon.is_some() {
             sql.push_str(&format!(" AND {}dungeon = ?{}", col_prefix, param_idx));
@@ -2424,27 +2475,44 @@ impl LootDatabase {
             param_idx += 1;
         }
 
-        // Free-text search across mob name, dungeon, and item name.
+        // Free-text search across mob name, dungeon, and item name, matching a
+        // reskinned encounter by either of its names.
         let search_like = filters
             .search_text
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| format!("%{}%", s));
+        let alias_likes: Vec<String> = filters
+            .search_text
+            .as_deref()
+            .map(crate::assets::encounter_alias_names_matching)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| format!("%{}%", n))
+            .collect();
         if search_like.is_some() {
             let drop_id_ref = if has_item_filter {
                 "d.id"
             } else {
                 "loot_drops.id"
             };
-            sql.push_str(&format!(
-                " AND ({p}mob_name LIKE ?{i} OR {p}dungeon LIKE ?{i} \
-                 OR EXISTS (SELECT 1 FROM loot_items li WHERE li.drop_id = {d} AND li.item_name LIKE ?{i}))",
-                p = col_prefix,
-                d = drop_id_ref,
-                i = param_idx
+            let p = col_prefix;
+            let mut idx = param_idx;
+            let mut name_parts = vec![format!("{p}mob_name LIKE ?{idx}")];
+            idx += 1;
+            for _ in &alias_likes {
+                name_parts.push(format!("{p}mob_name LIKE ?{idx}"));
+                idx += 1;
+            }
+            name_parts.push(format!("{p}dungeon LIKE ?{idx}"));
+            idx += 1;
+            name_parts.push(format!(
+                "EXISTS (SELECT 1 FROM loot_items li WHERE li.drop_id = {drop_id_ref} AND li.item_name LIKE ?{idx})"
             ));
-            param_idx += 1;
+            idx += 1;
+            param_idx = idx;
+            sql.push_str(&format!(" AND ({})", name_parts.join(" OR ")));
         }
 
         // Add bag type filter with IN clause.
@@ -2473,8 +2541,10 @@ impl LootDatabase {
         params.push(Box::new(start));
         params.push(Box::new(end));
 
-        if let Some(mob) = filters.mob_type {
-            params.push(Box::new(mob));
+        if let Some(variants) = &mob_variants {
+            for &v in variants {
+                params.push(Box::new(v));
+            }
         }
         if let Some(ref dung) = filters.dungeon {
             params.push(Box::new(dung.clone()));
@@ -2486,6 +2556,11 @@ impl LootDatabase {
             params.push(Box::new(item));
         }
         if let Some(ref like) = search_like {
+            params.push(Box::new(like.clone()));
+            for alias in &alias_likes {
+                params.push(Box::new(alias.clone()));
+            }
+            params.push(Box::new(like.clone()));
             params.push(Box::new(like.clone()));
         }
         if let Some(ref bag_types) = filters.bag_types {
@@ -2507,6 +2582,7 @@ impl LootDatabase {
         let skin_id: i32 = row.get::<_, i32>("skin_id").unwrap_or(0);
         let tex1: u32 = row.get::<_, i32>("tex1").unwrap_or(0) as u32;
         let tex2: u32 = row.get::<_, i32>("tex2").unwrap_or(0) as u32;
+        let mob_type: i32 = row.get("mob_type")?;
 
         Ok(LootDropRecord {
             id: row.get("id")?,
@@ -2525,10 +2601,68 @@ impl LootDatabase {
             loot_drop_active: row.get::<_, i32>("loot_drop_active")? != 0,
             loot_tier_active: row.get::<_, i32>("loot_tier_active")? != 0,
             bag_type: row.get("bag_type")?,
-            mob_type: row.get("mob_type")?,
+            mob_type,
+            // Defaults to the stored type; the list calls resolve the encounter's
+            // display variant once per load (see `apply_display_variants`).
+            display_object_type: mob_type,
             mob_name: row.get("mob_name")?,
             items: Vec::new(),
         })
+    }
+
+    /// One display variant per reskinned source: the variant whose bag dropped
+    /// most recently, keyed by canonical type. Resolved once per list load so
+    /// every row for one encounter shows a single name and sprite, whichever
+    /// variant's id each drop was stored under (the stored ids are never
+    /// changed). Sources with no reskin never appear.
+    fn display_variants(&self) -> SqlResult<std::collections::HashMap<i32, i32>> {
+        let groups = crate::assets::encounter_reskin_groups();
+        let tracked: Vec<i32> = groups
+            .iter()
+            .flat_map(|group| group.iter().copied())
+            .collect();
+        if tracked.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", tracked.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT mob_type, MAX(timestamp) FROM loot_drops
+             WHERE mob_type IN ({placeholders}) GROUP BY mob_type"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let latest: std::collections::HashMap<i32, i64> = stmt
+            .query_map(rusqlite::params_from_iter(tracked.iter()), |row| {
+                Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<SqlResult<_>>()?;
+        let mut out = std::collections::HashMap::new();
+        for group in groups {
+            let observed = group
+                .iter()
+                .filter_map(|t| latest.get(t).map(|recency| (*t, *recency)));
+            if let Some(display) = crate::assets::encounter_display_variant(observed) {
+                out.insert(crate::assets::encounter_canonical_type(display), display);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Point every drop's `display_object_type` at its encounter's display
+    /// variant (see [`Self::display_variants`]).
+    fn apply_display_variants(&self, drops: Vec<LootDropRecord>) -> SqlResult<Vec<LootDropRecord>> {
+        let variants = self.display_variants()?;
+        Ok(drops
+            .into_iter()
+            .map(|mut drop| {
+                drop.display_object_type = variants
+                    .get(&crate::assets::encounter_canonical_type(drop.mob_type))
+                    .copied()
+                    .unwrap_or(drop.mob_type);
+                drop
+            })
+            .collect())
     }
 
     /// Load items for a list of drops.
@@ -2716,13 +2850,57 @@ impl LootDatabase {
     /// Get all distinct mobs from loot history.
     /// Returns (mob_type, mob_name) pairs sorted by name for autocomplete.
     pub fn get_distinct_mobs(&self) -> SqlResult<Vec<(i32, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT mob_type, mob_name FROM loot_drops ORDER BY mob_name ASC")?;
-        let result = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        // Each source with when it was last seen, so seasonal reskin variants of
+        // one encounter collapse to a single suggestion labelled by the most
+        // recently dropped variant (the season actually in play).
+        let mut stmt = self.conn.prepare(
+            "SELECT mob_type, mob_name, MAX(timestamp) AS latest FROM loot_drops \
+             GROUP BY mob_type, mob_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        // (latest_dropped, variant mob_type, stored name)
+        let mut by_canonical: std::collections::HashMap<i32, (i64, i32, String)> =
+            std::collections::HashMap::new();
+        // Unresolved sources (mob_type 0/unknown) keep their distinct names.
+        let mut unknown: Vec<(i32, String)> = Vec::new();
+        for row in rows {
+            let (mob_type, name, latest) = row?;
+            if mob_type <= 0 {
+                if !unknown.iter().any(|(_, n)| *n == name) {
+                    unknown.push((mob_type, name));
+                }
+                continue;
+            }
+            let canonical = crate::assets::encounter_canonical_type(mob_type);
+            by_canonical
+                .entry(canonical)
+                .and_modify(|entry| {
+                    if latest > entry.0 {
+                        *entry = (latest, mob_type, name.clone());
+                    }
+                })
+                .or_insert((latest, mob_type, name));
+        }
+        let manager = crate::assets::get_asset_manager();
+        let mut out: Vec<(i32, String)> = by_canonical
+            .into_iter()
+            .map(|(_, (_, mob_type, stored))| {
+                // Key by the most recently dropped variant (its sprite — the
+                // reskin during the season) and name it from the live asset so
+                // the tag carries the current seasonal name.
+                let name = manager.object_name(mob_type).unwrap_or(stored);
+                (mob_type, name)
+            })
+            .chain(unknown)
             .collect();
-        result
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        Ok(out)
     }
 
     /// Get all distinct items from loot history.

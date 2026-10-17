@@ -21,13 +21,15 @@ use std::collections::VecDeque;
 use crate::api::character::parse_enchant_ids;
 use crate::assets::get_asset_manager;
 use crate::assets::LethalStrikeParams;
+use crate::assets::SummonTrigger;
 use crate::loot::class_ids;
 use crate::protocol::data::{ObjectStatusData, StatType};
+use crate::stats::derived::pet_ability_deals_damage;
 
 use super::damage::{self, AttackerStats, Rng, DEFAULT_EXALT_BONUS};
 use super::types::{
-    CompletedFight, DamageProvenance, DamageTakenProvenance, FightParticipant,
-    ParticipantEndStatus, PetInfo,
+    AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
+    FightParticipant, ParticipantEndStatus, PetInfo, SummonContribution, WeaponContribution,
 };
 
 /// MaxHP fallback for boss classification, used only when an enemy is not tag-
@@ -103,6 +105,124 @@ const COND_INVISIBLE: i32 = 0x0000_1000;
 /// Primary condition bit (id 29) for Invulnerable: the target takes no damage,
 /// so no Lethal Strike bonus is attributed either.
 const COND_INVULNERABLE: i32 = 0x0100_0000;
+/// Primary condition bits surfaced in the local player's boost log. Only bits
+/// whose meaning is known here are named; any other bit change is ignored rather
+/// than shown as a raw mask.
+const BOOST_CONDITIONS: &[(i32, &str)] = &[
+    (0x0000_0004, "Weak"),         // damage x0.5
+    (0x0004_0000, "Damaging"),     // damage x1.25
+    (COND_INVISIBLE, "Invisible"), // cloaked (rogue sneak)
+    (COND_INVULNERABLE, "Invulnerable"),
+];
+/// How long after a local `UseItem` a stat change is attributed to that item
+/// ("consumable (Potion of Attack)") rather than left unexplained. The server's
+/// stat update trails the use by a packet or two, so this is a small window.
+const BOOST_SOURCE_HINT_MS: i64 = 1_500;
+/// How long after a local shot an on-shoot proc's stat change may arrive and still
+/// be attributed to that proc. The server applies the buff in the same tick as the
+/// hit it triggered, so this only covers packet ordering.
+const BOOST_PROC_HINT_MS: i64 = 800;
+
+/// The stat a boost-log label describes, for verifying an inferred source against
+/// the game data. `None` for condition labels (`Damaging`, `Weak`, ...), which are
+/// matched against an item's declared conditions instead. `ATT boost` (stat 48) is
+/// the companion of `Attack` (stat 20) and is declared as `ATT` too.
+///
+/// Public so the UI can apply the same check to rows recorded before the tracker
+/// verified its sources.
+pub fn stat_kind_for_boost_label(label: &str) -> Option<crate::assets::StatKind> {
+    use crate::assets::StatKind;
+    match label {
+        "Attack" | "ATT boost" => Some(StatKind::Attack),
+        "Defense" => Some(StatKind::Defense),
+        "Speed" => Some(StatKind::Speed),
+        "Dexterity" => Some(StatKind::Dexterity),
+        "Vitality" => Some(StatKind::Vitality),
+        "Wisdom" => Some(StatKind::Wisdom),
+        "Max HP" => Some(StatKind::MaxHp),
+        "Max MP" => Some(StatKind::MaxMp),
+        _ => None,
+    }
+}
+/// Attribution window for one ability activation, in milliseconds: local damage
+/// packets inside it are credited to that activation. A heuristic -- the wire
+/// carries no effect id -- capped so overlapping activations cannot double-count.
+const ABILITY_ATTRIBUTION_WINDOW_MS: i64 = 2_000;
+/// How long after an activation an ability-spawned summon can still be landing
+/// hits. Measured on live captures: a Flowering Kimono's spirits put 123 of 125
+/// bulletless hits within 5s of one of the player's own activations, in a fight
+/// whose activations were up to 15s apart, while a pet out at the same time
+/// attacks on its own clock (an Electric pet landed all of its hits 4.5-6s after
+/// the last activation, and in a fight with no activations at all). Sage's
+/// Wakibiki's tooltip states the matching lifetime -- "Lifetime: 6 seconds",
+/// "Cooldown: 1.5 seconds" -- so the window is the creature's own life rather
+/// than an arbitrary grace period.
+const SUMMON_SPAWN_ATTRIBUTION_MS: i64 = 6_000;
+/// How far a summoned creature can be from a target and still be the one that hit
+/// it. Measured in game: a spirit reaches an enemy 5 tiles away and cannot reach
+/// one at 6. The item tooltip's "3 squares" is the radius of its *slow*, not of
+/// its zap. This is a disambiguator, not a hit model -- the packet already says
+/// how much damage landed -- so its only job is to pick between creatures of the
+/// player's that are out at the same moment (a Kimono and a Wakibiki spirit
+/// "synergize", so more than one can be alive at once). Being wrong here moves a
+/// hit between two of the player's own rows, never in or out of the total.
+const SUMMON_ATTACK_MAX_DIST: f32 = 5.0;
+/// How long a tracked summoned creature stays a candidate with no further sight
+/// of it. Bounds the map when a removal packet never arrives.
+const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;
+/// Whether an object type is a mechanic that damages the boss *for* the player: a
+/// pushed barrel, a cannonball.
+///
+/// Curated, because nothing in the object data says "this damages the boss when
+/// pushed". The two Parasite Chambers barrels are pinned by id so the behaviour does
+/// not depend on the asset catalog being loaded, and names are matched as well so a
+/// reskin or a new barrel-like object works without a code change. Anything else
+/// leaving the world at the same tick as a hit -- a trap, a wall piece, a mob -- is
+/// not a source, however plausible the coincidence. Background: issue #74.
+fn is_boss_damaging_mechanic(object_type: i32) -> bool {
+    matches!(object_type, 0x0786 | 0x0796)
+        || get_asset_manager()
+            .object_name(object_type)
+            .map(|name| {
+                let lower = name.to_lowercase();
+                ["barrel", "cannon", "gunpowder"]
+                    .iter()
+                    .any(|key| lower.contains(key))
+            })
+            .unwrap_or(false)
+}
+
+/// The object type a mechanic's row is named and drawn by.
+///
+/// The boss room has two barrels and the game gives them different object types
+/// (`0x0786` and `0x0796`); only one of them has a texture in the sprite atlas, so
+/// reporting them as they are showed the same name twice, once without a sprite. They
+/// are one mechanic, so they are one row -- count and total damage together, drawn by
+/// the type that renders.
+fn mechanic_row_type(object_type: i32) -> i32 {
+    match object_type {
+        0x0796 => 0x0786,
+        other => other,
+    }
+}
+
+/// How close in time an object's removal has to be to a packet for it to be the
+/// packet's source. Measured at the same tick on a barrel-only capture; the window is
+/// wider than one tick because a live tick can straddle the two packets.
+const MECHANIC_REMOVAL_WINDOW_MS: i64 = 800;
+/// How close an object has to leave the world, relative to the hit's target, to be
+/// that hit's source. A pushed barrel explodes at the boss; anything vanishing on
+/// the far side of the instance is not this packet's source.
+const MECHANIC_REMOVAL_MAX_DIST: f32 = 10.0;
+/// Source label for a transition the character cache reported directly rather
+/// than a numeric stat the wire moved: a Blood Ritual or Crucible switch. Only
+/// these are seeded into a fight's windows when they were already active before
+/// it, since a stat's first reading (VIT arriving at 75) is not a boost.
+const CHARACTER_STATE_SOURCE: &str = "character state";
+/// Cap on the rolling local-event logs the performance sections are rebuilt
+/// from. A long session keeps the most recent entries; the alternative (growing
+/// without bound) is worse than losing detail from very old fights.
+const MAX_LOCAL_EVENT_LOG: usize = 4_096;
 /// Item slot index of the ability item (rogue cloak) in a player's equipment.
 const ABILITY_SLOT: usize = 1;
 /// Item slot index of the main-hand weapon in a player's equipment.
@@ -138,8 +258,10 @@ const MAX_RECENT_FIGHTS: usize = 200;
 /// a gravestone spawned within this many tiles of their last-seen position.
 const GRAVE_MATCH_RADIUS: f32 = 3.0;
 /// ...and within this time window of their removal (covers a grave that arrives
-/// slightly before or after the removal packet in the same/adjacent tick).
-const GRAVE_MATCH_WINDOW_MS: i64 = 15_000;
+/// slightly before or after the removal packet in the same/adjacent tick). Also
+/// used by the combat-history database when applying a stored death broadcast to
+/// a fight that was already written.
+pub(crate) const GRAVE_MATCH_WINDOW_MS: i64 = 15_000;
 /// A departure only counts for a fight if it happened no earlier than this before
 /// the fight's start (guards against correlating a much older, unrelated exit).
 const DEPARTURE_GRACE_MS: i64 = 5_000;
@@ -167,6 +289,18 @@ struct Departure {
     x: f32,
     y: f32,
     time: i64,
+}
+
+/// A server death broadcast observed for another player, handed to the caller to
+/// persist so a death announced after its fight was written can still be applied.
+#[derive(Debug, Clone)]
+pub struct DeathBroadcast {
+    /// The victim's name as broadcast.
+    pub player: String,
+    /// Who killed them (best-effort context from the broadcast).
+    pub killer: String,
+    /// When the broadcast was received (unix ms).
+    pub time: i64,
 }
 
 /// Per-instance pet association state. A pet follows its owner, so
@@ -260,6 +394,10 @@ struct TrackedObject {
     equipment_enchants: [Vec<u16>; 4],
     /// Attack stat (id 20); relevant for the local player's damage multiplier.
     attack: i32,
+    /// AttackBoost stat (id 48). Not part of the damage math (stat 20 already
+    /// carries the effective value); tracked so the local player's boost log can
+    /// show an ATT buff landing even when the base stat is unchanged.
+    attack_boost: i32,
     /// Defense stat (id 21); relevant when this object is a damage target.
     defense: i32,
     /// Primary condition bitmask (id 29).
@@ -280,6 +418,13 @@ struct TrackedObject {
     /// Dexterity (id 28); the server already folds DexterityBoost (id 53) into
     /// it. Scales DEX-scaled abilities (e.g. Enchantment Orb).
     dexterity: i32,
+    /// Vitality (id 26); the server already folds VitalityBoost (id 51) into
+    /// it. Scales VIT-scaled gear (e.g. the Cloak of the Darkened Sun's Lethal
+    /// Strike).
+    vitality: i32,
+    /// Speed (id 22); the server already folds SpeedBoost (id 50) into it.
+    /// Scales SPD-scaled gear (e.g. Sharktooth Sigil's Lethal Strike).
+    speed: i32,
     /// Whether a base Wisdom stat has been observed (avoids a 0-WIS default
     /// under-applying the Lethal Strike bonus before the first stat arrives).
     wisdom_seen: bool,
@@ -293,6 +438,11 @@ struct TrackedObject {
     /// Whether a Defense stat has been observed (so the local player's damage
     /// taken is not estimated from a zero default).
     defense_seen: bool,
+    /// Whether a Vitality stat has been observed (so a VIT-scaled Lethal Strike
+    /// bonus is not computed from a zero default).
+    vitality_seen: bool,
+    /// Whether a Speed stat has been observed (see `vitality_seen`).
+    speed_seen: bool,
     /// Last time (epoch millis) this object's stats were updated.
     last_seen: i64,
     /// Last-seen world position (tile coords), used to correlate a departed
@@ -322,6 +472,7 @@ impl Default for TrackedObject {
             equipment: [-1; 4],
             equipment_enchants: Default::default(),
             attack: 0,
+            attack_boost: 0,
             defense: 0,
             condition: 0,
             condition_new: 0,
@@ -330,10 +481,14 @@ impl Default for TrackedObject {
             wisdom: 0,
             max_mp: 0,
             dexterity: 0,
+            vitality: 0,
+            speed: 0,
             wisdom_seen: false,
             attack_seen: false,
             hp_seen: false,
             defense_seen: false,
+            vitality_seen: false,
+            speed_seen: false,
             last_seen: 0,
             last_x: 0.0,
             last_y: 0.0,
@@ -364,8 +519,9 @@ impl TrackedObject {
             ScalingStat::Attack => self.attack_seen.then_some(self.attack),
             ScalingStat::Defense => self.defense_seen.then_some(self.defense),
             ScalingStat::Dexterity => Some(self.dexterity),
+            ScalingStat::Vitality => self.vitality_seen.then_some(self.vitality),
+            ScalingStat::Speed => self.speed_seen.then_some(self.speed),
             ScalingStat::MaxMp => Some(self.max_mp),
-            _ => None,
         }
     }
 
@@ -432,6 +588,10 @@ impl TrackedObject {
             attack: self.attack,
             condition: self.condition,
             exalt_bonus: self.exalt_bonus,
+            // Mastery and the seasonal challenge multipliers are character data,
+            // not object stats, so they are not known here; `on_local_shot` fills
+            // them from the tracker (see `set_shot_damage_bonus`).
+            ..Default::default()
         }
     }
 }
@@ -439,10 +599,20 @@ impl TrackedObject {
 /// A local shot awaiting its `EnemyHit` confirmation, keyed by bullet id. The
 /// base (pre-defense) damage is rolled at shoot time; defense is applied per hit
 /// against the target's live stats (a piercing bullet may hit several targets).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct PendingShot {
     base_damage: i32,
     armor_piercing: bool,
+    /// The loadout this shot is attributed to: the player's gear when it was
+    /// fired, with the weapon slot taken from the `PlayerShoot` packet (the
+    /// authoritative firing weapon, so a lagging stat update cannot mislabel it).
+    ///
+    /// Damage is bucketed by the gear that fired it, not by whatever is equipped
+    /// when the `EnemyHit` is processed. A bullet can be in flight across a swap,
+    /// and a loot-bonus weapon equipped for the last moments of a fight would
+    /// otherwise collect every shot still in the air (the loot swapout then reads
+    /// as the main damage weapon).
+    shot_gear: ([i32; 4], [Vec<u16>; 4]),
     /// When this shot was fired (epoch millis), used to test membership in a
     /// Lethal Strike window at hit time (hits arrive after the window is known).
     shot_time: i64,
@@ -508,6 +678,418 @@ struct ParticipantAccum {
     /// the most damage with -- and its matching enchants -- rather than whatever
     /// they happened to have equipped when the boss died.
     damage_by_equipment: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
+    /// Summon/pet-sourced subset of `damage`/`hits`. The owner's row keeps the
+    /// total (the game attributes pet damage to the player), but the split lets
+    /// the summary show the pet's own line and keeps pet hits out of the owner's
+    /// per-hit average and per-loadout buckets.
+    summon_damage: i64,
+    summon_hits: u64,
+    /// Summon hits whose shoot packet was missed, so no base damage was known.
+    unresolved_summon_hits: u64,
+    /// Per-summon contribution, keyed by the summon/pet object id.
+    summons: HashMap<i32, SummonAccum>,
+    /// Damage the server itself attributed to this participant inside a local
+    /// damage packet: an ability/DoT/proc figure the client did not compute.
+    /// Only ever non-zero for the local player (every remote row arrives solely
+    /// this way). Deliberately kept out of `damage_by_equipment` so the weapon
+    /// rows stay purely self-computed instead of claiming a packet's damage.
+    packet_damage: i64,
+    packet_hits: u64,
+}
+
+/// Contribution of one summon or pet: a shooting entity owned by a participant.
+#[derive(Debug, Clone, Default)]
+struct SummonAccum {
+    damage: i64,
+    hits: u64,
+    /// Pet sprite / skin id (`StatType::PetType`); 0 when not a pet.
+    pet_type: i32,
+    /// Whether the entity carried a pet stat, i.e. it is a pet and not a
+    /// summon spawned by an item or ability.
+    is_pet: bool,
+    /// The entity's own object type, which names and draws the row when it is a
+    /// summon: a summoned creature's type is its identity, where a pet's is its
+    /// skin under `pet_type`. 0 until the entity is observed.
+    object_type: i32,
+    /// The item that created it and the enchants that item had, resolved from the
+    /// local player's loadout and activation log (see
+    /// [`CombatTracker::summon_source_item`]). 0 until resolved.
+    source_item: i32,
+    source_enchants: Vec<u16>,
+}
+
+/// One boost-relevant stat/condition transition on the local player, in absolute
+/// time. Per-fight windows are rebuilt from consecutive transitions of the same
+/// label at finalize.
+#[derive(Debug, Clone)]
+struct LocalStatChange {
+    time_ms: i64,
+    /// Stat or condition name; also the key a window is closed on.
+    label: &'static str,
+    from: i32,
+    to: i32,
+    /// Best-effort source hint (an item used just before, "expired", or unknown).
+    source: String,
+    /// Object id of the item `source` names, when one was resolved.
+    source_item: Option<i32>,
+}
+
+/// One activation of the local player's ability-slot item (absolute time).
+#[derive(Debug, Clone)]
+struct LocalAbilityUse {
+    time_ms: i64,
+    item_id: i32,
+    enchants: Vec<u16>,
+    /// How long after this activation the item's own declared server-applied
+    /// effect can still be producing the bulletless `DamagePacket`s (see
+    /// [`AbilityEffects::server_applied_damage_window_ms`]), resolved once at
+    /// activation time. `None` when the item declares no such effect, i.e. when a
+    /// bulletless packet could not have come from it.
+    server_effect_window_ms: Option<i64>,
+}
+
+/// One item in the local player's loadout that declares a summon of the creature
+/// being resolved.
+#[derive(Debug, Clone, Copy)]
+struct SummonCandidate {
+    /// Equipment slot it sits in, which is where its enchants are read from.
+    slot: usize,
+    item: i32,
+    trigger: SummonTrigger,
+    /// The spawning element's own `lifeTime`, 0 when it declares none.
+    lifetime_ms: i64,
+}
+
+/// Decide which of the local player's items created a summoned creature (see
+/// [`CombatTracker::summon_source_item`]), returning the item and the enchants it
+/// had.
+fn pick_summon_source(
+    candidates: &[SummonCandidate],
+    uses: &VecDeque<LocalAbilityUse>,
+    equipment_enchants: &[Vec<u16>],
+    at_ms: i64,
+) -> Option<(i32, Vec<u16>)> {
+    let mut best: Option<(i64, i32, Vec<u16>)> = None;
+    for &SummonCandidate {
+        slot,
+        item,
+        trigger,
+        lifetime_ms,
+    } in candidates
+    {
+        let lifetime = if lifetime_ms > 0 {
+            lifetime_ms
+        } else {
+            SUMMON_SPAWN_ATTRIBUTION_MS
+        };
+        let fired = uses
+            .iter()
+            .filter(|u| match trigger {
+                SummonTrigger::Use => u.item_id == item,
+                // An ability-activated summon is created by the *declaring* item
+                // (the Kimono), not by whichever ability happened to be pressed,
+                // so any activation dates it.
+                SummonTrigger::OnAbilityUse => true,
+                _ => false,
+            })
+            .filter(|u| u.time_ms <= at_ms && at_ms - u.time_ms <= lifetime)
+            .max_by_key(|u| u.time_ms);
+        let Some(use_) = fired else { continue };
+        // The enchants belong to the *declaring* item, which is the item whose
+        // slot is being read -- never to the ability that happened to be pressed
+        // (a Kimono's spirits come from an activation of something else entirely,
+        // and taking that item's enchants would split one Kimono across two rows).
+        let enchants = equipment_enchants.get(slot).cloned().unwrap_or_default();
+        if best.as_ref().map_or(true, |(at, _, _)| use_.time_ms > *at) {
+            best = Some((use_.time_ms, item, enchants));
+        }
+    }
+    if let Some((_, item, enchants)) = best {
+        return Some((item, enchants));
+    }
+    // Nothing in the log triggered it (a shoot-triggered summon, say): the one
+    // equipped item that declares the creature is the answer, and only when it is
+    // alone.
+    match candidates {
+        [only] => Some((
+            only.item,
+            equipment_enchants
+                .get(only.slot)
+                .cloned()
+                .unwrap_or_default(),
+        )),
+        _ => None,
+    }
+}
+
+/// Whether an activation's own declared server-applied effect could still be
+/// producing a bulletless `DamagePacket` at `time_ms`. The single definition of
+/// "this packet is already accounted for", shared by the ability-credit pass and
+/// the pet/summon attribution so an event can never be credited twice.
+fn activation_claims_packet(use_: &LocalAbilityUse, time_ms: i64) -> bool {
+    use_.server_effect_window_ms
+        .is_some_and(|window| time_ms >= use_.time_ms && time_ms <= use_.time_ms + window)
+}
+
+/// What produced one bulletless `DamagePacket` the server credited to the local
+/// player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketDamageSource {
+    /// A creature spawned by an activation of the player's loadout.
+    Summon {
+        /// Its own object type, which names and draws the row.
+        creature: i32,
+        /// Its object id when it was seen in the world, so the row keys on the
+        /// real instance; `None` when only the timing window places it.
+        object_id: Option<i32>,
+    },
+    /// The damage-capable pet that was out when the packet landed.
+    Pet { pet_id: i32 },
+}
+
+/// Decide which pet or summon a packet-borne local damage event belongs to, or
+/// `None` when nothing explains it (the event then stays an unattributed
+/// `packet_damage` figure).
+///
+/// `spawns` are the summons the loadout can spawn, per
+/// [`CombatTracker::activation_spawned_summons_of_local_loadout`]; `uses` are the
+/// player's activations in the fight. Evidence wins in this order:
+///
+/// 1. a summoned creature seen in the world, alive and in reach of the target --
+///    the closest thing to a direct trace, since it is observed rather than
+///    inferred from timing;
+/// 2. a damage-capable pet that was out and in range;
+/// 3. an activation-created summon, when the creature itself was never seen (a
+///    missed spawn packet) and no pet could have been the shooter. A pet out at
+///    the same time takes precedence here, because a spammed ability makes the
+///    timing window nearly always true and it can no longer tell the two apart.
+fn packet_damage_source(
+    uses: &[&LocalAbilityUse],
+    spawns: &[(i32, Option<i32>)],
+    seen_creatures: &HashSet<i32>,
+    event: &LocalDamageEvent,
+) -> Option<PacketDamageSource> {
+    // An activation whose item declares a server-applied effect owns its packet,
+    // so it is never re-attributed to a pet or a summon sitting nearby.
+    if uses
+        .iter()
+        .any(|u| activation_claims_packet(u, event.time_ms))
+    {
+        return None;
+    }
+    if let Some((object_id, creature)) = event.summon {
+        return Some(PacketDamageSource::Summon {
+            creature,
+            object_id: Some(object_id),
+        });
+    }
+    if let Some(pet_id) = event.pet_id {
+        return Some(PacketDamageSource::Pet { pet_id });
+    }
+    // Creatures the loadout can spawn, each with the last activation that could
+    // have created it (a `Use` summon only by its own item's, anything else by
+    // any activation).
+    let mut candidates: Vec<(i64, i32)> = spawns
+        .iter()
+        .filter_map(|&(creature, only_item)| {
+            let at = uses
+                .iter()
+                .filter(|u| only_item.map_or(true, |item| u.item_id == item))
+                .map(|u| u.time_ms)
+                .filter(|&t| event.time_ms >= t && event.time_ms - t <= SUMMON_SPAWN_ATTRIBUTION_MS)
+                .max();
+            at.map(|t| (t, creature))
+        })
+        .collect();
+    // A creature seen in the world around this fight is the better guess: an item
+    // that spawns on any activation keeps this window open almost always, so the
+    // timing alone would hand the packet to whichever creature happened to be
+    // activated last, including one that was never actually out.
+    if candidates.len() > 1 {
+        let observed: Vec<(i64, i32)> = candidates
+            .iter()
+            .filter(|(_, creature)| seen_creatures.contains(creature))
+            .copied()
+            .collect();
+        if !observed.is_empty() {
+            candidates = observed;
+        }
+    }
+    // Most recent activation wins; ties by lowest creature id so the choice cannot
+    // depend on iteration order.
+    candidates
+        .into_iter()
+        .max_by_key(|&(at, creature)| (at, std::cmp::Reverse(creature)))
+        .map(|(_, creature)| PacketDamageSource::Summon {
+            creature,
+            object_id: None,
+        })
+}
+
+/// A creature the local player's own item summons, seen in the world.
+#[derive(Debug, Clone, Copy)]
+struct LocalSummonEntity {
+    /// The creature's own object type, which names and draws its row.
+    object_type: i32,
+    /// When it first appeared, which bounds how long it can have been hitting
+    /// anything: a spirit item's own tooltip gives a 6 second lifetime.
+    first_seen_ms: i64,
+    last_seen_ms: i64,
+    x: f32,
+    y: f32,
+}
+
+/// One packet-borne damage event the server credited to the local player. Only
+/// such damage is on the wire; the rest of the local player's damage is
+/// reconstructed from their own shot packets and has no server-side event.
+/// An object that left the world, with where it was last seen and when.
+///
+/// A hit the engine cannot explain any other way is credited to the one that
+/// vanished as it landed: several dungeons damage the boss *for* the player through
+/// an object -- Parasite Chambers' barrels, the Galleon's cannonballs -- and the
+/// server credits the player who last touched it. Nothing else on the wire names
+/// the source, but the removal is tick-aligned with the packet (measured on a solo
+/// Nightmare Colony killed with barrels alone: all 105 hits coincided with an
+/// `Explosive Barrel` removal).
+#[derive(Debug, Clone, Copy)]
+struct LocalObjectRemoval {
+    time_ms: i64,
+    object_type: i32,
+    x: f32,
+    y: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalDamageEvent {
+    time_ms: i64,
+    damage: i64,
+    /// A pet of the local player that was out, in range and able to deal damage
+    /// when this landed (`None` otherwise). The packet names the *owner*, never
+    /// the shooter, so this observation is what separates a pet's server-credited
+    /// damage from any other bulletless damage the server credits to the player.
+    pet_id: Option<i32>,
+    /// A summoned creature of the local player's that was alive and within reach
+    /// of this packet's target when it landed, as `(object id, object type)`.
+    /// Seen in the world rather than inferred, so it outranks the timing window.
+    summon: Option<(i32, i32)>,
+    /// The object type of something that left the world near the target as this
+    /// landed: the source of a mechanic that damages the boss for the player (see
+    /// [`LocalObjectRemoval`]). Last resort, only when nothing the player fired
+    /// explains the packet.
+    removal: Option<i32>,
+}
+/// One landed hit from a volley the server fired for the local player. The
+/// `ServerPlayerShoot` packet names the item that fired the bullet, so the hit
+/// (and its packet-borne damage) belongs to that item's own activation.
+#[derive(Debug, Clone, Copy)]
+struct LocalVolleyHit {
+    time_ms: i64,
+    item_id: i32,
+    damage: i64,
+}
+
+/// The local player's boost-relevant stats, snapshotted around one stat update
+/// so the change can be turned into a boost window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoostSnapshot {
+    attack: i32,
+    attack_boost: i32,
+    defense: i32,
+    dexterity: i32,
+    wisdom: i32,
+    max_hp: i32,
+    max_mp: i32,
+    vitality: i32,
+    speed: i32,
+    condition: i32,
+}
+
+impl BoostSnapshot {
+    fn of(obj: &TrackedObject) -> Self {
+        Self {
+            attack: obj.attack,
+            attack_boost: obj.attack_boost,
+            defense: obj.defense,
+            dexterity: obj.dexterity,
+            wisdom: obj.wisdom,
+            max_hp: obj.max_hp,
+            max_mp: obj.max_mp,
+            vitality: obj.vitality,
+            speed: obj.speed,
+            condition: obj.condition,
+        }
+    }
+
+    /// Level-stat changes between two snapshots, as (label, from, to). Vitality
+    /// and Speed are included so a VIT-stacking build's stat swings are visible
+    /// in the fight's boost timeline, not just its damage; Max HP is included
+    /// because the life-buffing treats raise it.
+    fn level_changes(&self, after: &Self) -> Vec<(&'static str, i32, i32)> {
+        [
+            ("Attack", self.attack, after.attack),
+            ("ATT boost", self.attack_boost, after.attack_boost),
+            ("Defense", self.defense, after.defense),
+            ("Dexterity", self.dexterity, after.dexterity),
+            ("Wisdom", self.wisdom, after.wisdom),
+            ("Max HP", self.max_hp, after.max_hp),
+            ("Max MP", self.max_mp, after.max_mp),
+            ("Vitality", self.vitality, after.vitality),
+            ("Speed", self.speed, after.speed),
+        ]
+        .into_iter()
+        .filter(|(_, before, now)| before != now)
+        .collect()
+    }
+
+    /// Condition-bit changes between two snapshots, as (label, from, to) with
+    /// 0/1 values: a bit turning on opens a window, turning off closes it.
+    ///
+    /// Only the primary mask (stat 29) is read here. The secondary mask (stat 69)
+    /// is a *different* layout -- its bits mean other things (`NEWCON_*` in
+    /// `damage`) -- so testing this mask's bits against the combined value made a
+    /// new-condition bit read as a classic one, e.g. a phantom `Invisible` on a
+    /// character that can never become invisible.
+    fn condition_changes(&self, after: &Self) -> Vec<(&'static str, i32, i32)> {
+        let before_bits = self.condition;
+        let after_bits = after.condition;
+        BOOST_CONDITIONS
+            .iter()
+            .filter(|(bit, _)| (before_bits & bit) != (after_bits & bit))
+            .map(|(bit, name)| {
+                if after_bits & bit != 0 {
+                    (*name, 0, 1)
+                } else {
+                    (*name, 1, 0)
+                }
+            })
+            .collect()
+    }
+}
+
+/// The live character's state as the *character cache* reports it -- the same
+/// values the ATTRIBUTES panel reads.
+///
+/// Blood Ritual and the Crucible never reach the engine as numeric stats (the
+/// ritual is a string stat, the crucible a marker), and a pet's identity lives
+/// only in the account cache. The processor pushes them here, and every fight
+/// finalised from then on carries them in its own record, so the fight card
+/// shows the state the fight was fought under rather than whatever is true when
+/// the card is opened.
+#[derive(Debug, Clone, Default)]
+struct LocalSnapshot {
+    /// The Blood Ritual tier the character has on (its id -- the definition itself
+    /// is the season's, not the character's), or `None` when none is active. The
+    /// *id* is what a fight has to keep: a character's recorded tier is cleared the
+    /// moment the ritual is switched off, so a card that resolved it later showed a
+    /// fight fought under a ritual as having none.
+    blood_ritual: Option<String>,
+    crucible: bool,
+    /// The pet's sprite: its skin, or its type where it has no skin -- the same
+    /// choice ATTRIBUTES makes. 0 when the character has no pet out.
+    pet_skin: i32,
+    /// The pet's own type id, which is what the wire reports for a pet
+    /// (`StatType::PetType`): the identity a claim has to match. 0 when unknown.
+    pet_type: i32,
 }
 
 /// State of an in-progress boss fight, keyed by the boss object id.
@@ -548,6 +1130,31 @@ struct FightState {
     /// Moonlight Village spirits released during this fight. Each spirit is one
     /// `MV Total Counter` object spawned at the end of a dance/Umi phase.
     spirits: i32,
+    /// Total time the boss was both vulnerable and taking damage, in ms. Drives
+    /// the damage-per-minute figure; 0 means the value is unknown (records
+    /// written before this existed), so the UI falls back to the whole duration.
+    boss_uptime_ms: i64,
+    /// Cursor for uptime accrual. Only gaps up to [`MAX_UPTIME_GAP_MS`] count, so
+    /// a boss left standing between phases does not accrue idle time.
+    uptime_cursor_ms: i64,
+}
+
+/// Longest gap between boss events that still counts as fight uptime. Anything
+/// longer is treated as idle (boss parked, players away) and contributes only
+/// this much, which keeps DPM from being diluted by standing around.
+const MAX_UPTIME_GAP_MS: i64 = 5_000;
+
+impl FightState {
+    /// Accrue boss uptime up to `now_ms`, counting the elapsed slice only while
+    /// the boss is vulnerable. Call on every boss damage event and on every boss
+    /// condition change (with the state that applied *before* the change).
+    fn account_uptime(&mut self, now_ms: i64, vulnerable: bool) {
+        let delta = (now_ms - self.uptime_cursor_ms).clamp(0, MAX_UPTIME_GAP_MS);
+        if vulnerable {
+            self.boss_uptime_ms += delta;
+        }
+        self.uptime_cursor_ms = now_ms;
+    }
 }
 
 /// Run-scoped tally of one aux category's member instances (object id -> highest
@@ -585,6 +1192,14 @@ pub struct CombatTracker {
     dungeon_entered_at: Option<i64>,
     /// Local player's object id (0 until known).
     local_object_id: i32,
+    /// Mastery and seasonal challenge damage multipliers applied to the local
+    /// player's rolled weapon shots. Character data, not packets: the app pushes
+    /// them with [`CombatTracker::set_shot_damage_bonus`], resolved through
+    /// [`crate::stats::derived::shot_damage_bonus`] -- the same helper the
+    /// theoretical DPS page uses, so Combat History and that page cannot
+    /// disagree about what the player's own shot is worth. Neutral (1.0) until
+    /// set, which reproduces the pre-existing numbers exactly.
+    shot_damage_bonus: crate::stats::derived::ShotDamageBonus,
     /// Local player's character id / char_id (0 until known). Stamped onto each
     /// fight when it begins so the UI can filter by character.
     local_char_id: i32,
@@ -653,11 +1268,13 @@ pub struct CombatTracker {
     pending_summon_shots: HashMap<(i32, i16), i32>,
     /// Pre-defense damage of the local player's OWN server-fired bullets (weapon
     /// procs, ability volleys/secondary shots) awaiting their `EnemyHit`, keyed
-    /// by bullet id. The value is `(damage, armor_piercing)`. These arrive via
-    /// `ServerPlayerShoot` with owner == local and are confirmed by an outgoing
-    /// `EnemyHit`; their damage is only in that packet. Kept disjoint from
-    /// `pending_shots` (newest registration owns an id). Cleared on map change.
-    pending_server_shots: HashMap<i16, (i32, bool)>,
+    /// by bullet id. The value is `(damage, armor_piercing, item_id)`, where the
+    /// item is the one the server named as the shot's source (a spell's volley
+    /// names the spell). These arrive via `ServerPlayerShoot` with owner == local
+    /// and are confirmed by an outgoing `EnemyHit`; their damage is only in that
+    /// packet. Kept disjoint from `pending_shots` (newest registration owns an
+    /// id). Cleared on map change.
+    pending_server_shots: HashMap<i16, (i32, bool, i32)>,
     /// Object ids of every player-class object seen in the current map instance.
     /// Used at finalize to prove a fight was effectively solo (no *other* player
     /// present) before crediting unattributed boss-HP loss to the local player.
@@ -695,6 +1312,10 @@ pub struct CombatTracker {
     /// die in a tight cluster), so it overrides a Nexused verdict at finalize.
     /// Cleared on map change / disconnect like the other correlation buffers.
     remote_deaths: HashMap<String, i64>,
+    /// Death broadcasts observed since the last drain, for the caller to persist.
+    /// Never cleared on map change: the caller persists them and the persisted row
+    /// is what lets a death announced after its fight was written be applied.
+    pending_death_broadcasts: Vec<DeathBroadcast>,
     /// Set while a map change / disconnect force-finalizes active fights, so the
     /// local player -- always still in `objects` from their own view -- is scored
     /// as having left (nexused) any boss fight that was not completed.
@@ -702,6 +1323,40 @@ pub struct CombatTracker {
     /// Per-instance pet -> owner proximity votes and pet identity.
     /// Keyed by pet object id; reset on map change / disconnect.
     pet_tracks: HashMap<i32, PetTrack>,
+    /// Summoned creatures of the local player's that are currently in the world,
+    /// keyed by object id (see [`CombatTracker::track_local_summon`]).
+    local_summons: HashMap<i32, LocalSummonEntity>,
+    /// Rolling log of the local player's stat/condition transitions in absolute
+    /// time. Sliced into per-fight boost windows at finalize, so one log serves
+    /// every fight in the session (and multi-phase merges stay correct without
+    /// any merge bookkeeping).
+    local_stat_changes: VecDeque<LocalStatChange>,
+    /// The live character's Blood Ritual, Crucible and pet, pushed by the
+    /// processor from the character cache (see [`LocalSnapshot`]).
+    local_snapshot: LocalSnapshot,
+    /// Objects that left the world recently, so a packet nothing else explains can
+    /// be credited to the one that vanished as it landed (see
+    /// [`LocalObjectRemoval`]).
+    object_removals: VecDeque<LocalObjectRemoval>,
+    /// Rolling log of the local player's ability activations (absolute time),
+    /// likewise sliced per fight at finalize.
+    local_ability_uses: VecDeque<LocalAbilityUse>,
+    /// Rolling log of packet-borne damage the server credited to the local
+    /// player. This is the only local damage that reaches the wire, so it is what
+    /// ability activations can be credited from.
+    local_damage_events: VecDeque<LocalDamageEvent>,
+    /// Rolling log of the local player's server-fired volley hits: the damage the
+    /// `ServerPlayerShoot` packet named, on the bullet's `EnemyHit`, together with
+    /// the item that packet said fired it. Unlike `local_damage_events` (which
+    /// carries no source), these are source-exact and are credited to that same
+    /// item's own activation.
+    local_volley_hits: VecDeque<LocalVolleyHit>,
+    /// Last local `UseItem` (item id, time), used to propose a source for a stat
+    /// change that follows it. `None` until the first use this session.
+    last_local_use: Option<(i32, i64)>,
+    /// Timestamp (epoch millis) of the local player's most recent weapon shot, used
+    /// to tell an on-shoot gear proc from an ally's buff arriving at the same time.
+    last_shot_ms: i64,
     /// Boss object types marked completed for the current run by a Moonlight
     /// Village completion marker. Bosses here go invulnerable
     /// instead of dying, so any fight of these types is force-scored as a kill at
@@ -800,6 +1455,7 @@ impl CombatTracker {
             dungeon_entered_at: None,
             local_object_id: 0,
             local_char_id: 0,
+            shot_damage_bonus: crate::stats::derived::ShotDamageBonus::none(),
             objects: HashMap::new(),
             fights: HashMap::new(),
             aux_fights: HashMap::new(),
@@ -826,8 +1482,18 @@ impl CombatTracker {
             departures: HashMap::new(),
             pending_local_grave: None,
             remote_deaths: HashMap::new(),
+            pending_death_broadcasts: Vec::new(),
             local_departing: false,
             pet_tracks: HashMap::new(),
+            local_summons: HashMap::new(),
+            local_stat_changes: VecDeque::new(),
+            local_snapshot: LocalSnapshot::default(),
+            object_removals: VecDeque::new(),
+            local_ability_uses: VecDeque::new(),
+            local_damage_events: VecDeque::new(),
+            local_volley_hits: VecDeque::new(),
+            last_local_use: None,
+            last_shot_ms: 0,
             completed_boss_types: HashSet::new(),
             completed_recorded_types: HashSet::new(),
             shield_dr_until: 0,
@@ -848,6 +1514,21 @@ impl CombatTracker {
             shatters_bridge_engaged: false,
             shatters_hm_named: HashSet::new(),
         }
+    }
+
+    /// Set the local player's shot damage multipliers (exaltation mastery times
+    /// the seasonal challenge multipliers). The app derives them from the
+    /// character's own data with [`crate::stats::derived::shot_damage_bonus`],
+    /// the same helper the theoretical DPS page uses. Until they are set the
+    /// engine runs neutral, i.e. exactly as it did before they existed.
+    pub fn set_shot_damage_bonus(&mut self, bonus: crate::stats::derived::ShotDamageBonus) {
+        self.shot_damage_bonus = bonus;
+    }
+
+    /// The shot damage multipliers currently applied to self-computed shots.
+    /// Neutral (1.0/1.0) until the app pushes the character's values.
+    pub fn shot_damage_bonus(&self) -> crate::stats::derived::ShotDamageBonus {
+        self.shot_damage_bonus
     }
 
     /// Recently completed fights held in memory.
@@ -926,6 +1607,7 @@ impl CombatTracker {
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
         self.summon_owners.clear();
+        self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
         self.seen_player_ids.clear();
@@ -975,6 +1657,7 @@ impl CombatTracker {
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
         self.summon_owners.clear();
+        self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
         self.seen_player_ids.clear();
@@ -986,6 +1669,7 @@ impl CombatTracker {
         self.pending_local_grave = None;
         self.remote_deaths.clear();
         self.pet_tracks.clear();
+        self.local_summons.clear();
         self.completed_boss_types.clear();
         self.completed_recorded_types.clear();
         self.reset_local_mitigation_windows();
@@ -1057,6 +1741,7 @@ impl CombatTracker {
         if entry.is_pet {
             self.record_pet_observation(object_id);
         }
+        self.track_local_summon(object_id, object_type, status.pos.x, status.pos.y, time_ms);
         let spawn_max_hp = self.objects.get(&object_id).map(|o| o.max_hp).unwrap_or(0);
         self.note_aux_instance(object_id, object_type, spawn_max_hp);
         // The Bridge Sentinel coming into view means the local player reached the
@@ -1127,6 +1812,124 @@ impl CombatTracker {
         }
     }
 
+    /// Follow a spawned creature that one of the local player's items can summon.
+    ///
+    /// The wire never says who owns a summoned creature, so this keeps only the
+    /// ones that (a) have a type an equipped item of the player's declares a
+    /// summon for and (b) appeared next to the player. Its lifetime is then the
+    /// strongest evidence of whose hits are whose: a packet names the owner and
+    /// never the shooter, so a creature alive at that moment -- rather than a
+    /// 6s window after an activation -- is the closest thing to a direct trace.
+    fn track_local_summon(
+        &mut self,
+        object_id: i32,
+        object_type: i32,
+        x: f32,
+        y: f32,
+        time_ms: i64,
+    ) {
+        if object_id == self.local_object_id {
+            return;
+        }
+        let declared = self
+            .activation_spawned_summons_of_local_loadout()
+            .into_iter()
+            .any(|(creature, _)| creature == object_type);
+        if !declared {
+            return;
+        }
+        let Some(local) = self.objects.get(&self.local_object_id) else {
+            return;
+        };
+        let (dx, dy) = (x - local.last_x, y - local.last_y);
+        if dx * dx + dy * dy > PET_ASSOC_MAX_DIST * PET_ASSOC_MAX_DIST {
+            return;
+        }
+        self.local_summons.insert(
+            object_id,
+            LocalSummonEntity {
+                object_type,
+                first_seen_ms: time_ms,
+                last_seen_ms: time_ms,
+                x,
+                y,
+            },
+        );
+        // Bounded: a creature that never sends a removal is forgotten once it has
+        // not been seen for a while, so a long session cannot accumulate ids.
+        let cutoff = time_ms - LOCAL_SUMMON_MAX_AGE_MS;
+        self.local_summons
+            .retain(|&id, e| id == object_id || e.last_seen_ms >= cutoff);
+    }
+
+    /// The local player's summoned creature that could have shot `target_id`: the
+    /// nearest one still within its own lifetime and within reach of it. `None`
+    /// when the player has none out.
+    fn local_summon_attacking(&self, target_id: i32, time_ms: i64) -> Option<(i32, i32)> {
+        let target = self.objects.get(&target_id)?;
+        let (tx, ty) = (target.last_x, target.last_y);
+        self.local_summons
+            .iter()
+            .filter(|(_, e)| time_ms - e.first_seen_ms <= SUMMON_SPAWN_ATTRIBUTION_MS)
+            .filter_map(|(&id, e)| {
+                let (dx, dy) = (e.x - tx, e.y - ty);
+                let dist = (dx * dx + dy * dy).sqrt();
+                (dist <= SUMMON_ATTACK_MAX_DIST).then_some((dist, id, e.object_type))
+            })
+            .min_by(|a, b| {
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.1.cmp(&b.1))
+            })
+            .map(|(_, id, object_type)| (id, object_type))
+    }
+
+    /// The item that created a summon of `creature_type`, with the enchants it had
+    /// at the time.
+    ///
+    /// A creature's catalog entry lists *every* item that can spawn it, so
+    /// `Summon Bear` names both `Sovereign Mace` and its `(SB)` twin and the row
+    /// reads "from 2 items" even though one mace was used. The player's own
+    /// equipment and activation log settle it:
+    ///
+    /// * an equipped item that declares the creature is a candidate, and the one
+    ///   whose trigger the log can still satisfy at `at_ms` wins -- a `Use` summon
+    ///   needs its own activation, an ability-activated one is created by *any*
+    ///   activation (the Kimono's spirits come from the Kimono, not from the
+    ///   ability that happened to be pressed), and each spawning element declares
+    ///   its creature's `lifeTime`, so a summon cast before the fight is still
+    ///   traceable;
+    /// * with nothing in the log, a candidate that is equipped now is the only
+    ///   other answer, and only when it is the single one.
+    fn summon_source_item(&self, creature_type: i32, at_ms: i64) -> Option<(i32, Vec<u16>)> {
+        let sources = get_asset_manager().summon_sources(creature_type);
+        if sources.is_empty() {
+            return None;
+        }
+        let local = self.objects.get(&self.local_object_id)?;
+        let mut candidates: Vec<SummonCandidate> = Vec::new();
+        for (slot, &item) in local.equipment.iter().enumerate() {
+            if item <= 0 {
+                continue;
+            }
+            let Some(source) = sources.iter().find(|s| s.item_type == item) else {
+                continue;
+            };
+            candidates.push(SummonCandidate {
+                slot,
+                item,
+                trigger: source.trigger,
+                lifetime_ms: source.lifetime_ms,
+            });
+        }
+        pick_summon_source(
+            &candidates,
+            &self.local_ability_uses,
+            &local.equipment_enchants,
+            at_ms,
+        )
+    }
+
     /// Update an existing object's stats (from a `NewTick` status, which does not
     /// carry the object type). Returns any fight segment finalized as a side
     /// effect (a Marble Colossus survival-phase split emits the pre-survival
@@ -1148,6 +1951,56 @@ impl CombatTracker {
         } else {
             0
         };
+        // Diagnostic: the Blood Ritual (stat 155) and Crucible (stat 128) markers
+        // are the only server signal for those challenges, and their meaning lives
+        // in the *string* field (the active definition's id), not the number. Kept
+        // at debug level: the processor consumes stat 155 for the live tier, and
+        // the whole-update dump stays available when a new marker needs decoding.
+        // Bounded to updates that mention either id, which are rare.
+        if status
+            .stats
+            .iter()
+            .any(|s| s.stat_type_id == 155 || s.stat_type_id == 128)
+        {
+            let dump: Vec<String> = status
+                .stats
+                .iter()
+                .map(|s| {
+                    let mut out = format!("{}={}", s.stat_type_id, s.stat_value);
+                    if let Some(v) = &s.string_stat_value {
+                        out.push_str(&format!(" str={v:?}"));
+                    }
+                    if s.stat_value_two != 0 {
+                        out.push_str(&format!(" v2={}", s.stat_value_two));
+                    }
+                    out
+                })
+                .collect();
+            tracing::debug!(
+                "challenge marker update (object {}, local={}): {}",
+                object_id,
+                object_id == self.local_object_id,
+                dump.join(", ")
+            );
+        }
+        // Same idea for the boost log: the stats that a consumable, an ally's buff
+        // or a status tick would move, snapshotted so the update can be diffed.
+        let old_local_boost = if object_id == self.local_object_id && self.local_object_id != 0 {
+            self.objects.get(&object_id).map(BoostSnapshot::of)
+        } else {
+            None
+        };
+        // Boss uptime: settle the interval that just ended using the condition
+        // that applied to it, before the new state takes over. Only an engaged
+        // fight tracks this.
+        let old_boss_condition = if self.fights.contains_key(&object_id) {
+            self.objects
+                .get(&object_id)
+                .map(|o| o.condition)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let (new_hp, obj_type, obj_max_hp, previous_hp) = {
             let entry = self.objects.entry(object_id).or_default();
             let previous_hp = entry.hp as i64;
@@ -1159,6 +2012,19 @@ impl CombatTracker {
                 previous_hp,
             )
         };
+        // Diff the local player's boost-relevant stats against the snapshot taken
+        // before the update, recording a transition per stat/condition that moved.
+        if let Some(before) = old_local_boost {
+            if let Some(after) = self.objects.get(&object_id).map(BoostSnapshot::of) {
+                self.note_local_stat_changes(&before, &after, time_ms);
+            }
+        }
+        if self.fights.contains_key(&object_id) {
+            let vulnerable_before = old_boss_condition & COND_INVULNERABLE == 0;
+            if let Some(fight) = self.fights.get_mut(&object_id) {
+                fight.account_uptime(time_ms, vulnerable_before);
+            }
+        }
         // The Shatters hard mode is unlocked by two objects the group has to
         // destroy, and both are invulnerable or unreachable until then:
         //   - the Stone Idol cannot be damaged until the Void Phantasm is
@@ -1190,6 +2056,13 @@ impl CombatTracker {
             .unwrap_or(false)
         {
             self.record_pet_observation(object_id);
+        }
+        // A tracked summoned creature keeps its last-seen position and time, which
+        // is what decides whether it could have hit a target minutes later.
+        if let Some(entity) = self.local_summons.get_mut(&object_id) {
+            entity.last_seen_ms = time_ms;
+            entity.x = status.pos.x;
+            entity.y = status.pos.y;
         }
 
         // Local-player "close call" detection: count each time the
@@ -1572,6 +2445,8 @@ impl CombatTracker {
                 // The local player saw the whole revive segment; not late.
                 joined_late: false,
                 spirits: 0,
+                boss_uptime_ms: 0,
+                uptime_cursor_ms: time_ms,
             },
         );
         finished
@@ -1584,9 +2459,36 @@ impl CombatTracker {
         // A removed object's id can be reused; drop any summon-ownership so a
         // later reuse of this id can't inherit a stale owner.
         self.summon_owners.remove(&object_id);
+        self.local_summons.remove(&object_id);
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
+        // Remember what left the world, when it is the kind of object that damages the
+        // boss *for* the player (see [`is_boss_damaging_mechanic`]). Everything else is
+        // excluded -- a boss's own death, a pet, a player, a trap or a wall piece all
+        // leave the world too, and their removals mean something else.
+        if let Some(obj) = &last {
+            if !obj.is_pet
+                && !self.fights.contains_key(&object_id)
+                && crate::assets::aux_target_for_type(obj.object_type).is_none()
+                && !class_ids::is_player_class(obj.object_type)
+                && is_boss_damaging_mechanic(obj.object_type)
+            {
+                self.object_removals.push_back(LocalObjectRemoval {
+                    time_ms,
+                    object_type: mechanic_row_type(obj.object_type),
+                    x: obj.last_x,
+                    y: obj.last_y,
+                });
+                while self
+                    .object_removals
+                    .front()
+                    .is_some_and(|r| time_ms - r.time_ms > 2_000)
+                {
+                    self.object_removals.pop_front();
+                }
+            }
+        }
         // The Shatters' Stone Idol needs no removal handling: it patrols, chases
         // and wanders out of view in a regular run just as it does in hard mode,
         // so a removal -- however close to the local player it happens -- proves
@@ -1825,10 +2727,21 @@ impl CombatTracker {
                 )
             })
             .unwrap_or((None, 0, [-1; 4], Default::default(), 0, 0, 0));
+        // Boss uptime also accrues from other players' damage, so a fight the
+        // local player is only watching still records a meaningful denominator.
+        let vulnerable = if is_boss {
+            self.objects
+                .get(&target_id)
+                .map(|o| o.condition & COND_INVULNERABLE == 0)
+                .unwrap_or(true)
+        } else {
+            true
+        };
         let fight = match aux {
             Some(aux) => self.ensure_aux_fight(aux, time_ms),
             None => self.fights.get_mut(&target_id).expect("fight ensured"),
         };
+        fight.account_uptime(time_ms, vulnerable);
         fight.last_activity = time_ms;
         let accum = fight.attackers.entry(attacker_id).or_default();
         accum.damage += amount;
@@ -1853,12 +2766,30 @@ impl CombatTracker {
         if tex2 != 0 {
             accum.last_tex2 = tex2;
         }
-        let bucket = accum
-            .damage_by_equipment
-            .entry((equipment, enchants))
-            .or_default();
-        bucket.0 += amount;
-        bucket.1 += 1;
+        if is_local {
+            // A local damage packet is the server reporting damage it attributes to
+            // the local player -- the only local damage that is packet-borne, since
+            // the player's own hits are reconstructed from their shot packets. It
+            // gets its own total (an ability activation can be credited it) and stays
+            // out of the loadout buckets, which hold self-computed weapon damage only.
+            accum.packet_damage += amount;
+            accum.packet_hits += 1;
+            self.local_damage_events.push_back(LocalDamageEvent {
+                time_ms,
+                damage: amount,
+                pet_id: self.damage_capable_pet_near_local(),
+                summon: self.local_summon_attacking(target_id, time_ms),
+                removal: self.object_removal_near(target_id, time_ms),
+            });
+        } else {
+            let bucket = accum
+                .damage_by_equipment
+                .entry((equipment, enchants))
+                .or_default();
+            bucket.0 += amount;
+            bucket.1 += 1;
+        }
+        self.trim_local_event_logs();
     }
 
     /// Credit a remote player's damage taken (exact, post-defense) from a
@@ -2009,6 +2940,403 @@ impl CombatTracker {
             self.shield_dr_until = time_ms + SHIELD_ACTIVE_MS;
             self.shield_dr_pct = pct;
         }
+        // Two facts are all the performance sections need from a use: what the
+        // local player used, and when. The item is remembered as the proposed
+        // source of the next stat change, and an ability-slot use opens an
+        // activation window for the damage breakdown.
+        self.last_local_use = Some((item_id, time_ms));
+        let ability_enchants = self
+            .objects
+            .get(&self.local_object_id)
+            .filter(|o| o.equipment[ABILITY_SLOT] == item_id)
+            .map(|o| o.equipment_enchants[ABILITY_SLOT].clone());
+        if let Some(enchants) = ability_enchants {
+            self.local_ability_uses.push_back(LocalAbilityUse {
+                time_ms,
+                item_id,
+                enchants,
+                server_effect_window_ms: get_asset_manager()
+                    .server_applied_damage_window_ms(item_id),
+            });
+            self.trim_local_event_logs();
+        }
+    }
+
+    /// Record one local stat update as boost-window transitions. Called with the
+    /// snapshot taken before the update and the one after it.
+    fn note_local_stat_changes(
+        &mut self,
+        before: &BoostSnapshot,
+        after: &BoostSnapshot,
+        time_ms: i64,
+    ) {
+        let mut changes = before.level_changes(after);
+        changes.extend(before.condition_changes(after));
+        for (label, from, to) in changes {
+            // A falling stat is the previous boost expiring; only a rising one can
+            // be sourced to an item the player just used.
+            let (source, source_item) = self.boost_source_hint(time_ms, to > from, label);
+            self.local_stat_changes.push_back(LocalStatChange {
+                time_ms,
+                label,
+                from,
+                to,
+                source,
+                source_item,
+            });
+        }
+        self.trim_local_event_logs();
+    }
+
+    /// Record the live character's Blood Ritual, Crucible and pet as they stand
+    /// now. The processor calls this wherever the character cache changes -- a
+    /// ritual switched on or off, the crucible marker, a different pet equipped --
+    /// and every fight finalised afterwards is stamped with them (see
+    /// [`Self::local_state_windows`]).
+    ///
+    /// `pet_skin` is the sprite to draw and `pet_type` the pet's own type id, which
+    /// is what the wire reports for a pet: the identity that decides which pet in
+    /// the world is this character's.
+    pub fn set_local_snapshot(
+        &mut self,
+        blood_ritual: Option<String>,
+        crucible: bool,
+        pet_skin: i32,
+        pet_type: i32,
+    ) {
+        self.local_snapshot = LocalSnapshot {
+            blood_ritual,
+            crucible,
+            pet_skin: pet_skin.max(0),
+            pet_type: pet_type.max(0),
+        };
+    }
+
+    /// The windows a fight carries for a state the character cache reports rather
+    /// than a stat the engine watched: a ritual or crucible that was on while the
+    /// fight was fought is written as on for its whole length.
+    ///
+    /// Writing it into the fight's own record is the point. Both live on the
+    /// character *now*, so a card that read them back from there -- or from the
+    /// transition log, which a later switch rewrites -- made a stored fight follow
+    /// every later toggle.
+    fn local_state_windows(&self, started_at: i64, ended_at: i64) -> Vec<BoostWindow> {
+        let mut out = Vec::new();
+        // The ritual's window names the tier it was fought under, so the card can
+        // render the right definition without asking the character (which may have
+        // switched the ritual off since).
+        let ritual = self
+            .local_snapshot
+            .blood_ritual
+            .as_deref()
+            .map(|id| format!("{CHARACTER_STATE_SOURCE}:{id}"))
+            .unwrap_or_else(|| CHARACTER_STATE_SOURCE.to_string());
+        for (stat, source, active) in [
+            (
+                "Blood Ritual",
+                ritual,
+                self.local_snapshot.blood_ritual.is_some(),
+            ),
+            (
+                "Crucible",
+                CHARACTER_STATE_SOURCE.to_string(),
+                self.local_snapshot.crucible,
+            ),
+        ] {
+            if !active {
+                continue;
+            }
+            out.push(BoostWindow {
+                start_offset_ms: 0,
+                end_offset_ms: (ended_at - started_at).max(0),
+                stat: stat.to_string(),
+                from: 0,
+                to: 1,
+                source,
+                source_item: None,
+            });
+        }
+        out
+    }
+
+    /// The object that vanished as a hit landed, if one did -- the source of a
+    /// mechanic that damages the boss *for* the player (a barrel pushed into it, a
+    /// cannonball fired at it).
+    ///
+    /// Both sides of this were measured on a solo Nightmare Colony killed with
+    /// barrels alone: all 105 hits the server credited to the player coincided with
+    /// an `Explosive Barrel` removal, in the same tick, with no shot, activation or
+    /// creature of theirs behind the packet. Only objects that are such a mechanic are
+    /// recorded at all (see [`is_boss_damaging_mechanic`]), so a trap or a wall piece
+    /// despawning at the same tick cannot claim the hit. Background: issue #74.
+    fn object_removal_near(&self, target_id: i32, time_ms: i64) -> Option<i32> {
+        let target = self.objects.get(&target_id)?;
+        let (tx, ty) = (target.last_x, target.last_y);
+        let mut best: Option<(i64, i32)> = None;
+        for removal in &self.object_removals {
+            let dt = (removal.time_ms - time_ms).abs();
+            if dt > MECHANIC_REMOVAL_WINDOW_MS {
+                continue;
+            }
+            let dx = removal.x - tx;
+            let dy = removal.y - ty;
+            if (dx * dx + dy * dy).sqrt() > MECHANIC_REMOVAL_MAX_DIST {
+                continue;
+            }
+            if best.map_or(true, |(bd, _)| dt < bd) {
+                best = Some((dt, removal.object_type));
+            }
+        }
+        best.map(|(_, object_type)| object_type)
+    }
+
+    /// Whether the engine knows `shooter_id` as a creature of the local player's: a
+    /// summon whose ownership it learned from the summon's own shoot packet, a
+    /// creature it has watched as the local player's summon in the world, or the pet
+    /// the character cache names.
+    fn knows_local_creature(&self, shooter_id: i32) -> bool {
+        if self.summon_owners.get(&shooter_id) == Some(&self.local_object_id) {
+            return true;
+        }
+        if self.local_summons.contains_key(&shooter_id) {
+            return true;
+        }
+        let Some(o) = self.objects.get(&shooter_id) else {
+            return false;
+        };
+        if !o.is_pet || o.pet_type == 0 {
+            return false;
+        }
+        let mine = self.local_snapshot.pet_type;
+        if mine != 0 {
+            return o.pet_type == mine;
+        }
+        self.pet_follows_local(shooter_id)
+    }
+
+    /// The identity of a pet credited to the local player: the skin the character
+    /// cache reports, which is what ATTRIBUTES draws and names. The wire carries
+    /// the pet's *type* id, which is not a sprite, so it is only the fallback for
+    /// when no cache pet is known.
+    fn local_pet_identity(&self, wire_type: i32) -> i32 {
+        if self.local_snapshot.pet_skin > 0 {
+            self.local_snapshot.pet_skin
+        } else {
+            wire_type
+        }
+    }
+
+    /// The wire never says what caused a change, so the tracker infers it and the
+    /// UI labels it as an inference. An item use is only accepted as the cause when
+    /// that item's own XML declares the effect: casting a spell is also a `UseItem`
+    /// (so a spell used to be blamed for any nearby Attack boost) and a treat that
+    /// only raises Speed must never be blamed for an Attack change. Failing that,
+    /// an on-shoot enchantment proc on the equipped gear is checked, and only then
+    /// is the change left unexplained.
+    fn boost_source_hint(&self, time_ms: i64, rising: bool, label: &str) -> (String, Option<i32>) {
+        if !rising {
+            return ("expired".to_string(), None);
+        }
+        let am = get_asset_manager();
+        if let Some((item, at)) = self.last_local_use {
+            if item >= 0 && time_ms - at <= BOOST_SOURCE_HINT_MS && self.item_can_cause(item, label)
+            {
+                let name = am
+                    .object_name(item)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| format!("Item 0x{item:X}"));
+                return (name, Some(item));
+            }
+        }
+        if let Some(proc) = self.gear_proc_source(time_ms, label) {
+            return proc;
+        }
+        // Nothing local explains it. These arrive from the server with no source,
+        // and the only distinction available is the effect itself: Weak is a
+        // monster-applied debuff, everything else is credited to an ally.
+        let fallback = if label == "Weak" {
+            "Enemy debuff"
+        } else {
+            "Ally buff"
+        };
+        (fallback.to_string(), None)
+    }
+
+    /// Whether `item` itself declares the effect a boost label names: a stat buff
+    /// for a stat label, a condition for a condition label. A label we do not map
+    /// to a stat is matched as a condition, so an item is never accepted merely
+    /// because the label is unfamiliar.
+    fn item_can_cause(&self, item: i32, label: &str) -> bool {
+        let am = get_asset_manager();
+        match stat_kind_for_boost_label(label) {
+            Some(stat) => am.item_declares_stat_boost(item, stat),
+            None => am.item_declares_condition(item, label),
+        }
+    }
+
+    /// The equipped item and enchantment whose on-shoot proc raises `label`, when
+    /// a local shot landed close enough for that proc to have fired. Returns the
+    /// label to show (`"Attack Boost IV (Staff of The Vital Unity)"`) and the item
+    /// the UI should draw.
+    fn gear_proc_source(&self, time_ms: i64, label: &str) -> Option<(String, Option<i32>)> {
+        let stat = stat_kind_for_boost_label(label)?;
+        if self.last_shot_ms == 0 || time_ms - self.last_shot_ms > BOOST_PROC_HINT_MS {
+            return None;
+        }
+        let local = self.objects.get(&self.local_object_id)?;
+        let am = get_asset_manager();
+        for slot in 0..local.equipment.len() {
+            let item = local.equipment[slot];
+            if item < 0 {
+                continue;
+            }
+            let Some(enchant) =
+                am.enchant_declaring_stat_boost(&local.equipment_enchants[slot], stat)
+            else {
+                continue;
+            };
+            let enchant_name = am.enchant_name(enchant).unwrap_or_default();
+            let item_name = am.object_name(item).unwrap_or_default();
+            let text = match (enchant_name.is_empty(), item_name.is_empty()) {
+                (false, false) => format!("{enchant_name} ({item_name} proc)"),
+                (false, true) => format!("{enchant_name} (proc)"),
+                (true, false) => format!("{item_name} (proc)"),
+                (true, true) => format!("Item 0x{item:X} (proc)"),
+            };
+            return Some((text, Some(item)));
+        }
+        None
+    }
+
+    /// Trim the rolling local-event logs to their cap.
+    fn trim_local_event_logs(&mut self) {
+        while self.local_stat_changes.len() > MAX_LOCAL_EVENT_LOG {
+            self.local_stat_changes.pop_front();
+        }
+        while self.local_ability_uses.len() > MAX_LOCAL_EVENT_LOG {
+            self.local_ability_uses.pop_front();
+        }
+        while self.local_damage_events.len() > MAX_LOCAL_EVENT_LOG {
+            self.local_damage_events.pop_front();
+        }
+        while self.local_volley_hits.len() > MAX_LOCAL_EVENT_LOG {
+            self.local_volley_hits.pop_front();
+        }
+    }
+
+    /// Rebuild the local player's boost windows for one fight from the rolling
+    /// transition log. Each transition opens a window that closes at the next
+    /// transition of the same label, or at the fight's end while still active.
+    fn boost_windows_for(&self, started_at: i64, ended_at: i64) -> Vec<BoostWindow> {
+        let mut out: Vec<BoostWindow> = Vec::new();
+        let window = |change: &LocalStatChange, start: i64, end: i64| BoostWindow {
+            start_offset_ms: (start - started_at).max(0),
+            end_offset_ms: (end - started_at).max(0),
+            stat: change.label.to_string(),
+            from: change.from,
+            to: change.to,
+            source: change.source.clone(),
+            source_item: change.source_item,
+        };
+        // A buff already held when the fight starts has no transition inside it, so
+        // the fight's own record carries the state it was fought under instead --
+        // stamped at finalize (see `local_state_windows`), which survives a later
+        // switch-off where this log does not.
+        for (i, change) in self.local_stat_changes.iter().enumerate() {
+            if change.time_ms < started_at || change.time_ms > ended_at {
+                continue;
+            }
+            let end = self
+                .local_stat_changes
+                .iter()
+                .skip(i + 1)
+                .find(|c| c.label == change.label && c.time_ms <= ended_at)
+                .map(|c| c.time_ms)
+                .unwrap_or(ended_at);
+            out.push(window(change, change.time_ms, end));
+        }
+        out.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
+        out
+    }
+
+    /// The local player's ability activations inside one fight, each credited the
+    /// packet-borne damage that belongs to it. Damage is matched by **source**,
+    /// never by "whatever was used last":
+    ///
+    /// * a bulletless `DamagePacket` carries no ability id, so it is credited only
+    ///   to an activation of an item whose own XML declares a server-applied
+    ///   effect (`DamageNova` waves, a poison's ticks, a hex detonation) and only
+    ///   within that declared duration -- the mushroom a spray leaves behind
+    ///   cannot be blamed on the spell cast next;
+    /// * a volley the server fired for the player names its item in the
+    ///   `ServerPlayerShoot` packet, so its landed hits are credited to that
+    ///   item's own activation and to nothing else.
+    ///
+    /// An activation with no credited damage is an effect that never connected
+    /// (see the UI note); it is listed anyway so nothing is silently dropped.
+    fn ability_activations_for(&self, started_at: i64, ended_at: i64) -> Vec<AbilityActivation> {
+        let uses: Vec<&LocalAbilityUse> = self
+            .local_ability_uses
+            .iter()
+            .filter(|u| u.time_ms >= started_at && u.time_ms <= ended_at)
+            .collect();
+        // Credit every packet to the activation that can own it, so no packet is
+        // counted twice and none lands on an ability that could not have produced
+        // it.
+        let mut credited: Vec<(i64, u64)> = vec![(0, 0); uses.len()];
+        for event in self
+            .local_damage_events
+            .iter()
+            .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
+        {
+            let owner = uses
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, use_)| activation_claims_packet(use_, event.time_ms));
+            if let Some((i, _)) = owner {
+                credited[i].0 += event.damage;
+                credited[i].1 += 1;
+            }
+        }
+        for hit in self
+            .local_volley_hits
+            .iter()
+            .filter(|h| h.time_ms >= started_at && h.time_ms <= ended_at)
+        {
+            let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
+                use_.item_id == hit.item_id
+                    && hit.time_ms >= use_.time_ms
+                    && hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
+            });
+            if let Some((i, _)) = owner {
+                credited[i].0 += hit.damage;
+                credited[i].1 += 1;
+            }
+        }
+        let mut out = Vec::with_capacity(uses.len());
+        for (i, use_) in uses.iter().enumerate() {
+            // The activation window still bounds the *record*: it ends at the next
+            // activation or after the fixed window, whichever is sooner.
+            let next = uses
+                .iter()
+                .map(|u| u.time_ms)
+                .filter(|&t| t > use_.time_ms)
+                .min()
+                .unwrap_or(i64::MAX);
+            let until = (use_.time_ms + ABILITY_ATTRIBUTION_WINDOW_MS)
+                .min(next)
+                .min(ended_at);
+            out.push(AbilityActivation {
+                item_id: use_.item_id,
+                enchants: use_.enchants.clone(),
+                start_offset_ms: (use_.time_ms - started_at).max(0),
+                window_ms: (until - use_.time_ms).max(0),
+                damage: credited[i].0,
+                hits: credited[i].1,
+            });
+        }
+        out
     }
 
     /// Advance the local player's Armor of Nil "Planar Absorption" proc/cooldown
@@ -2139,6 +3467,10 @@ impl CombatTracker {
         // the same id (newest registration owns an id). Done before the guards so
         // the maps stay disjoint even when self-damage is disabled for this map.
         self.pending_server_shots.remove(&bullet_id);
+        // On-shoot procs (an "OnShoot Attack Boost IV" enchantment, say) apply with
+        // the shot that fired them, so the moment of the last shot is what tells a
+        // proc from an ally's buff landing at the same time.
+        self.last_shot_ms = time_ms;
         // A multi-projectile weapon fires several bullets in one trigger, all
         // stamped with the same client time and weapon. The first is the primary
         // projectile; the rest are secondaries. Tracked across the guards so the
@@ -2151,19 +3483,41 @@ impl CombatTracker {
             return;
         }
         if !self.rng_seeded {
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: RNG not seeded (no map \
+                 seed yet) at weapon={weapon_id} projectile_id={projectile_id}"
+            );
             self.self_damage_available = false;
             return;
         }
         // The local player's stats must be known to compute the attack multiplier.
         let Some(local) = self.objects.get(&self.local_object_id) else {
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: local object {} not in \
+                 the object table at weapon={weapon_id} projectile_id={projectile_id}",
+                self.local_object_id
+            );
             self.self_damage_available = false;
             return;
         };
         if !local.attack_seen {
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: local ATT stat not \
+                 observed yet at weapon={weapon_id} projectile_id={projectile_id}"
+            );
             self.self_damage_available = false;
             return;
         }
-        let atk = local.attacker_stats();
+        // Mastery and the seasonal Crucible/Blood Ritual multipliers are
+        // character data rather than object stats, so they are folded in from the
+        // tracker (see `set_shot_damage_bonus`) -- the game scales the weapon's
+        // whole damage range by them, and the server-side spell values the
+        // ability rows use already include them.
+        let atk = AttackerStats {
+            mastery_mult: self.shot_damage_bonus.mastery,
+            challenge_mult: self.shot_damage_bonus.challenge,
+            ..local.attacker_stats()
+        };
         let lethal_strike = self.lethal_strike_snapshot();
 
         let proj_index = if projectile_id < 0 {
@@ -2176,6 +3530,12 @@ impl CombatTracker {
         let Some((min, max, ap, slot)) = resolved else {
             // Unknown projectile data: cannot determine whether this shot advances
             // the RNG, so all later rolls would be unreliable.
+            tracing::warn!(
+                "[COMBAT] self-compute disabled for this map: no projectile data for \
+                 weapon={weapon_id} projectile_id={projectile_id} (index {proj_index}, \
+                 weapon defines {} projectile type(s))",
+                get_asset_manager().projectile_type_count(weapon_id)
+            );
             self.self_damage_available = false;
             return;
         };
@@ -2194,11 +3554,22 @@ impl CombatTracker {
 
         let base_damage =
             damage::roll_base_damage(&mut self.rng, min, max, min_mult, max_mult, slot, &atk);
+        // The gear this shot is credited to, snapshotted now: the hit may arrive
+        // after a swap (see `PendingShot::shot_gear`).
+        let mut shot_gear = (local.equipment, local.equipment_enchants.clone());
+        if shot_gear.0[WEAPON_SLOT] != weapon_id {
+            // The equipment snapshot lags the swap (same condition the damage-roll
+            // guard above covers): trust the packet's weapon and drop the stale
+            // weapon enchants rather than pair one weapon with another's.
+            shot_gear.0[WEAPON_SLOT] = weapon_id;
+            shot_gear.1[WEAPON_SLOT].clear();
+        }
         self.pending_shots.insert(
             bullet_id,
             PendingShot {
                 base_damage,
                 armor_piercing: ap,
+                shot_gear,
                 shot_time: time_ms,
                 lethal_strike,
                 procs_credited: false,
@@ -2298,7 +3669,8 @@ impl CombatTracker {
                 self.pending_shots.remove(&bid);
                 match resolved {
                     Some(ap) => {
-                        self.pending_server_shots.insert(bid, (damage as i32, ap));
+                        self.pending_server_shots
+                            .insert(bid, (damage as i32, ap, container_type));
                     }
                     None => {
                         self.pending_server_shots.remove(&bid);
@@ -2391,10 +3763,20 @@ impl CombatTracker {
             return;
         }
 
+        // The gear a weapon shot is credited to, taken from the shot itself (see
+        // `PendingShot::shot_gear`) so a swap between firing and the hit landing
+        // cannot move the damage to the newly equipped weapon.
+        let shot_gear = self
+            .pending_shots
+            .get(&bullet_id)
+            .map(|shot| shot.shot_gear.clone());
+        // Set when this hit came from a volley the server fired for a local
+        // ability activation; its damage is that ability's, not the weapon's.
+        let mut volley_item: Option<i32> = None;
         let resolved = if shooter_id == self.local_object_id {
             // Weapon shot: damage was rolled from the map RNG at shoot time.
             let weapon_resolved = if self.self_damage_available {
-                self.pending_shots.get(&bullet_id).copied().map(|shot| {
+                self.pending_shots.get(&bullet_id).cloned().map(|shot| {
                     let base = damage::damage_with_defense(
                         shot.base_damage,
                         shot.armor_piercing,
@@ -2463,11 +3845,29 @@ impl CombatTracker {
             // ServerPlayerShoot packet; apply the target's live defense with the
             // projectile's armor-piercing flag. Ids are disjoint from
             // pending_shots, so this only resolves genuine server shots.
-            weapon_resolved.or_else(|| {
-                self.pending_server_shots
-                    .get(&bullet_id)
-                    .map(|&(base, ap)| damage::damage_with_defense(base, ap, defense, cond0, cond1))
-            })
+            match weapon_resolved {
+                Some(dmg) => Some(dmg),
+                None => {
+                    let volley = self.pending_server_shots.get(&bullet_id).copied();
+                    // The packet named the item that fired this bullet. When that
+                    // item is one the local player activated, the hit is that
+                    // ability's own damage (a spell volley), not the weapon's, so
+                    // it is credited to the ability row instead of the loadout
+                    // bucket (which stays self-computed weapon damage only).
+                    if let Some((_, _, item_id)) = volley {
+                        if self.local_ability_uses.iter().any(|u| {
+                            u.item_id == item_id
+                                && u.time_ms <= time_ms
+                                && time_ms - u.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
+                        }) {
+                            volley_item = Some(item_id);
+                        }
+                    }
+                    volley.map(|(base, ap, _)| {
+                        damage::damage_with_defense(base, ap, defense, cond0, cond1)
+                    })
+                }
+            }
         } else {
             // Summon shot: damage is the server-provided projectile value; apply
             // the target's defense. Summon projectiles are treated as non-armor-
@@ -2478,6 +3878,50 @@ impl CombatTracker {
         };
 
         let local_id = self.local_object_id;
+        // A hit fired by anything other than the local player is a summon/pet hit.
+        // Its own base damage came from that entity's shoot packet, so it is
+        // tracked separately: the owner's row keeps it in the totals (the game
+        // attributes it to the player) but not in the owner's per-hit average or
+        // per-loadout buckets.
+        //
+        // That holds only for a creature the engine actually knows is theirs. A
+        // secondary projectile names a shooter id that can belong to an object that
+        // is no creature of the player's at all -- ids are reused as objects despawn
+        // -- and reading that object's identity as the source invented pet rows out
+        // of other players' pets (a Battle God, a Poison Drake) hit by nobody's pet
+        // (see `Self::knows_local_creature`). Anything else is the player's own hit.
+        let is_summon = shooter_id != local_id && self.knows_local_creature(shooter_id);
+        let (summon_pet_type, summon_is_pet, summon_object_type) = if is_summon {
+            self.objects
+                .get(&shooter_id)
+                .map(|o| {
+                    // A creature that merely carries pet-ish stats is not a pet: an
+                    // ability summon (a Summoner's bear, a Pocket Rat) can arrive with
+                    // a `PetName` and no pet type, and crediting its hits to a "pet"
+                    // with no identity hides which creature, and which item, made
+                    // them. An identity is what makes a pet a pet; everything else is
+                    // named and drawn by its own object type.
+                    let is_pet = o.is_pet && o.pet_type != 0;
+                    (
+                        if is_pet {
+                            self.local_pet_identity(o.pet_type)
+                        } else {
+                            0
+                        },
+                        is_pet,
+                        o.object_type,
+                    )
+                })
+                .unwrap_or((0, false, 0))
+        } else {
+            (0, false, 0)
+        };
+        // Resolved before the fight is borrowed mutably below.
+        let summon_source = if is_summon && !summon_is_pet {
+            self.summon_source_item(summon_object_type, time_ms)
+        } else {
+            None
+        };
         let (name, object_type, equipment, enchants, skin_id, tex1, tex2) = self
             .objects
             .get(&local_id)
@@ -2493,10 +3937,22 @@ impl CombatTracker {
                 )
             })
             .unwrap_or((None, 0, [-1; 4], Default::default(), 0, 0, 0));
+        // Boss uptime advances on every hit: the boss was reachable and being shot
+        // at. Aux summaries have no invulnerability concept, so they count as
+        // always vulnerable.
+        let vulnerable = if is_boss {
+            self.objects
+                .get(&target_id)
+                .map(|o| o.condition & COND_INVULNERABLE == 0)
+                .unwrap_or(true)
+        } else {
+            true
+        };
         let fight = match aux {
             Some(aux) => self.ensure_aux_fight(aux, time_ms),
             None => self.fights.get_mut(&target_id).expect("fight ensured"),
         };
+        fight.account_uptime(time_ms, vulnerable);
         fight.last_activity = time_ms;
         let accum = fight.attackers.entry(local_id).or_default();
         accum.hits += 1;
@@ -2528,16 +3984,57 @@ impl CombatTracker {
                 dmg as i64
             }
             None => {
-                accum.unresolved_local_hits += 1;
+                if is_summon {
+                    accum.unresolved_summon_hits += 1;
+                } else {
+                    accum.unresolved_local_hits += 1;
+                }
                 0
             }
         };
-        let bucket = accum
-            .damage_by_equipment
-            .entry((equipment, enchants))
-            .or_default();
-        bucket.0 += dmg;
-        bucket.1 += 1;
+        if is_summon {
+            accum.summon_hits += 1;
+            accum.summon_damage += dmg;
+            let entry = accum.summons.entry(shooter_id).or_default();
+            entry.hits += 1;
+            entry.damage += dmg;
+            entry.is_pet = entry.is_pet || summon_is_pet;
+            if summon_pet_type != 0 {
+                entry.pet_type = summon_pet_type;
+            }
+            if summon_object_type != 0 {
+                entry.object_type = summon_object_type;
+            }
+            if entry.source_item == 0 {
+                if let Some((item, enchants)) = summon_source {
+                    entry.source_item = item;
+                    entry.source_enchants = enchants;
+                }
+            }
+        } else if let Some(item_id) = volley_item {
+            // An ability volley's hit: the packet named the ability that fired it,
+            // so the damage belongs to that ability's own activation. It stays out
+            // of the loadout bucket, which is the weapon breakdown and holds
+            // self-computed weapon damage only -- the same reason a local
+            // DamagePacket's figure is kept out of it.
+            self.local_volley_hits.push_back(LocalVolleyHit {
+                time_ms,
+                item_id,
+                damage: dmg,
+            });
+            self.trim_local_event_logs();
+        } else {
+            // Only the player's own hits are bucketed per loadout: the bucket is
+            // what the gear breakdown reports, and pet damage is not a property of
+            // the equipped weapon. A weapon shot's bucket comes from the shot's own
+            // gear snapshot (the gear that fired it); a server-fired shot (an
+            // ability proc or volley) has no shot record, so the gear equipped when
+            // it lands is the best available.
+            let key = shot_gear.unwrap_or((equipment, enchants));
+            let bucket = accum.damage_by_equipment.entry(key).or_default();
+            bucket.0 += dmg;
+            bucket.1 += 1;
+        }
     }
 
     /// Periodic tick: finalize fights whose boss died or timed out.
@@ -2693,6 +4190,8 @@ impl CombatTracker {
                 } else {
                     0
                 },
+                boss_uptime_ms: 0,
+                uptime_cursor_ms: time_ms,
             },
         );
         true
@@ -2743,6 +4242,8 @@ impl CombatTracker {
                 split_done: false,
                 joined_late: false,
                 spirits: 0,
+                boss_uptime_ms: 0,
+                uptime_cursor_ms: time_ms,
             })
     }
 
@@ -2971,9 +4472,12 @@ impl CombatTracker {
         // Some bosses fought from the realm belong to a rated dungeon the raw
         // map name doesn't reflect (Oryx the Mad God 2 -> Wine Cellar). Remap so
         // the fight classifies by that dungeon's difficulty and shows its card.
-        let dungeon = crate::assets::canonical_dungeon_for_boss(fight.boss_object_type)
-            .map(str::to_string)
-            .unwrap_or(dungeon);
+        let dungeon = crate::assets::canonical_dungeon_for_boss_named(
+            fight.boss_object_type,
+            boss_name.trim(),
+        )
+        .map(str::to_string)
+        .unwrap_or(dungeon);
 
         // Group every boss of a dungeon instance under one card. Curated bosses
         // keep their encounter id (so aux repr types still resolve); non-curated
@@ -3002,6 +4506,10 @@ impl CombatTracker {
         // The local player joined after the fight began when the boss was already
         // damaged on first sight; ally damage dealt before then was never seen.
         let joined_late = fight.joined_late;
+        let fight_started_at = fight.started_at;
+        // Server-credited, bulletless damage first: a pet's or an ability-summon's
+        // hits have to reach their own rows before the participant is built.
+        self.attribute_owner_packet_damage(&mut fight, fight_started_at, time_ms);
         let mut participants: Vec<FightParticipant> = fight
             .attackers
             .iter()
@@ -3070,6 +4578,13 @@ impl CombatTracker {
         // Attach each participant's pet, matched by proximity votes.
         self.assign_pets(&mut participants);
 
+        // The stat/condition boosts the player was observed under, plus the state
+        // the character cache reports (see `local_state_windows`): both belong to
+        // the fight's own record, so nothing can rewrite them afterwards.
+        let mut boosts = self.boost_windows_for(fight.started_at, time_ms);
+        boosts.extend(self.local_state_windows(fight.started_at, time_ms));
+        boosts.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
+
         let cf = CompletedFight {
             started_at: fight.started_at,
             ended_at: time_ms,
@@ -3084,6 +4599,7 @@ impl CombatTracker {
             local_char_id: fight.local_char_id,
             killed: fight.killed,
             reached_zero: fight.min_hp_seen <= 0,
+            boss_uptime_ms: fight.boss_uptime_ms,
             joined_late: fight.joined_late,
             encounter_id,
             encounter_run_id,
@@ -3104,6 +4620,8 @@ impl CombatTracker {
             petless: self.mv_petless,
             spectral_hm,
             shatters_hm,
+            boosts,
+            abilities: self.ability_activations_for(fight.started_at, time_ms),
             participants,
         };
 
@@ -3339,15 +4857,39 @@ impl CombatTracker {
             // value; any unresolved hit (or a desynced/unavailable RNG) means we
             // cannot claim an exact total.
             let resolved_hits = accum.hits.saturating_sub(accum.unresolved_local_hits);
-            let prov = if accum.unresolved_local_hits > 0 || accum.hits == 0 {
-                if accum.damage > 0 && resolved_hits > 0 {
-                    // Estimate the unvalued hits from the average of the resolved
-                    // ones instead of leaving them at zero. An unresolved EnemyHit
-                    // still landed on the target, so zero systematically
-                    // under-counts; the average is a far better approximation.
-                    let avg = accum.damage / resolved_hits as i64;
-                    let extra = (accum.unresolved_local_hits as i128 * avg as i128)
-                        .min(i64::MAX as i128) as i64;
+            let prov = if accum.unresolved_local_hits > 0
+                || accum.unresolved_summon_hits > 0
+                || accum.hits == 0
+            {
+                // Estimate the unvalued hits from the average of the resolved ones
+                // instead of leaving them at zero. An unresolved EnemyHit still
+                // landed on the target, so zero systematically under-counts; the
+                // average is a far better approximation. The two populations are
+                // averaged separately, so a missed pet hit is never valued at the
+                // player's per-hit rate (and vice versa).
+                let own_damage = accum.damage - accum.summon_damage;
+                let own_resolved_hits = resolved_hits.saturating_sub(
+                    accum
+                        .summon_hits
+                        .saturating_sub(accum.unresolved_summon_hits),
+                );
+                let own_avg = if own_resolved_hits > 0 {
+                    own_damage / own_resolved_hits as i64
+                } else {
+                    0
+                };
+                let resolved_summon_hits = accum
+                    .summon_hits
+                    .saturating_sub(accum.unresolved_summon_hits);
+                let summon_avg = if resolved_summon_hits > 0 {
+                    accum.summon_damage / resolved_summon_hits as i64
+                } else {
+                    0
+                };
+                let extra = (accum.unresolved_local_hits as i128 * own_avg as i128)
+                    .saturating_add(accum.unresolved_summon_hits as i128 * summon_avg as i128)
+                    .min(i64::MAX as i128) as i64;
+                if accum.damage > 0 && extra > 0 {
                     local_damage_override = Some(accum.damage.saturating_add(extra));
                     DamageProvenance::SelfEstimated
                 } else if accum.damage > 0 {
@@ -3425,9 +4967,43 @@ impl CombatTracker {
             pet: None,
             damage_taken,
             damage_taken_provenance,
+            // Recorded for every participant, a zero included: the flawless
+            // marker has to tell "never hit" apart from "this fight predates
+            // hits-taken tracking" (a NULL row), and only a recorded zero can.
+            damage_taken_hits: Some(accum.damage_taken_hits),
             damage_blocked,
             guarded_damage: Some(accum.guarded_damage),
             guarded_hits: Some(accum.guarded_hits),
+            summon_damage: accum.summon_damage,
+            summon_hits: accum.summon_hits,
+            summons: {
+                let mut v: Vec<SummonContribution> = accum
+                    .summons
+                    .iter()
+                    .map(|(&object_id, s)| SummonContribution {
+                        object_id,
+                        pet_type: s.pet_type,
+                        is_pet: s.is_pet,
+                        object_type: s.object_type,
+                        source_item: s.source_item,
+                        source_enchants: s.source_enchants.clone(),
+                        damage: s.damage,
+                        hits: s.hits,
+                    })
+                    .collect();
+                v.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
+                v
+            },
+            // Per-weapon rows are only meaningful for the local player, whose
+            // damage is reconstructed from their own shot packets. Remote rows are
+            // whole damage packets with no weapon attribution.
+            weapons: if is_local {
+                aggregate_weapons(&accum.damage_by_equipment)
+            } else {
+                Vec::new()
+            },
+            packet_damage: accum.packet_damage,
+            packet_hits: accum.packet_hits,
         }
     }
 
@@ -3499,8 +5075,15 @@ impl CombatTracker {
                 continue;
             };
             let track = &self.pet_tracks[&pet_id];
+            // The local player's pet carries its identity from the character cache
+            // instead of the type id the wire sent (see `local_pet_identity`).
+            let pet_type = if p.is_local {
+                self.local_pet_identity(track.pet_type)
+            } else {
+                track.pet_type
+            };
             p.pet = Some(PetInfo {
-                pet_type: track.pet_type,
+                pet_type,
                 abilities: track
                     .pet_abilities
                     .iter()
@@ -3510,6 +5093,254 @@ impl CombatTracker {
             });
             used_pets.insert(pet_id);
             used_players.insert(player_id);
+        }
+    }
+
+    /// The damage-capable pet the local player has out, if any.
+    ///
+    /// A pet's hits are credited to its owner by the server and arrive as
+    /// bulletless `DamagePacket`s naming the player, so the pet's own presence is
+    /// the only handle on them. "Damage-capable" uses the ability ids `pets.xml`
+    /// declares (Attack Close/Mid/Far, Electric); heal, magic heal, Savage and
+    /// Decoy cannot damage anything. Only a pet close enough to its owner to be
+    /// the shooter counts, and the nearest wins (ties by lowest id).
+    ///
+    /// *Which* pet that is comes from the character cache -- the pet ATTRIBUTES
+    /// shows -- and not from distance. The wire reports every pet in the world with
+    /// its own type id, and the character's own pet has a known one, so only a pet
+    /// answering to that type can claim their damage: in a group a teammate's pet
+    /// stands right beside them, and distance alone credited 943 damage the server
+    /// reported to the local player to a teammate's Great Jelly, while their own pet
+    /// was a Blue Ant that cannot damage anything. When the character's own pet is
+    /// not in the world at all, nothing claims -- an unattributed packet is better
+    /// than a teammate's pet wearing their damage.
+    ///
+    /// A character whose pet the cache does not know falls back to the pet that
+    /// follows the local player (see [`Self::pet_follows_local`]).
+    fn damage_capable_pet_near_local(&self) -> Option<i32> {
+        let mine = self.local_snapshot.pet_type;
+        if mine != 0 {
+            return self.nearest_damage_capable_pet(|_, o| o.pet_type == mine);
+        }
+        self.nearest_damage_capable_pet(|_, _| true)
+    }
+
+    /// The nearest pet within [`PET_ASSOC_MAX_DIST`] of the local player that can
+    /// deal damage, follows the local player, and passes `keep`; ties are broken by
+    /// the lowest object id.
+    fn nearest_damage_capable_pet(
+        &self,
+        keep: impl Fn(i32, &TrackedObject) -> bool,
+    ) -> Option<i32> {
+        let local = self.objects.get(&self.local_object_id)?;
+        let (lx, ly) = (local.last_x, local.last_y);
+        let mut best: Option<(f32, i32)> = None;
+        for (&oid, o) in &self.objects {
+            if !o.is_pet || o.pet_type == 0 {
+                continue;
+            }
+            if !o.pet_abilities.iter().any(|&a| pet_ability_deals_damage(a)) {
+                continue;
+            }
+            if !keep(oid, o) || !self.pet_follows_local(oid) {
+                continue;
+            }
+            let dx = o.last_x - lx;
+            let dy = o.last_y - ly;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > PET_ASSOC_MAX_DIST {
+                continue;
+            }
+            if best.map_or(true, |(bd, bid)| dist < bd || (dist == bd && oid < bid)) {
+                best = Some((dist, oid));
+            }
+        }
+        best.map(|(_, oid)| oid)
+    }
+
+    /// Whether a pet object follows the local player, by the same proximity vote
+    /// that resolves a participant's own pet row ([`Self::assign_pets`]).
+    ///
+    /// A pet with no vote recorded at all is left to proximity: a fight whose pet
+    /// was never observed following anyone keeps the behaviour it had, while a pet
+    /// whose owner *is* known -- every pet in a group fight -- has to be the local
+    /// player's before it can claim their damage.
+    fn pet_follows_local(&self, pet_id: i32) -> bool {
+        let Some(track) = self.pet_tracks.get(&pet_id) else {
+            return true;
+        };
+        match track
+            .votes
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        {
+            Some((&owner, &votes)) if votes > 0 => owner == self.local_object_id,
+            _ => true,
+        }
+    }
+
+    /// The summons an activation of the local player's loadout can spawn, as
+    /// `(creature object type, the item whose own use spawns it or None when any
+    /// activation does)`.
+    ///
+    /// `Flowering Kimono` declares `OnPlayerAbilityActivate Pet` for its spirits:
+    /// any activation of any of the player's abilities spawns them. An item whose
+    /// summon is declared on its own `Use` is only spawned by its own activations,
+    /// so that distinction is kept.
+    fn activation_spawned_summons_of_local_loadout(&self) -> Vec<(i32, Option<i32>)> {
+        let Some(local) = self.objects.get(&self.local_object_id) else {
+            return Vec::new();
+        };
+        let manager = get_asset_manager();
+        let mut out: Vec<(i32, Option<i32>)> = Vec::new();
+        for &item in local.equipment.iter() {
+            if item <= 0 {
+                continue;
+            }
+            for (creature, source) in manager.summoned_by_item(item) {
+                // A summon the item's own text never claims damage for (the Marble
+                // Seal's Eye of Marble buffers allies) cannot be the source of a
+                // damage packet, however close it stands to the target.
+                if !source.deals_damage {
+                    continue;
+                }
+                let only_item = match source.trigger {
+                    SummonTrigger::OnAbilityUse => None,
+                    SummonTrigger::Use => Some(item),
+                    _ => continue,
+                };
+                if !out.contains(&(creature, only_item)) {
+                    out.push((creature, only_item));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Split the local player's bulletless `DamagePacket`s into the pet/summon
+    /// rows they came from, and only that much more -- what nothing explains stays
+    /// in `packet_damage` as an unattributed figure.
+    ///
+    /// The packet names the *owner*, never the shooter, so a source has to be
+    /// decided by elimination against what else could have produced the damage:
+    ///
+    /// * an activation whose item declares a server-applied damage effect already
+    ///   claims its own window (see [`Self::ability_activations_for`]), so those
+    ///   events are not candidates here and cannot be counted twice;
+    /// * of the rest, one landing within [`SUMMON_SPAWN_ATTRIBUTION_MS`] of an
+    ///   activation that can spawn the loadout's ability-summon belongs to that
+    ///   creature;
+    /// * otherwise one that landed while a damage-capable pet of the player was
+    ///   out and in range belongs to that pet.
+    ///
+    /// Both kinds are credited where a source-exact summon hit goes: inside the
+    /// owner's total, outside its weapon and ability buckets.
+    fn attribute_owner_packet_damage(
+        &self,
+        fight: &mut FightState,
+        started_at: i64,
+        ended_at: i64,
+    ) {
+        let local_id = self.local_object_id;
+        let events: Vec<LocalDamageEvent> = self
+            .local_damage_events
+            .iter()
+            .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
+            .copied()
+            .collect();
+        if events.is_empty() {
+            return;
+        }
+        let uses: Vec<&LocalAbilityUse> = self
+            .local_ability_uses
+            .iter()
+            .filter(|u| u.time_ms >= started_at && u.time_ms <= ended_at)
+            .collect();
+        let summons = self.activation_spawned_summons_of_local_loadout();
+        if summons.is_empty()
+            && events
+                .iter()
+                .all(|e| e.pet_id.is_none() && e.removal.is_none())
+        {
+            return;
+        }
+        // Creatures seen in the world during this fight, which outrank timing when
+        // more than one of the loadout's summons could have fired.
+        let mut seen_creatures: HashSet<i32> = self
+            .local_summons
+            .values()
+            .filter(|e| e.last_seen_ms >= started_at && e.last_seen_ms <= ended_at)
+            .map(|e| e.object_type)
+            .collect();
+        seen_creatures.extend(events.iter().filter_map(|e| e.summon).map(|(_, t)| t));
+        let Some(accum) = fight.attackers.get_mut(&local_id) else {
+            return;
+        };
+        for event in events {
+            let source = match packet_damage_source(&uses, &summons, &seen_creatures, &event) {
+                Some(source) => source,
+                // Nothing the player fired explains this packet. An object that left
+                // the world as it landed does: a mechanic that damages the boss for
+                // the player (see `object_removal_near`). Its row is drawn from the
+                // object's own type, so it reads and sprites as what it is. A packet
+                // carrying no damage names nothing -- it would only add empty rows for
+                // whatever else happened to despawn at that tick.
+                None => match event.removal.filter(|_| event.damage > 0) {
+                    Some(creature) => PacketDamageSource::Summon {
+                        creature,
+                        object_id: None,
+                    },
+                    None => continue,
+                },
+            };
+            // A creature the packet never names is keyed by the negative of its
+            // object type, which no live object id can collide with; the type
+            // itself is what names and draws the row.
+            let (key, is_pet, pet_type, object_type) = match source {
+                PacketDamageSource::Summon {
+                    creature,
+                    object_id,
+                } => {
+                    // A creature the packet never named, and never seen in the
+                    // world either, is keyed by the negative of its object type --
+                    // which no live object id can collide with. The type itself is
+                    // what names and draws the row either way.
+                    (object_id.unwrap_or(-creature), false, 0, creature)
+                }
+                PacketDamageSource::Pet { pet_id } => {
+                    // Identified by the cache, like every other pet row credited to
+                    // the local player: the wire's type id is not a sprite.
+                    let (pet_type, object_type) = self
+                        .objects
+                        .get(&pet_id)
+                        .map(|o| (self.local_pet_identity(o.pet_type), o.object_type))
+                        .unwrap_or((0, 0));
+                    (pet_id, true, pet_type, object_type)
+                }
+            };
+            accum.summon_damage += event.damage;
+            accum.summon_hits += 1;
+            let entry = accum.summons.entry(key).or_default();
+            entry.damage += event.damage;
+            entry.hits += 1;
+            entry.is_pet = entry.is_pet || is_pet;
+            if pet_type != 0 {
+                entry.pet_type = pet_type;
+            }
+            if object_type != 0 {
+                entry.object_type = object_type;
+            }
+            // The item behind the creature, resolved from the player's own
+            // loadout and activation log rather than from the catalog, which
+            // cannot tell an item from its `(SB)` twin.
+            if entry.source_item == 0 && !is_pet {
+                if let Some((item, enchants)) = self.summon_source_item(object_type, event.time_ms)
+                {
+                    entry.source_item = item;
+                    entry.source_enchants = enchants;
+                }
+            }
         }
     }
 
@@ -3546,24 +5377,51 @@ impl CombatTracker {
         }
     }
 
-    /// Consume the buffered gravestone spawn closest (in position, then time) to a
-    /// departure at `(x, y, time)`, if one lies within the match radius/window.
-    fn take_matching_grave(&mut self, x: f32, y: f32, time: i64) -> Option<i32> {
+    /// Assign buffered gravestones to departed participants closest pair first,
+    /// consuming the claimed graves. Each participant claims at most one grave and
+    /// each grave is claimed at most once; resolving the closest pairs before the
+    /// farther ones is what stops a clustered death from stealing the grave that
+    /// sits on a neighbour, which would otherwise leave that neighbour with no
+    /// grave at all (and mark them Nexused despite having died).
+    fn match_graves_nearest_first(
+        &mut self,
+        departures: &[(usize, Departure, bool)],
+    ) -> Vec<Option<i32>> {
         let r2 = GRAVE_MATCH_RADIUS * GRAVE_MATCH_RADIUS;
-        let mut best: Option<(usize, f32)> = None;
-        for (i, g) in self.recent_graves.iter().enumerate() {
-            if (g.time - time).abs() > GRAVE_MATCH_WINDOW_MS {
-                continue;
-            }
-            let dx = g.x - x;
-            let dy = g.y - y;
-            let dist2 = dx * dx + dy * dy;
-            if dist2 <= r2 && best.is_none_or(|(_, b)| dist2 < b) {
-                best = Some((i, dist2));
+        let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+        for (di, (_, d, _)) in departures.iter().enumerate() {
+            for (gi, g) in self.recent_graves.iter().enumerate() {
+                if (g.time - d.time).abs() > GRAVE_MATCH_WINDOW_MS {
+                    continue;
+                }
+                let dx = g.x - d.x;
+                let dy = g.y - d.y;
+                let dist2 = dx * dx + dy * dy;
+                if dist2 <= r2 {
+                    pairs.push((dist2, di, gi));
+                }
             }
         }
-        let (idx, _) = best?;
-        self.recent_graves.remove(idx).map(|g| g.grave_type)
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut assigned = vec![None; departures.len()];
+        let mut claimed = vec![false; self.recent_graves.len()];
+        for (_, di, gi) in pairs {
+            if assigned[di].is_none() && !claimed[gi] {
+                assigned[di] = Some(self.recent_graves[gi].grave_type);
+                claimed[gi] = true;
+            }
+        }
+        if claimed.iter().any(|c| *c) {
+            self.recent_graves = self
+                .recent_graves
+                .iter()
+                .zip(&claimed)
+                .filter(|(_, c)| !**c)
+                .map(|(g, _)| *g)
+                .collect();
+        }
+        assigned
     }
 
     /// Resolve each participant's end status (present / died / nexused), consuming
@@ -3576,7 +5434,13 @@ impl CombatTracker {
         local_char_id: i32,
         local_left: bool,
     ) {
-        for p in participants.iter_mut() {
+        // Participants that left the fight and may still own a gravestone, with
+        // their departure and whether the death broadcast confirmed them. Graves
+        // are assigned after the loop so the matching can run nearest-first across
+        // the whole roster instead of in roster order (see `match_graves_nearest_first`).
+        let mut departed: Vec<(usize, Departure, bool)> = Vec::new();
+
+        for (idx, p) in participants.iter_mut().enumerate() {
             // The local player's death is authoritative (from `CharacterDied`), and
             // overrides presence: on a death-to-nexus map change the local object
             // is still in `objects` when this finalize runs.
@@ -3615,19 +5479,26 @@ impl CombatTracker {
             // (type 0, which the UI renders as the default gravestone).
             let name_died = self.remote_death_in_window(&p.name, started, ended);
             // Only a departure inside this fight's lifetime can carry a grave.
-            let dep = self
+            match self
                 .departures
                 .get(&p.object_id)
                 .copied()
-                .filter(|d| d.time >= started - DEPARTURE_GRACE_MS);
-            let grave_type = dep.and_then(|d| self.take_matching_grave(d.x, d.y, d.time));
-            p.end_status = match (grave_type, name_died) {
+                .filter(|d| d.time >= started - DEPARTURE_GRACE_MS)
+            {
+                Some(dep) => departed.push((idx, dep, name_died)),
+                None if name_died => p.end_status = ParticipantEndStatus::Died { grave_type: 0 },
+                None => p.end_status = ParticipantEndStatus::Present,
+            }
+        }
+
+        let graves = self.match_graves_nearest_first(&departed);
+        for (i, (idx, _, name_died)) in departed.iter().enumerate() {
+            participants[*idx].end_status = match (graves[i], name_died) {
                 (Some(grave_type), _) => ParticipantEndStatus::Died { grave_type },
                 (None, true) => ParticipantEndStatus::Died { grave_type: 0 },
                 // No death evidence: a departure inside the fight means they left
                 // (nexused); no departure means they were simply present.
-                (None, false) if dep.is_some() => ParticipantEndStatus::Nexused,
-                (None, false) => ParticipantEndStatus::Present,
+                (None, false) => ParticipantEndStatus::Nexused,
             };
         }
     }
@@ -3639,17 +5510,32 @@ impl CombatTracker {
         self.pending_local_grave = Some((char_id, gravestone_type, time_ms));
     }
 
-    /// Record a remote player's death from the server death-broadcast text
-    /// ("<name> died at level N, killed by <killer>"). Buffered by name until the
-    /// current fight(s) finalize; this authoritative signal is what marks a
-    /// clustered-death player as Died even when their gravestone couldn't be
-    /// position-correlated (see `resolve_end_statuses`).
-    pub fn on_remote_death(&mut self, player_name: &str, time_ms: i64) {
+    /// Record a remote player's death from the server death broadcast (`s.death`,
+    /// rendering as "<name> died at level N, killed by <killer>"). Buffered by name
+    /// until the current fight(s) finalize; this authoritative signal is what marks
+    /// a clustered-death player as Died even when their gravestone couldn't be
+    /// position-correlated (see `resolve_end_statuses`). The raw broadcast is also
+    /// queued for the caller to persist (see `take_pending_death_broadcasts`), so a
+    /// death announced after its fight was written can still be applied to it.
+    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
         let key = sanitize_player_name(player_name).to_ascii_lowercase();
         if key.is_empty() {
             return;
         }
         self.remote_deaths.insert(key, time_ms);
+        if self.pending_death_broadcasts.len() >= CORRELATION_MAX_ENTRIES {
+            self.pending_death_broadcasts.remove(0);
+        }
+        self.pending_death_broadcasts.push(DeathBroadcast {
+            player: player_name.trim().to_string(),
+            killer: killer.trim().to_string(),
+            time: time_ms,
+        });
+    }
+
+    /// Take the death broadcasts observed since the last drain, for persistence.
+    pub fn take_pending_death_broadcasts(&mut self) -> Vec<DeathBroadcast> {
+        std::mem::take(&mut self.pending_death_broadcasts)
     }
 
     /// Whether a remote death broadcast named `name` and it landed within this
@@ -3704,6 +5590,7 @@ fn apply_stats(obj: &mut TrackedObject, status: &ObjectStatusData, time_ms: i64)
                 obj.attack = stat.stat_value;
                 obj.attack_seen = true;
             }
+            x if x == StatType::AttackBoost as u8 => obj.attack_boost = stat.stat_value,
             x if x == StatType::Defense as u8 => {
                 obj.defense = stat.stat_value;
                 obj.defense_seen = true;
@@ -3718,6 +5605,14 @@ fn apply_stats(obj: &mut TrackedObject, status: &ObjectStatusData, time_ms: i64)
             }
             x if x == StatType::MaxMP as u8 => obj.max_mp = stat.stat_value,
             x if x == StatType::Dexterity as u8 => obj.dexterity = stat.stat_value,
+            x if x == StatType::Vitality as u8 => {
+                obj.vitality = stat.stat_value;
+                obj.vitality_seen = true;
+            }
+            x if x == StatType::Speed as u8 => {
+                obj.speed = stat.stat_value;
+                obj.speed_seen = true;
+            }
             x if x == StatType::PetType as u8 => {
                 obj.is_pet = true;
                 obj.pet_type = stat.stat_value;
@@ -3815,6 +5710,8 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
     dst.joined_late = dst.joined_late || src.joined_late;
     dst.local_close_calls += src.local_close_calls;
     dst.spirits += src.spirits;
+    dst.boss_uptime_ms += src.boss_uptime_ms;
+    dst.uptime_cursor_ms = dst.uptime_cursor_ms.max(src.uptime_cursor_ms);
     for (aid, accum) in src.attackers {
         let e = dst.attackers.entry(aid).or_default();
         e.damage += accum.damage;
@@ -3823,6 +5720,20 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
         e.guarded_damage += accum.guarded_damage;
         e.guarded_hits += accum.guarded_hits;
         e.unresolved_local_hits += accum.unresolved_local_hits;
+        e.summon_damage += accum.summon_damage;
+        e.summon_hits += accum.summon_hits;
+        e.packet_damage += accum.packet_damage;
+        e.packet_hits += accum.packet_hits;
+        e.unresolved_summon_hits += accum.unresolved_summon_hits;
+        for (sid, s) in accum.summons {
+            let entry = e.summons.entry(sid).or_default();
+            entry.damage += s.damage;
+            entry.hits += s.hits;
+            entry.is_pet = entry.is_pet || s.is_pet;
+            if s.pet_type != 0 {
+                entry.pet_type = s.pet_type;
+            }
+        }
         e.damage_taken += accum.damage_taken;
         e.damage_taken_hits += accum.damage_taken_hits;
         e.damage_blocked += accum.damage_blocked;
@@ -3848,6 +5759,40 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
             bucket.1 += hits;
         }
     }
+}
+
+/// Collapse a participant's per-loadout damage buckets into one row per weapon
+/// (item id plus the enchants it was fired with), summing across loadouts so a
+/// mid-fight armor or ring swap does not split the same weapon's contribution.
+/// Highest damage first.
+fn aggregate_weapons(
+    buckets: &HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
+) -> Vec<WeaponContribution> {
+    let mut out: Vec<WeaponContribution> = Vec::new();
+    for ((gear, enchants), &(damage, hits)) in buckets {
+        let weapon_id = gear[WEAPON_SLOT];
+        if weapon_id < 0 {
+            continue;
+        }
+        let weapon_enchants = enchants[WEAPON_SLOT].clone();
+        match out
+            .iter_mut()
+            .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
+        {
+            Some(w) => {
+                w.damage += damage;
+                w.hits += hits;
+            }
+            None => out.push(WeaponContribution {
+                weapon_id,
+                enchants: weapon_enchants,
+                damage,
+                hits,
+            }),
+        }
+    }
+    out.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
+    out
 }
 
 /// Drop every unresolved attacker (server sentinel id `0xFFFFFF` = damage with
@@ -3955,6 +5900,18 @@ mod tests {
         }
     }
 
+    /// The stat an ability summon can carry with no pet type behind it, which is
+    /// what used to turn a Pocket Rat's hits into a nameless "Pet" row.
+    fn pet_name_stat(name: &str) -> StatData {
+        StatData {
+            stat_type_id: StatType::PetName as u8,
+            stat_type: StatType::PetName,
+            stat_value: 0,
+            string_stat_value: Some(name.to_string()),
+            stat_value_two: 0,
+        }
+    }
+
     fn status(object_id: i32, stats: Vec<StatData>) -> ObjectStatusData {
         ObjectStatusData {
             object_id,
@@ -4018,9 +5975,16 @@ mod tests {
             pet: None,
             damage_taken: None,
             damage_taken_provenance: DamageTakenProvenance::Observed,
+            damage_taken_hits: None,
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
         }
     }
 
@@ -4306,6 +6270,8 @@ mod tests {
             split_done: false,
             joined_late: false,
             spirits: 0,
+            boss_uptime_ms: 0,
+            uptime_cursor_ms: started_at,
         }
     }
 
@@ -4381,6 +6347,58 @@ mod tests {
     }
 
     #[test]
+    fn end_status_clustered_deaths_each_claim_their_own_grave() {
+        // Two players die within the match radius of each other and of both
+        // graves. Roster order must not decide ownership: the nearer departure
+        // claims its own grave and the other is left with its grave, not Nexused.
+        let mut t = CombatTracker::new();
+        // Listed farthest-first, which is what used to steal the near grave.
+        t.departures.insert(
+            1,
+            Departure {
+                x: 12.0,
+                y: 12.0,
+                time: 1_000,
+            },
+        );
+        t.departures.insert(
+            2,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 1_000,
+            },
+        );
+        // Grave A sits on participant 2, grave B on participant 1.
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1829,
+            x: 10.1,
+            y: 10.1,
+            time: 1_100,
+        });
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1837,
+            x: 12.1,
+            y: 12.1,
+            time: 1_100,
+        });
+
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
+        assert_eq!(
+            ps[1].end_status,
+            ParticipantEndStatus::Died { grave_type: 1829 }
+        );
+        // Both graves were consumed.
+        assert!(t.recent_graves.is_empty());
+    }
+
+    #[test]
     fn end_status_remote_death_broadcast_overrides_nexused() {
         let mut t = CombatTracker::new();
         // Two players die in a tight cluster; the position match assigns the one
@@ -4411,8 +6429,8 @@ mod tests {
             time: 1_100,
         });
         // Both deaths were broadcast during the fight window.
-        t.on_remote_death("Zannmp", 1_050);
-        t.on_remote_death("Yumiho", 1_050);
+        t.on_remote_death("Zannmp", "Oryx the Mad God", 1_050);
+        t.on_remote_death("Yumiho", "Oryx the Mad God", 1_050);
 
         let mut p1 = participant(1, false);
         p1.name = "Zannmp".into();
@@ -4446,6 +6464,20 @@ mod tests {
     }
 
     #[test]
+    fn remote_death_broadcasts_are_queued_for_persistence() {
+        let mut t = CombatTracker::new();
+        t.on_remote_death("Pillar", "Oryx the Mad God", 1_234);
+        // A broadcast carrying no player name persists nothing.
+        t.on_remote_death("   ", "a Spider", 2_000);
+        let queued = t.take_pending_death_broadcasts();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].player, "Pillar");
+        assert_eq!(queued[0].killer, "Oryx the Mad God");
+        assert_eq!(queued[0].time, 1_234);
+        assert!(t.take_pending_death_broadcasts().is_empty());
+    }
+
+    #[test]
     fn end_status_remote_death_outside_window_is_ignored() {
         let mut t = CombatTracker::new();
         // A death broadcast far outside this fight's window (a later boss) must not
@@ -4458,7 +6490,7 @@ mod tests {
                 time: 1_000,
             },
         );
-        t.on_remote_death("Later", 500_000);
+        t.on_remote_death("Later", "Oryx the Mad God", 500_000);
         let mut p1 = participant(1, false);
         p1.name = "Later".into();
         let mut ps = vec![p1];
@@ -5158,6 +7190,30 @@ mod tests {
             !t.self_damage_available,
             "missing attack stat disables self-damage"
         );
+    }
+
+    #[test]
+    fn shot_damage_bonus_defaults_neutral_and_is_settable() {
+        // The engine must start at the raw roll (what every pre-fix fight was
+        // credited with) and take whatever the character data resolves to. The
+        // roll arithmetic itself is covered in damage.rs; this pins the plumbing
+        // the app pushes through.
+        let mut t = CombatTracker::new();
+        assert_eq!(
+            t.shot_damage_bonus,
+            crate::stats::ShotDamageBonus::none(),
+            "a new tracker applies no shot multiplier"
+        );
+        let bonus = crate::stats::ShotDamageBonus {
+            mastery: 1.1,
+            challenge: 1.24,
+        };
+        t.set_shot_damage_bonus(bonus);
+        assert_eq!(t.shot_damage_bonus, bonus);
+        assert!((t.shot_damage_bonus.total() - 1.364).abs() < 1e-6);
+        // Back to neutral: the pre-fix numbers exactly.
+        t.set_shot_damage_bonus(crate::stats::ShotDamageBonus::none());
+        assert_eq!(t.shot_damage_bonus.total(), 1.0);
     }
 
     #[test]
@@ -6631,6 +8687,610 @@ mod tests {
     }
 
     #[test]
+    fn weapon_buckets_aggregate_by_weapon_across_loadouts() {
+        // The same weapon fired with two different armors must read as one row;
+        // the enchant that was on the weapon rides with it.
+        let mut buckets: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)> = HashMap::new();
+        buckets.insert(
+            ([100, 1, 2, 3], [vec![7], vec![], vec![], vec![]]),
+            (500, 5),
+        );
+        buckets.insert(
+            ([100, 1, 9, 3], [vec![7], vec![], vec![], vec![]]),
+            (300, 3),
+        );
+        buckets.insert(([200, 1, 2, 3], [vec![], vec![], vec![], vec![]]), (100, 2));
+        let weapons = aggregate_weapons(&buckets);
+        assert_eq!(weapons.len(), 2, "one row per weapon, not per loadout");
+        assert_eq!(weapons[0].weapon_id, 100);
+        assert_eq!(weapons[0].damage, 800);
+        assert_eq!(weapons[0].hits, 8);
+        assert_eq!(weapons[0].enchants, vec![7]);
+        assert_eq!(weapons[1].weapon_id, 200);
+        assert_eq!(weapons[1].damage, 100);
+    }
+
+    #[test]
+    fn a_shot_is_credited_to_the_weapon_that_fired_it_across_a_swap() {
+        // Reported: a T7 loot-bonus staff swapped in for the last moments of a
+        // fight took credit for shots fired with the T13 main staff that were still
+        // in flight, making it read as the main damage weapon. Damage is bucketed
+        // by the shot's own gear, so a swap only counts the shots fired with it.
+        const MAIN: i32 = 2513; // Staff of the Vital Unity (T13)
+        const LOOT: i32 = 2718; // Staff of Destruction (T7)
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    name_stat("Lovens"),
+                    stat(StatType::Attack, 65),
+                    stat(StatType::Inventory0, MAIN),
+                ],
+            ),
+            10,
+        );
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+            ),
+            10,
+        );
+
+        // A shot fired with the main staff is still in flight ...
+        t.pending_shots.insert(
+            7,
+            PendingShot {
+                shot_gear: ([MAIN, -1, -1, -1], Default::default()),
+                ..Default::default()
+            },
+        );
+        // ... while the loot swapout is equipped, which is the gear seen when the
+        // hit below is processed.
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::Inventory0, LOOT)]),
+            11,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 12);
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local participant retained");
+        assert_eq!(local.weapons.len(), 1, "one weapon row");
+        assert_eq!(
+            local.weapons[0].weapon_id, MAIN,
+            "the in-flight shot must stay credited to the weapon that fired it"
+        );
+        assert_eq!(local.weapons[0].hits, 1);
+    }
+
+    #[test]
+    fn a_local_attack_change_is_logged_and_sourced_to_a_local_use() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 10);
+        // A consumable use immediately before the jump, so the change is sourced
+        // to it (the item name may be unresolvable in tests, so only the inferred
+        // marker is asserted).
+        t.on_use_item(0x0B50, 0.0, 0.0, 15);
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 80)]), 20);
+
+        let changes: Vec<(&str, i32, i32)> = t
+            .local_stat_changes
+            .iter()
+            .map(|c| (c.label, c.from, c.to))
+            .collect();
+        assert!(changes.contains(&("Attack", 65, 80)), "got {changes:?}");
+        let boost = t
+            .local_stat_changes
+            .iter()
+            .find(|c| c.label == "Attack" && c.to == 80)
+            .unwrap();
+        // The use is only *proposed* as the source: it stands when the item's own
+        // XML declares the stat, and otherwise the change falls back to the ally
+        // label. Either way the log must never blame an item that cannot cause it.
+        assert!(
+            boost.source == "Ally buff" || boost.source.contains("Potion"),
+            "unexpected source for a local consumable use: {}",
+            boost.source
+        );
+
+        // The window closes at the fight's end, since the value never reverted.
+        let windows = t.boost_windows_for(0, 100);
+        let attack = windows
+            .iter()
+            .find(|w| w.stat == "Attack" && w.to == 80)
+            .expect("the boost is a window");
+        assert_eq!(attack.start_offset_ms, 20);
+        assert_eq!(attack.end_offset_ms, 100);
+    }
+
+    #[test]
+    fn the_secondary_condition_mask_does_not_read_as_a_classic_condition() {
+        // Condition stat 69 is a *different* bit layout (`NEWCON_*` in `damage`), so
+        // one of its bits must never be tested against the classic bits: a new-mask
+        // bit 0x1000 used to surface as a phantom "Invisible" on a Wizard who has no
+        // way to become invisible.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        // The object must exist first: a change is only diffed against the previous
+        // snapshot, so the very update that creates it logs nothing.
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 5);
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::ConditionNew, 0x1000)]),
+            10,
+        );
+        assert!(
+            !t.local_stat_changes.iter().any(|c| c.label == "Invisible"),
+            "a secondary-mask bit must not read as a classic condition: {:?}",
+            t.local_stat_changes
+                .iter()
+                .map(|c| c.label)
+                .collect::<Vec<_>>()
+        );
+        // The primary mask still reports it, which is what a rogue's cloak sets.
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::Condition, 0x1000)]),
+            20,
+        );
+        assert!(t.local_stat_changes.iter().any(|c| c.label == "Invisible"));
+    }
+
+    #[test]
+    fn weak_is_reported_as_a_monster_debuff_and_other_rises_as_an_ally_buff() {
+        // Nothing local explains either: Weak is applied by monsters, a Damaging
+        // burst by an ally's aura, so the two must not share one label.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        // Establish the object first: the update that creates it is not diffed.
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 5);
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::Condition, 0x4 | 0x0004_0000)]),
+            10,
+        );
+        let source = |label: &str| {
+            t.local_stat_changes
+                .iter()
+                .find(|c| c.label == label && c.to == 1)
+                .map(|c| c.source.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(source("Weak"), "Enemy debuff");
+        assert_eq!(source("Damaging"), "Ally buff");
+    }
+
+    #[test]
+    fn ability_activation_is_credited_only_packet_borne_damage() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        // The local player with that ability in their ability slot.
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![name_stat("You"), stat(StatType::Inventory1, 999)],
+            ),
+            10,
+        );
+
+        t.on_use_item(999, 0.0, 0.0, 100);
+        // Damage the server itself attributed to the local player afterwards.
+        t.on_damage(500, 1000, 700, 120);
+        // A second activation with no packet-borne damage in its window.
+        t.on_use_item(999, 0.0, 0.0, 400);
+
+        let acts = t.ability_activations_for(0, 1_000);
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[0].item_id, 999);
+        assert_eq!(acts[0].start_offset_ms, 100);
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (0, 0),
+            "an item that declares no server-applied effect is never credited a \
+             bulletless packet, however close the packet lands"
+        );
+        assert_eq!(
+            (acts[1].damage, acts[1].hits),
+            (0, 0),
+            "an activation with no packet damage stays at zero, never borrowed"
+        );
+        // The packet is still the fight's own packet-borne figure.
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!((p.packet_damage, p.packet_hits), (700, 1));
+    }
+
+    #[test]
+    fn volley_hit_is_credited_to_the_ability_that_fired_it() {
+        // A spell's volley is fired by the server, and the ServerPlayerShoot
+        // packet names the item that fired it -- so its landed damage belongs to
+        // that ability's row, never to the weapon the player happened to hold.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 20),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![name_stat("You"), stat(StatType::Inventory1, 777)],
+            ),
+            10,
+        );
+        t.on_use_item(777, 0.0, 0.0, 100);
+        // The volley's per-bullet pre-defense damage, as on_ally_shot registers it
+        // for the local player's own server-fired bullets.
+        t.pending_server_shots.insert(5, (300, false, 777));
+        t.on_local_hit(500, 5, 1000, 1000, 150);
+
+        let acts = t.ability_activations_for(0, 1_000);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (280, 1),
+            "300 pre-defense, the target's 20 defense applied"
+        );
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!(p.damage, 280, "the hit still counts in the fight total");
+        assert!(
+            p.damage_by_equipment.is_empty(),
+            "a spell volley is not the weapon's self-computed damage"
+        );
+    }
+
+    #[test]
+    fn a_spray_nova_is_credited_by_its_declared_effect_window() {
+        // The mushroom a spray leaves behind pulses its nova for the effect's own
+        // declared life (4 waves 1.2s apart), so its packets stay with the spray
+        // even after the player has cast something else -- and a spell that
+        // declares no such effect never claims them.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() || am.server_applied_damage_window_ms(0x04b3).is_none() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        assert!(
+            am.server_applied_damage_window_ms(0x9443).is_none(),
+            "a BulletNova spell declares no server-applied effect of its own"
+        );
+
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        // The ability slot holds the spray, so its uses register as activations.
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![name_stat("You"), stat(StatType::Inventory1, 0x04b3)],
+            ),
+            10,
+        );
+        t.on_use_item(0x04b3, 0.0, 0.0, 1_000);
+        // Nova pulses 0.28s and 2.5s later (inside the mushroom's life)...
+        t.on_damage(500, 1000, 1_088, 1_280);
+        t.on_damage(500, 1000, 1_088, 3_500);
+        // ...and a third long after it expired, which no activation may claim.
+        t.on_damage(500, 1000, 1_088, 30_000);
+
+        let acts = t.ability_activations_for(0, 31_000);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (2_176, 2),
+            "the mushroom's waves stay with the spray that spawned it"
+        );
+    }
+
+    #[test]
+    fn beer_god_is_curated_as_its_own_fight() {
+        // "New Beer God" (0x5670) is defined only in encounters.xml, which the
+        // object catalog does not index: it has no resolvable name and no
+        // <Labels>, so nothing but the 10k-HP fallback ever classified it -- and a
+        // real capture showed the fight being dropped entirely. It is curated
+        // explicitly instead, name included.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 12345, 1_000);
+        t.on_player_loaded(1000, 2537);
+        // MaxHP deliberately omitted: the classification must not depend on it.
+        t.on_object_spawn(
+            500,
+            22128,
+            &status(500, vec![stat(StatType::HP, 80_000)]),
+            1_100,
+        );
+        t.on_damage(500, 1000, 1_000, 2_000);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20_000);
+
+        let done = t.on_tick(20_000);
+        assert_eq!(done.len(), 1, "the Beer God fight must be recorded");
+        assert_eq!(done[0].boss_object_type, 22128);
+        assert_eq!(done[0].boss_name, "Beer God");
+        assert!(done[0].killed);
+        assert_eq!(done[0].total_damage(), 1_000);
+    }
+
+    #[test]
+    fn summon_hits_are_split_from_the_owners_own_hits() {
+        // A pet-only fight. The owner's row keeps the damage (the game attributes
+        // pet damage to the player) but the pet gets its own line, and nothing is
+        // bucketed as the owner's weapon damage.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+
+        // The pet (object 200) fires with the local player as its summoner.
+        t.on_ally_shot(200, 1000, 5, 1, 300, 0, 0);
+        t.on_local_hit(500, 5, 200, 1000, 10);
+
+        let accum = t.fights.get(&500).unwrap().attackers.get(&1000).unwrap();
+        assert_eq!(accum.summon_damage, 300);
+        assert_eq!(accum.summon_hits, 1);
+        assert!(
+            accum.damage_by_equipment.is_empty(),
+            "pet damage must not be bucketed as the owner's weapon damage"
+        );
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let p = &done[0].participants[0];
+        assert_eq!(p.damage, 300);
+        assert_eq!(p.hits, 1);
+        assert_eq!(p.summon_damage, 300);
+        assert_eq!(p.summon_hits, 1);
+        assert_eq!(p.summons.len(), 1);
+        assert_eq!(p.summons[0].object_id, 200);
+        assert_eq!(p.summons[0].damage, 300);
+        assert_eq!(p.summons[0].hits, 1);
+        // The owner's own hits are all accounted for, so the row stays exact.
+        assert_eq!(p.provenance, DamageProvenance::SelfComputed);
+    }
+
+    #[test]
+    fn summon_rows_carry_the_entitys_own_object_type() {
+        // A summoned creature's object type is its identity: it names the row and
+        // gives it a sprite ("Summon Pocket Rat" is 0x4683), where a pet is named
+        // by its skin under `pet_type`. The type comes from the spawned entity, so
+        // the row is right even before its first hit resolves.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        // Three summoned Pocket Rats, as the Pocket Rat consumable spawns them.
+        for id in [157, 158, 159] {
+            t.on_object_spawn(id, 0x4683, &status(id, vec![]), 0);
+        }
+
+        t.on_ally_shot(157, 1000, 5, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 5, 157, 1000, 10);
+        t.on_ally_shot(158, 1000, 6, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 6, 158, 1000, 11);
+        // A summon that was never seen spawning keeps a zero type, so the UI can
+        // still fall back to the generic label.
+        t.on_ally_shot(999, 1000, 7, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 7, 999, 1000, 12);
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let p = &done[0].participants[0];
+        assert_eq!(p.summons.len(), 3);
+        for s in &p.summons {
+            if s.object_id == 999 {
+                assert_eq!(s.object_type, 0, "an unseen entity has no type to show");
+                assert!(!s.is_pet);
+                continue;
+            }
+            assert_eq!(
+                s.object_type, 0x4683,
+                "object {} has the rat's type",
+                s.object_id
+            );
+            assert!(!s.is_pet);
+            assert_eq!(s.pet_type, 0, "a summon is not named by a pet skin");
+            assert_eq!(s.damage, 50);
+            assert_eq!(s.hits, 1);
+        }
+    }
+
+    #[test]
+    fn summon_pet_type_still_wins_for_pets() {
+        // A real pet is named by its skin: the type it carries is a pet skin id,
+        // which is what the UI draws, not the object type it was spawned as.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 12_000), stat(StatType::HP, 12_000)],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            200,
+            0x0321,
+            &status(200, vec![stat(StatType::PetType, 12_345), name_stat("Rat")]),
+            0,
+        );
+        t.on_ally_shot(200, 1000, 5, 1, 300, 0, 0);
+        t.on_local_hit(500, 5, 200, 1000, 10);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let s = &done[0].participants[0].summons[0];
+        assert_eq!(s.pet_type, 12_345);
+        assert!(s.is_pet);
+        assert_eq!(
+            s.object_type, 0x0321,
+            "the spawned type is kept alongside the skin"
+        );
+    }
+
+    #[test]
+    fn missed_summon_shot_is_valued_at_the_summon_rate() {
+        // A pet hit whose shoot packet was missed must not be valued at the
+        // owner's (much larger) average: it falls back to the summon's own
+        // average, so a pet-heavy fight cannot inflate the owner's figure.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
+
+        // Owner's own shot: 1000 pre-defense. Resolving a real server shot needs the
+        // asset set, so register the pre-defense value directly, as the other local
+        // shot tests do.
+        t.on_ally_shot(1000, 0, 1, 1, 1000, 0, 0);
+        t.pending_server_shots.insert(1, (1000, false, 0));
+        t.on_local_hit(500, 1, 1000, 1000, 10);
+        // Pet: one shot with its packet (100) and one hit whose shot was missed.
+        t.on_ally_shot(200, 1000, 5, 1, 100, 0, 0);
+        t.on_local_hit(500, 5, 200, 1000, 11);
+        t.on_local_hit(500, 9, 200, 1000, 12);
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let p = &done[0].participants[0];
+        assert_eq!(p.summon_hits, 2);
+        assert_eq!(p.summon_damage, 100);
+        // 1000 (own) + 100 (resolved pet) + 100 (missed pet hit at the pet's rate),
+        // never + 1000.
+        assert_eq!(p.damage, 1200);
+        assert_eq!(p.provenance, DamageProvenance::SelfEstimated);
+    }
+
+    #[test]
+    fn boss_uptime_counts_only_vulnerable_time() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                    stat(StatType::Condition, 0x0100_0000),
+                ],
+            ),
+            0,
+        );
+        // Damage while invulnerable, then the boss opens up and takes a hit.
+        t.on_damage(500, 600, 100, 1_000);
+        t.on_object_status(500, &status(500, vec![stat(StatType::Condition, 0)]), 2_000);
+        t.on_damage(500, 600, 100, 3_000);
+
+        let fight = t.fights.get(&500).expect("fight tracked");
+        // 1000 -> 2000 was invulnerable (nothing counted); 2000 -> 3000 counts.
+        assert_eq!(fight.boss_uptime_ms, 1_000);
+    }
+
+    #[test]
     fn local_server_shot_applies_defense_and_is_computed() {
         // A local server-fired bullet (weapon proc / ability volley) resolves via
         // pending_server_shots: non-AP damage has the target's defense applied and
@@ -6655,7 +9315,7 @@ mod tests {
         // the solo HP-gap reconciliation (which has its own tests).
         t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
         // Registered by on_ally_shot for a local server bullet (base 300, non-AP).
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // shooter == local
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -6685,7 +9345,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, true)); // armor-piercing
+        t.pending_server_shots.insert(5, (300, true, 0)); // armor-piercing
         t.on_local_hit(500, 5, 1000, 1000, 10);
         assert_eq!(
             t.fights
@@ -6707,7 +9367,7 @@ mod tests {
         let mut t = CombatTracker::new();
         t.on_map_change("Realm", 1, 0);
         t.on_player_loaded(1000, 1);
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_shot(2824, 0, 5, 10, 0.0, 0.0, 0.0, 10); // reuse id 5
         assert!(
             !t.pending_server_shots.contains_key(&5),
@@ -6961,7 +9621,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -7026,7 +9686,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
                                                 // Last HP tick shows 100 (< 1% of 12000), then the object is removed.
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 100)]), 20);
@@ -7063,7 +9723,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1_000)]), 20); // ~8%
         let done: Vec<_> = t.on_object_removed(500, 30).into_iter().collect();
@@ -7100,6 +9760,10 @@ mod tests {
                     stat(StatType::WisdomBoost, 20),
                     stat(StatType::Dexterity, 65),
                     stat(StatType::DexterityBoost, 15),
+                    stat(StatType::Vitality, 55),
+                    stat(StatType::VitalityBoost, 20),
+                    stat(StatType::Speed, 45),
+                    stat(StatType::SpeedBoost, 10),
                     stat(StatType::MaxMP, 400),
                     stat(StatType::MaxMPBoost, 100),
                 ],
@@ -7120,6 +9784,183 @@ mod tests {
             Some(65)
         );
         assert_eq!(local.effective_scaling_stat(ScalingStat::MaxMp), Some(400));
+        // VIT- and SPD-scaled gear (Cloak of the Darkened Sun, Sharktooth Sigil)
+        // must resolve too; returning `None` for them silently dropped the whole
+        // stat-scaled proc.
+        assert_eq!(
+            local.effective_scaling_stat(ScalingStat::Vitality),
+            Some(55)
+        );
+        assert_eq!(local.effective_scaling_stat(ScalingStat::Speed), Some(45));
+    }
+
+    #[test]
+    fn vitality_and_speed_changes_are_recorded_as_boosts() {
+        // A VIT-stacking build's stat swings must reach the fight's boost
+        // timeline, not just the damage math: only ATT/DEF/DEX/WIS/MP used to be
+        // snapshotted, so a VIT potion or VIT-buffing ability was invisible.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        // Pre-fight stats (their arrival precedes the fight, so it is not a boost).
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Vitality, 75),
+                    stat(StatType::Speed, 50),
+                    stat(StatType::MaxHP, 800),
+                ],
+            ),
+            5,
+        );
+        // Open the fight.
+        t.pending_server_shots.insert(1, (100, false, 0));
+        t.on_local_hit(500, 1, 1000, 1000, 10);
+        // A VIT potion / VIT-buffing ability lands mid-fight; SPD does not move,
+        // while a life treat raises Max HP.
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Vitality, 100),
+                    stat(StatType::Speed, 50),
+                    stat(StatType::MaxHP, 820),
+                ],
+            ),
+            20,
+        );
+        let done = t.on_map_change("Nexus", 0, 40);
+        let vit: Vec<_> = done[0]
+            .boosts
+            .iter()
+            .filter(|b| b.stat == "Vitality")
+            .collect();
+        assert_eq!(vit.len(), 1, "exactly one VIT boost window");
+        assert_eq!((vit[0].from, vit[0].to), (75, 100));
+        assert!(
+            done[0].boosts.iter().all(|b| b.stat != "Speed"),
+            "an unchanged SPD must not open a window"
+        );
+        // Max HP is a buffed stat too (life treats raise it), so it is tracked.
+        let hp: Vec<_> = done[0]
+            .boosts
+            .iter()
+            .filter(|b| b.stat == "Max HP")
+            .collect();
+        assert_eq!(hp.len(), 1, "exactly one Max HP boost window");
+        assert_eq!((hp[0].from, hp[0].to), (800, 820));
+    }
+
+    #[test]
+    fn unobserved_vitality_does_not_apply_a_vitality_scaled_bonus() {
+        // Before the VIT stat arrives, a VIT-scaled proc must not be computed
+        // from the zero default (which would under-credit it silently).
+        use crate::assets::ScalingStat;
+        let mut t = CombatTracker::new();
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
+        let local = t.objects.get(&1000).expect("local");
+        assert_eq!(local.effective_scaling_stat(ScalingStat::Vitality), None);
+        assert_eq!(local.effective_scaling_stat(ScalingStat::Speed), None);
+    }
+
+    #[test]
+    fn vitality_scaled_lethal_strike_bonus_is_credited() {
+        // Regression for the Cloak of the Darkened Sun: its Lethal Strike scales
+        // off Vitality, so the proc used to resolve to no bonus at all (the stat
+        // was never tracked). Params mirror the parsed asset values.
+        use crate::assets::ScalingStat;
+        let params = LethalStrikeParams {
+            ignore_flat: 60.0,
+            ignore_perc: 0.45,
+            stat_mod_flat: 3.0,
+            stat_mod_perc: 0.01,
+            stat_mod_scaling_min: 24.0,
+            scaling_stat: ScalingStat::Vitality,
+            duration: 2.4,
+            extra_shots: 2,
+        };
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Vitality, 130),
+                    // The server folds the boost into the base stat; adding it
+                    // again would inflate the bonus.
+                    stat(StatType::VitalityBoost, 20),
+                ],
+            ),
+            10,
+        );
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 65),
+                ],
+            ),
+            0,
+        );
+
+        let vit = t
+            .objects
+            .get(&1000)
+            .expect("local")
+            .effective_scaling_stat(ScalingStat::Vitality)
+            .expect("VIT observed");
+        assert_eq!(vit, 130);
+
+        // w = 130 - 24 = 106 -> flat = 60 + 3*106 = 378, perc = 0.45 + 1.06 = 1.51
+        // bonus vs 65 DEF = 378 + 1.51*65 = 476.15 -> 476 (two side procs included)
+        let bonus = damage::lethal_strike_bonus(&params, vit, 65);
+        assert_eq!(bonus, 476);
+
+        t.lethal_strike_windows.push_back((0, 10_000));
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                shot_time: 100,
+                lethal_strike: Some((params, vit)),
+                extra_projectile: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 100);
+        let done = t.on_map_change("Nexus", 0, 200);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local");
+        // weapon 1000 - 65 DEF = 935, plus the main bonus and both side procs.
+        assert_eq!(local.damage, 935 + 3 * 476);
     }
 
     #[test]
@@ -7144,7 +9985,7 @@ mod tests {
         );
         // Another player object appears (records into seen_player_ids).
         t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Bob")]), 0);
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -7185,7 +10026,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -7220,7 +10061,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 600)]), 15); // 5%
         let cf = t
@@ -7254,7 +10095,7 @@ mod tests {
             ),
             0,
         );
-        t.pending_server_shots.insert(5, (300, false));
+        t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_hit(500, 5, 1000, 1000, 10); // 280 computed
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
         let done = t.on_tick(20);
@@ -7538,9 +10379,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 2,
@@ -7559,9 +10407,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
         ];
         cap_overkill(&mut ps, 10_000);
@@ -7592,9 +10447,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: Some(9000),
                 guarded_hits: Some(10),
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 2,
@@ -7613,9 +10475,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: Some(0),
                 guarded_hits: Some(0),
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
         ];
         cap_overkill(&mut ps, 10_000);
@@ -7646,9 +10515,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 2,
@@ -7667,9 +10543,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
         ];
         cap_overkill(&mut ps, 100_000);
@@ -7698,9 +10581,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 2,
@@ -7719,9 +10609,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 3,
@@ -7740,9 +10637,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
         ];
         cap_overkill(&mut ps, 2);
@@ -7773,9 +10677,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 2,
@@ -7794,9 +10705,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 3,
@@ -7815,9 +10733,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
         ];
         drop_unresolved(&mut ps);
@@ -7854,9 +10779,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
             FightParticipant {
                 object_id: 2,
@@ -7875,9 +10807,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             },
         ];
         drop_unresolved(&mut ps);
@@ -7966,6 +10905,59 @@ mod tests {
         assert_eq!(
             alice.damage_taken_provenance,
             DamageTakenProvenance::Observed
+        );
+    }
+
+    #[test]
+    fn hits_taken_is_recorded_for_every_participant_including_zero() {
+        // Every participant's row carries a hit count, a zero included, so the UI
+        // can tell "never hit" apart from a fight recorded before the field
+        // existed (a NULL row).
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 50_000), stat(StatType::HP, 50_000)],
+            ),
+            0,
+        );
+        t.on_object_spawn(600, 0x0321, &status(600, vec![name_stat("Alice")]), 0);
+        t.on_object_spawn(601, 0x0321, &status(601, vec![name_stat("Bob")]), 0);
+
+        // Local engages the boss; Alice and Bob both deal damage, only Alice is hit.
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        t.on_damage(500, 600, 5000, 20);
+        t.on_damage(500, 601, 4000, 21);
+        t.on_damage(600, 500, 300, 30);
+        t.on_damage(600, 500, 200, 35);
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 40);
+        let done = t.on_tick(40);
+        let hits_taken = |name: &str| {
+            done[0]
+                .participants
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} recorded"))
+                .damage_taken_hits
+        };
+        assert_eq!(hits_taken("Alice"), Some(2), "both incoming hits counted");
+        assert_eq!(
+            hits_taken("Bob"),
+            Some(0),
+            "a player who was never hit records a zero, not None"
         );
     }
 
@@ -9528,5 +12520,801 @@ mod tests {
             "got {}",
             regular.boss_name
         );
+    }
+
+    fn local_damage_event(time_ms: i64, damage: i64, pet_id: Option<i32>) -> LocalDamageEvent {
+        LocalDamageEvent {
+            time_ms,
+            damage,
+            pet_id,
+            summon: None,
+            removal: None,
+        }
+    }
+
+    fn local_damage_event_from_summon(
+        time_ms: i64,
+        damage: i64,
+        pet_id: Option<i32>,
+        summon: (i32, i32),
+    ) -> LocalDamageEvent {
+        LocalDamageEvent {
+            time_ms,
+            damage,
+            pet_id,
+            summon: Some(summon),
+            removal: None,
+        }
+    }
+
+    fn ability_use(time_ms: i64, item_id: i32, window_ms: Option<i64>) -> LocalAbilityUse {
+        LocalAbilityUse {
+            time_ms,
+            item_id,
+            enchants: Vec::new(),
+            server_effect_window_ms: window_ms,
+        }
+    }
+
+    fn no_creatures_seen() -> HashSet<i32> {
+        HashSet::new()
+    }
+
+    /// A tracker holding one boss, the local player, and -- when `pet_type` is
+    /// non-zero -- a pet out next to the player with the given abilities.
+    fn pet_packet_tracker(pet_abilities: &[i32], pet_type: i32) -> CombatTracker {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_status(1000, &status_at(1000, 0.0, 0.0, vec![name_stat("You")]), 0);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 16_000),
+                    stat(StatType::HP, 16_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        if pet_type != 0 {
+            let mut stats = vec![stat(StatType::PetType, pet_type)];
+            for (i, ability) in pet_abilities.iter().enumerate() {
+                let kind = [
+                    StatType::PetFirstAbilityType,
+                    StatType::PetSecondAbilityType,
+                    StatType::PetThirdAbilityType,
+                ][i];
+                stats.push(stat(kind, *ability));
+            }
+            t.on_object_spawn(900, 0x9999, &status_at(900, 1.0, 1.0, stats), 0);
+        }
+        t
+    }
+
+    fn local_row(done: &CompletedFight) -> &FightParticipant {
+        done.participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("the local player's row")
+    }
+
+    #[test]
+    fn a_spawn_window_only_claims_what_a_pet_cannot_explain() {
+        let use_ = ability_use(1_000, 999, None);
+        let uses = vec![&use_];
+        let spawns = [(0x500a, None)];
+        // A pet out at the same moment owns this one: a spammed ability keeps the
+        // window open almost always, so it can no longer tell the two apart, and
+        // the pet is the source that was actually observed.
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(3_000, 130, Some(42))
+            ),
+            Some(PacketDamageSource::Pet { pet_id: 42 })
+        );
+        // With no pet out the window is the only explanation left, and the row
+        // falls back to the creature's type since it was never seen.
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(3_000, 130, None)
+            ),
+            Some(PacketDamageSource::Summon {
+                creature: 0x500a,
+                object_id: None,
+            })
+        );
+        // Past the window, with no pet and nothing seen: unattributed.
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(9_000, 130, None)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_creature_seen_in_the_world_outranks_the_timing_window_and_the_pet() {
+        let use_ = ability_use(1_000, 999, None);
+        let uses = vec![&use_];
+        let spawns = [(0x500a, None)];
+        let seen = no_creatures_seen();
+        // Seen alive and in reach of the target: it is the shooter, and the row
+        // keys on the instance that was actually observed.
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &seen,
+                &local_damage_event_from_summon(3_000, 130, Some(42), (777, 0x500a)),
+            ),
+            Some(PacketDamageSource::Summon {
+                creature: 0x500a,
+                object_id: Some(777),
+            })
+        );
+        // A spammed ability puts every packet inside the window, so a creature
+        // seen in the world is what keeps a pet's own hits off the summon's row --
+        // and out of the window's reach once it is gone.
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &seen,
+                &local_damage_event_from_summon(4_000, 280, Some(42), (777, 0x500a)),
+            ),
+            Some(PacketDamageSource::Summon {
+                creature: 0x500a,
+                object_id: Some(777),
+            })
+        );
+    }
+
+    #[test]
+    fn a_creature_seen_in_the_world_beats_one_only_its_window_reached() {
+        // Two items in the loadout each spawn their own creature on their own use.
+        // The one activated last is not necessarily the one that is out, so a
+        // creature actually seen around the fight takes the packet.
+        let first = ability_use(1_000, 111, None);
+        let second = ability_use(4_000, 222, None);
+        let uses = vec![&first, &second];
+        let spawns = [(0x500a, Some(111)), (0xb053, Some(222))];
+        let event = local_damage_event(4_500, 130, None);
+        // Nothing seen: the window's own order decides, and the later use wins.
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &no_creatures_seen(), &event),
+            Some(PacketDamageSource::Summon {
+                creature: 0xb053,
+                object_id: None,
+            })
+        );
+        // Seen in the world: it takes the packet despite the later activation.
+        let mut seen = no_creatures_seen();
+        seen.insert(0x500a);
+        assert_eq!(
+            packet_damage_source(&uses, &spawns, &seen, &event),
+            Some(PacketDamageSource::Summon {
+                creature: 0x500a,
+                object_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_summon_declared_on_the_items_own_use_ignores_other_activations() {
+        let other = ability_use(1_000, 111, None);
+        let own = ability_use(2_000, 999, None);
+        let uses = vec![&other, &own];
+        let spawns = [(0x4683, Some(999))];
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(1_500, 40, None)
+            ),
+            None,
+            "an unrelated activation cannot spawn this item's creature"
+        );
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &spawns,
+                &no_creatures_seen(),
+                &local_damage_event(2_500, 40, None)
+            ),
+            Some(PacketDamageSource::Summon {
+                creature: 0x4683,
+                object_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_packet_an_activation_already_owns_is_never_handed_to_a_pet() {
+        // The item declares a server-applied effect, so its own window owns the
+        // packet (`ability_activations_for` credits it there). A pet out at the
+        // same moment must not be credited the same damage a second time.
+        let use_ = ability_use(1_000, 999, Some(2_000));
+        let uses = vec![&use_];
+        assert_eq!(
+            packet_damage_source(
+                &uses,
+                &[],
+                &no_creatures_seen(),
+                &local_damage_event(1_500, 500, Some(42))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn owner_credited_packet_damage_lands_on_the_pets_own_row() {
+        let mut t = pet_packet_tracker(&[406, 407, 408], 32643);
+        // The server credits the pet's hits to the player: attacker = the player.
+        t.on_damage(500, 1000, 280, 200);
+        t.on_damage(500, 1000, 280, 300);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!((me.summon_damage, me.summon_hits), (560, 2));
+        let row = me.summons.first().expect("a pet row");
+        assert!(row.is_pet);
+        assert_eq!(row.pet_type, 32643);
+        assert_eq!((row.damage, row.hits), (560, 2));
+        // The raw packet channel keeps its own tally.
+        assert_eq!((me.packet_damage, me.packet_hits), (560, 2));
+    }
+
+    #[test]
+    fn a_savage_only_pet_claims_nothing() {
+        // Heal, magic heal and Savage: the pet cannot deal damage at all, so the
+        // packets stay unattributed instead of being credited to it.
+        let mut t = pet_packet_tracker(&[408, 407, 409], 32625);
+        assert_eq!(t.damage_capable_pet_near_local(), None);
+        t.on_damage(500, 1000, 130, 200);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!((me.summon_damage, me.summon_hits), (0, 0));
+        assert!(me.summons.is_empty());
+        assert_eq!((me.packet_damage, me.packet_hits), (130, 1));
+    }
+
+    #[test]
+    fn a_creature_nothing_in_the_loadout_declares_is_never_tracked() {
+        // The loadout here declares nothing (no assets are loaded in a unit test),
+        // so a spawn that merely looks like a summon is left alone: attribution
+        // never guesses from a type it cannot place.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(900, 0x500a, &status_at(900, 1.0, 1.0, vec![]), 0);
+        assert!(t.local_summons.is_empty());
+        assert_eq!(t.local_summon_attacking(500, 150), None);
+    }
+
+    #[test]
+    fn a_tracked_summon_claims_only_what_is_in_reach_and_forgets_despawns() {
+        let mut t = pet_packet_tracker(&[], 0);
+        t.local_summons.insert(
+            900,
+            LocalSummonEntity {
+                object_type: 0x500a,
+                first_seen_ms: 100,
+                last_seen_ms: 100,
+                x: 1.0,
+                y: 1.0,
+            },
+        );
+        // Seen on the boss: it can have hit it.
+        assert_eq!(t.local_summon_attacking(500, 150), Some((900, 0x500a)));
+        // Walked away from the target it would have had to hit.
+        t.local_summons.get_mut(&900).unwrap().x = 40.0;
+        t.local_summons.get_mut(&900).unwrap().y = 40.0;
+        assert_eq!(t.local_summon_attacking(500, 150), None);
+        // Back in reach, but despawned: no longer a candidate at all.
+        t.local_summons.get_mut(&900).unwrap().x = 1.0;
+        t.local_summons.get_mut(&900).unwrap().y = 1.0;
+        t.on_object_removed(900, 200);
+        assert_eq!(t.local_summon_attacking(500, 150), None);
+    }
+
+    #[test]
+    fn a_teammates_damage_pet_cannot_claim_the_local_players_packets() {
+        // In a group every pet stands near someone. Proximity alone made the
+        // nearest damage-capable pet the local player's, so a teammate's pet beside
+        // them claimed the local player's own unattributed packets: a fight whose
+        // only pet of theirs was a Decoy pet still grew a pet row worth 943 damage,
+        // which was really a teammate's Great Jelly standing nearby.
+        let mut t = pet_packet_tracker(&[], 0);
+        // A teammate (a Necromancer) with their Electric pet at their side; the
+        // local player is at the origin, well inside pet range of it.
+        t.on_object_spawn(
+            600,
+            0x0321,
+            &status_at(600, 1.0, 1.0, vec![name_stat("Friend")]),
+            0,
+        );
+        t.on_object_spawn(
+            901,
+            0x9999,
+            &status_at(
+                901,
+                1.0,
+                2.0,
+                vec![
+                    stat(StatType::PetType, 32_645),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        assert_eq!(
+            t.pet_tracks.get(&901).map(|p| p.votes.clone()),
+            Some(HashMap::from([(600, 1)])),
+            "the pet follows the teammate, not the local player"
+        );
+        assert_eq!(
+            t.damage_capable_pet_near_local(),
+            None,
+            "a teammate's pet is not the local player's, however close it stands"
+        );
+    }
+
+    #[test]
+    fn only_the_pet_the_character_cache_names_can_claim_their_packets() {
+        // The pet ATTRIBUTES shows is the character's own, and the wire reports
+        // every pet in the world with its own type id, so the cache's type decides
+        // which one that is -- distance cannot, because in a group every pet stands
+        // near someone.
+        let mut t = pet_packet_tracker(&[], 0);
+        // 32548 is this character's pet (Blue Ant); 32645 is a teammate's (Great
+        // Jelly) standing nearer to the local player than their own pet is.
+        t.set_local_snapshot(None, false, 24_724, 32_548);
+        t.on_object_spawn(
+            901,
+            0x9999,
+            &status_at(
+                901,
+                0.5,
+                0.5,
+                vec![
+                    stat(StatType::PetType, 32_645),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        assert_eq!(
+            t.damage_capable_pet_near_local(),
+            None,
+            "a Great Jelly is not this character's Blue Ant"
+        );
+        // Their own pet out, and able to damage: it is the claimant.
+        t.on_object_spawn(
+            902,
+            0x9999,
+            &status_at(
+                902,
+                2.0,
+                2.0,
+                vec![
+                    stat(StatType::PetType, 32_548),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        assert_eq!(
+            t.damage_capable_pet_near_local(),
+            Some(902),
+            "the pet the cache names is the one that can claim"
+        );
+    }
+
+    #[test]
+    fn a_shooter_that_is_no_creature_of_mine_is_my_own_hit() {
+        // A secondary projectile names a shooter id that can belong to an object that
+        // is no creature of the player's -- ids are reused as objects despawn -- and
+        // reading that object as the source invented pet rows out of other players'
+        // pets: rows for a Battle God, a Poison Drake, a Great Jelly, none of them
+        // the player's, on the player's own row.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.set_local_snapshot(None, false, 24_724, 32_548);
+        t.on_object_spawn(
+            700,
+            0x9999,
+            &status_at(
+                700,
+                3.0,
+                3.0,
+                vec![
+                    stat(StatType::PetType, 32_645),
+                    stat(StatType::PetFirstAbilityType, 406),
+                ],
+            ),
+            0,
+        );
+        // The local player's own hit, reported with that pet's id as its shooter.
+        t.on_local_hit(500, 5, 700, 1000, 10);
+        let accum = t
+            .fights
+            .get(&500)
+            .and_then(|f| f.attackers.get(&1000))
+            .expect("the local player's row");
+        assert!(
+            accum.summons.is_empty(),
+            "no creature of the local player's fired this shot"
+        );
+        assert_eq!((accum.summon_damage, accum.summon_hits), (0, 0));
+        assert_eq!(accum.hits, 1, "it stays a hit of theirs");
+    }
+
+    #[test]
+    fn an_unexplained_packet_is_credited_to_the_object_that_vanished() {
+        // A barrel pushed into the boss: the server credits the player, and the only
+        // thing on the wire that names the source is the barrel leaving the world as
+        // the hit lands (measured on a barrel-only Nightmare Colony: 105 of 105 hits,
+        // same tick, and the whole fight on one row).
+        let mut t = pet_packet_tracker(&[], 0);
+        for (i, at) in [400, 500, 600, 700].into_iter().enumerate() {
+            let id = 700 + i as i32;
+            t.on_object_spawn(id, 0x0786, &status_at(id, 1.0, 1.0, vec![]), 0);
+            t.on_object_removed(id, at);
+        }
+        t.on_damage(500, 1000, 1_006, 700);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        let row = me.summons.first().expect("a row for the barrel");
+        assert!(!row.is_pet);
+        assert_eq!(row.object_type, 0x0786, "named and drawn as the barrel");
+        assert_eq!((row.damage, row.hits), (1_006, 1));
+        assert_eq!((me.packet_damage, me.packet_hits), (1_006, 1));
+    }
+
+    #[test]
+    fn an_object_that_despawns_once_claims_nothing() {
+        // A boss room is full of things that despawn -- a trap, a wall piece, a mob --
+        // and one of them leaving the world as a barrel hit lands is not the barrel.
+        // Only an object that is such a mechanic is a source at all, so this hit stays
+        // unattributed rather than being credited to the nearest despawn.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(700, 0x0813, &status_at(700, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(700, 700);
+        t.on_damage(500, 1000, 1_006, 700);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert!(me.summons.is_empty(), "a wall piece explains nothing");
+        assert_eq!((me.packet_damage, me.packet_hits), (1_006, 1));
+    }
+
+    #[test]
+    fn both_barrel_types_report_as_the_one_that_draws() {
+        // The room has two barrels and the game gives them different object types;
+        // only one has a texture in the atlas, so reporting them separately showed the
+        // same name twice, once without a sprite. One mechanic, one row.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(700, 0x0786, &status_at(700, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(700, 500);
+        t.on_damage(500, 1000, 1_100, 500);
+        t.on_object_spawn(701, 0x0796, &status_at(701, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(701, 700);
+        t.on_damage(500, 1000, 900, 700);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!(me.summons.len(), 1, "one row for the mechanic");
+        assert_eq!(
+            me.summons[0].object_type, 0x0786,
+            "drawn by the type that renders"
+        );
+        assert_eq!((me.summons[0].damage, me.summons[0].hits), (2_000, 2));
+    }
+
+    #[test]
+    fn a_wall_piece_despawns_with_the_barrel_and_stays_out_of_it() {
+        // Both the barrel and a wall piece leave the world as the hit lands. The row
+        // is the barrel's -- the wall is not a mechanic that can damage the boss, so it
+        // never becomes a candidate, however close in time it went.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(800, 0x0813, &status_at(800, 2.0, 2.0, vec![]), 0);
+        t.on_object_removed(800, 500);
+        t.on_object_spawn(700, 0x0786, &status_at(700, 1.0, 1.0, vec![]), 0);
+        t.on_object_removed(700, 500);
+        t.on_damage(500, 1000, 1_088, 500);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert_eq!(me.summons.len(), 1, "one row, not one per despawn");
+        assert_eq!(me.summons[0].object_type, 0x0786);
+        assert_eq!((me.summons[0].damage, me.summons[0].hits), (1_088, 1));
+    }
+
+    #[test]
+    fn a_removal_away_from_the_hit_explains_nothing() {
+        // The correlation is place-bound as well as tick-bound: a barrel leaving the
+        // world on the far side of the instance is not this packet's source, and the
+        // damage stays unattributed rather than being credited to it.
+        let mut t = pet_packet_tracker(&[], 0);
+        for (i, at) in [400, 500, 600, 700].into_iter().enumerate() {
+            let id = 700 + i as i32;
+            t.on_object_spawn(id, 0x0786, &status_at(id, 60.0, 60.0, vec![]), 0);
+            t.on_object_removed(id, at);
+        }
+        t.on_damage(500, 1000, 1_006, 700);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        assert!(me.summons.is_empty(), "nothing explains this hit");
+        assert_eq!((me.packet_damage, me.packet_hits), (1_006, 1));
+    }
+
+    #[test]
+    fn an_electric_pet_is_a_candidate_only_while_it_is_out_and_in_range() {
+        let mut t = pet_packet_tracker(&[406], 32643);
+        assert_eq!(t.damage_capable_pet_near_local(), Some(900));
+        // Out of range of its owner: it cannot be the shooter.
+        t.on_object_status(900, &status_at(900, 40.0, 40.0, vec![]), 10);
+        assert_eq!(t.damage_capable_pet_near_local(), None);
+        // Back in range but with Savage instead of a damage ability.
+        t.on_object_status(
+            900,
+            &status_at(
+                900,
+                1.0,
+                1.0,
+                vec![stat(StatType::PetFirstAbilityType, 409)],
+            ),
+            20,
+        );
+        assert_eq!(t.damage_capable_pet_near_local(), None);
+    }
+
+    #[test]
+    fn a_fight_is_stamped_with_the_state_it_was_fought_under() {
+        // The processor pushes the character cache's state (the ritual and the
+        // crucible never reach the engine as numeric stats). It is written into the
+        // fight's own record at finalize, so switching the ritual off afterwards
+        // cannot rewrite what the fight says it was fought under.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.set_local_snapshot(Some("tier-a".to_string()), true, 0, 0);
+        t.on_damage(500, 1000, 280, 200);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let was_on = |f: &CompletedFight, label: &str| {
+            f.boosts.iter().any(|b| b.stat == label && b.to > b.from)
+        };
+        assert!(was_on(&done, "Blood Ritual"));
+        assert!(was_on(&done, "Crucible"));
+        assert_eq!(
+            done.boosts
+                .iter()
+                .find(|b| b.stat == "Blood Ritual")
+                .map(|b| b.source.as_str()),
+            Some("character state:tier-a"),
+            "the fight keeps the tier it was fought under"
+        );
+
+        t.set_local_snapshot(None, false, 0, 0);
+        assert!(
+            was_on(&done, "Blood Ritual"),
+            "a recorded fight does not follow a later switch-off"
+        );
+        assert!(was_on(&done, "Crucible"));
+
+        // A fight fought without them carries neither, so a row recorded before
+        // this was tracked reads as off rather than as a live value.
+        let mut off = pet_packet_tracker(&[], 0);
+        off.on_damage(500, 1000, 280, 200);
+        let fight = off.fights.remove(&500).expect("open fight");
+        let plain = off.finalize_fight(fight, 1_000).expect("finalize");
+        assert!(!was_on(&plain, "Blood Ritual"));
+        assert!(!was_on(&plain, "Crucible"));
+    }
+
+    #[test]
+    fn a_creature_that_only_carries_a_pet_name_is_not_a_pet() {
+        // A Pocket Rat arrives with a `PetName` and no pet type. Crediting its hits
+        // to a nameless "Pet" row hides both the creature and the item that made it,
+        // so pet-ness requires an identity -- and this row then shows the rat, from
+        // the rat.
+        let mut t = pet_packet_tracker(&[], 0);
+        t.on_object_spawn(
+            700,
+            0x4683,
+            &status(700, vec![pet_name_stat("Pocket Rat")]),
+            0,
+        );
+        t.on_ally_shot(700, 1000, 5, 1, 50, 0x4683, 0);
+        t.on_local_hit(500, 5, 700, 1000, 10);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        let row = me.summons.first().expect("a row");
+        assert!(!row.is_pet, "a name with no pet type is a creature");
+        assert_eq!(row.object_type, 0x4683, "named and drawn by its own type");
+        assert_eq!(row.pet_type, 0, "no pet skin to draw");
+    }
+
+    #[test]
+    fn the_local_pets_row_carries_the_skin_the_cache_reports() {
+        // The wire's pet id is a *type*, not a sprite: ATTRIBUTES resolves the pet
+        // from the account cache, and the fight's own row does the same, so the row
+        // draws the pet and not a placeholder.
+        let mut t = pet_packet_tracker(&[406, 407, 408], 32643);
+        t.set_local_snapshot(None, false, 12_345, 0);
+        t.on_damage(500, 1000, 280, 200);
+        let fight = t.fights.remove(&500).expect("open fight");
+        let done = t.finalize_fight(fight, 1_000).expect("finalize");
+        let me = local_row(&done);
+        let row = me.summons.first().expect("a pet row");
+        assert!(row.is_pet);
+        assert_eq!(
+            row.pet_type, 12_345,
+            "the cache's skin, not the wire's type"
+        );
+    }
+
+    fn ability_use_with(time_ms: i64, item_id: i32, enchants: &[u16]) -> LocalAbilityUse {
+        LocalAbilityUse {
+            time_ms,
+            item_id,
+            enchants: enchants.to_vec(),
+            server_effect_window_ms: None,
+        }
+    }
+
+    fn no_enchants() -> Vec<Vec<u16>> {
+        vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()]
+    }
+
+    #[test]
+    fn a_bear_is_credited_to_the_mace_that_was_used_not_to_its_twin() {
+        // Both a Sovereign Mace and its (SB) twin declare `Summon Bear`, so the
+        // catalog cannot tell them apart -- and the row used to read "from 2
+        // items". Only one of them was activated.
+        let mut uses = VecDeque::new();
+        uses.push_back(ability_use_with(1_000, 0x9581, &[338]));
+        let candidates = [
+            SummonCandidate {
+                slot: 1,
+                item: 0x3849,
+                trigger: SummonTrigger::Use,
+                lifetime_ms: 10_000,
+            },
+            SummonCandidate {
+                slot: 2,
+                item: 0x9581,
+                trigger: SummonTrigger::Use,
+                lifetime_ms: 10_000,
+            },
+        ];
+        let enchants = [Vec::new(), Vec::new(), vec![338], Vec::new()];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 2_000),
+            Some((0x9581, vec![338]))
+        );
+        // Past the bear's own declared 10s lifetime, that activation can no longer
+        // explain the creature, and two candidates means nothing is claimed.
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 20_000),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ability_spawned_spirit_names_the_item_that_declares_it() {
+        // A Kimono's spirits are created by *any* ability activation, so the item
+        // credited is the Kimono itself, never the ability that was pressed.
+        let mut uses = VecDeque::new();
+        uses.push_back(ability_use_with(5_000, 999, &[]));
+        let candidates = [SummonCandidate {
+            slot: 2,
+            item: 0x4ff4,
+            trigger: SummonTrigger::OnAbilityUse,
+            lifetime_ms: 0,
+        }];
+        let enchants = [Vec::new(), Vec::new(), vec![6], Vec::new()];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 5_500),
+            Some((0x4ff4, vec![6])),
+            "the declaring item's own enchants name the row, never the pressed ability's"
+        );
+        // Even when the activation carries enchants of its own, they belong to the
+        // ability that was pressed, not to the Kimono.
+        let mut other = VecDeque::new();
+        other.push_back(ability_use_with(5_000, 999, &[42, 43]));
+        assert_eq!(
+            pick_summon_source(&candidates, &other, &enchants, 5_500),
+            Some((0x4ff4, vec![6])),
+            "an unrelated ability's enchants must not split the Kimono's row"
+        );
+        // With no `lifeTime` declared, the shortest documented summon life bounds
+        // the *search*, but with only one item able to spawn the creature the
+        // answer is still unambiguous: nothing else could have made it.
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 12_000),
+            Some((0x4ff4, vec![6]))
+        );
+    }
+
+    #[test]
+    fn a_summon_cast_before_the_fight_still_names_its_item() {
+        // The activation log is a rolling session log, so a bear summoned before
+        // the fight started is still traceable to its mace.
+        let mut uses = VecDeque::new();
+        uses.push_back(ability_use_with(-4_000, 0x3849, &[]));
+        let candidates = [SummonCandidate {
+            slot: 1,
+            item: 0x3849,
+            trigger: SummonTrigger::Use,
+            lifetime_ms: 10_000,
+        }];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &no_enchants(), 1_000),
+            Some((0x3849, Vec::new()))
+        );
+        // Outside that lifetime the activation no longer counts, but the mace is
+        // still the only item that could have made this creature.
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &no_enchants(), 20_000),
+            Some((0x3849, Vec::new()))
+        );
+        // Two candidates and a stale activation: nothing is claimed rather than
+        // one of them guessed.
+        let twin = [
+            candidates[0],
+            SummonCandidate {
+                slot: 2,
+                item: 0x9581,
+                trigger: SummonTrigger::Use,
+                lifetime_ms: 10_000,
+            },
+        ];
+        assert_eq!(
+            pick_summon_source(&twin, &uses, &no_enchants(), 20_000),
+            None
+        );
+    }
+
+    #[test]
+    fn a_shoot_spawned_summon_falls_back_to_the_single_equipped_item() {
+        // Nothing in the activation log triggers a shoot-summon: the one equipped
+        // item that declares it is the answer, and only when it is alone.
+        let uses = VecDeque::new();
+        let candidates = [SummonCandidate {
+            slot: 1,
+            item: 0x6102,
+            trigger: SummonTrigger::OnShoot,
+            lifetime_ms: 0,
+        }];
+        let enchants = vec![Vec::new(), vec![17], Vec::new(), Vec::new()];
+        assert_eq!(
+            pick_summon_source(&candidates, &uses, &enchants, 1_000),
+            Some((0x6102, vec![17]))
+        );
+        let two = [
+            candidates[0],
+            SummonCandidate {
+                slot: 2,
+                item: 0x3849,
+                trigger: SummonTrigger::OnShoot,
+                lifetime_ms: 0,
+            },
+        ];
+        assert_eq!(pick_summon_source(&two, &uses, &enchants, 1_000), None);
     }
 }

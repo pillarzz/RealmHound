@@ -1,5 +1,62 @@
 //! XML parser for char/list API responses.
 
+/// Report a character-list tag that RH does not model.
+///
+/// The character list is parsed by tag *name*: `CrucibleActive` is recognised
+/// because it is matched by name, and an unrecognised name is dropped silently,
+/// so a tag RH has never heard of is indistinguishable in the cached data from
+/// one the server did not send. Collecting the names as a payload is parsed
+/// makes such a tag observable without having to guess at its name -- which is
+/// how the `BloodRitualActive` tag behind issue #64 was found.
+fn note_unmodelled_char_tag(name: &str) {
+    unmodelled_char_tags()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name.to_string());
+}
+
+/// Accumulator behind [`note_unmodelled_char_tag`].
+fn unmodelled_char_tags() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Drop the accumulator at the start of a payload.
+fn reset_unmodelled_char_tags() {
+    unmodelled_char_tags()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Log the name of every character-list tag the parser does not model.
+///
+/// Called when a payload is finished, so parsing always produces a line --
+/// `none` included. That matters because this reports only what the parser saw,
+/// and an absent line would otherwise be indistinguishable from a payload that
+/// never reached it.
+fn dump_unmodelled_char_tags() {
+    let mut names: Vec<String> = unmodelled_char_tags()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    names.sort_unstable();
+    tracing::info!(
+        "unmodelled char-list tags ({}): {}",
+        names.len(),
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    );
+}
+
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -123,6 +180,7 @@ pub fn parse_char_list(xml: &str) -> Result<Vec<RealmCharacter>, ParseError> {
     reader.config_mut().trim_text(true);
 
     let mut characters = Vec::new();
+    reset_unmodelled_char_tags();
     let mut current_char: Option<RealmCharacter> = None;
     let mut current_pet: Option<Pet> = None;
     let mut current_element = String::new();
@@ -238,6 +296,10 @@ pub fn parse_char_list(xml: &str) -> Result<Vec<RealmCharacter>, ParseError> {
                             "CurrentFame" => char.fame = text.parse().unwrap_or(0),
                             "Seasonal" => char.seasonal = text == "True",
                             "CrucibleActive" => char.crucible_active = !text.is_empty(),
+                            "BloodRitualActive" => {
+                                let id = text.trim();
+                                char.blood_ritual_id = (!id.is_empty()).then(|| id.to_string());
+                            }
                             "HasBackpack" => char.has_backpack = text == "1",
                             "BackpackSlots" => char.backpack_slots = text.parse().unwrap_or(0),
                             "Has3Quickslots" => char.has_3_quickslots = text == "1",
@@ -271,7 +333,7 @@ pub fn parse_char_list(xml: &str) -> Result<Vec<RealmCharacter>, ParseError> {
                                     .map(|v| v.max(0.0) as u32)
                                     .filter(|s| *s > 0);
                             }
-                            _ => {}
+                            _ => note_unmodelled_char_tag(&current_element),
                         }
                     }
                 }
@@ -289,6 +351,7 @@ pub fn parse_char_list(xml: &str) -> Result<Vec<RealmCharacter>, ParseError> {
         buf.clear();
     }
 
+    dump_unmodelled_char_tags();
     Ok(characters)
 }
 
@@ -307,6 +370,7 @@ pub fn parse_account_data(xml: &str) -> Result<AccountData, ParseError> {
     reader.config_mut().trim_text(true);
 
     let mut account_data = AccountData::default();
+    reset_unmodelled_char_tags();
     let mut current_char: Option<RealmCharacter> = None;
     let mut current_pet: Option<Pet> = None;
     let mut current_element = String::new();
@@ -465,6 +529,10 @@ pub fn parse_account_data(xml: &str) -> Result<AccountData, ParseError> {
                             "CurrentFame" => char.fame = text.parse().unwrap_or(0),
                             "Seasonal" => char.seasonal = text == "True",
                             "CrucibleActive" => char.crucible_active = !text.is_empty(),
+                            "BloodRitualActive" => {
+                                let id = text.trim();
+                                char.blood_ritual_id = (!id.is_empty()).then(|| id.to_string());
+                            }
                             "HasBackpack" => char.has_backpack = text == "1",
                             "BackpackSlots" => char.backpack_slots = text.parse().unwrap_or(0),
                             "Has3Quickslots" => char.has_3_quickslots = text == "1",
@@ -495,7 +563,7 @@ pub fn parse_account_data(xml: &str) -> Result<AccountData, ParseError> {
                                     .map(|v| v.max(0.0) as u32)
                                     .filter(|s| *s > 0);
                             }
-                            _ => {}
+                            _ => note_unmodelled_char_tag(&current_element),
                         }
                     }
                 } else if in_account {
@@ -614,6 +682,7 @@ pub fn parse_account_data(xml: &str) -> Result<AccountData, ParseError> {
         account_data.accelerators = super::parse_accelerators(&raw, server_timestamp);
     }
 
+    dump_unmodelled_char_tags();
     Ok(account_data)
 }
 
@@ -689,6 +758,34 @@ mod tests {
         assert_eq!(chars.len(), 2);
         assert_eq!(chars[0].class, CharacterClass::Rogue);
         assert_eq!(chars[1].class, CharacterClass::Knight);
+    }
+
+    #[test]
+    fn test_parse_blood_ritual_tag() {
+        let xml = r#"
+            <Chars>
+                <Char id="1">
+                    <ObjectType>784</ObjectType>
+                    <BloodRitualActive>5027802235043840</BloodRitualActive>
+                </Char>
+                <Char id="2">
+                    <ObjectType>768</ObjectType>
+                    <BloodRitualActive></BloodRitualActive>
+                </Char>
+                <Char id="3">
+                    <ObjectType>768</ObjectType>
+                </Char>
+            </Chars>
+        "#;
+
+        let chars = parse_char_list(xml).unwrap();
+        assert_eq!(
+            chars[0].blood_ritual_id.as_deref(),
+            Some("5027802235043840"),
+            "the tag carries the id of the tier the character last took"
+        );
+        assert_eq!(chars[1].blood_ritual_id, None, "an empty tag is no ritual");
+        assert_eq!(chars[2].blood_ritual_id, None, "an absent tag is no ritual");
     }
 
     #[test]

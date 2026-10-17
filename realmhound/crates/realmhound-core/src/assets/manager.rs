@@ -27,9 +27,10 @@ use super::dungeon_mods_xml::{ModifierDef, ModifierTable};
 use super::enchantments::EnchantmentList;
 use super::item_category::ItemCategorizer;
 use super::object_list::{
-    AbilityEffects, LethalStrikeParams, ObjectAsset, ObjectList, TileAsset, TileList,
+    AbilityEffect, AbilityEffects, LethalStrikeParams, ObjectAsset, ObjectList, TileAsset, TileList,
 };
 use super::sprite_atlas::{SpriteAtlas, SpriteData};
+use super::stat_bonus::StatKind;
 use super::unity::{find_resources_assets, UnityExtractor};
 
 /// How the dye/cloth color is applied.
@@ -165,6 +166,8 @@ const CURATED_BOSS_TYPES: &[i32] = &[
     21943, // New Kage Kami (Adept Hero of Oryx) -- ENEMY,MINION,UNDEAD,MINION_MID, 3000 HP, no boss label
     21946, // New Great Coil Snake (Rookie Hero of Oryx) -- not always labeled MINIBOSS
     22109, // Kogbold Expedition Engine (realm event) -- MINION,BEAST,MINION_WEAK,VETERAN_ENCOUNTER, 700k HP
+    22128, // New Beer God (realm event) -- defined only in encounters.xml, which the catalog
+    //        does not index, so it has no name and no <Labels> at all; 80k HP
     24020, // Criminal Monkey (Animal Merchant realm set-piece spawn) -- no labels
     24021, // Fraudulent Tiger (Animal Merchant realm set-piece spawn) -- no labels
     24023, // Animal Merchant (Adept Hero of Oryx realm set-piece) -- no labels
@@ -879,6 +882,184 @@ pub fn boss_for_loot_emitter(chest_type: i32) -> Option<i32> {
         .map(|(dragon, _)| *dragon)
 }
 
+/// Boss reskin groups that are the same fight for loot/fight correlation.
+///
+/// A seasonal reskin is a *different* object type with the same identity, and it
+/// emits loot anonymously, so bags get attributed to the canonical boss (e.g.
+/// via the Mark of Janus rule) while Combat History records the fight against
+/// the reskin's type. Exact-type matching then fails to link them. Members of a
+/// group are treated as interchangeable when correlating bags with fights.
+const BOSS_LOOT_CORRELATION_GROUPS: &[&[i32]] = &[
+    // Janus the Doorwarden: classic (Oryx's Castle) and the Season 31 "Infested"
+    // Halloween reskin.
+    &[8200, 46385],
+];
+
+/// Seasonal reskin groups: each is the set of object types that are the *same*
+/// encounter shipped under different ids and display names (the Halloween
+/// "New ..." / "Infested ..." variants). The first id is the canonical base.
+///
+/// A single id can be recorded under different names by season (e.g. the reskin
+/// object is named "Grand Sphinx" off-season and "Withered Sphinx" during
+/// Halloween), so grouping by id — not name — is what unifies search tags and
+/// history. The UI then labels the encounter by whatever was actually detected
+/// most recently, and matches history under any variant name.
+const ENCOUNTER_RESKIN_GROUPS: &[&[i32]] = &[
+    &[3412, 22000],        // Grand Sphinx / Withered Sphinx
+    &[3417, 22009],        // Cube God / Calcium God
+    &[3414, 22003, 22006], // Skull Shrine / Pumpkin Shrine (+ "New Skull Shrine")
+    &[3639, 22042],        // Ghost Ship / The Flying Dutchman
+    &[3425, 22023],        // Hermit God / Reanimated Hermit God
+    &[3428, 22026],        // Hermit God Tentacle / Reanimated Hermit God Tentacle
+    &[28619, 22149],       // Jade Statue / Blue Oni
+    &[28618, 22150],       // Garnet Statue / Red Oni
+    &[3448, 46390],        // Stone Guardian (right) / Infested
+    &[3449, 46391],        // Stone Guardian (left) / Infested
+    &[8200, 46385],        // Janus the Doorwarden / Infested
+    &[5952, 45973],        // Oryx the Mad God 1 / Infested
+    &[2354, 28989],        // Oryx the Mad God 2 / Infested
+];
+
+/// Stable, season-independent names for the encounters in
+/// [`ENCOUNTER_RESKIN_GROUPS`], in the same order: the classic name first, then
+/// every seasonal name the encounter has shipped under.
+///
+/// The assets only ever name the variant that is live *now* ("New Grand Sphinx"
+/// today, "Withered Sphinx" during a past Halloween), so an alias list built from
+/// them alone stops matching the moment Deca renames the assets again: a search
+/// for a name from a previous season would silently find nothing. These names are
+/// baked in for search only — they never change what is displayed (see
+/// [`encounter_display_variant`]).
+const ENCOUNTER_RESKIN_NAMES: &[&[&str]] = &[
+    &["Grand Sphinx", "Withered Sphinx"],
+    &["Cube God", "Calcium God"],
+    &["Skull Shrine", "Pumpkin Shrine"],
+    &["Ghost Ship", "The Flying Dutchman"],
+    &["Hermit God", "Reanimated Hermit God"],
+    &["Hermit God Tentacle", "Reanimated Hermit God Tentacle"],
+    &["Jade Statue", "Blue Oni"],
+    &["Garnet Statue", "Red Oni"],
+    &[
+        "Oryx Stone Guardian Right",
+        "Infested Oryx Stone Guardian Right",
+    ],
+    &[
+        "Oryx Stone Guardian Left",
+        "Infested Oryx Stone Guardian Left",
+    ],
+    &["Janus the Doorwarden", "Infested Janus the Doorwarden"],
+    &["Oryx the Mad God 1", "Infested Oryx the Mad God 1"],
+    &["Oryx the Mad God 2", "Infested Oryx the Mad God 2"],
+];
+
+/// The reskin group containing `object_type`, or `None`.
+fn reskin_group(object_type: i32) -> Option<&'static [i32]> {
+    ENCOUNTER_RESKIN_GROUPS
+        .iter()
+        .copied()
+        .find(|group| group.contains(&object_type))
+}
+
+/// The base (canonical) object type of `object_type`'s encounter: the classic id
+/// when `object_type` is a seasonal reskin, otherwise `object_type` itself.
+pub fn encounter_canonical_type(object_type: i32) -> i32 {
+    reskin_group(object_type)
+        .and_then(|group| group.first().copied())
+        .unwrap_or(object_type)
+}
+
+/// Every object type of `object_type`'s encounter: the base and, when known, its
+/// seasonal reskins.
+pub fn encounter_variant_types(object_type: i32) -> Vec<i32> {
+    reskin_group(object_type)
+        .map(|group| group.to_vec())
+        .unwrap_or_else(|| vec![object_type])
+}
+
+/// The known seasonal-reskin groups: each group's object types are the same
+/// encounter shipped under different ids. Used by the history databases to look
+/// up one display variant per encounter.
+pub fn encounter_reskin_groups() -> &'static [&'static [i32]] {
+    ENCOUNTER_RESKIN_GROUPS
+}
+
+/// The object type that should represent an encounter in the UI, chosen from the
+/// variants observed in the account's own records.
+///
+/// `observed` pairs a variant object type with a recency stamp (any monotonic
+/// unit of the caller's choosing); the most recent variant wins. An encounter is
+/// therefore named and drawn by whichever variant was live when it was last
+/// played, so every card, tag and sprite reads uniformly regardless of which
+/// variant's id each individual record was stored under (the stored ids are
+/// never changed). Returns `None` when nothing was observed, leaving the
+/// caller's own default in place.
+pub fn encounter_display_variant(observed: impl IntoIterator<Item = (i32, i64)>) -> Option<i32> {
+    observed
+        .into_iter()
+        .max_by_key(|(_, recency)| *recency)
+        .map(|(object_type, _)| object_type)
+}
+
+/// Display names of every reskin encounter one of whose variant names contains
+/// `text` (case-insensitive). Lets a search by either the base name ("Grand
+/// Sphinx") or the reskin name ("Withered Sphinx") match records stored under
+/// the other.
+///
+/// Matches against the stable [`ENCOUNTER_RESKIN_NAMES`] as well as the current
+/// asset names, so a name from a past season keeps working after Deca renames the
+/// assets again.
+pub fn encounter_alias_names_matching(text: &str) -> Vec<String> {
+    let needle = text.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let manager = get_asset_manager();
+    let mut out: Vec<String> = Vec::new();
+    for (group, stable) in ENCOUNTER_RESKIN_GROUPS
+        .iter()
+        .copied()
+        .zip(ENCOUNTER_RESKIN_NAMES.iter().copied())
+    {
+        let mut names: Vec<String> = stable.iter().map(|n| (*n).to_string()).collect();
+        for id in group {
+            if let Some(name) = manager.object_name(*id) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        if names.iter().any(|n| n.to_lowercase().contains(&needle)) {
+            for n in names {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The loot-correlation group containing `object_type` (which is included in the
+/// returned slice), or an empty slice when it has no known reskin siblings.
+pub fn boss_loot_family(object_type: i32) -> &'static [i32] {
+    BOSS_LOOT_CORRELATION_GROUPS
+        .iter()
+        .find(|group| group.contains(&object_type))
+        .copied()
+        .unwrap_or(&[])
+}
+
+/// Whether two object types are the same boss for loot/fight correlation:
+/// identical, or reskin siblings in the same [`BOSS_LOOT_CORRELATION_GROUPS`]
+/// group (e.g. Janus the Doorwarden and its Infested reskin).
+pub fn same_boss_for_loot(a: i32, b: i32) -> bool {
+    if a == b {
+        return true;
+    }
+    let family = boss_loot_family(a);
+    !family.is_empty() && family.contains(&b)
+}
+
 /// The Legacy Lair of Draconis `(dragon_type, chest_type)` pairs, for the combat
 /// database's loot-completion backfill.
 pub fn lod_dragon_chest_pairs() -> &'static [(i32, i32)] {
@@ -941,7 +1122,12 @@ pub const SHATTERS_TEMPEST_TYPE: i32 = 0x4452;
 /// she has no `DisplayId` in the game files (deliberate on Deca's part -- her
 /// name is only revealed in the fight's dialogue), which would otherwise leave
 /// the fight card reading "Shatters A22".
-const OBJECT_NAME_OVERRIDES: &[(i32, &str)] = &[(SHATTERS_QUEEN_TYPE, "The Shattered Queen")];
+const OBJECT_NAME_OVERRIDES: &[(i32, &str)] = &[
+    (SHATTERS_QUEEN_TYPE, "The Shattered Queen"),
+    // "New Beer God" is defined only in encounters.xml, which the object catalog
+    // does not index, so it has no name to resolve from the XML.
+    (22128, "Beer God"),
+];
 
 /// The display name overriding the catalog name for `id`, or `None` to use the
 /// catalog's. See [`OBJECT_NAME_OVERRIDES`].
@@ -2195,10 +2381,26 @@ pub fn encounter_by_id(id: &str) -> Option<&'static Encounter> {
 /// classify by grave difficulty and show the correct portal / card instead of
 /// a bare realm entry.
 const BOSS_DUNGEON_OVERRIDES: &[(i32, &str)] = &[
-    (2354, "Wine Cellar"),   // Oryx the Mad God 2
-    (8200, "Oryx's Castle"), // Janus the Doorwarden
-    (3448, "Oryx's Castle"), // Stone Guardian (variant a)
-    (3449, "Oryx's Castle"), // Stone Guardian (variant b)
+    (2354, "Wine Cellar"),     // Oryx the Mad God 2
+    (8200, "Oryx's Castle"),   // Janus the Doorwarden
+    (3448, "Oryx's Castle"),   // Stone Guardian (variant a)
+    (3449, "Oryx's Castle"),   // Stone Guardian (variant b)
+    (46385, "Oryx's Castle"),  // Infested Janus the Doorwarden (Season 31 reskin)
+    (46390, "Oryx's Castle"),  // Infested Stone Guardian (reskin, variant a)
+    (46391, "Oryx's Castle"),  // Infested Stone Guardian (reskin, variant b)
+    (45973, "Oryx's Chamber"), // Infested Oryx the Mad God 1 (Season 31 reskin)
+    (28989, "Wine Cellar"),    // Infested Oryx the Mad God 2 (Season 31 reskin)
+];
+
+/// Display names whose realm spawns belong to a dungeon regardless of object id.
+///
+/// Seasonal reskins are new object types with the same display name, so this
+/// keeps a reskinned realm spawn (e.g. next season's Janus / Stone Guardian)
+/// logging under Oryx's Castle without adding its id to
+/// [`BOSS_DUNGEON_OVERRIDES`]. Checked only when the id isn't already mapped.
+const BOSS_DUNGEON_NAME_OVERRIDES: &[(&str, &str)] = &[
+    ("Janus the Doorwarden", "Oryx's Castle"),
+    ("Stone Guardian", "Oryx's Castle"),
 ];
 
 /// Canonical dungeon name for a boss type when the raw map name doesn't reflect
@@ -2208,6 +2410,22 @@ pub fn canonical_dungeon_for_boss(boss_object_type: i32) -> Option<&'static str>
         .iter()
         .find(|(t, _)| *t == boss_object_type)
         .map(|(_, d)| *d)
+}
+
+/// Canonical dungeon name for a boss, preferring its object type and falling
+/// back to its display name so reskinned variants (new ids, same name) still
+/// resolve (see [`BOSS_DUNGEON_NAME_OVERRIDES`]).
+pub fn canonical_dungeon_for_boss_named(
+    boss_object_type: i32,
+    boss_name: &str,
+) -> Option<&'static str> {
+    canonical_dungeon_for_boss(boss_object_type).or_else(|| {
+        let name = boss_name.trim();
+        BOSS_DUNGEON_NAME_OVERRIDES
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, d)| *d)
+    })
 }
 
 /// Encounters whose members are alternative/mini bosses that funnel into a single
@@ -2520,6 +2738,20 @@ impl AssetManager {
                     }
                 }
 
+                // Index which items spawn which summoned creatures, so a credited
+                // summon can be traced back to its source (Pocket Rat, Summoner
+                // maces, Flowering Kimono, ...). Reads the item files plus
+                // allies.xml, where the summoned entities themselves live.
+                let summon_paths: Vec<PathBuf> = ["equip.xml", "token.xml", "allies.xml"]
+                    .iter()
+                    .map(|name| assets_dir.join("xml").join(name))
+                    .filter(|path| path.exists())
+                    .collect();
+                match list.merge_summon_sources_xml(&summon_paths) {
+                    Ok(count) => tracing::info!("Indexed {} item -> summon source link(s)", count),
+                    Err(e) => tracing::warn!("Failed to index summon sources: {}", e),
+                }
+
                 // Merge cosmetic unlock targets: skin items (equipSkins.xml) and
                 // pet stones (pets.xml). Neither file is read above, and both
                 // map an unlocker item to a different cosmetic object, the same
@@ -2657,6 +2889,44 @@ impl AssetManager {
                 Some(name.to_string())
             }
         })
+    }
+
+    /// The items that spawn a given summoned creature, from their own
+    /// `<Activate>` / `On*Activate` summon effects (object_list's
+    /// `merge_summon_sources_xml`). Empty for pets and for creatures no item
+    /// declares; more than one entry when several items share a summon (base and
+    /// `(SB)` or shiny variants, or a generic creature several items raise).
+    pub fn summon_sources(&self, object_type: i32) -> Vec<super::object_list::SummonSource> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard
+            .as_ref()
+            .map(|list| list.summon_sources(object_type).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The summoned creature's own display name from the spawning item's effect
+    /// text (see `object_list::summon_name_from_text`), for a `DisplayId`-less
+    /// entity like `MV Kimono Summon` whose in-game name is "Friendly Spirit".
+    pub fn summon_name(&self, object_type: i32) -> Option<String> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard
+            .as_ref()
+            .and_then(|list| list.summon_name(object_type).map(str::to_string))
+    }
+
+    /// The creatures an item spawns, with the trigger that spawns each (the
+    /// reverse of [`Self::summon_sources`]). Used to name the creature behind a
+    /// summon that was spawned by an ability activation, where no packet ever
+    /// names the creature itself.
+    pub fn summoned_by_item(&self, item_type: i32) -> Vec<(i32, super::object_list::SummonSource)> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard
+            .as_ref()
+            .map(|list| list.summoned_by_item(item_type))
+            .unwrap_or_default()
     }
 
     /// Parse a " xN" stack-count suffix from an item name.
@@ -3072,6 +3342,31 @@ impl AssetManager {
         is_curated_non_boss_type(id)
     }
 
+    /// Whether a loot bag attributed to `mob_type` proves that mob died in its
+    /// instance.
+    ///
+    /// A bag only ever spawns where its dropper died, and the loot tracker
+    /// attributes one to the entity the local player hit that left the map nearest
+    /// the bag (`loot::attribution::find_attribution_for_bag`), so a bag
+    /// attributed to a boss is that boss's death. A Mark is only needed when the
+    /// bag's source is left Unknown or pinned to a nearby minion: it identifies
+    /// the dungeon's main boss, which an attribution that already names one of the
+    /// two does not need.
+    ///
+    /// This is the proof for a boss killed out of the local player's sight: its
+    /// removal reads as "left view", so its fight is suspended as a despawn and
+    /// stored Escaped with the party's whole damage on it, and the bag is the only
+    /// evidence it was ever killed.
+    ///
+    /// Invulnerable-finish bosses (Moonlight Village) are excluded: they never
+    /// die, their loot is pooled by an invisible emitter, and their runs are
+    /// completed by their own signal instead.
+    pub fn bag_attribution_proves_kill(&self, mob_type: i32) -> bool {
+        mob_type > 0
+            && !is_invuln_finish_boss(mob_type)
+            && (self.is_boss_like(mob_type) || is_curated_boss_type(mob_type))
+    }
+
     /// Whether `id` is a curated wandering boss ([`WANDERING_BOSS_TYPES`]): a
     /// boss that roams in and out of view within a single map instance, so its
     /// fight must be suspended on despawn and resumed on re-entry rather than
@@ -3336,21 +3631,24 @@ impl AssetManager {
         projectile_id: usize,
     ) -> Option<(i32, i32, bool, i32)> {
         self.try_load();
-        self.objects
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|list| list.get(id))
-            .and_then(|asset| {
-                asset.projectiles.get(projectile_id).map(|p| {
-                    (
-                        p.min_damage,
-                        p.max_damage,
-                        p.armor_piercing,
-                        asset.slot_type,
-                    )
-                })
-            })
+        let guard = self.objects.read().unwrap();
+        let list = guard.as_ref()?;
+        let asset = list.get(id)?;
+        // Most weapons index their `<Projectile>` list directly, but the client's
+        // `PlayerShoot.projectileId` is the *subattack* index. Longbows fire 3
+        // spread arrows (patterns 0/1/2) that all use projectile 0, so fall back
+        // to the subattack's projectile when the direct index is missing rather
+        // than reporting no data (which disables self-compute for the map).
+        let resolved = asset.projectiles.get(projectile_id).or_else(|| {
+            list.subattack_projectile_index(id, projectile_id)
+                .and_then(|i| asset.projectiles.get(i))
+        })?;
+        Some((
+            resolved.min_damage,
+            resolved.max_damage,
+            resolved.armor_piercing,
+            asset.slot_type,
+        ))
     }
 
     /// Whether the object `id`'s projectile at `projectile_id` is armor-piercing
@@ -3382,6 +3680,63 @@ impl AssetManager {
             .and_then(|list| list.get(id))
             .map(|asset| asset.projectiles.len().max(1) as i32)
             .unwrap_or(1)
+    }
+
+    /// Whether an item's own XML declares a buff that raises `stat` on the player
+    /// (`StatBoostSelf`, or the `StatBoostAura` consumable treats use).
+    ///
+    /// The wire never names what caused a stat change, so the tracker's "you used
+    /// this just before it" hint is checked against the item's declaration first:
+    /// a treat that only raises Speed must never be blamed for an Attack change.
+    pub fn item_declares_stat_boost(&self, item_id: i32, stat: StatKind) -> bool {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        let Some(list) = guard.as_ref() else {
+            return false;
+        };
+        let Some(effects) = list.ability_effects(item_id) else {
+            return false;
+        };
+        effects.effects.iter().any(|e| match e {
+            AbilityEffect::StatBoost(b) => StatKind::parse(&b.stat) == Some(stat),
+            _ => false,
+        })
+    }
+
+    /// The first equipped enchantment that declares an on-shoot / on-hit self
+    /// buff raising `stat` (e.g. "OnShoot Attack Boost IV"), if any. An equipment
+    /// proc rather than a consumable, so a boost that lands while shooting can be
+    /// attributed to the item it came from instead of to an ally's aura.
+    pub fn enchant_declaring_stat_boost(&self, enchant_ids: &[u16], stat: StatKind) -> Option<u16> {
+        self.try_load();
+        let guard = self.enchantments.read().unwrap();
+        let list = guard.as_ref()?;
+        enchant_ids.iter().copied().find(|&id| {
+            list.effects(id).iter().any(|eff| {
+                eff.kind == super::enchantments::EnchantEffectKind::StatBoostSelf
+                    && eff.stat == Some(stat)
+            })
+        })
+    }
+
+    /// Whether an item's own XML applies condition `effect` to the player
+    /// (`ConditionEffectSelf` / `Sneak` / an `EffectBlast`), used for the same
+    /// verification on condition boosts (a treat that strips conditions must not
+    /// be blamed for one landing).
+    pub fn item_declares_condition(&self, item_id: i32, effect: &str) -> bool {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        let Some(list) = guard.as_ref() else {
+            return false;
+        };
+        let Some(effects) = list.ability_effects(item_id) else {
+            return false;
+        };
+        effects.effects.iter().any(|e| match e {
+            AbilityEffect::Condition(c) => c.effect.eq_ignore_ascii_case(effect),
+            AbilityEffect::EffectBlast(b) => b.condition.eq_ignore_ascii_case(effect),
+            _ => false,
+        })
     }
 
     /// Returns the object's base defense (enemy DEF from game data), or `None`
@@ -3433,6 +3788,16 @@ impl AssetManager {
             .unwrap()
             .as_ref()
             .and_then(|list| list.ability_effects(id).cloned())
+    }
+
+    /// How long after its activation an ability can still own a bulletless
+    /// `DamagePacket`, from the effect it declares in equip.xml (`DamageNova`
+    /// waves, a poison's tick duration, a hex detonation). `None` when the item
+    /// declares no server-applied damage, i.e. when crediting it a packet would
+    /// be a guess.
+    pub fn server_applied_damage_window_ms(&self, id: i32) -> Option<i64> {
+        self.ability_effects(id)
+            .and_then(|effects| effects.server_applied_damage_window_ms())
     }
 
     /// Native damaging procs (OnPlayerShootActivate/OnEnemyHitActivate) for a
@@ -5774,6 +6139,126 @@ mod tests {
         // A boss that emits its own loot has no chest alias.
         assert_eq!(loot_emitter_for_boss(47927), None);
         assert_eq!(boss_for_loot_emitter(47927), None);
+    }
+
+    #[test]
+    fn janus_reskin_shares_a_loot_correlation_family() {
+        // Classic Janus (Oryx's Castle) and the Season 31 "Infested" reskin are
+        // separate object types; bags are attributed to 8200, so both must be in
+        // the same correlation family for the fights to link.
+        assert_eq!(boss_loot_family(8200), &[8200, 46385]);
+        assert_eq!(boss_loot_family(46385), &[8200, 46385]);
+        assert!(same_boss_for_loot(8200, 46385));
+        assert!(same_boss_for_loot(46385, 8200));
+        assert!(same_boss_for_loot(8200, 8200));
+        // A boss with no known reskin has no family and matches only itself.
+        assert!(boss_loot_family(47927).is_empty());
+        assert!(!same_boss_for_loot(8200, 47927));
+    }
+
+    #[test]
+    fn encounter_variant_types_cover_reskin_pairs() {
+        // Seasonal reskins share an encounter: the canonical type is the base id
+        // and the variant list holds both, for alias-aware search/filtering.
+        assert_eq!(encounter_canonical_type(22000), 3412); // Withered Sphinx
+        assert_eq!(encounter_canonical_type(3412), 3412); // Grand Sphinx
+        assert_eq!(encounter_variant_types(3412), vec![3412, 22000]);
+        assert_eq!(encounter_variant_types(46385), vec![8200, 46385]); // Janus
+        assert_eq!(encounter_variant_types(28989), vec![2354, 28989]); // Oryx 2
+                                                                       // Skull Shrine spans the base plus both reskin ids.
+        assert_eq!(encounter_canonical_type(22006), 3414);
+        assert_eq!(encounter_variant_types(22003), vec![3414, 22003, 22006]);
+        // Non-reskin types are their own encounter.
+        assert_eq!(encounter_canonical_type(47927), 47927);
+        assert_eq!(encounter_variant_types(47927), vec![47927]);
+    }
+
+    #[test]
+    fn every_reskin_group_has_a_stable_name_row() {
+        // The baked-in names are paired with the id groups by position, so the
+        // two tables must stay the same length as encounters are added.
+        assert_eq!(ENCOUNTER_RESKIN_GROUPS.len(), ENCOUNTER_RESKIN_NAMES.len());
+        for (group, names) in ENCOUNTER_RESKIN_GROUPS.iter().zip(ENCOUNTER_RESKIN_NAMES) {
+            assert!(
+                !names.is_empty() && names.len() <= group.len(),
+                "group {group:?} needs one stable name per variant (at least the base)"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_search_keeps_old_seasonal_names_matching() {
+        // "Withered Sphinx" and "Calcium God" are names from past seasons: they
+        // only exist in the stable table, so they must still match after the
+        // assets rename those encounters back (this is the outside-Halloween
+        // search behaviour requested in #56).
+        let withered = encounter_alias_names_matching("Withered Sphinx");
+        assert!(withered.iter().any(|n| n == "Withered Sphinx"));
+        assert!(withered.iter().any(|n| n == "Grand Sphinx"));
+
+        let calcium = encounter_alias_names_matching("calcium god");
+        assert!(calcium
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("Calcium God")));
+        assert!(calcium.iter().any(|n| n.eq_ignore_ascii_case("Cube God")));
+
+        // The classic name still resolves the group, and unrelated text matches
+        // nothing.
+        let grand = encounter_alias_names_matching("Grand Sphinx");
+        assert!(grand.iter().any(|n| n == "Withered Sphinx"));
+        assert!(encounter_alias_names_matching("Withered Sphinx")
+            .iter()
+            .all(|n| !n.contains("Cube God")));
+        assert!(encounter_alias_names_matching("   ").is_empty());
+    }
+
+    #[test]
+    fn display_variant_is_the_most_recently_seen_one() {
+        // One display variant per encounter: whichever was played last, so a
+        // history stored under both the classic and the reskin id reads
+        // uniformly.
+        assert_eq!(
+            encounter_display_variant([(3412, 10), (22000, 40)]),
+            Some(22000)
+        );
+        assert_eq!(
+            encounter_display_variant([(22000, 10), (3412, 40)]),
+            Some(3412)
+        );
+        // A tie resolves to the last maximum in iteration order, so the choice
+        // is deterministic whatever the caller's row order is.
+        assert_eq!(
+            encounter_display_variant([(3412, 7), (22000, 7)]),
+            Some(22000)
+        );
+        assert_eq!(encounter_display_variant(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn reskinned_realm_bosses_map_to_oryxs_castle() {
+        // Janus and the Stone Guardians are realm-spawned but belong to Oryx's
+        // Castle. The Season 31 reskins are new ids, so all six must resolve.
+        for t in [8200, 3448, 3449, 46385, 46390, 46391] {
+            assert_eq!(canonical_dungeon_for_boss(t), Some("Oryx's Castle"));
+        }
+        // The reskinned Oryx 1 / 2 belong to Oryx's Chamber / Wine Cellar.
+        assert_eq!(canonical_dungeon_for_boss(45973), Some("Oryx's Chamber"));
+        assert_eq!(canonical_dungeon_for_boss(28989), Some("Wine Cellar"));
+        // A future reskin (new id, same name) still resolves via the display name.
+        assert_eq!(
+            canonical_dungeon_for_boss_named(999_999, "Janus the Doorwarden"),
+            Some("Oryx's Castle")
+        );
+        assert_eq!(
+            canonical_dungeon_for_boss_named(999_999, "Stone Guardian"),
+            Some("Oryx's Castle")
+        );
+        // Unrelated bosses are unaffected.
+        assert_eq!(
+            canonical_dungeon_for_boss_named(47927, "Some Other Boss"),
+            None
+        );
+        assert_eq!(canonical_dungeon_for_boss(47927), None);
     }
 
     #[test]

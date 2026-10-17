@@ -18,9 +18,10 @@ use realmhound_core::{
         DungeonPortalMap, MV_UMI_TYPE,
     },
     combat::{
-        build_bundle, sanitize_player_name, CombatDatabase, DamageProvenance,
-        DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord, FightSelection,
-        FightSummary, ParticipantEndStatus, ParticipantRecord, LOOT_LINK_POST_MS, LOOT_LINK_PRE_MS,
+        build_bundle, sanitize_player_name, AbilityActivation, BoostWindow, CombatDatabase,
+        DamageProvenance, DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord,
+        FightSelection, FightSummary, ParticipantEndStatus, ParticipantRecord, WeaponContribution,
+        LOOT_LINK_POST_MS, LOOT_LINK_PRE_MS,
     },
     loot::{LootDatabase, LootDropRecord, LootItemRecord},
 };
@@ -126,6 +127,513 @@ struct RunModes {
 /// neither is comparable with a normal clear. The Shatters and Spectral
 /// Penitentiary mark hard mode the same way, since its extra mechanics (and, in
 /// the Shatters, its renamed bosses) make it a different fight.
+/// Item display name from the asset catalog, falling back to its id so a missing
+/// name never renders an empty cell.
+fn item_name(item_id: i32) -> String {
+    get_asset_manager()
+        .object_name(item_id)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("Item 0x{item_id:X}"))
+}
+
+/// The sprite shown in the effect column of the condensed Boosts table.
+enum BoostIcon {
+    /// A game object: the consumable that caused the change, or the affected
+    /// stat's potion when the source names no item.
+    Item(i32),
+    /// A condition with no object of its own (the embedded Damaging / Weak art).
+    Condition(EmbeddedIcon),
+    /// Nothing to draw (e.g. Invisible, which has no damage effect).
+    None,
+}
+
+/// One condensed boost row: every occurrence of the same effect from the same
+/// source, collapsed into a single line.
+///
+/// The recorded log is one row per transition, which is exact but unreadable over
+/// a long fight -- a repeating gear proc writes a row a second, and each of its
+/// occurrences has its own apply/expire pair.
+struct CondensedBoost {
+    icon: BoostIcon,
+    /// e.g. `ATT ↑` for a stat, `Damaging` for a condition.
+    effect: String,
+    /// The canonical stat this row is about (`ATT`, `SPD`, ...); `None` for
+    /// conditions. Used for the one-row-per-stat-and-source rule.
+    stat_key: Option<&'static str>,
+    /// True when the row came from the `* boost` companion stat, which mirrors the
+    /// base stat it is folded into and must not double up with it.
+    mirror: bool,
+    /// Every amount the effect granted, so a proc that varied shows a range.
+    deltas: Vec<i32>,
+    duration_ms: i64,
+    source: String,
+}
+
+impl CondensedBoost {
+    /// The amount column: the flat stat move, or the damage multiplier for a
+    /// damage condition. A proc that granted different amounts over the fight is
+    /// shown as the range it spanned instead of one row per occurrence.
+    fn amount(&self) -> String {
+        if self.stat_key.is_none() {
+            return match self.effect.as_str() {
+                "Damaging" => "×1.25".to_string(),
+                "Weak" => "×0.5".to_string(),
+                _ => "—".to_string(),
+            };
+        }
+        let min = *self.deltas.iter().min().unwrap_or(&0);
+        let max = *self.deltas.iter().max().unwrap_or(&0);
+        if min == max {
+            format!("{min:+}")
+        } else {
+            format!("{min:+}…{max:+}")
+        }
+    }
+}
+
+/// The effect column for a recorded boost label, plus the stat it belongs to, the
+/// mirror flag and the condition art to use.
+///
+/// The `* boost` labels are the wire's companion stats (`ATT boost` is stat 48);
+/// the server folds them into the base stat, so they are labelled apart from it
+/// (their held time must never be summed with it) while still claiming the base
+/// stat's key for de-duplication.
+fn boost_effect(stat: &str) -> (String, Option<&'static str>, bool, Option<EmbeddedIcon>) {
+    let (text, key, mirror, icon): (&str, Option<&'static str>, bool, Option<EmbeddedIcon>) =
+        match stat {
+            "Attack" => ("ATT ↑", Some("ATT"), false, None),
+            "ATT boost" => ("ATT boost ↑", Some("ATT"), true, None),
+            "Defense" => ("DEF ↑", Some("DEF"), false, None),
+            "Speed" => ("SPD ↑", Some("SPD"), false, None),
+            "Dexterity" => ("DEX ↑", Some("DEX"), false, None),
+            "Vitality" => ("VIT ↑", Some("VIT"), false, None),
+            "Wisdom" => ("WIS ↑", Some("WIS"), false, None),
+            "Max HP" => ("HP ↑", Some("HP"), false, None),
+            "Max MP" => ("MP ↑", Some("MP"), false, None),
+            // Damage conditions: the multiplier is the amount, and the game's own
+            // status art is the icon.
+            "Damaging" => ("Damaging", None, false, Some(EmbeddedIcon::Damaging)),
+            "Weak" => ("Weak", None, false, Some(EmbeddedIcon::Weak)),
+            other => (other, None, false, None),
+        };
+    (text.to_string(), key, mirror, icon)
+}
+
+/// The label for a rise nothing local can explain: Weak is applied by monsters,
+/// everything else is credited to an ally's buff or aura.
+fn unexplained_label(stat: &str) -> &'static str {
+    if stat == "Weak" {
+        "Enemy debuff"
+    } else {
+        "Ally buff"
+    }
+}
+
+/// The game-data lookups the source decoding needs. Behind a trait so the rule can
+/// be tested without the asset files, which the unit tests do not have.
+trait SourceOracle {
+    fn id_for_name(&self, name: &str) -> Option<i32>;
+    fn declares(&self, item: i32, stat: &str) -> bool;
+}
+
+struct AssetOracle;
+
+impl SourceOracle for AssetOracle {
+    fn id_for_name(&self, name: &str) -> Option<i32> {
+        get_asset_manager().object_id_for_display_name(name)
+    }
+
+    /// Whether an item's own XML declares the effect a boost label names: a stat
+    /// buff for a stat label, a condition for a condition label. An item with no
+    /// ability data at all counts as declaring it: unverifiable is not disproven,
+    /// and a gear proc comes from an enchantment the item itself never lists.
+    fn declares(&self, item: i32, stat: &str) -> bool {
+        let am = get_asset_manager();
+        if am.ability_effects(item).is_none() {
+            return true;
+        }
+        match realmhound_core::combat::stat_kind_for_boost_label(stat) {
+            Some(kind) => am.item_declares_stat_boost(item, kind),
+            None => am.item_declares_condition(item, stat),
+        }
+    }
+}
+
+/// Split a recorded boost source into a display label and the item it names.
+///
+/// The wire carries no source id, so the tracker infers one and the UI presents it
+/// as an inference. Current rows name the item (or `Ally buff` / `Enemy debuff`)
+/// and carry the resolved item id on the window itself, so the icon is exactly the
+/// item involved -- a name round-trip could draw the shiny variant of an item the
+/// player does not own. Rows written before that field existed are decoded from
+/// their wording instead, and re-checked against the item's own declaration: they
+/// named whatever the player had just used, which is how a spell came to own an
+/// Attack boost on a card recorded by an older build.
+fn boost_source(source: &str, item: Option<i32>, stat: &str) -> (String, Option<i32>) {
+    boost_source_with(&AssetOracle, source, item, stat)
+}
+
+fn boost_source_with(
+    oracle: &dyn SourceOracle,
+    source: &str,
+    item: Option<i32>,
+    stat: &str,
+) -> (String, Option<i32>) {
+    if let Some(rest) = source.strip_prefix("consumable (") {
+        if let Some(name) = rest.strip_suffix(") [inferred]") {
+            // A row that carries an id was checked against the game data as it was
+            // written; only the name-only rows older builds wrote are re-checked.
+            if let Some(id) = item {
+                return (name.to_string(), Some(id));
+            }
+            let id = oracle.id_for_name(name);
+            if let Some(id) = id {
+                if !oracle.declares(id, stat) {
+                    // The item cannot cause this change, so the row was miscredited.
+                    return (unexplained_label(stat).to_string(), None);
+                }
+            }
+            return (name.to_string(), id);
+        }
+    }
+    if let Some(rest) = source.strip_prefix("local item use (0x") {
+        if let Some(hex) = rest.strip_suffix(") [inferred]") {
+            // Same wording rule as above: a recorded id was checked when the row was
+            // written, and the hex an older build inlined is re-checked here.
+            let id = item.or_else(|| i32::from_str_radix(hex, 16).ok());
+            if item.is_none() {
+                if let Some(id) = id {
+                    if !oracle.declares(id, stat) {
+                        // The item cannot cause this change, so the row was miscredited.
+                        return (unexplained_label(stat).to_string(), None);
+                    }
+                }
+            }
+            return (format!("Item use 0x{hex}"), id);
+        }
+    }
+    if source.starts_with("external (") {
+        // Rows recorded before the sources were named for what they are all read as
+        // one generic "external" note; Weak is a monster-applied debuff, so it is
+        // relabelled here instead of being shown as an ally's buff.
+        return (unexplained_label(stat).to_string(), None);
+    }
+    (source.to_string(), item)
+}
+
+/// Condense a fight's recorded boost log into one row per effect and source.
+///
+/// Only rising transitions open a session: a fall either closes the window it ends
+/// (and is already that window's `end`) or is an expiry nothing can be attributed
+/// to, so listing falls separately would double every buff.
+fn condensed_boosts(boosts: &[BoostWindow]) -> Vec<CondensedBoost> {
+    let mut rows: Vec<CondensedBoost> = Vec::new();
+    for b in boosts.iter().filter(|b| b.to > b.from) {
+        let (effect, stat_key, mirror, condition_icon) = boost_effect(&b.stat);
+        // A condition that turns on and off between two updates carries no duration:
+        // it is a mask artifact, not a buff anyone held, so it is dropped instead of
+        // listed as a 0:00 row. Conditions are the labels with no stat behind them.
+        if stat_key.is_none() && b.end_offset_ms <= b.start_offset_ms {
+            continue;
+        }
+        let (source, item) = boost_source(&b.source, b.source_item, &b.stat);
+        // A `* boost` stat mirrors the base stat's move, so it only stands alone
+        // when no base-stat row was recorded for the same source.
+        if mirror
+            && rows
+                .iter()
+                .any(|r| r.stat_key == stat_key && !r.mirror && r.source == source)
+        {
+            continue;
+        }
+        // Icon precedence: the condition's own art, then the consumable, then the
+        // affected stat's potion.
+        let icon = if let Some(icon) = condition_icon {
+            BoostIcon::Condition(icon)
+        } else if let Some(id) = item {
+            BoostIcon::Item(id)
+        } else if let Some(id) = stat_key.and_then(crate::panels::character_card::stat_potion_id) {
+            BoostIcon::Item(id)
+        } else {
+            BoostIcon::None
+        };
+        let held = (b.end_offset_ms - b.start_offset_ms).max(0);
+        let delta = b.to - b.from;
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|r| r.effect == effect && r.source == source)
+        {
+            row.duration_ms += held;
+            row.deltas.push(delta);
+        } else {
+            rows.push(CondensedBoost {
+                icon,
+                effect,
+                stat_key,
+                mirror,
+                deltas: vec![delta],
+                duration_ms: held,
+                source,
+            });
+        }
+    }
+    rows
+}
+
+/// A section header in the fight card: the same bold, light blue 15px the
+/// character page's stat cards title their sections with, so the two read as one
+/// design. Returns the response so the caller can attach a tooltip.
+fn section_header(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(
+        RichText::new(text)
+            .strong()
+            .size(crate::panels::derived_stats::HEADER_SIZE)
+            .color(crate::panels::derived_stats::HEADER_COLOR),
+    )
+}
+
+/// The distinct items that can spawn a summoned creature, and the hover that lists
+/// them with how they spawn it.
+///
+/// Sources are deduplicated by name so an item and its `(SB)`/shiny variants read
+/// as one item (they spawn the same creature), which is what makes "from Sovereign
+/// Mace" possible instead of "from 2 items". Returns `(names, tooltip)`; both empty
+/// when no item declares the creature (a pet, or an entity the game spawns itself).
+fn summon_source_labels(
+    sources: &[realmhound_core::assets::SummonSource],
+) -> (Vec<String>, String) {
+    let mut names: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for s in sources {
+        if !names.iter().any(|n| n == &s.item_name) {
+            names.push(s.item_name.clone());
+        }
+        let line = match s.chance {
+            c if c > 0.0 && c < 1.0 => format!(
+                "{} ({}, {:.0}% chance)",
+                s.item_name,
+                s.trigger.label(),
+                c * 100.0
+            ),
+            _ => format!("{} ({})", s.item_name, s.trigger.label()),
+        };
+        if !lines.iter().any(|l| l == &line) {
+            lines.push(line);
+        }
+    }
+    let tooltip = if lines.is_empty() {
+        String::new()
+    } else if lines.len() == 1 {
+        format!("Summoned by {}", lines[0])
+    } else {
+        format!("Summoned by:\n  {}", lines.join("\n  "))
+    };
+    (names, tooltip)
+}
+
+/// One row per pet or summon *entity type and source pair*, summing the instances.
+///
+/// A Summoner mace spawns a fresh Bear on every use, so a long fight lists dozens
+/// of one-creature rows that say nothing extra: the split that matters is between
+/// entity types, not between instances of the same one. Rows are keyed by what
+/// names the creature -- its own object type for a summon, its skin for a pet --
+/// *and* by the item that created it with its enchants, so one summon is never
+/// merged under two items (a `Summon Bear` row cannot end up claiming both a
+/// Sovereign Mace and its `(SB)` twin), while the same item used with different
+/// enchants shows as two rows. Rows recorded before a type or source was stored
+/// (all zero there) collapse into the single generic row they were already
+/// labelled with. Returns the rows by damage, highest first, matching the
+/// per-instance order they replace.
+fn group_summons(
+    summons: &[realmhound_core::combat::SummonContribution],
+) -> Vec<realmhound_core::combat::SummonContribution> {
+    /// What names a row: pets by skin, summons by creature type, each with the
+    /// item that created it.
+    fn key_of(s: &realmhound_core::combat::SummonContribution) -> (bool, i32, i32, Vec<u16>) {
+        if s.is_pet {
+            (true, s.pet_type, 0, Vec::new())
+        } else {
+            (
+                false,
+                s.object_type,
+                s.source_item,
+                s.source_enchants.clone(),
+            )
+        }
+    }
+    let mut out: Vec<realmhound_core::combat::SummonContribution> = Vec::new();
+    for s in summons {
+        let key = key_of(s);
+        match out.iter_mut().find(|g| key_of(g) == key) {
+            Some(g) => {
+                g.damage += s.damage;
+                g.hits += s.hits;
+            }
+            None => out.push(s.clone()),
+        }
+    }
+    out.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
+    out
+}
+
+/// The horizontal padding a card leaves inside its own outline, on every side.
+const CARD_PADDING: f32 = 6.0;
+
+/// The Blood Ritual tier a fight was fought under, from the id its own record
+/// carries (see `CombatTracker::local_state_windows`). A fight recorded before the
+/// tier was stored has the plain source and resolves to `None`.
+fn fight_ritual_id(boosts: &[BoostWindow]) -> Option<&str> {
+    boosts
+        .iter()
+        .find(|b| b.stat == "Blood Ritual" && b.to > b.from)?
+        .source
+        .strip_prefix("character state:")
+}
+
+/// A section divider: the empty row it occupies is allocated at `width` so the
+/// card keeps the width the stats table gives it, and where the rule goes is
+/// recorded for [`paint_divider_rows`] to draw once the card's own width is known.
+///
+/// The rules cannot be laid here. The card grows to its widest section -- the stats
+/// table, whose grid lays out a few tens of points wider than the width this module
+/// computes for it -- so a rule of that computed width would stop short of the
+/// card's right edge while its left margin stayed at the card's padding, which is
+/// exactly the lopsided look this replaced.
+fn section_divider(ui: &mut egui::Ui, width: f32) {
+    let width = width.min(ui.available_width()).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 7.0), egui::Sense::hover());
+    let y = rect.center().y;
+    ui.data_mut(|d| {
+        let mut rows = d
+            .get_persisted::<Vec<f32>>(divider_rows_id())
+            .unwrap_or_default();
+        rows.push(y);
+        d.insert_persisted(divider_rows_id(), rows);
+    });
+}
+
+/// Where the rules of the card currently being laid out belong (see
+/// [`section_divider`]). One card is drawn at a time, so a single slot serves.
+fn divider_rows_id() -> egui::Id {
+    egui::Id::new("my_performance_divider_rows")
+}
+
+/// Start a card: forget any rule positions from the previous one.
+fn clear_divider_rows(ui: &mut egui::Ui) {
+    ui.data_mut(|d| d.insert_persisted(divider_rows_id(), Vec::<f32>::new()));
+}
+
+/// Draw the card's section rules across its own content box, so the gap on the
+/// right of a rule matches the card's padding on the left, whatever width the
+/// card ended up with.
+fn paint_divider_rows(ui: &egui::Ui, content: egui::Rect) {
+    let rows = ui.data_mut(|d| {
+        let rows = d
+            .get_persisted::<Vec<f32>>(divider_rows_id())
+            .unwrap_or_default();
+        d.insert_persisted(divider_rows_id(), Vec::<f32>::new());
+        rows
+    });
+    if rows.is_empty() {
+        return;
+    }
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    for y in rows {
+        ui.painter()
+            .hline(content.left()..=content.right(), y, stroke);
+    }
+}
+
+/// Where a section divider ends on a card that draws its own sections: the right
+/// edge of the Stats table's Blood Ritual column, which is what sets the card's
+/// own width. Using the panel's available width here instead would make the
+/// divider claim the whole panel and stretch the card with it.
+fn section_divider_width(ui: &egui::Ui) -> f32 {
+    let w = crate::panels::derived_stats::attr_col_widths(ui);
+    // The grid lays out twelve columns (the stat icon, then two five-column
+    // groups) with `STATS_GRID_GAP` between each pair.
+    STATS_ICON_CELL
+        + 2.0 * (w.total + w.gear + w.exalt + w.crucible + w.blood_ritual)
+        + STATS_GRID_GAP * 11.0
+}
+
+/// The rounded box around one boss's expanded section in a grouped run: the same
+/// thin outline and 8px corners the character page's stat cards use.
+fn section_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            crate::ui_colors::card_stroke(ui.visuals()),
+        ))
+        .corner_radius(8.0)
+        .inner_margin(CARD_PADDING)
+}
+
+/// Horizontal gap between the Stats table's columns.
+const STATS_GRID_GAP: f32 = 16.0;
+/// Width of the Stats table's leading stat-icon cell.
+const STATS_ICON_CELL: f32 = 16.0;
+
+/// A PgUp / PgDn page delta in points for the visible height, or `None` when
+/// neither key was pressed this frame. The fight card pages through its own scroll
+/// area with these, since egui's scroll area does not handle them itself.
+fn page_scroll_delta(ui: &egui::Ui) -> Option<f32> {
+    let page = (ui.available_height() * 0.9).max(80.0);
+    let (up, down) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::PageUp),
+            i.key_pressed(egui::Key::PageDown),
+        )
+    });
+    match (up, down) {
+        (true, false) => Some(-page),
+        (false, true) => Some(page),
+        _ => None,
+    }
+}
+
+/// Merge a run's per-phase boost timelines into one, shifting each phase's offsets
+/// by its start relative to the run's, so the merged list reads against the run.
+fn merge_run_boosts(enc: &EncounterRecord) -> Vec<BoostWindow> {
+    let mut out: Vec<BoostWindow> = Vec::new();
+    for phase in &enc.phases {
+        let shift = (phase.started_at - enc.started_at).max(0);
+        for b in &phase.boosts {
+            out.push(BoostWindow {
+                start_offset_ms: b.start_offset_ms + shift,
+                end_offset_ms: b.end_offset_ms + shift,
+                stat: b.stat.clone(),
+                from: b.from,
+                to: b.to,
+                source: b.source.clone(),
+                source_item: b.source_item,
+            });
+        }
+    }
+    out.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
+    out
+}
+
+/// Merge a run's per-phase ability activations, shifted like the boost windows.
+fn merge_run_abilities(enc: &EncounterRecord) -> Vec<AbilityActivation> {
+    let mut out: Vec<AbilityActivation> = Vec::new();
+    for phase in &enc.phases {
+        let shift = (phase.started_at - enc.started_at).max(0);
+        for a in &phase.abilities {
+            out.push(AbilityActivation {
+                item_id: a.item_id,
+                enchants: a.enchants.clone(),
+                start_offset_ms: a.start_offset_ms + shift,
+                window_ms: a.window_ms,
+                damage: a.damage,
+                hits: a.hits,
+            });
+        }
+    }
+    out.sort_by_key(|a| a.start_offset_ms);
+    out
+}
+
 fn dungeon_display_name(portal_map: &DungeonPortalMap, dungeon: &str, modes: RunModes) -> String {
     let name = portal_map.normalize_dungeon_name(dungeon);
     let mut tags: Vec<&str> = Vec::new();
@@ -336,6 +844,16 @@ pub struct CombatHistoryPanel {
     show_damage_taken: bool,
     /// Show the Damage blocked column in the detail table.
     show_damage_blocked: bool,
+    /// Whether the Team Overview table shows the "Hits taken" column. Off by
+    /// default: it is a per-player survivability detail, not a headline figure.
+    show_hits_taken: bool,
+    /// Whether the fight card shows the "My Performance" tab instead of the
+    /// roster overview. Both sit above the card's header, under its own divider.
+    show_performance: bool,
+    /// The fight card's scroll offset, tracked so PgUp / PgDn can page the card.
+    detail_scroll_offset: f32,
+    /// A pending PgUp / PgDn scroll applied to the next frame's fight card.
+    detail_scroll_delta: Option<f32>,
     /// Cached distinct bosses/dungeons for search autocomplete.
     autocomplete: AutocompleteCache,
     /// Whether the search suggestion popup is open.
@@ -403,6 +921,10 @@ impl Default for CombatHistoryPanel {
             show_hits: true,
             show_damage_taken: true,
             show_damage_blocked: true,
+            show_hits_taken: false,
+            show_performance: false,
+            detail_scroll_offset: 0.0,
+            detail_scroll_delta: None,
             autocomplete: AutocompleteCache::default(),
             search_popup_open: false,
             search_selected_index: None,
@@ -628,7 +1150,13 @@ impl CombatHistoryPanel {
         let mut fights: Vec<(FightSelection, i64, i64)> = Vec::new();
         let mut candidates: Vec<(usize, LootDropRecord)> = Vec::new();
         for summary in &self.summaries {
-            if !summary.killed || summary.map_seed == 0 {
+            if summary.map_seed == 0 {
+                continue;
+            }
+            // Standalone escaped fights were never eligible (their single
+            // `killed_bosses` entry is synthetic), so keep skipping them.
+            let is_encounter = summary.encounter_run_id.is_some();
+            if !is_encounter && !summary.killed {
                 continue;
             }
             let mut boss_types: Vec<i32> = summary
@@ -637,7 +1165,14 @@ impl CombatHistoryPanel {
                 .map(|(object_type, _)| *object_type)
                 .filter(|object_type| *object_type > 0)
                 .collect();
-            if boss_types.is_empty() && summary.boss_object_type > 0 {
+            // An escaped run still has loot worth linking for the mini-bosses that
+            // *were* completed (e.g. Beisa before an O3 nexus): its `killed_bosses`
+            // holds those killed sections. A fully escaped run has none and stays
+            // skipped.
+            if boss_types.is_empty() {
+                if !summary.killed || summary.boss_object_type <= 0 {
+                    continue;
+                }
                 boss_types.push(summary.boss_object_type);
             }
             boss_types.sort_unstable();
@@ -655,6 +1190,19 @@ impl CombatHistoryPanel {
             {
                 boss_types.push(chest);
             }
+            // Reskin variants are separate object types with the same identity;
+            // their anonymously emitted bags are attributed to the canonical boss
+            // (e.g. Janus 8200 vs the Season 31 "Infested" reskin 46385), so query
+            // the whole family or the bags never surface on the reskin's card.
+            for family in boss_types
+                .iter()
+                .map(|t| realmhound_core::assets::boss_loot_family(*t))
+                .collect::<Vec<_>>()
+            {
+                boss_types.extend_from_slice(family);
+            }
+            boss_types.sort_unstable();
+            boss_types.dedup();
 
             let time_lo = summary.started_at - LOOT_LINK_PRE_MS;
             let time_hi = summary.ended_at + LOOT_LINK_POST_MS;
@@ -983,27 +1531,12 @@ fn damage_taken_tooltip(p: DamageTakenProvenance) -> &'static str {
     }
 }
 
-/// Resolve a character's icon sprite id and cloth dyes by char id from account
-/// data. Returns `(icon_id, tex1, tex2)`, or `None` when the character is not in
-/// the cache (e.g. dead/unknown) so callers can fall back to the recorded class.
-fn char_visuals(ctx: &PanelContext, char_id: i32) -> Option<(i32, u32, u32)> {
-    if char_id == 0 {
-        return None;
-    }
-    let c = ctx.account_data.find_character(char_id)?;
-    let icon_id = if c.skin > 0 {
-        c.skin
-    } else {
-        c.class_id as i32
-    };
-    Some((icon_id, c.tex1, c.tex2))
-}
-
 /// Fall back to the appearance recorded on the fight's local participant when
-/// the live account cache no longer has the character (e.g. after death), so
-/// the card icon keeps its skin and dyes instead of reverting to the plain
-/// class sprite. Returns `None` when there is nothing custom to draw (no skin
-/// and no dyes), letting the caller render the default class sprite.
+/// the live account cache no longer has the character (e.g. a character deleted
+/// from the roster, or one from another account), so the card icon keeps its
+/// skin and dyes instead of reverting to the plain class sprite. Returns `None`
+/// when there is nothing custom to draw (no skin and no dyes), letting the
+/// caller render the default class sprite.
 fn stored_char_visuals(fight: &FightSummary) -> Option<(i32, u32, u32)> {
     if fight.local_skin_id <= 0 && fight.local_tex1 == 0 && fight.local_tex2 == 0 {
         return None;
@@ -1277,12 +1810,20 @@ impl CombatHistoryPanel {
                 let search_lower = self.search.trim().to_lowercase();
                 let mut results: Vec<SearchResult> = Vec::new();
                 if !search_lower.is_empty() {
+                    // Names of reskinned encounters matching the query under
+                    // *either* their base or seasonal name, so searching "Grand
+                    // Sphinx" surfaces the "Withered Sphinx" tag and vice versa.
+                    let alias_matches: Vec<String> =
+                        realmhound_core::assets::encounter_alias_names_matching(&self.search);
                     let portal_map = get_dungeon_portal_map();
                     for (object_type, name) in self
                         .autocomplete
                         .bosses
                         .iter()
-                        .filter(|(_, n)| n.to_lowercase().contains(&search_lower))
+                        .filter(|(_, n)| {
+                            n.to_lowercase().contains(&search_lower)
+                                || alias_matches.iter().any(|a| a.eq_ignore_ascii_case(n))
+                        })
                         .take(8)
                     {
                         results.push(SearchResult::Boss {
@@ -1649,7 +2190,8 @@ impl CombatHistoryPanel {
                     }
                 }
                 if let Some((char_id, name)) = self.filter_char.clone() {
-                    let (icon, tex1, tex2) = char_visuals(ctx, char_id).unwrap_or((0, 0, 0));
+                    let (icon, tex1, tex2) = crate::panels::character_appearance(&ctx.account_data, char_id)
+                        .unwrap_or((0, 0, 0));
                     if ctx.sprite_renderer.render_filter_pill_character(
                         ui,
                         icon,
@@ -1885,11 +2427,11 @@ impl CombatHistoryPanel {
                 // Boss portrait (click -> boss filter).
                 let (brect, bresp) =
                     cui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
-                if fight.boss_object_type != 0 {
+                if fight.display_object_type != 0 {
                     draw_boss_sprite(
                         ctx.sprite_renderer,
                         cui,
-                        fight.boss_object_type,
+                        fight.display_object_type,
                         fight.shatters_hm,
                         brect,
                     );
@@ -1909,15 +2451,15 @@ impl CombatHistoryPanel {
                 let boss_display = fight
                     .killed_bosses
                     .iter()
-                    .find(|(t, _)| *t == fight.boss_object_type)
+                    .find(|(t, _)| *t == fight.display_object_type)
                     .map(|(_, n)| n.clone())
                     .unwrap_or_else(|| fight.boss_name.clone());
                 if bresp
                     .hover_tip(format!("{}\n(Click to filter)", boss_display))
                     .clicked()
-                    && fight.boss_object_type != 0
+                    && fight.display_object_type != 0
                 {
-                    set_boss = Some((fight.boss_object_type, boss_display.clone()));
+                    set_boss = Some((fight.display_object_type, boss_display.clone()));
                 }
 
                 // Character sprite (moved to the left, same size as the portal
@@ -1925,7 +2467,8 @@ impl CombatHistoryPanel {
                 // filter. A fixed 32x32 slot is always reserved so text lines up
                 // across cards even when the character is unknown.
                 let vis =
-                    char_visuals(ctx, fight.local_char_id).or_else(|| stored_char_visuals(fight));
+                    crate::panels::character_appearance(&ctx.account_data, fight.local_char_id)
+                        .or_else(|| stored_char_visuals(fight));
                 let ot = fight.local_object_type.unwrap_or(0);
                 let (crect, cresp) =
                     cui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
@@ -2437,6 +2980,7 @@ impl CombatHistoryPanel {
                 ui.checkbox(&mut self.show_dmg, "DMG");
                 ui.checkbox(&mut self.show_hits, "Hits landed");
                 ui.checkbox(&mut self.show_damage_taken, "Damage taken");
+                ui.checkbox(&mut self.show_hits_taken, "Hits taken");
                 ui.checkbox(&mut self.show_damage_blocked, "Damage blocked");
             });
         });
@@ -2461,165 +3005,1202 @@ impl CombatHistoryPanel {
         };
 
         let mut player_click: Option<(String, i32, u32, u32)> = None;
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(6.0);
-                // --- Header: stylized boss HP bar + meta ---
-                let portal_map = get_dungeon_portal_map();
-                let portal_id = portal_map.get_portal_id(&fight.dungeon).unwrap_or(0);
+        // The sub-tab row is the card's navigation, so it stays put while the card
+        // scrolls beneath it, and it is what a reader looks for first: it sits above
+        // the header (boss bar, name, fight details), which stays visible in both
+        // sub-tabs, with the row's own divider between them.
+        let local = fight.participants.iter().find(|p| p.is_local);
+        self.render_performance_subtabs(ui, ctx, local);
 
-                let bar_inset = self.draw_boss_hp_bar(
-                    ui,
-                    ctx.sprite_renderer,
-                    portal_id,
-                    fight.boss_object_type,
-                    fight.boss_start_hp as i64,
-                    fight.boss_max_hp as i64,
-                    fight.total_damage(),
-                    fight.shatters_hm,
-                );
+        if let Some(delta) = page_scroll_delta(ui) {
+            self.detail_scroll_delta = Some(delta);
+        }
+        let mut area = ScrollArea::vertical()
+            .id_salt("combat_history_fight_detail")
+            .auto_shrink([false, false]);
+        if let Some(delta) = self.detail_scroll_delta.take() {
+            area = area.vertical_scroll_offset((self.detail_scroll_offset + delta).max(0.0));
+        }
+        let scroll_out = area.show(ui, |ui| {
+            // --- Header: stylized boss HP bar + meta ---
+            let portal_map = get_dungeon_portal_map();
+            let portal_id = portal_map.get_portal_id(&fight.dungeon).unwrap_or(0);
 
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(bar_inset);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new(&fight.boss_name).size(18.0).strong());
+            let bar_inset = self.draw_boss_hp_bar(
+                ui,
+                ctx.sprite_renderer,
+                portal_id,
+                fight.boss_object_type,
+                fight.boss_start_hp as i64,
+                fight.boss_max_hp as i64,
+                fight.total_damage(),
+                fight.shatters_hm,
+            );
 
-                        // location · date time (no dot between date and time so the
-                        // start time doesn't read as a duration).
-                        let datetime_s = match Local.timestamp_millis_opt(fight.started_at).single()
-                        {
-                            Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
-                            None => "-".to_string(),
-                        };
-                        ui.label(
-                            RichText::new(format!(
-                                "{}  ·  {}",
-                                dungeon_display_name(
-                                    portal_map,
-                                    &fight.dungeon,
-                                    RunModes {
-                                        leisurely: fight.leisurely,
-                                        petless: fight.petless,
-                                        hard_mode: fight.shatters_hm || fight.spectral_hm,
-                                    },
-                                ),
-                                datetime_s,
-                            ))
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(bar_inset);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new(&fight.boss_name).size(18.0).strong());
+
+                    // location · date time (no dot between date and time so the
+                    // start time doesn't read as a duration).
+                    let datetime_s = match Local.timestamp_millis_opt(fight.started_at).single() {
+                        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+                        None => "-".to_string(),
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  ·  {}",
+                            dungeon_display_name(
+                                portal_map,
+                                &fight.dungeon,
+                                RunModes {
+                                    leisurely: fight.leisurely,
+                                    petless: fight.petless,
+                                    hard_mode: fight.shatters_hm || fight.spectral_hm,
+                                },
+                            ),
+                            datetime_s,
+                        ))
+                        .color(Color32::GRAY),
+                    );
+                    ui.label(
+                        RichText::new(format!("Duration: {}", fmt_duration(fight.duration_ms())))
                             .color(Color32::GRAY),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "Duration: {}",
-                                fmt_duration(fight.duration_ms())
-                            ))
-                            .color(Color32::GRAY),
-                        );
-                        if fight.local_close_calls > 0 {
-                            // After death the live cache drops the character, so fall
-                            // back to the local participant's stored appearance so the
-                            // icon keeps its skin/dyes instead of disappearing.
-                            let cc_vis = char_visuals(ctx, fight.local_char_id).or_else(|| {
-                                fight
-                                    .participants
-                                    .iter()
-                                    .find(|p| p.is_local)
-                                    .and_then(|p| {
-                                        let icon_id = if p.skin_id > 0 {
-                                            p.skin_id
-                                        } else {
-                                            p.object_type
-                                        };
-                                        (icon_id != 0).then_some((icon_id, p.tex1, p.tex2))
-                                    })
-                            });
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Close calls: {}",
-                                        fight.local_close_calls
-                                    ))
-                                    .color(Color32::GRAY),
-                                );
-                                if let Some((icon, t1, t2)) = cc_vis {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(20.0, 20.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ctx.sprite_renderer
-                                        .draw_dyed_outlined_character_sprite_colored_outline(
-                                            ui,
-                                            icon,
-                                            rect,
-                                            8,
-                                            t1,
-                                            t2,
-                                            Some(Color32::from_rgba_unmultiplied(255, 0, 0, 128)),
-                                            Color32::from_rgb(255, 0, 0),
-                                        );
-                                }
-                            })
-                            .response
-                            .hover_tip(
-                                "Times you dropped to 20% HP or below during this fight \
-                             (deaths included).",
-                            );
-                        }
-                        // Participants: finished / total. "Finished" means the player
-                        // was still present when the fight ended (did not nexus, move
-                        // out of range, or die).
-                        let finished = fight
-                            .participants
-                            .iter()
-                            .filter(|p| matches!(p.end_status, ParticipantEndStatus::Present))
-                            .count();
-                        let total = fight.participants.len();
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 3.0;
-                            ui.label(RichText::new("Participants:").color(Color32::GRAY).small());
-                            ui.label(
-                                RichText::new(format!("{}", finished))
-                                    .color(Color32::GRAY)
-                                    .small(),
-                            )
-                            .hover_tip(
-                                "Players who finished the fight (were still present \
-                             when it ended).",
-                            );
-                            ui.label(RichText::new("/").color(Color32::GRAY).small());
-                            ui.label(
-                                RichText::new(format!("{}", total))
-                                    .color(Color32::GRAY)
-                                    .small(),
-                            )
-                            .hover_tip("Players who participated in the fight.");
+                    );
+                    if fight.local_close_calls > 0 {
+                        // A dead character keeps its last-seen appearance from the
+                        // graveyard; for one missing from the cache entirely (e.g.
+                        // another account's) fall back to the local participant's
+                        // stored appearance so the icon keeps its skin/dyes.
+                        let cc_vis = crate::panels::character_appearance(
+                            &ctx.account_data,
+                            fight.local_char_id,
+                        )
+                        .or_else(|| {
+                            fight
+                                .participants
+                                .iter()
+                                .find(|p| p.is_local)
+                                .and_then(|p| {
+                                    let icon_id = if p.skin_id > 0 {
+                                        p.skin_id
+                                    } else {
+                                        p.object_type
+                                    };
+                                    (icon_id != 0).then_some((icon_id, p.tex1, p.tex2))
+                                })
                         });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(
+                                RichText::new(format!("Close calls: {}", fight.local_close_calls))
+                                    .color(Color32::GRAY),
+                            );
+                            if let Some((icon, t1, t2)) = cc_vis {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(20.0, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                ctx.sprite_renderer
+                                    .draw_dyed_outlined_character_sprite_colored_outline(
+                                        ui,
+                                        icon,
+                                        rect,
+                                        8,
+                                        t1,
+                                        t2,
+                                        Some(Color32::from_rgba_unmultiplied(255, 0, 0, 128)),
+                                        Color32::from_rgb(255, 0, 0),
+                                    );
+                            }
+                        })
+                        .response
+                        .hover_tip(
+                            "Times you dropped to 20% HP or below during this fight \
+                             (deaths included).",
+                        );
+                    }
+                    // Participants: finished / total. "Finished" means the player
+                    // was still present when the fight ended (did not nexus, move
+                    // out of range, or die).
+                    let finished = fight
+                        .participants
+                        .iter()
+                        .filter(|p| matches!(p.end_status, ParticipantEndStatus::Present))
+                        .count();
+                    let total = fight.participants.len();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        ui.label(RichText::new("Participants:").color(Color32::GRAY).small());
+                        ui.label(
+                            RichText::new(format!("{}", finished))
+                                .color(Color32::GRAY)
+                                .small(),
+                        )
+                        .hover_tip(
+                            "Players who finished the fight (were still present \
+                             when it ended).",
+                        );
+                        ui.label(RichText::new("/").color(Color32::GRAY).small());
+                        ui.label(
+                            RichText::new(format!("{}", total))
+                                .color(Color32::GRAY)
+                                .small(),
+                        )
+                        .hover_tip("Players who participated in the fight.");
                     });
                 });
-
-                ui.add_space(8.0);
-                shadcn.full_width_separator(ui);
-                ui.add_space(4.0);
-
-                let loot_x = self.render_participant_table(
-                    ui,
-                    ctx,
-                    &fight.participants,
-                    "combat_detail_table",
-                    share_hp_pool(fight.boss_object_type, fight.boss_start_hp),
-                    fight.killed,
-                    !fight.killed,
-                    fight.boss_object_type == O3_BOSS_TYPE,
-                    &mut player_click,
-                );
-                self.render_boss_loot(ui, ctx, &FightSelection::Single(fight_id), None, loot_x);
             });
+
+            // The fight card header ends here. This divider is the full width of the
+            // card, unlike the short ones that close the sections below it.
+            ui.add_space(6.0);
+            shadcn.full_width_separator(ui);
+            ui.add_space(4.0);
+
+            if self.show_performance {
+                // One boss, one section: the whole card reads as a single rounded
+                // box, exactly like each collapsible section of a multi-boss run.
+                let width = section_divider_width(ui);
+                clear_divider_rows(ui);
+                let card = section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(width);
+                    self.render_my_performance(ui, ctx, &fight, width);
+                });
+                paint_divider_rows(ui, card.response.rect.shrink(CARD_PADDING));
+                return;
+            }
+
+            let loot_x = self.render_participant_table(
+                ui,
+                ctx,
+                &fight.participants,
+                "combat_detail_table",
+                share_hp_pool(fight.boss_object_type, fight.boss_start_hp),
+                fight.killed,
+                !fight.killed,
+                fight.boss_object_type == O3_BOSS_TYPE,
+                &mut player_click,
+            );
+            self.render_boss_loot(ui, ctx, &FightSelection::Single(fight_id), None, loot_x);
+        });
+        self.detail_scroll_offset = scroll_out.state.offset.y;
         if let Some((name, icon, tex1, tex2)) = player_click {
             self.apply_player_click(name, icon, tex1, tex2);
         }
+    }
+
+    /// Section A0: where the local player placed and what they dealt and took.
+    /// This belongs to the whole card rather than to any one section, so it sits
+    /// directly under the boss header, ahead of the stats it summarises.
+    fn render_summary_section(
+        &self,
+        ui: &mut egui::Ui,
+        fight: &FightRecord,
+        local: &ParticipantRecord,
+        rank: usize,
+        total: usize,
+        dpm: f64,
+        denom_label: &str,
+        divider_w: f32,
+    ) {
+        ui.add_space(10.0);
+        section_header(ui, "Summary");
+        ui.add_space(4.0);
+        egui::Grid::new("my_performance_summary")
+            .num_columns(2)
+            .spacing([18.0, 4.0])
+            .show(ui, |ui| {
+                let pct = |part: i64, whole: i64| -> String {
+                    if whole <= 0 {
+                        "-".to_string()
+                    } else {
+                        format!("{:.1}%", part.max(0) as f64 * 100.0 / whole as f64)
+                    }
+                };
+                let row = |ui: &mut egui::Ui, label: &str, value: String| {
+                    ui.label(RichText::new(label).color(Color32::GRAY));
+                    ui.label(RichText::new(value).strong());
+                    ui.end_row();
+                };
+                // The figure is bright; what qualifies it -- a share of the boss, a
+                // provenance, a rate's basis -- is dimmed grey beside it, so the
+                // number is what the eye lands on.
+                let row_notes = |ui: &mut egui::Ui, label: &str, value: String, notes: String| {
+                    ui.label(RichText::new(label).color(Color32::GRAY));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(value).strong());
+                        if !notes.is_empty() {
+                            ui.label(RichText::new(notes).color(Color32::GRAY));
+                        }
+                    });
+                    ui.end_row();
+                };
+                // The boss-HP share is the fight's own yardstick; the share of the
+                // team's damage only restated it, so it is not shown.
+                row(ui, "Rank", format!("{} of {}", rank, total));
+                row_notes(
+                    ui,
+                    "Damage",
+                    local.damage.max(0).to_string(),
+                    format!(
+                        "({} of boss HP)",
+                        pct(local.damage, fight.boss_max_hp as i64)
+                    ),
+                );
+                row_notes(
+                    ui,
+                    "Damage per minute",
+                    format!("{:.0}", dpm),
+                    format!("per {denom_label}"),
+                );
+                // Hits come from hit packets, so they carry no provenance tag;
+                // the tag describes how damage values were derived.
+                row(ui, "Hits landed", local.hits.to_string());
+                row(
+                    ui,
+                    "Shots tanked",
+                    local
+                        .damage_taken_hits
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                match local.damage_taken {
+                    Some(d) => row_notes(
+                        ui,
+                        "Damage taken",
+                        d.to_string(),
+                        format!("({})", local.damage_taken_provenance.as_str()),
+                    ),
+                    None => row(ui, "Damage taken", "-".to_string()),
+                }
+                row(
+                    ui,
+                    "Damage blocked",
+                    local
+                        .damage_blocked
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            });
+        ui.add_space(2.0);
+        section_divider(ui, divider_w);
+    }
+
+    /// Section A: the local player's stats as they stood for this fight, split by
+    /// source (base, gear + enchants, exaltations, crucible).
+    ///
+    /// The gear is the loadout recorded for the fight itself, so a later gear
+    /// swap cannot rewrite it, and so is the Blood Ritual and Crucible the fight
+    /// was fought under. Maxed stats and exaltations come from the account cache,
+    /// which reflects the present rather than the fight -- stated in the row note
+    /// so the breakdown is not read as a historical fact.
+    fn render_stats_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        fight: &FightRecord,
+        local: &ParticipantRecord,
+        divider_w: f32,
+    ) {
+        ui.add_space(2.0);
+        section_header(ui, "Stats");
+        ui.add_space(4.0);
+
+        let cache = &ctx.account_data.characters;
+        let Some(character) = cache.find_any_character(fight.local_char_id) else {
+            ui.label(
+                RichText::new(
+                    "This character is not in the account cache, so no stat breakdown \
+                     could be built for this fight.",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        };
+        let mut loadout = crate::panels::derived_stats::build_loadout(character, cache);
+        if local.equipment.iter().any(|&slot| slot >= 0) {
+            loadout.equipment = local.equipment.iter().map(|&slot| slot.max(0)).collect();
+            loadout.enchants = local.equipment_enchants.to_vec();
+        }
+        // Blood Ritual and Crucible come from the *fight's* own record, not from
+        // the character's state now: the engine cannot see either as a numeric
+        // stat, so the processor pushes them from the account cache and every fight
+        // is stamped with what was true while it was fought. A fight recorded
+        // before that is unstamped and reads as off, like every other
+        // pre-tracking field -- rather than picking up whatever is active when the
+        // card happens to be opened.
+        //
+        // The ritual's *tier* is part of that record: a character's recorded tier is
+        // cleared the moment the ritual is switched off, so resolving the tier here
+        // (as this used to, from the fight's on/off window alone) dropped the Blood
+        // Ritual from fights that had already been recorded, and re-adding it when
+        // the ritual was switched back on.
+        loadout.blood_ritual =
+            fight_ritual_id(&fight.boosts).and_then(|id| cache.blood_ritual_def(id));
+        // The crucible's definitions belong to the season, not to the character, so
+        // the marker's state *now* must not decide whether the fight was fought
+        // under them.
+        loadout.crucible = if fight
+            .boosts
+            .iter()
+            .any(|b| b.stat == "Crucible" && b.to > b.from)
+        {
+            cache.active_crucible.clone()
+        } else {
+            None
+        };
+        let derived = realmhound_core::stats::derived::derive(get_asset_manager(), &loadout);
+
+        let attrs = &derived.attributes;
+        // Exactly the character page's Attributes readout: the stat's potion
+        // icon and name, then the value cells (Total plus the Gear / Exalts /
+        // Crucible breakdown) drawn by the shared renderer, so the colors,
+        // brackets and column widths match the Character Stats page. The maxed
+        // flags come from the account cache, like the maxed/exalt/crucible values
+        // themselves. The eight stats are paired into two columns of four exactly
+        // as the character page pairs them (HP/MP, ATT/DEF, SPD/DEX, VIT/WIS), so
+        // the block reads as a compact table rather than one long list.
+        let maxed = character.maxed_flags();
+        let rows = [
+            [
+                ("HP", "Max HP", &attrs.max_hp, maxed[0]),
+                ("MP", "Max MP", &attrs.max_mp, maxed[1]),
+            ],
+            [
+                ("ATT", "Attack", &attrs.attack, maxed[2]),
+                ("DEF", "Defense", &attrs.defense, maxed[3]),
+            ],
+            [
+                ("SPD", "Speed", &attrs.speed, maxed[4]),
+                ("DEX", "Dexterity", &attrs.dexterity, maxed[5]),
+            ],
+            [
+                ("VIT", "Vitality", &attrs.vitality, maxed[6]),
+                ("WIS", "Wisdom", &attrs.wisdom, maxed[7]),
+            ],
+        ];
+        let widths = crate::panels::derived_stats::attr_col_widths(ui);
+        egui::Grid::new("my_performance_stats")
+            .num_columns(12)
+            .spacing([STATS_GRID_GAP, 4.0])
+            .show(ui, |ui| {
+                // One header band per stat column.
+                for _ in 0..2 {
+                    ui.label("");
+                    crate::panels::derived_stats::attr_header_cell(
+                        ui,
+                        widths.total,
+                        "Total",
+                        crate::panels::derived_stats::MAXED_COLOR,
+                    );
+                    crate::panels::derived_stats::attr_header_cell(
+                        ui,
+                        widths.gear,
+                        "Gear",
+                        crate::panels::derived_stats::GEAR_DIM,
+                    );
+                    crate::panels::derived_stats::attr_header_cell(
+                        ui,
+                        widths.exalt,
+                        "Exalts",
+                        crate::panels::derived_stats::EXALT_DIM,
+                    );
+                    crate::panels::derived_stats::attr_header_cell(
+                        ui,
+                        widths.crucible,
+                        "Crucible",
+                        crate::panels::derived_stats::CRUCIBLE_DIM,
+                    );
+                    crate::panels::derived_stats::attr_header_cell(
+                        ui,
+                        widths.blood_ritual,
+                        "Blood Ritual",
+                        crate::panels::derived_stats::BLOOD_RITUAL_COLOR,
+                    );
+                }
+                ui.end_row();
+                for pair in rows {
+                    for (abbr, label, attr, is_maxed) in pair {
+                        // The stat's name lives in the icon's tooltip: the potion
+                        // sprite already identifies the row, and printing the name
+                        // eight times was noise next to the numbers.
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                            if let Some(id) = crate::panels::character_card::stat_potion_id(abbr) {
+                                ctx.sprite_renderer.draw_sprite_in_rect(ui, id, rect);
+                            }
+                        })
+                        .response
+                        .hover_tip(label);
+                        crate::panels::derived_stats::attr_value_cells(ui, attr, is_maxed, &widths);
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.add_space(2.0);
+        section_divider(ui, divider_w);
+    }
+
+    /// Section B: the boosts the server reported on the local player during the
+    /// fight -- consumables, ally buffs, gear procs and condition effects --
+    /// condensed to one row per effect and source, with the durations summed
+    /// across the whole fight.
+    fn render_boost_section(&self, ui: &mut egui::Ui, ctx: &mut PanelContext, fight: &FightRecord) {
+        ui.add_space(10.0);
+        section_header(ui, "Boosts").hover_tip(
+            "One row per effect and source; the duration is the total time it was held. \
+             The source is inferred -- the wire names none.",
+        );
+        ui.add_space(4.0);
+
+        // Blood Ritual and Crucible are recorded so the stats block can show the
+        // state the fight was actually fought under (see `render_stats_section`);
+        // as boosts they would only repeat the pill the stats table already
+        // breaks down, so they stay out of this table.
+        let live: Vec<_> = fight
+            .boosts
+            .iter()
+            .filter(|b| b.stat != "Blood Ritual" && b.stat != "Crucible")
+            .cloned()
+            .collect();
+        let rows = condensed_boosts(&live);
+        if rows.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No stat or condition boost was observed on you in this fight (or the \
+                     fight predates boost tracking).",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        }
+        egui::Grid::new("my_performance_boosts")
+            .num_columns(5)
+            .spacing([18.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("");
+                for header in ["Effect", "Amount", "Duration", "Source"] {
+                    ui.label(RichText::new(header).color(Color32::GRAY).small());
+                }
+                ui.end_row();
+                for r in &rows {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                    match &r.icon {
+                        BoostIcon::Item(id) => {
+                            ctx.sprite_renderer.draw_sprite_in_rect(ui, *id, rect);
+                        }
+                        BoostIcon::Condition(icon) => {
+                            ctx.sprite_renderer
+                                .draw_outlined_embedded_icon(ui, *icon, rect);
+                        }
+                        BoostIcon::None => {}
+                    }
+                    ui.label(&r.effect);
+                    ui.label(r.amount());
+                    ui.label(fmt_duration(r.duration_ms));
+                    ui.label(RichText::new(&r.source).color(Color32::GRAY));
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Section C: the loadout recorded for this fight, each item with the
+    /// enchantments it had at the time.
+    fn render_gear_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        local: &ParticipantRecord,
+        divider_w: f32,
+    ) {
+        ui.add_space(10.0);
+        section_header(ui, "Gear");
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "The loadout recorded for this fight, weapon first. Hover a slot for \
+                 the item and the enchantments it had at the time.",
+            )
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.add_space(4.0);
+        // The same large inventory cells the Character Stats page uses, one column
+        // per slot: the loadout item on top, then anything swapped into that slot
+        // during the fight beneath it at the same icon size, so an alternative reads
+        // as an alternative to its own slot rather than as a separate list. The item
+        // and its enchantments (gems drawn on the cell) are described on hover.
+        let gear: Vec<realmhound_core::vault::CharacterItem> = (0..4)
+            .map(|slot| {
+                if local.equipment[slot] < 0 {
+                    realmhound_core::vault::CharacterItem::empty()
+                } else {
+                    realmhound_core::vault::CharacterItem {
+                        item_id: local.equipment[slot],
+                        enchant_ids: local.equipment_enchants[slot].clone(),
+                        ..Default::default()
+                    }
+                }
+            })
+            .collect();
+        // Only the weapon slot is recorded per hit, so a weapon swap is recoverable
+        // from the damage buckets; an armour, ability or ring swap is not, and those
+        // columns show the single item the fight was recorded with.
+        let main_weapon = local.equipment[0];
+        let swapped: Vec<&WeaponContribution> = local
+            .weapons
+            .iter()
+            .filter(|w| w.weapon_id != main_weapon && w.damage > 0)
+            .collect();
+        let card = crate::panels::character_card::CharacterCardWidget::compact();
+        ui.horizontal(|ui| {
+            for (slot, item) in gear.iter().enumerate() {
+                ui.vertical(|ui| {
+                    card.render_item_slot(ui, item, ctx.sprite_renderer);
+                    // An alternate keeps its own enchantments, so its tooltip
+                    // describes the item as it was worn at the time.
+                    if slot == 0 {
+                        for w in &swapped {
+                            let alt = realmhound_core::vault::CharacterItem {
+                                item_id: w.weapon_id,
+                                enchant_ids: w.enchants.clone(),
+                                ..Default::default()
+                            };
+                            card.render_item_slot(ui, &alt, ctx.sprite_renderer);
+                        }
+                    }
+                });
+                ui.add_space(crate::panels::character_card::SLOT_SPACING);
+            }
+        });
+        ui.add_space(2.0);
+        section_divider(ui, divider_w);
+    }
+
+    /// Section E.1: the local player's damage split by weapon. The per-shot value
+    /// is rolled from the map seed and the player's Attack at shoot time -- the
+    /// server never reports your own damage -- hence the `Self-computed` tag.
+    fn render_weapon_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        local: &ParticipantRecord,
+    ) {
+        ui.add_space(10.0);
+        section_header(ui, "Damage by weapon").hover_tip(
+            "Self-computed: each hit's value is rolled from the map seed and your \
+                 Attack at shoot time, then reduced by the target's Defense.",
+        );
+        ui.add_space(4.0);
+        if local.weapons.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No weapon damage was attributed to you in this fight (or the fight \
+                     predates per-weapon tracking).",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        }
+        ui.add_space(4.0);
+        egui::Grid::new("my_performance_weapons")
+            .num_columns(4)
+            .spacing([18.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for header in ["Weapon", "Hits", "Average", "Damage"] {
+                    ui.label(RichText::new(header).color(Color32::GRAY).small());
+                }
+                ui.end_row();
+                for w in &local.weapons {
+                    // The item's own cell, enchant gems and tooltip included, the
+                    // way the character page's weapon line draws it: the gems show
+                    // which enchantments were on it, and hovering anywhere on the
+                    // cell opens the same tooltip the big gear icons use.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let ench: Vec<i32> = w.enchants.iter().map(|&e| e as i32).collect();
+                        ctx.sprite_renderer.render_item_sprite_with_enchants_native(
+                            ui,
+                            w.weapon_id,
+                            &ench,
+                            20.0,
+                        );
+                        ui.label(item_name(w.weapon_id));
+                    });
+                    ui.label(w.hits.to_string());
+                    let avg = if w.hits > 0 {
+                        format!("{:.1}", w.damage.max(0) as f64 / w.hits as f64)
+                    } else {
+                        "-".to_string()
+                    };
+                    ui.label(avg);
+                    ui.label(RichText::new(w.damage.max(0).to_string()).strong());
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Section E.2: the local player's ability activations, each credited the
+    /// damage the game reported for it -- the volley the server fired for that
+    /// item, or the server-applied effect it declared (a nova, poison, hex).
+    ///
+    /// An activation whose damage never reached the client stays listed with no
+    /// damage instead of being dropped -- nothing is silently omitted.
+    fn render_ability_section(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        fight: &FightRecord,
+    ) {
+        ui.add_space(10.0);
+        section_header(ui, "Damage by ability").hover_tip(
+            "Damage the game reported for this ability. The server sends the damage \
+             of the volleys it fires for you (a spell's bolts) and of the effects it \
+             applies for you (a mushroom's nova, thrown poison); each figure is \
+             credited to the activation it belongs to. An ability whose damage never \
+             reached the client stays blank.",
+        );
+        ui.add_space(4.0);
+        if fight.abilities.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No ability activations were observed in this fight (or the fight \
+                     predates ability tracking).",
+                )
+                .color(Color32::GRAY),
+            );
+            return;
+        }
+        ui.add_space(4.0);
+
+        // One row per ability (item + enchants), with its activations and whatever
+        // packet-borne damage could be credited across them.
+        struct Row {
+            item_id: i32,
+            enchants: Vec<u16>,
+            activations: usize,
+            damage: i64,
+            hits: u64,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for a in &fight.abilities {
+            match rows
+                .iter_mut()
+                .find(|r| r.item_id == a.item_id && r.enchants == a.enchants)
+            {
+                Some(r) => {
+                    r.activations += 1;
+                    r.damage += a.damage;
+                    r.hits += a.hits;
+                }
+                None => rows.push(Row {
+                    item_id: a.item_id,
+                    enchants: a.enchants.clone(),
+                    activations: 1,
+                    damage: a.damage,
+                    hits: a.hits,
+                }),
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.damage
+                .cmp(&a.damage)
+                .then(b.activations.cmp(&a.activations))
+        });
+
+        egui::Grid::new("my_performance_abilities")
+            .num_columns(4)
+            .spacing([18.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for header in ["Ability", "Activations", "From packets", "Notes"] {
+                    ui.label(RichText::new(header).color(Color32::GRAY).small());
+                }
+                ui.end_row();
+                for r in &rows {
+                    // Same item cell as the weapon table: enchant gems, glow and
+                    // the shared item tooltip.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let ench: Vec<i32> = r.enchants.iter().map(|&e| e as i32).collect();
+                        ctx.sprite_renderer
+                            .render_item_sprite_with_enchants_native(ui, r.item_id, &ench, 20.0);
+                        ui.label(item_name(r.item_id));
+                    });
+                    ui.label(r.activations.to_string());
+                    if r.damage > 0 {
+                        ui.label(RichText::new(r.damage.to_string()).strong());
+                        ui.label(RichText::new(format!("{} packet hit(s)", r.hits)).small());
+                    } else {
+                        ui.label(RichText::new("-").color(Color32::GRAY));
+                        // Say which blank this is: an ability whose declared
+                        // effect never connected (its damage is applied by the
+                        // server, so nothing means the nova/poison missed) versus
+                        // one whose shots the server reported no hit for.
+                        let server_applied = get_asset_manager()
+                            .server_applied_damage_window_ms(r.item_id)
+                            .is_some();
+                        let note = if server_applied {
+                            "the server-applied effect never connected"
+                        } else {
+                            "the server reported no hits from this ability's shots"
+                        };
+                        ui.label(RichText::new(note).color(Color32::GRAY).small());
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Fold an encounter run's phases into a single record for the "My
+    /// Performance" view: the aggregated roster plus run-level totals, so the
+    /// same renderer works for a grouped card and for a single fight.
+    fn aggregated_performance_fight(&self, enc: &EncounterRecord) -> Option<FightRecord> {
+        let anchor = enc
+            .phases
+            .iter()
+            .find(|p| p.boss_object_type == enc.anchor_object_type)
+            .or_else(|| enc.phases.first())?;
+        let boss_max_hp = enc
+            .phases
+            .iter()
+            .map(|p| p.boss_max_hp as i64)
+            .sum::<i64>()
+            .min(i32::MAX as i64) as i32;
+        Some(FightRecord {
+            id: 0,
+            started_at: enc.started_at,
+            ended_at: enc.ended_at,
+            dungeon: enc.dungeon.clone(),
+            dungeon_entered_at: anchor.dungeon_entered_at,
+            map_seed: anchor.map_seed,
+            boss_object_type: enc.anchor_object_type,
+            boss_name: enc.display_name.clone(),
+            boss_max_hp,
+            boss_start_hp: boss_max_hp,
+            local_object_id: anchor.local_object_id,
+            local_char_id: anchor.local_char_id,
+            killed: enc.killed,
+            local_close_calls: enc.phases.iter().map(|p| p.local_close_calls).sum(),
+            aux_member_count: None,
+            spirits: enc.phases.iter().map(|p| p.spirits).sum(),
+            leisurely: enc.leisurely,
+            petless: enc.petless,
+            spectral_hm: enc.spectral_hm,
+            shatters_hm: enc.shatters_hm,
+            boss_uptime_ms: enc.phases.iter().map(|p| p.boss_uptime_ms).sum(),
+            boosts: merge_run_boosts(enc),
+            abilities: merge_run_abilities(enc),
+            participants: enc.roster.clone(),
+        })
+    }
+
+    /// The fight card's sub-tab row ("Team Overview" / "My Performance"), drawn as
+    /// a centered band between two dividers at the top of the card -- the same shape
+    /// the Vault's Seasonal / Regular row uses -- above the header (boss bar + fight
+    /// details), which stays visible in both sub-tabs. The people emote stands for
+    /// the roster, the local player's own character sprite for their breakdown.
+    fn render_performance_subtabs(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        local: Option<&ParticipantRecord>,
+    ) {
+        let shadcn = ctx.shadcn;
+        // The band's own dividers are the row's only top and bottom edges: the
+        // frame's margins alone, as the Vault's sub-tab band has, so the buttons
+        // sit tight between them instead of floating in a padded strip.
+        shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
+            ui.vertical_centered(|ui| {
+                ui.horizontal(|ui| {
+                    if ctx
+                        .sprite_renderer
+                        .render_icon_button(
+                            ui,
+                            Some(crate::tab_icons::get_team_overview_subtab_icon()),
+                            "Team Overview",
+                            !self.show_performance,
+                            Some(Color32::WHITE),
+                            None,
+                        )
+                        .clicked()
+                    {
+                        self.show_performance = false;
+                    }
+
+                    let avatar = local.and_then(|p| {
+                        crate::tab_icons::get_character_avatar_icon(
+                            p.object_type,
+                            p.skin_id,
+                            p.tex1,
+                            p.tex2,
+                        )
+                    });
+                    if ctx
+                        .sprite_renderer
+                        .render_icon_button(
+                            ui,
+                            avatar,
+                            "My Performance",
+                            self.show_performance,
+                            Some(Color32::WHITE),
+                            None,
+                        )
+                        .clicked()
+                    {
+                        self.show_performance = true;
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    /// One boss of a grouped run, in the "My Performance" view: the boss's own
+    /// header -- exactly the row the Team Overview lists, with the status, the
+    /// duration and the Main badge inline after its HP -- over a foldable block of
+    /// that boss's breakdown. Damage is read per boss because a phase is what the
+    /// player actually fought, and it is what the roster rows above report.
+    ///
+    /// The fold state is the Team Overview's own, so the boss unfolded there is
+    /// the one unfolded here and every other row stays collapsed.
+    fn render_boss_performance(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        enc: &EncounterRecord,
+        phase: &FightRecord,
+        anchor_id: Option<i64>,
+    ) {
+        let phase_name = match phase.aux_member_count {
+            Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
+            _ => phase.boss_name.clone(),
+        };
+        let (phase_stats, phase_spirits) = boss_row_stats_parts(
+            phase.boss_object_type,
+            phase.boss_start_hp,
+            phase.boss_max_hp,
+            phase.total_damage(),
+            phase.spirits,
+        );
+        let (state, scolor) = if phase.killed || enc.killed {
+            ("Completed", Color32::from_rgb(120, 200, 120))
+        } else {
+            ("Escaped", Color32::GRAY)
+        };
+        let expanded = self.expanded_phases.contains(&phase.id);
+        let arrow = if expanded { "▼" } else { "▶" };
+        let header = format!("{arrow}  {phase_name}   {phase_stats}");
+        ui.horizontal(|ui| {
+            if phase.boss_object_type != 0 {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                draw_boss_sprite(
+                    ctx.sprite_renderer,
+                    ui,
+                    phase.boss_object_type,
+                    phase.shatters_hm,
+                    rect,
+                );
+            }
+            if ui
+                .add(egui::Button::new(RichText::new(header).strong()).frame(false))
+                .clicked()
+            {
+                if expanded {
+                    self.expanded_phases.remove(&phase.id);
+                } else {
+                    self.expanded_phases.insert(phase.id);
+                }
+            }
+            if let Some(spirits) = phase_spirits {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                draw_spirit_sprite(
+                    ctx.sprite_renderer,
+                    ui,
+                    phase.boss_object_type == MV_UMI_TYPE,
+                    rect,
+                );
+                ui.label(format!("Spirits {spirits}"));
+            }
+            ui.label(fmt_duration(phase.duration_ms()));
+            ui.label(RichText::new(state).color(scolor).small());
+            // Kitsune Umi is an optional boss: a card she is the only boss of still
+            // headlines on her, but she is never the run's "Main".
+            if Some(phase.id) == anchor_id
+                && !get_asset_manager().is_treasure_crate(phase.boss_object_type)
+                && phase.boss_object_type != MV_UMI_TYPE
+            {
+                ui.label(
+                    RichText::new("Main")
+                        .color(Color32::from_rgb(0xff, 0xc1, 0x00))
+                        .small()
+                        .strong(),
+                )
+                .hover_tip("Main dungeon boss (shown in the HP bar above).");
+            }
+        });
+        if expanded {
+            // The expanded section reads as its own little card inside the run,
+            // exactly like the character page's stat cards: a rounded outline
+            // instead of an indent line, hugging the data it holds -- the Stats
+            // table's width -- rather than stretching the whole card, with the
+            // section dividers running that full width.
+            ui.add_space(2.0);
+            let width = section_divider_width(ui);
+            clear_divider_rows(ui);
+            let card = section_frame(ui).show(ui, |ui| {
+                ui.set_min_width(width);
+                self.render_my_performance(ui, ctx, phase, width);
+            });
+            paint_divider_rows(ui, card.response.rect.shrink(CARD_PADDING));
+        }
+        ui.add_space(6.0);
+    }
+
+    /// "My Performance": the local player's own breakdown for one fight -- where
+    /// they placed, what they dealt and took, and how their damage was built.
+    /// Every figure here is Combat History's own reconstruction for the local
+    /// player, which is why the section is labelled by provenance.
+    fn render_my_performance(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &mut PanelContext,
+        fight: &FightRecord,
+        divider_w: f32,
+    ) {
+        let Some(local) = fight.participants.iter().find(|p| p.is_local) else {
+            ui.label(
+                RichText::new("No local-player row was recorded for this fight.")
+                    .color(Color32::GRAY),
+            );
+            return;
+        };
+        // The fight's own loadout, derived once for the pet row: the pet's name,
+        // skin and abilities come from the account cache exactly as the ATTRIBUTES
+        // panel shows them, since the wire carries only the pet's type id.
+        let derived: Option<realmhound_core::stats::derived::DerivedStats> = {
+            let cache = &ctx.account_data.characters;
+            cache
+                .find_any_character(fight.local_char_id)
+                .map(|character| {
+                    let mut loadout = crate::panels::derived_stats::build_loadout(character, cache);
+                    if local.equipment.iter().any(|&slot| slot >= 0) {
+                        loadout.equipment =
+                            local.equipment.iter().map(|&slot| slot.max(0)).collect();
+                        loadout.enchants = local.equipment_enchants.to_vec();
+                    }
+                    realmhound_core::stats::derived::derive(
+                        realmhound_core::assets::get_asset_manager(),
+                        &loadout,
+                    )
+                })
+        };
+
+        let rank = fight
+            .participants
+            .iter()
+            .position(|p| p.is_local)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        let total = fight.participants.len();
+        // Boss uptime is only known for fights recorded after it was tracked; on
+        // older rows the whole fight duration is the denominator and the row says
+        // so rather than pretending the fight was continuous.
+        let (denom_ms, denom_label) = if fight.boss_uptime_ms > 0 {
+            (fight.boss_uptime_ms, "boss uptime")
+        } else {
+            (fight.duration_ms(), "whole fight duration")
+        };
+        let dpm = if denom_ms > 0 {
+            local.damage.max(0) as f64 * 60_000.0 / denom_ms as f64
+        } else {
+            0.0
+        };
+
+        // Sections run in the order the feature was specified, with the summary
+        // lifted to the top: it describes the whole fight rather than any one
+        // section, so it reads directly under the boss header -- then the stats the
+        // fight was fought with, the boosts observed on the player, the gear worn,
+        // and finally how the damage was built.
+        self.render_summary_section(ui, fight, local, rank, total, dpm, denom_label, divider_w);
+        self.render_stats_section(ui, ctx, fight, local, divider_w);
+        self.render_gear_section(ui, ctx, local, divider_w);
+
+        self.render_weapon_section(ui, ctx, local);
+        self.render_ability_section(ui, ctx, fight);
+
+        ui.add_space(10.0);
+        section_header(ui, "Pets, Summons and other sources").hover_tip(
+            "Pet and summon hits are credited to you by the game, and so is damage from a \
+             dungeon mechanic that strikes the boss for you -- a Parasite Chambers barrel \
+             pushed into it, a Galleon cannonball. They are listed here so the split is \
+             visible, and they are excluded from your weapon and ability damage.",
+        );
+        ui.add_space(4.0);
+        if local.summons.is_empty() {
+            ui.label(
+                RichText::new("No pet, summon or other source hits were recorded in this fight.")
+                    .color(Color32::GRAY),
+            );
+        } else {
+            egui::Grid::new("my_performance_pets")
+                .num_columns(4)
+                .spacing([18.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Entity").color(Color32::GRAY).small());
+                    ui.label(RichText::new("Hits").color(Color32::GRAY).small());
+                    ui.label(RichText::new("Damage").color(Color32::GRAY).small());
+                    ui.label(RichText::new("Average").color(Color32::GRAY).small());
+                    ui.end_row();
+                    for s in &group_summons(&local.summons) {
+                        // Name and draw the entity from its own object type when it
+                        // has one: a summoned creature's type is its identity, so
+                        // "Summon Pocket Rat" is `0x4683` with that object's sprite.
+                        // Pets keep the skin (`pet_type`) and their own sprite path,
+                        // and rows recorded before the type was stored fall back to
+                        // the old generic label.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if s.is_pet {
+                                // The row carries the pet's skin, snapshotted at fight
+                                // time from the account cache -- the same value the
+                                // ATTRIBUTES panel draws and names. The wire's pet type id
+                                // is not a sprite, which is why this row used to show a
+                                // placeholder ("Pet" over a potion icon).
+                                let manager = realmhound_core::assets::get_asset_manager();
+                                let skin = s.pet_type;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(16.0),
+                                    egui::Sense::hover(),
+                                );
+                                if skin != 0 {
+                                    ctx.sprite_renderer.draw_sprite_in_rect(ui, skin, rect);
+                                }
+                                let name = manager
+                                    .object_name(skin)
+                                    .filter(|n| !n.is_empty())
+                                    .unwrap_or_else(|| "Pet".to_string());
+                                // The abilities on hover come from the cache now, so they
+                                // are offered only while it still holds this same pet.
+                                let known = derived
+                                    .as_ref()
+                                    .filter(|d| d.pet_skin == Some(skin) && !d.pet.is_empty());
+                                if let Some(d) = known {
+                                    ui.label(name).on_hover_ui(|ui| {
+                                        crate::panels::derived_stats::pet_abilities_tooltip(
+                                            ui, &d.pet,
+                                        );
+                                    });
+                                } else {
+                                    ui.label(name);
+                                }
+                            } else if s.object_type != 0 {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ctx.sprite_renderer
+                                    .draw_sprite_in_rect(ui, s.object_type, rect);
+                                let manager = realmhound_core::assets::get_asset_manager();
+                                let raw = manager
+                                    .object_name(s.object_type)
+                                    .unwrap_or_else(|| format!("0x{:X}", s.object_type));
+                                // A spirit's object entry carries no display name --
+                                // `MV Kimono Summon` is an internal id -- so the name
+                                // the game shows comes from the spawning item's own
+                                // text ("Summon a Friendly Spirit which..."). Only
+                                // substitute it where the object's own name is that
+                                // kind of internal label, so a creature already named
+                                // well ("Summon Bear") keeps its name.
+                                let internal = raw.starts_with("MV ") || raw.contains("Summon");
+                                let name = if internal {
+                                    manager.summon_name(s.object_type).unwrap_or(raw)
+                                } else {
+                                    raw
+                                };
+                                // Where the creature came from. The fight resolves
+                                // the item that actually created it from the
+                                // player's own loadout and activations, so the row
+                                // names one source and draws that item's sprite --
+                                // the catalog alone lists every item that *can*
+                                // spawn the creature, which reads as "from 2 items"
+                                // the moment an item has an `(SB)` or shiny twin.
+                                let (sources, tooltip) =
+                                    summon_source_labels(&manager.summon_sources(s.object_type));
+                                let mut response = ui.label(name);
+                                if s.source_item != 0 {
+                                    let enemy: Vec<i32> =
+                                        s.source_enchants.iter().map(|&e| e as i32).collect();
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    ctx.sprite_renderer.render_item_sprite_with_enchants_native(
+                                        ui,
+                                        s.source_item,
+                                        &enemy,
+                                        16.0,
+                                    );
+                                    let item = manager
+                                        .object_name(s.source_item)
+                                        .unwrap_or_else(|| format!("0x{:X}", s.source_item));
+                                    let label = ui.label(
+                                        RichText::new(format!("(from {item})"))
+                                            .color(Color32::GRAY)
+                                            .small(),
+                                    );
+                                    response = response.union(label);
+                                } else if sources.len() == 1 {
+                                    ui.label(
+                                        RichText::new(format!("(from {})", sources[0]))
+                                            .color(Color32::GRAY)
+                                            .small(),
+                                    );
+                                } else if sources.len() > 1 {
+                                    ui.label(
+                                        RichText::new(format!("(from {} items)", sources.len()))
+                                            .color(Color32::GRAY)
+                                            .small(),
+                                    );
+                                }
+                                if !tooltip.is_empty() {
+                                    response = response.on_hover_text(tooltip);
+                                }
+                                let _ = response;
+                            } else {
+                                ui.label("Summon");
+                            }
+                        });
+                        ui.label(s.hits.to_string());
+                        ui.label(s.damage.max(0).to_string());
+                        ui.label(if s.hits > 0 {
+                            (s.damage.max(0) / s.hits as i64).to_string()
+                        } else {
+                            "-".to_string()
+                        });
+                        ui.end_row();
+                    }
+                    ui.label(RichText::new("Included in your total").italics());
+                    ui.label(local.summon_hits.to_string());
+                    ui.label(local.summon_damage.max(0).to_string());
+                    ui.label("-");
+                    ui.end_row();
+                });
+        }
+        // The boost log closes the card: it is the longest section and the most
+        // detailed, so everything a reader checks first -- where they placed, the
+        // stats, the gear, the damage breakdown -- sits above it, divided off.
+        ui.add_space(10.0);
+        section_divider(ui, divider_w);
+        ui.add_space(2.0);
+        self.render_boost_section(ui, ctx, fight);
     }
 
     /// Render the loot dropped by one boss as compact rows (bag sprite + item
@@ -2646,6 +4227,7 @@ impl CombatHistoryPanel {
                 filter_type.map_or(true, |t| {
                     d.mob_type == t
                         || realmhound_core::assets::loot_emitter_for_boss(t) == Some(d.mob_type)
+                        || realmhound_core::assets::same_boss_for_loot(d.mob_type, t)
                 })
             })
             .collect();
@@ -2918,6 +4500,20 @@ impl CombatHistoryPanel {
         } else {
             None
         };
+        let total_taken_hits: Option<i64> = if self.show_hits_taken {
+            let vals: Vec<i64> = participants
+                .iter()
+                .filter_map(|p| p.damage_taken_hits)
+                .map(|h| h as i64)
+                .collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.iter().sum())
+            }
+        } else {
+            None
+        };
         let total_blocked: Option<i64> = if self.show_damage_blocked {
             let vals: Vec<i64> = participants
                 .iter()
@@ -2937,7 +4533,11 @@ impl CombatHistoryPanel {
 
         let mut col1_x: f32 = ui.min_rect().left();
         egui::Grid::new(salt)
-            .num_columns(8 + show_guarded as usize + self.show_damage_blocked as usize)
+            .num_columns(
+                8 + show_guarded as usize
+                    + self.show_damage_blocked as usize
+                    + self.show_hits_taken as usize,
+            )
             .striped(true)
             .spacing(egui::vec2(6.0, 6.0))
             .show(ui, |ui| {
@@ -2974,6 +4574,13 @@ impl CombatHistoryPanel {
                              the fight. Exact for other visible players; estimated \
                              for you (the game never sends your own damage taken). \
                              \"-\" means no data was captured.",
+                    );
+                }
+                if self.show_hits_taken {
+                    ui.label(RichText::new("Hits taken").strong()).hover_tip(
+                        "Number of incoming hits this player took from the \
+                         boss/enemies during the fight. \"-\" means the fight \
+                         predates hits-taken tracking.",
                     );
                 }
                 if self.show_damage_blocked {
@@ -3191,6 +4798,29 @@ impl CombatHistoryPanel {
                             }
                         }
                     }
+                    if self.show_hits_taken {
+                        match p.damage_taken_hits {
+                            Some(hits) => {
+                                track(
+                                    ui.label(dimmed(format!("{}", hits)))
+                                        .hover_tip(
+                                            "Incoming hits this player took from the \
+                                             boss/enemies during the fight.",
+                                        )
+                                        .rect,
+                                    &mut row_rect,
+                                );
+                            }
+                            None => {
+                                track(
+                                    ui.label(RichText::new("-").color(Color32::GRAY))
+                                        .hover_tip("Hits taken was not recorded for this fight.")
+                                        .rect,
+                                    &mut row_rect,
+                                );
+                            }
+                        }
+                    }
                     if self.show_damage_blocked {
                         match p.damage_blocked {
                             Some(blocked) => {
@@ -3326,6 +4956,9 @@ impl CombatHistoryPanel {
                         if self.show_damage_taken {
                             ui.label("");
                         }
+                        if self.show_hits_taken {
+                            ui.label("");
+                        }
                         if self.show_damage_blocked {
                             ui.label("");
                         }
@@ -3359,6 +4992,16 @@ impl CombatHistoryPanel {
                     }
                     if self.show_damage_taken {
                         match total_taken {
+                            Some(t) => {
+                                ui.label(RichText::new(format!("{}", t)).strong());
+                            }
+                            None => {
+                                ui.label(RichText::new("-").strong().color(Color32::GRAY));
+                            }
+                        }
+                    }
+                    if self.show_hits_taken {
+                        match total_taken_hits {
                             Some(t) => {
                                 ui.label(RichText::new(format!("{}", t)).strong());
                             }
@@ -3448,6 +5091,7 @@ impl CombatHistoryPanel {
                 ui.checkbox(&mut self.show_dmg, "DMG");
                 ui.checkbox(&mut self.show_hits, "Hits landed");
                 ui.checkbox(&mut self.show_damage_taken, "Damage taken");
+                ui.checkbox(&mut self.show_hits_taken, "Hits taken");
                 ui.checkbox(&mut self.show_damage_blocked, "Damage blocked");
             });
         });
@@ -3486,17 +5130,6 @@ impl CombatHistoryPanel {
             .filter(|p| !(hide_crates && get_asset_manager().is_treasure_crate(p.boss_object_type)))
             .collect();
 
-        // Display order: the last boss fought at the top, so reading the rows
-        // bottom-to-top is the order the party fought them. Ordering is by fight
-        // start, not finalization: an earlier phase can flush after a later one
-        // (e.g. a Moonlight Village dancer suspended and folded at the run's end),
-        // and it must not jump above the boss the run actually finished on.
-        visible_phases.sort_by(|a, b| {
-            b.started_at
-                .cmp(&a.started_at)
-                .then(b.ended_at.cmp(&a.ended_at))
-        });
-
         // The main dungeon boss: the run anchor (last real boss), else the last
         // non-crate phase. Its section auto-expands and shows the "Main" badge.
         // The latest row of that object type is the anchor phase itself, since a
@@ -3515,6 +5148,30 @@ impl CombatHistoryPanel {
             })
             .or_else(|| enc.phases.last())
             .map(|p| p.id);
+
+        // Display order: the main boss is the top row -- it is what the run was
+        // fought for, and a reader looks for it first -- with every other phase
+        // below it. A treasure-crate (side-room) phase is the one exception and may
+        // stay above the main boss, collapsed like any other row. Below the top the
+        // previous order holds (latest phase first), so the rows still read
+        // bottom-to-top as the party fought them: an earlier phase can flush after a
+        // later one (e.g. a Moonlight Village dancer suspended and folded at the
+        // run's end), and it must not jump above the boss the run finished on.
+        let rank = |p: &FightRecord| -> u8 {
+            if am.is_treasure_crate(p.boss_object_type) {
+                0
+            } else if Some(p.id) == anchor_id {
+                1
+            } else {
+                2
+            }
+        };
+        visible_phases.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then(b.started_at.cmp(&a.started_at))
+                .then(b.ended_at.cmp(&a.ended_at))
+        });
 
         // Anchor sprite for the header icon: the main boss above.
         let icon_type = enc
@@ -3547,348 +5204,400 @@ impl CombatHistoryPanel {
             .map(|e| (e.anchor_type, e.display_name.to_string()))
             .unwrap_or((icon_type, header_title));
 
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(6.0);
-                // --- Header: stylized boss HP bar + meta ---
-                let portal_map = get_dungeon_portal_map();
-                let portal_id = portal_map.get_portal_id(&enc.dungeon).unwrap_or(0);
+        let mut area = ScrollArea::vertical()
+            .id_salt("combat_history_run_detail")
+            .auto_shrink([false, false]);
+        if let Some(delta) = self.detail_scroll_delta.take() {
+            area = area.vertical_scroll_offset((self.detail_scroll_offset + delta).max(0.0));
+        }
 
-                // The HP bar reflects the main boss identified above.
-                let (anchor_start, anchor_max, anchor_damage) = enc
-                    .phases
-                    .iter()
-                    .find(|p| Some(p.id) == anchor_id)
-                    .map(|p| {
-                        (
-                            p.boss_start_hp as i64,
-                            p.boss_max_hp as i64,
-                            p.total_damage(),
-                        )
-                    })
-                    .unwrap_or((0, 0, 0));
+        // The sub-tab row stays above the scrolling card, the same as a single fight.
+        let local = enc.roster.iter().find(|p| p.is_local);
+        self.render_performance_subtabs(ui, ctx, local);
 
-                let bar_inset = self.draw_boss_hp_bar(
-                    ui,
-                    ctx.sprite_renderer,
-                    portal_id,
-                    icon_type,
-                    anchor_start,
-                    anchor_max,
-                    anchor_damage,
-                    enc.shatters_hm,
-                );
+        let scroll_out = area.show(ui, |ui| {
+            // --- Header: stylized boss HP bar + meta ---
+            let portal_map = get_dungeon_portal_map();
+            let portal_id = portal_map.get_portal_id(&enc.dungeon).unwrap_or(0);
 
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(bar_inset);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(RichText::new(&header_title).size(18.0).strong());
-                            let (state, color) = if enc.killed {
-                                ("Completed", Color32::from_rgb(120, 200, 120))
-                            } else {
-                                ("Escaped", Color32::GRAY)
-                            };
-                            ui.label(RichText::new(state).color(color).small());
-                        });
-                        // location · date time (no dot between date and time so the
-                        // start time doesn't read as a duration), then the two
-                        // durations on their own labeled lines.
-                        let datetime_s = match Local.timestamp_millis_opt(enc.started_at).single() {
-                            Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
-                            None => "-".to_string(),
+            // The HP bar reflects the main boss identified above.
+            let (anchor_start, anchor_max, anchor_damage) = enc
+                .phases
+                .iter()
+                .find(|p| Some(p.id) == anchor_id)
+                .map(|p| {
+                    (
+                        p.boss_start_hp as i64,
+                        p.boss_max_hp as i64,
+                        p.total_damage(),
+                    )
+                })
+                .unwrap_or((0, 0, 0));
+
+            let bar_inset = self.draw_boss_hp_bar(
+                ui,
+                ctx.sprite_renderer,
+                portal_id,
+                icon_type,
+                anchor_start,
+                anchor_max,
+                anchor_damage,
+                enc.shatters_hm,
+            );
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(bar_inset);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(&header_title).size(18.0).strong());
+                        let (state, color) = if enc.killed {
+                            ("Completed", Color32::from_rgb(120, 200, 120))
+                        } else {
+                            ("Escaped", Color32::GRAY)
                         };
-                        ui.label(
-                            RichText::new(format!(
-                                "{}  ·  {}",
-                                dungeon_display_name(
-                                    portal_map,
-                                    &enc.dungeon,
-                                    RunModes {
-                                        leisurely: enc.leisurely,
-                                        petless: enc.petless,
-                                        hard_mode: enc.shatters_hm || enc.spectral_hm,
-                                    },
-                                ),
-                                datetime_s,
-                            ))
-                            .color(Color32::GRAY),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "Active combat time: {}",
-                                fmt_duration(enc.active_duration_ms())
-                            ))
-                            .color(Color32::GRAY),
-                        )
-                        .hover_tip(
-                            "Sum of each big boss's fight duration - active combat only, \
+                        ui.label(RichText::new(state).color(color).small());
+                    });
+                    // location · date time (no dot between date and time so the
+                    // start time doesn't read as a duration), then the two
+                    // durations on their own labeled lines.
+                    let datetime_s = match Local.timestamp_millis_opt(enc.started_at).single() {
+                        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+                        None => "-".to_string(),
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  ·  {}",
+                            dungeon_display_name(
+                                portal_map,
+                                &enc.dungeon,
+                                RunModes {
+                                    leisurely: enc.leisurely,
+                                    petless: enc.petless,
+                                    hard_mode: enc.shatters_hm || enc.spectral_hm,
+                                },
+                            ),
+                            datetime_s,
+                        ))
+                        .color(Color32::GRAY),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Active combat time: {}",
+                            fmt_duration(enc.active_duration_ms())
+                        ))
+                        .color(Color32::GRAY),
+                    )
+                    .hover_tip(
+                        "Sum of each big boss's fight duration - active combat only, \
                          excluding add-on rows and travel/idle time between bosses.",
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "Total dungeon time: {}",
-                                fmt_duration(enc.total_dungeon_ms())
-                            ))
-                            .color(Color32::GRAY),
-                        )
-                        .hover_tip(
-                            "Wall-clock time from entering the dungeon to the final \
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Total dungeon time: {}",
+                            fmt_duration(enc.total_dungeon_ms())
+                        ))
+                        .color(Color32::GRAY),
+                    )
+                    .hover_tip(
+                        "Wall-clock time from entering the dungeon to the final \
                          boss death, including minion clear and travel between bosses.",
-                        );
-                        // Moonlight Village spirits: each spirit released at the
-                        // end of a dance (or Umi) phase is one object, and the
-                        // run total sets the dungeon's loot tier. Shown per side
-                        // because the dancers and Umi have separate thresholds.
-                        let dancer_spirits: i32 = enc
-                            .phases
-                            .iter()
-                            // Sage Genji / Dancer Miko / Drummer Kaguya.
-                            .filter(|p| matches!(p.boss_object_type, 20450..=20452))
-                            .map(|p| p.spirits)
-                            .sum();
-                        let umi_spirits: i32 = enc
-                            .phases
-                            .iter()
-                            .filter(|p| p.boss_object_type == 20493)
-                            .map(|p| p.spirits)
-                            .sum();
-                        for (label, count, umi, tip) in [
-                            (
-                                "Total spirits collected (Dancers): ",
-                                dancer_spirits,
-                                false,
-                                "Moonlight Village spirits collected from Sage Genji, \
+                    );
+                    // Moonlight Village spirits: each spirit released at the
+                    // end of a dance (or Umi) phase is one object, and the
+                    // run total sets the dungeon's loot tier. Shown per side
+                    // because the dancers and Umi have separate thresholds.
+                    let dancer_spirits: i32 = enc
+                        .phases
+                        .iter()
+                        // Sage Genji / Dancer Miko / Drummer Kaguya.
+                        .filter(|p| matches!(p.boss_object_type, 20450..=20452))
+                        .map(|p| p.spirits)
+                        .sum();
+                    let umi_spirits: i32 = enc
+                        .phases
+                        .iter()
+                        .filter(|p| p.boss_object_type == 20493)
+                        .map(|p| p.spirits)
+                        .sum();
+                    for (label, count, umi, tip) in [
+                        (
+                            "Total spirits collected (Dancers): ",
+                            dancer_spirits,
+                            false,
+                            "Moonlight Village spirits collected from Sage Genji, \
                                  Dancer Miko and Drummer Kaguya. This total sets the \
                                  dancers' loot tier (Tier 4 from 78, Tier 3 from 58, \
                                  Tier 2 from 40) and the odds of the Kitsune Umi \
                                  encounter. A Leisurely Mode dance is scored on Umi's \
                                  lower thresholds instead.",
-                            ),
-                            (
-                                "Total spirits collected (Umi): ",
-                                umi_spirits,
-                                true,
-                                "Moonlight Village spirits collected during the \
+                        ),
+                        (
+                            "Total spirits collected (Umi): ",
+                            umi_spirits,
+                            true,
+                            "Moonlight Village spirits collected during the \
                                  Kitsune Umi phases, scored on their own, lower tier \
                                  thresholds (Tier 4 from 48, Tier 3 from 36, Tier 2 \
                                  from 24).",
-                            ),
-                        ] {
-                            if count <= 0 {
-                                continue;
-                            }
-                            // Tier the total earned: 4 is the best, and a Leisurely
-                            // Mode dance shares Umi's thresholds.
-                            let text = spirit_total_label(label, count, enc.leisurely, umi);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(16.0, 16.0),
-                                    egui::Sense::hover(),
-                                );
-                                draw_spirit_sprite(ctx.sprite_renderer, ui, umi, rect);
-                                ui.label(RichText::new(text).color(Color32::GRAY))
-                                    .hover_tip(tip);
-                            });
+                        ),
+                    ] {
+                        if count <= 0 {
+                            continue;
                         }
-                        let enc_close_calls = enc.total_close_calls();
-                        if enc_close_calls > 0 {
-                            let cc_char_id = enc
-                                .phases
-                                .iter()
-                                .find_map(|p| (p.local_char_id != 0).then_some(p.local_char_id))
-                                .unwrap_or(0);
-                            // After death the live cache drops the character, so fall
-                            // back to the local player's stored roster appearance so
-                            // the icon keeps its skin/dyes instead of disappearing.
-                            let cc_vis = char_visuals(ctx, cc_char_id).or_else(|| {
-                                enc.roster.iter().find(|p| p.is_local).and_then(|p| {
-                                    let icon_id = if p.skin_id > 0 {
-                                        p.skin_id
-                                    } else {
-                                        p.object_type
-                                    };
-                                    (icon_id != 0).then_some((icon_id, p.tex1, p.tex2))
-                                })
-                            });
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                ui.label(
-                                    RichText::new(format!("Close calls: {}", enc_close_calls))
-                                        .color(Color32::GRAY),
-                                );
-                                if let Some((icon, t1, t2)) = cc_vis {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(20.0, 20.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ctx.sprite_renderer
-                                        .draw_dyed_outlined_character_sprite_colored_outline(
-                                            ui,
-                                            icon,
-                                            rect,
-                                            8,
-                                            t1,
-                                            t2,
-                                            Some(Color32::from_rgba_unmultiplied(255, 0, 0, 128)),
-                                            Color32::from_rgb(255, 0, 0),
-                                        );
-                                }
-                            })
-                            .response
-                            .hover_tip(
-                                "Times you dropped to 20% HP or below during this run \
-                             (deaths included).",
-                            );
-                        }
-                        if visible_phases.len() > 1 {
-                            ui.label(
-                                RichText::new(format!("{} phases grouped", visible_phases.len()))
-                                    .color(Color32::from_rgb(180, 150, 90))
-                                    .small(),
-                            );
-                        }
-                        // Participants: finished / total. "Finished" means the player
-                        // was still present when the fight ended (did not nexus, move
-                        // out of range, or die).
-                        let finished = enc
-                            .roster
-                            .iter()
-                            .filter(|p| matches!(p.end_status, ParticipantEndStatus::Present))
-                            .count();
-                        let total = enc.roster.len();
+                        // Tier the total earned: 4 is the best, and a Leisurely
+                        // Mode dance shares Umi's thresholds.
+                        let text = spirit_total_label(label, count, enc.leisurely, umi);
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 3.0;
-                            ui.label(RichText::new("Participants:").color(Color32::GRAY).small());
-                            ui.label(
-                                RichText::new(format!("{}", finished))
-                                    .color(Color32::GRAY)
-                                    .small(),
-                            )
-                            .hover_tip(
-                                "Players who finished the fight (were still present \
-                             when it ended).",
-                            );
-                            ui.label(RichText::new("/").color(Color32::GRAY).small());
-                            ui.label(
-                                RichText::new(format!("{}", total))
-                                    .color(Color32::GRAY)
-                                    .small(),
-                            )
-                            .hover_tip("Players who participated in the fight.");
-                        });
-                    });
-                });
-
-                ui.add_space(8.0);
-                shadcn.full_width_separator(ui);
-                ui.add_space(6.0);
-
-                for phase in &visible_phases {
-                    let expanded = self.expanded_phases.contains(&phase.id);
-                    let arrow = if expanded { "▼" } else { "▶" };
-                    // A killed grouped encounter means every constituent phase was
-                    // cleared; transition bosses (e.g. Cult Hideout cultists) lock at
-                    // a threshold and never trip the per-object kill rule, so surface
-                    // them as Completed here rather than Escaped.
-                    let (state, scolor) = if phase.killed || enc.killed {
-                        ("Completed", Color32::from_rgb(120, 200, 120))
-                    } else {
-                        ("Escaped", Color32::GRAY)
-                    };
-                    let phase_name = match phase.aux_member_count {
-                        Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
-                        _ => phase.boss_name.clone(),
-                    };
-                    // An uncapped boss (Moonlight Village mechanics bosses) has no
-                    // finite HP, so its row shows the party's total damage instead
-                    // of an HP fraction. Its spirit tally is split out so the
-                    // spirit sprite can precede the count.
-                    let (phase_stats, phase_spirits) = boss_row_stats_parts(
-                        phase.boss_object_type,
-                        phase.boss_start_hp,
-                        phase.boss_max_hp,
-                        phase.total_damage(),
-                        phase.spirits,
-                    );
-                    let header = format!("{arrow}  {phase_name}   {phase_stats}");
-                    ui.horizontal(|ui| {
-                        if phase.boss_object_type != 0 {
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                            draw_boss_sprite(
-                                ctx.sprite_renderer,
-                                ui,
-                                phase.boss_object_type,
-                                phase.shatters_hm,
-                                rect,
-                            );
-                        }
-                        if ui.add(egui::Button::new(header).frame(false)).clicked() {
-                            if expanded {
-                                self.expanded_phases.remove(&phase.id);
-                            } else {
-                                self.expanded_phases.insert(phase.id);
-                            }
-                        }
-                        if let Some(spirits) = phase_spirits {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             let (rect, _) = ui
                                 .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                            draw_spirit_sprite(
-                                ctx.sprite_renderer,
-                                ui,
-                                phase.boss_object_type == MV_UMI_TYPE,
-                                rect,
-                            );
-                            ui.label(format!("Spirits {spirits}"));
-                        }
-                        ui.label(fmt_duration(phase.duration_ms()));
-                        ui.label(RichText::new(state).color(scolor).small());
-                        // Kitsune Umi is an optional boss: a card she is the only
-                        // boss of still headlines on her, but she is never the
-                        // run's "Main".
-                        let show_main = Some(phase.id) == anchor_id
-                            && !am.is_treasure_crate(phase.boss_object_type)
-                            && phase.boss_object_type != MV_UMI_TYPE;
-                        if show_main {
+                            draw_spirit_sprite(ctx.sprite_renderer, ui, umi, rect);
+                            ui.label(RichText::new(text).color(Color32::GRAY))
+                                .hover_tip(tip);
+                        });
+                    }
+                    let enc_close_calls = enc.total_close_calls();
+                    if enc_close_calls > 0 {
+                        let cc_char_id = enc
+                            .phases
+                            .iter()
+                            .find_map(|p| (p.local_char_id != 0).then_some(p.local_char_id))
+                            .unwrap_or(0);
+                        // A dead character keeps its last-seen appearance from the
+                        // graveyard; for one missing from the cache entirely (e.g.
+                        // another account's) fall back to the local player's stored
+                        // roster appearance so the icon keeps its skin/dyes.
+                        let cc_vis =
+                            crate::panels::character_appearance(&ctx.account_data, cc_char_id)
+                                .or_else(|| {
+                                    enc.roster.iter().find(|p| p.is_local).and_then(|p| {
+                                        let icon_id = if p.skin_id > 0 {
+                                            p.skin_id
+                                        } else {
+                                            p.object_type
+                                        };
+                                        (icon_id != 0).then_some((icon_id, p.tex1, p.tex2))
+                                    })
+                                });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             ui.label(
-                                RichText::new("Main")
-                                    .color(Color32::from_rgb(0xff, 0xc1, 0x00))
-                                    .small()
-                                    .strong(),
-                            )
-                            .hover_tip("Main dungeon boss (shown in the HP bar above).");
-                        }
+                                RichText::new(format!("Close calls: {}", enc_close_calls))
+                                    .color(Color32::GRAY),
+                            );
+                            if let Some((icon, t1, t2)) = cc_vis {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(20.0, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                ctx.sprite_renderer
+                                    .draw_dyed_outlined_character_sprite_colored_outline(
+                                        ui,
+                                        icon,
+                                        rect,
+                                        8,
+                                        t1,
+                                        t2,
+                                        Some(Color32::from_rgba_unmultiplied(255, 0, 0, 128)),
+                                        Color32::from_rgb(255, 0, 0),
+                                    );
+                            }
+                        })
+                        .response
+                        .hover_tip(
+                            "Times you dropped to 20% HP or below during this run \
+                             (deaths included).",
+                        );
+                    }
+                    if visible_phases.len() > 1 {
+                        ui.label(
+                            RichText::new(format!("{} phases grouped", visible_phases.len()))
+                                .color(Color32::from_rgb(180, 150, 90))
+                                .small(),
+                        );
+                    }
+                    // Participants: finished / total. "Finished" means the player
+                    // was still present when the fight ended (did not nexus, move
+                    // out of range, or die).
+                    let finished = enc
+                        .roster
+                        .iter()
+                        .filter(|p| matches!(p.end_status, ParticipantEndStatus::Present))
+                        .count();
+                    let total = enc.roster.len();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        ui.label(RichText::new("Participants:").color(Color32::GRAY).small());
+                        ui.label(
+                            RichText::new(format!("{}", finished))
+                                .color(Color32::GRAY)
+                                .small(),
+                        )
+                        .hover_tip(
+                            "Players who finished the fight (were still present \
+                             when it ended).",
+                        );
+                        ui.label(RichText::new("/").color(Color32::GRAY).small());
+                        ui.label(
+                            RichText::new(format!("{}", total))
+                                .color(Color32::GRAY)
+                                .small(),
+                        )
+                        .hover_tip("Players who participated in the fight.");
                     });
-                    if expanded {
-                        ui.add_space(2.0);
-                        let loot_x = self.render_participant_table(
-                            ui,
-                            ctx,
-                            &phase.participants,
-                            &format!("phase_table_{}", phase.id),
-                            share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
-                            phase.killed,
-                            !enc.killed,
-                            phase.boss_object_type == O3_BOSS_TYPE,
-                            &mut player_click,
+                });
+            });
+
+            // The encounter's header -- icons, boss bar, run details, participants
+            // -- ends here, as it does on a single-fight card.
+            ui.add_space(6.0);
+            ctx.shadcn.full_width_separator(ui);
+            ui.add_space(4.0);
+
+            if self.show_performance {
+                // One foldable block per boss, under the header the Team Overview
+                // rows use. A run-wide aggregate mixed the phases into a total
+                // that reconciled with no single roster row.
+                let mut shown = false;
+                for phase in &visible_phases {
+                    if !phase.participants.iter().any(|p| p.is_local) {
+                        continue;
+                    }
+                    shown = true;
+                    self.render_boss_performance(ui, ctx, &enc, phase, anchor_id);
+                }
+                if !shown {
+                    // A phase can be hidden from the roster list while the run
+                    // still has a local row, so fall back to the run-wide view.
+                    if let Some(aggregate) = self.aggregated_performance_fight(&enc) {
+                        // The fallback is the run shown as one section, so it gets
+                        // the same single rounded box a one-boss card does.
+                        let width = section_divider_width(ui);
+                        clear_divider_rows(ui);
+                        let card = section_frame(ui).show(ui, |ui| {
+                            ui.set_min_width(width);
+                            self.render_my_performance(ui, ctx, &aggregate, width);
+                        });
+                        paint_divider_rows(ui, card.response.rect.shrink(CARD_PADDING));
+                    } else {
+                        ui.label(
+                            RichText::new("No local-player row was recorded for this run.")
+                                .color(Color32::GRAY),
                         );
-                        self.render_boss_loot(
-                            ui,
-                            ctx,
-                            &FightSelection::Encounter(run_id.to_string()),
-                            Some(phase.boss_object_type),
-                            loot_x,
-                        );
-                        ui.add_space(6.0);
                     }
                 }
-            });
+                return;
+            }
+
+            for phase in &visible_phases {
+                let expanded = self.expanded_phases.contains(&phase.id);
+                let arrow = if expanded { "▼" } else { "▶" };
+                // A killed grouped encounter means every constituent phase was
+                // cleared; transition bosses (e.g. Cult Hideout cultists) lock at
+                // a threshold and never trip the per-object kill rule, so surface
+                // them as Completed here rather than Escaped.
+                let (state, scolor) = if phase.killed || enc.killed {
+                    ("Completed", Color32::from_rgb(120, 200, 120))
+                } else {
+                    ("Escaped", Color32::GRAY)
+                };
+                let phase_name = match phase.aux_member_count {
+                    Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
+                    _ => phase.boss_name.clone(),
+                };
+                // An uncapped boss (Moonlight Village mechanics bosses) has no
+                // finite HP, so its row shows the party's total damage instead
+                // of an HP fraction. Its spirit tally is split out so the
+                // spirit sprite can precede the count.
+                let (phase_stats, phase_spirits) = boss_row_stats_parts(
+                    phase.boss_object_type,
+                    phase.boss_start_hp,
+                    phase.boss_max_hp,
+                    phase.total_damage(),
+                    phase.spirits,
+                );
+                let header = format!("{arrow}  {phase_name}   {phase_stats}");
+                ui.horizontal(|ui| {
+                    if phase.boss_object_type != 0 {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                        draw_boss_sprite(
+                            ctx.sprite_renderer,
+                            ui,
+                            phase.boss_object_type,
+                            phase.shatters_hm,
+                            rect,
+                        );
+                    }
+                    if ui.add(egui::Button::new(header).frame(false)).clicked() {
+                        if expanded {
+                            self.expanded_phases.remove(&phase.id);
+                        } else {
+                            self.expanded_phases.insert(phase.id);
+                        }
+                    }
+                    if let Some(spirits) = phase_spirits {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        draw_spirit_sprite(
+                            ctx.sprite_renderer,
+                            ui,
+                            phase.boss_object_type == MV_UMI_TYPE,
+                            rect,
+                        );
+                        ui.label(format!("Spirits {spirits}"));
+                    }
+                    ui.label(fmt_duration(phase.duration_ms()));
+                    ui.label(RichText::new(state).color(scolor).small());
+                    // Kitsune Umi is an optional boss: a card she is the only
+                    // boss of still headlines on her, but she is never the
+                    // run's "Main".
+                    let show_main = Some(phase.id) == anchor_id
+                        && !am.is_treasure_crate(phase.boss_object_type)
+                        && phase.boss_object_type != MV_UMI_TYPE;
+                    if show_main {
+                        ui.label(
+                            RichText::new("Main")
+                                .color(Color32::from_rgb(0xff, 0xc1, 0x00))
+                                .small()
+                                .strong(),
+                        )
+                        .hover_tip("Main dungeon boss (shown in the HP bar above).");
+                    }
+                });
+                if expanded {
+                    ui.add_space(2.0);
+                    let loot_x = self.render_participant_table(
+                        ui,
+                        ctx,
+                        &phase.participants,
+                        &format!("phase_table_{}", phase.id),
+                        share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
+                        phase.killed,
+                        // Scope the "you left" nexus marker to escaped *sections*
+                        // of an escaped run: a completed mini-boss like Beisa
+                        // must not read as nexused just because O3 was escaped,
+                        // and a completed run (whose aux section is never
+                        // "killed") must not flag at all.
+                        !enc.killed && !phase.killed,
+                        phase.boss_object_type == O3_BOSS_TYPE,
+                        &mut player_click,
+                    );
+                    self.render_boss_loot(
+                        ui,
+                        ctx,
+                        &FightSelection::Encounter(run_id.to_string()),
+                        Some(phase.boss_object_type),
+                        loot_x,
+                    );
+                    ui.add_space(6.0);
+                }
+            }
+        });
+        self.detail_scroll_offset = scroll_out.state.offset.y;
         if let Some((name, icon, tex1, tex2)) = player_click {
             self.apply_player_click(name, icon, tex1, tex2);
         }
@@ -3970,10 +5679,389 @@ fn assign_drops_exclusive(
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_drops_exclusive, boss_bar_label, boss_row_hp_label, boss_row_stats_parts,
-        dungeon_display_name, share_hp_pool, spirit_total_label, RunModes,
+        assign_drops_exclusive, boost_source_with, boss_bar_label, boss_row_hp_label,
+        boss_row_stats_parts, condensed_boosts, dungeon_display_name, fight_ritual_id,
+        share_hp_pool, spirit_total_label, BoostIcon, RunModes, SourceOracle,
     };
     use realmhound_core::assets::get_dungeon_portal_map;
+    use realmhound_core::combat::BoostWindow;
+
+    #[test]
+    fn a_fight_names_the_ritual_tier_it_was_fought_under() {
+        // The tier is part of the fight's own record, so the card can render the
+        // ritual a fight was fought under even after the character has switched it
+        // off -- which clears the character's own recorded tier.
+        let with_tier = [boost(
+            "Blood Ritual",
+            0,
+            1,
+            0,
+            5_000,
+            "character state:tier-a",
+        )];
+        assert_eq!(fight_ritual_id(&with_tier), Some("tier-a"));
+        // A fight recorded before the tier was stored carries the plain source, so
+        // the card shows no ritual rather than inventing one.
+        let legacy = [boost("Blood Ritual", 0, 1, 0, 5_000, "character state")];
+        assert_eq!(fight_ritual_id(&legacy), None);
+        // No window, or one that only fell: nothing was on.
+        assert_eq!(fight_ritual_id(&[]), None);
+        let falling = [boost("Blood Ritual", 1, 0, 0, 5_000, "expired")];
+        assert_eq!(fight_ritual_id(&falling), None);
+    }
+
+    /// A rising boost window, the shape the tracker records for a buff landing.
+    fn boost(stat: &str, from: i32, to: i32, start: i64, end: i64, source: &str) -> BoostWindow {
+        boost_item(stat, from, to, start, end, source, None)
+    }
+
+    /// The same, with the resolved source item the tracker records alongside a
+    /// named source (used for the effect icon).
+    fn boost_item(
+        stat: &str,
+        from: i32,
+        to: i32,
+        start: i64,
+        end: i64,
+        source: &str,
+        source_item: Option<i32>,
+    ) -> BoostWindow {
+        BoostWindow {
+            start_offset_ms: start,
+            end_offset_ms: end,
+            stat: stat.to_string(),
+            from,
+            to,
+            source: source.to_string(),
+            source_item,
+        }
+    }
+
+    #[test]
+    fn repeated_boosts_from_one_source_condense_into_a_single_row() {
+        // A gear proc that lands every few seconds writes a row per occurrence; the
+        // table must show one row for it with the durations summed.
+        let boosts = [
+            boost(
+                "Attack",
+                61,
+                69,
+                0,
+                6_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+            boost(
+                "Attack",
+                61,
+                69,
+                28_000,
+                34_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+            boost(
+                "Attack",
+                61,
+                69,
+                60_000,
+                66_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+        ];
+        let rows = condensed_boosts(&boosts);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effect, "ATT ↑");
+        assert_eq!(rows[0].amount(), "+8");
+        assert_eq!(rows[0].duration_ms, 18_000);
+        assert_eq!(rows[0].source, "Ally buff");
+    }
+
+    #[test]
+    fn the_recorded_source_item_drives_the_icon_not_its_name() {
+        // The tracker stores the exact item id next to the source, so the icon can
+        // never drift to the shiny variant of an item the player never used -- the
+        // display-name lookup is shared by both variants.
+        let boosts = [boost_item(
+            "Speed",
+            54,
+            59,
+            0,
+            5_000,
+            "Beryl Treat",
+            Some(0x45E6),
+        )];
+        let rows = condensed_boosts(&boosts);
+        assert_eq!(rows[0].source, "Beryl Treat");
+        assert!(matches!(rows[0].icon, BoostIcon::Item(0x45E6)));
+    }
+
+    #[test]
+    fn unexplained_sources_are_named_for_what_they_are() {
+        // A rise nothing local explains is an ally's aura -- except Weak, which
+        // monsters apply. A gear proc keeps the enchantment and item it came from.
+        let boosts = [
+            boost("Damaging", 0, 1, 0, 60_000, "Ally buff"),
+            boost("Weak", 0, 1, 5_000, 23_000, "Enemy debuff"),
+            boost(
+                "Attack",
+                61,
+                69,
+                0,
+                29_000,
+                "Attack Boost IV (Staff of The Vital Unity proc)",
+            ),
+        ];
+        let rows = condensed_boosts(&boosts);
+        assert_eq!(rows[0].source, "Ally buff");
+        assert_eq!(rows[1].source, "Enemy debuff");
+        assert_eq!(
+            rows[2].source,
+            "Attack Boost IV (Staff of The Vital Unity proc)"
+        );
+    }
+
+    #[test]
+    fn one_source_per_row_and_a_varying_amount_reads_as_a_range() {
+        // The same stat from two different sources stays two rows: they are
+        // separate effects even though the stat is the same.
+        let boosts = [
+            boost(
+                "Defense",
+                42,
+                47,
+                0,
+                57_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+            boost(
+                "Defense",
+                47,
+                57,
+                59_000,
+                150_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+            boost(
+                "Attack",
+                61,
+                69,
+                0,
+                5_000,
+                "consumable (Sporous Spray Spell) [inferred]",
+            ),
+        ];
+        let rows = condensed_boosts(&boosts);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].effect, "DEF ↑");
+        // 5 then 10: shown as the range the proc spanned, not two rows.
+        assert_eq!(rows[0].amount(), "+5…+10");
+        assert_eq!(rows[1].source, "Sporous Spray Spell");
+    }
+
+    #[test]
+    fn the_boost_companion_stat_does_not_double_a_base_stat_row() {
+        // `ATT boost` (stat 48) moves with `Attack` for the same event, so it must
+        // not add a second row -- nor a second contribution to the held time.
+        let boosts = [
+            boost(
+                "Attack",
+                61,
+                69,
+                0,
+                5_000,
+                "consumable (Sporous Spray Spell) [inferred]",
+            ),
+            boost(
+                "ATT boost",
+                1,
+                9,
+                0,
+                5_000,
+                "consumable (Sporous Spray Spell) [inferred]",
+            ),
+        ];
+        let rows = condensed_boosts(&boosts);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effect, "ATT ↑");
+        assert_eq!(rows[0].duration_ms, 5_000);
+        // On its own (the base stat did not move) it still surfaces.
+        let lone = [boost(
+            "ATT boost",
+            1,
+            9,
+            0,
+            5_000,
+            "external (ally buff, pet, or status) [inferred]",
+        )];
+        let rows = condensed_boosts(&lone);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effect, "ATT boost ↑");
+        assert_eq!(rows[0].amount(), "+8");
+    }
+
+    #[test]
+    fn condition_boosts_show_their_damage_multiplier() {
+        let boosts = [
+            boost(
+                "Damaging",
+                0,
+                1,
+                0,
+                40_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+            boost(
+                "Damaging",
+                0,
+                1,
+                124_000,
+                140_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+            boost(
+                "Weak",
+                0,
+                1,
+                6_000,
+                8_000,
+                "external (ally buff, pet, or status) [inferred]",
+            ),
+            boost(
+                "Invisible",
+                0,
+                1,
+                228_000,
+                228_000,
+                "consumable (Beryl Treat) [inferred]",
+            ),
+        ];
+        let rows = condensed_boosts(&boosts);
+        assert_eq!(
+            rows.len(),
+            2,
+            "the zero-duration phantom condition is dropped"
+        );
+        assert_eq!(rows[0].effect, "Damaging");
+        assert_eq!(rows[0].amount(), "×1.25");
+        assert_eq!(rows[0].duration_ms, 56_000);
+        assert_eq!(rows[1].amount(), "×0.5");
+        assert_eq!(rows[1].source, "Enemy debuff");
+        assert!(
+            rows.iter().all(|r| r.effect != "Invisible"),
+            "a condition held for no time is a mask artifact, not a buff"
+        );
+    }
+
+    /// Stands in for the game data, which is not on disk in tests.
+    struct FixtureOracle;
+
+    impl SourceOracle for FixtureOracle {
+        fn id_for_name(&self, name: &str) -> Option<i32> {
+            match name {
+                "Sporous Spray Spell" => Some(0x0BE7),
+                "Beryl Treat" => Some(0x45E6),
+                _ => None,
+            }
+        }
+
+        fn declares(&self, item: i32, stat: &str) -> bool {
+            match item {
+                // A spell deals nova damage; it declares no Attack.
+                0x0BE7 => false,
+                // Beryl Treat raises Speed for 300s and applies no condition.
+                0x45E6 => stat == "Speed",
+                _ => true,
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_source_the_item_cannot_cause_is_relabelled() {
+        // Rows written by an older build name whatever the player had just used,
+        // which is how a spell came to own an Attack boost, and a treat drunk near
+        // a teammate's Paladin came to own a Damaging one.
+        let oracle = FixtureOracle;
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Sporous Spray Spell) [inferred]",
+                None,
+                "Attack",
+            ),
+            ("Ally buff".to_string(), None)
+        );
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Beryl Treat) [inferred]",
+                None,
+                "Damaging",
+            ),
+            ("Ally buff".to_string(), None)
+        );
+        // A hex-only row is re-checked the same way.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "local item use (0x0BE7) [inferred]",
+                None,
+                "Attack"
+            ),
+            ("Ally buff".to_string(), None)
+        );
+        // Weak is applied by monsters, and both wordings read the same.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                // Stored form: commas become spaces when the row is written.
+                "external (ally buff  pet  or status) [inferred]",
+                None,
+                "Weak",
+            ),
+            ("Enemy debuff".to_string(), None)
+        );
+        // A source the item does declare is kept exactly as recorded.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Beryl Treat) [inferred]",
+                None,
+                "Speed",
+            ),
+            ("Beryl Treat".to_string(), Some(0x45E6))
+        );
+        // An id recorded on the window was checked when the fight was written, and
+        // a gear proc names an item that need not declare the boost itself, so
+        // those rows are trusted as they stand.
+        assert_eq!(
+            boost_source_with(
+                &oracle,
+                "consumable (Sporous Spray Spell) [inferred]",
+                Some(0x0BE7),
+                "Attack",
+            ),
+            ("Sporous Spray Spell".to_string(), Some(0x0BE7))
+        );
+    }
+
+    #[test]
+    fn closing_transitions_are_not_listed_as_their_own_boost() {
+        // A buff's expiry is a falling window; listing it would double every row.
+        let boosts = [
+            boost(
+                "Speed",
+                54,
+                59,
+                0,
+                30_000,
+                "consumable (Beryl Treat) [inferred]",
+            ),
+            boost("Speed", 59, 54, 30_000, 40_000, "expired"),
+        ];
+        let rows = condensed_boosts(&boosts);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effect, "SPD ↑");
+        assert_eq!(rows[0].duration_ms, 30_000);
+    }
 
     #[test]
     fn mv_boss_rows_split_out_the_spirit_tally() {
@@ -4174,5 +6262,188 @@ mod tests {
         let candidates = [(0usize, 5i64, bag_ts), (1usize, 5i64, bag_ts)];
         let chosen = assign_drops_exclusive(&windows, &candidates);
         assert_eq!(chosen.get(&5), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod my_performance_summons_tests {
+    use super::{group_summons, summon_source_labels};
+    use realmhound_core::combat::SummonContribution;
+
+    fn summon(object_id: i32, object_type: i32, damage: i64, hits: u64) -> SummonContribution {
+        SummonContribution {
+            object_id,
+            pet_type: 0,
+            is_pet: false,
+            object_type,
+            source_item: 0,
+            source_enchants: Vec::new(),
+            damage,
+            hits,
+        }
+    }
+
+    fn pet(object_id: i32, pet_type: i32, damage: i64, hits: u64) -> SummonContribution {
+        SummonContribution {
+            object_id,
+            pet_type,
+            is_pet: true,
+            object_type: 0,
+            source_item: 0,
+            source_enchants: Vec::new(),
+            damage,
+            hits,
+        }
+    }
+
+    /// A Summoner mace spawns a fresh Bear per use, so the table must not list one
+    /// row per instance: the split that matters is between entity types.
+    #[test]
+    fn summons_group_by_entity_type_and_sum_their_instances() {
+        let rows = vec![
+            summon(157, 0x89b1, 3110, 8),
+            summon(158, 0x89b1, 2678, 7),
+            summon(159, 0x89b1, 1967, 5),
+            summon(160, 0x2222, 4530, 15),
+            summon(161, 0x2222, 4042, 14),
+            summon(162, 0x3333, 1110, 3),
+        ];
+        let grouped = group_summons(&rows);
+        assert_eq!(grouped.len(), 3, "three entity types");
+        // Highest combined damage first, matching the per-instance order.
+        assert_eq!(grouped[0].object_type, 0x2222);
+        assert_eq!(grouped[0].damage, 8572);
+        assert_eq!(grouped[0].hits, 29);
+        assert_eq!(grouped[1].object_type, 0x89b1);
+        assert_eq!(grouped[1].damage, 7755);
+        assert_eq!(grouped[1].hits, 20);
+        assert_eq!(grouped[2].object_type, 0x3333);
+        assert_eq!(grouped[2].damage, 1110);
+    }
+
+    /// Pets are named by their skin, so two pets of the same skin are one row, and
+    /// a pet never merges with a summon whose object type happens to be zero.
+    #[test]
+    fn pets_group_by_skin_and_stay_apart_from_unknown_summons() {
+        let rows = vec![
+            pet(201, 12_345, 300, 10),
+            pet(202, 12_345, 200, 5),
+            pet(203, 999, 50, 2),
+            summon(301, 0, 400, 8),
+            summon(302, 0, 100, 2),
+        ];
+        let grouped = group_summons(&rows);
+        assert_eq!(
+            grouped.len(),
+            3,
+            "skin 12345, skin 999, and the unknown summon"
+        );
+        assert_eq!(grouped[0].is_pet, true);
+        assert_eq!(grouped[0].pet_type, 12_345);
+        assert_eq!(grouped[0].damage, 500);
+        assert_eq!(grouped[0].hits, 15);
+        // Rows recorded before the type was stored carry 0 and collapse into the
+        // single generic row they were already labelled with.
+        let unknown = grouped.iter().find(|g| !g.is_pet).unwrap();
+        assert_eq!(unknown.object_type, 0);
+        assert_eq!(unknown.damage, 500);
+        assert_eq!(unknown.hits, 10);
+    }
+
+    /// One creature, two items: a `Summon Bear` resolved to the Sovereign Mace in
+    /// one phase and to its `(SB)` twin in another must not merge into a row that
+    /// claims both, and the same item with different enchants is two rows of its
+    /// own -- while the same item and enchants still collapse.
+    #[test]
+    fn summons_split_by_the_item_that_created_them() {
+        let mut first = summon(157, 0x89b1, 3110, 8);
+        first.source_item = 0x3849;
+        first.source_enchants = vec![338];
+        let mut second = summon(158, 0x89b1, 2678, 7);
+        second.source_item = 0x9581;
+        second.source_enchants = vec![338];
+        let mut third = summon(159, 0x89b1, 1967, 5);
+        third.source_item = 0x3849;
+        third.source_enchants = vec![];
+        let mut fourth = summon(160, 0x89b1, 900, 3);
+        fourth.source_item = 0x3849;
+        fourth.source_enchants = vec![338];
+        let grouped = group_summons(&[first, second, third, fourth]);
+        assert_eq!(grouped.len(), 3, "two items and two enchant sets");
+        // The mace with enchant 338 owns both of its instances.
+        let mace = grouped
+            .iter()
+            .find(|g| g.source_item == 0x3849 && g.source_enchants == vec![338])
+            .expect("the enchanted mace row");
+        assert_eq!(mace.damage, 4010);
+        assert_eq!(mace.hits, 11);
+        // The same item with no enchants is its own row.
+        assert!(grouped
+            .iter()
+            .any(|g| g.source_item == 0x3849 && g.source_enchants.is_empty() && g.hits == 5));
+        // The twin never absorbs the mace's damage, and vice versa.
+        assert!(grouped
+            .iter()
+            .any(|g| g.source_item == 0x9581 && g.damage == 2678));
+    }
+
+    /// One name covering several item types -- an item with its `(SB)` or shiny
+    /// variants -- reads as one source, which is what makes "from Sovereign Mace"
+    /// possible instead of "from 2 items".
+    #[test]
+    fn sources_deduplicate_by_item_name() {
+        let sources = vec![
+            realmhound_core::assets::SummonSource {
+                item_type: 0x3849,
+                item_name: "Sovereign Mace".into(),
+                trigger: realmhound_core::assets::SummonTrigger::Use,
+                chance: 1.0,
+                deals_damage: true,
+                lifetime_ms: 0,
+            },
+            realmhound_core::assets::SummonSource {
+                item_type: 0x9581,
+                item_name: "Sovereign Mace".into(),
+                trigger: realmhound_core::assets::SummonTrigger::Use,
+                chance: 1.0,
+                deals_damage: true,
+                lifetime_ms: 0,
+            },
+        ];
+        let (names, tooltip) = summon_source_labels(&sources);
+        assert_eq!(names, vec!["Sovereign Mace".to_string()]);
+        assert_eq!(tooltip, "Summoned by Sovereign Mace (on use)");
+
+        // A chance-based proc says so, and several unrelated items list.
+        let sources = vec![
+            realmhound_core::assets::SummonSource {
+                item_type: 0x6102,
+                item_name: "Soul's Guidance".into(),
+                trigger: realmhound_core::assets::SummonTrigger::OnShoot,
+                chance: 0.15,
+                deals_damage: false,
+                lifetime_ms: 0,
+            },
+            realmhound_core::assets::SummonSource {
+                item_type: 0x8114,
+                item_name: "Yarn Ball".into(),
+                trigger: realmhound_core::assets::SummonTrigger::Use,
+                chance: 1.0,
+                deals_damage: false,
+                lifetime_ms: 0,
+            },
+        ];
+        let (names, tooltip) = summon_source_labels(&sources);
+        assert_eq!(names.len(), 2);
+        assert!(
+            tooltip.contains("Soul's Guidance (on shoot, 15% chance)"),
+            "{tooltip}"
+        );
+        assert!(tooltip.contains("Yarn Ball (on use)"), "{tooltip}");
+
+        // Nothing declares the creature: no suffix, no hover.
+        let (names, tooltip) = summon_source_labels(&[]);
+        assert!(names.is_empty());
+        assert!(tooltip.is_empty());
     }
 }

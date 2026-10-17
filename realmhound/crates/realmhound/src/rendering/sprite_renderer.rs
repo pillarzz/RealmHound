@@ -1129,6 +1129,22 @@ impl SpriteRenderer {
                 TabIconSprite::Embedded(embedded) => {
                     self.draw_outlined_embedded_icon(ui, embedded, icon_rect)
                 }
+                TabIconSprite::Character {
+                    sprite_id,
+                    tex1,
+                    tex2,
+                } => self
+                    .draw_dyed_outlined_character_sprite(ui, sprite_id, icon_rect, 6, tex1, tex2),
+                TabIconSprite::Text(glyph) => {
+                    ui.painter().text(
+                        icon_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        glyph,
+                        egui::FontId::proportional(TAB_ICON_SIZE * 0.78),
+                        Color32::WHITE,
+                    );
+                    true
+                }
             };
 
             // Fallback: draw a placeholder if icon failed
@@ -1176,6 +1192,21 @@ impl SpriteRenderer {
                 self.draw_sprite_by_sheet(ui, sheet, index, rect)
             }
             TabIconSprite::Embedded(embedded) => self.draw_embedded_icon(ui, embedded, rect),
+            TabIconSprite::Character {
+                sprite_id,
+                tex1,
+                tex2,
+            } => self.draw_dyed_outlined_character_sprite(ui, sprite_id, rect, 6, tex1, tex2),
+            TabIconSprite::Text(glyph) => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    glyph,
+                    egui::FontId::proportional(TAB_ICON_SIZE * 0.78),
+                    Color32::WHITE,
+                );
+                true
+            }
         };
 
         // Fallback: draw a placeholder if icon failed

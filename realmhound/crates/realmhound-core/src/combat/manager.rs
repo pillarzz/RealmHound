@@ -202,6 +202,13 @@ impl CombatManager {
         &self.tracker
     }
 
+    /// Access the underlying engine mutably, for state the manager itself does not
+    /// route (a Blood Ritual or Crucible switch, which the API reports rather than
+    /// the wire).
+    pub fn tracker_mut(&mut self) -> &mut CombatTracker {
+        &mut self.tracker
+    }
+
     /// Drain the lifetime close-call counter accumulated in the tracker since the
     /// last call.
     pub fn take_pending_close_calls(&mut self) -> u32 {
@@ -244,6 +251,20 @@ impl CombatManager {
     /// Local player loaded into a map.
     pub fn on_player_loaded(&mut self, object_id: i32, char_id: i32) {
         self.tracker.on_player_loaded(object_id, char_id);
+    }
+
+    /// Set the local player's shot damage multipliers (exaltation mastery x the
+    /// seasonal Crucible/Blood Ritual multipliers). The app resolves them from
+    /// the character's data and must push them on character load and whenever
+    /// the mastery or the seasonal definitions change, because they never appear
+    /// in the packet stream the combat engine reads.
+    pub fn set_shot_damage_bonus(&mut self, bonus: crate::stats::derived::ShotDamageBonus) {
+        self.tracker.set_shot_damage_bonus(bonus);
+    }
+
+    /// The shot damage multipliers currently applied to self-computed shots.
+    pub fn shot_damage_bonus(&self) -> crate::stats::derived::ShotDamageBonus {
+        self.tracker.shot_damage_bonus()
     }
 
     /// Entered a new map.
@@ -291,7 +312,14 @@ impl CombatManager {
         }
         let proves_kill = mob_type > 0
             && (crate::loot::bag_has_boss_mark(item_ids)
-                || crate::assets::bag_proves_boss_killed(mob_type));
+                || crate::assets::bag_proves_boss_killed(mob_type)
+                // A boss's own bag proves it died even without a Mark: the bag is
+                // attributed to the entity the local player hit that left the map
+                // nearest it, which is that boss's death (see
+                // `AssetManager::bag_attribution_proves_kill`). Bosses killed out of
+                // sight are exactly the case: their fight is suspended as a despawn
+                // and stored Escaped, with the bag as the only proof of the kill.
+                || crate::assets::get_asset_manager().bag_attribution_proves_kill(mob_type));
         if proves_kill {
             self.pending_kill_proofs
                 .insert((map_seed, mob_type, time_ms));
@@ -443,11 +471,12 @@ impl CombatManager {
         self.flush_dungeon_timer(time_ms);
     }
 
-    /// A remote player died, parsed from the server death-broadcast text. Buffers
-    /// the death by name so the finalizing fight marks that participant as dead
-    /// even when their gravestone couldn't be position-correlated.
-    pub fn on_remote_death(&mut self, player_name: &str, time_ms: i64) {
-        self.tracker.on_remote_death(player_name, time_ms);
+    /// A remote player died, parsed from the server death broadcast (`s.death`).
+    /// Buffers the death by name so the finalizing fight marks that participant as
+    /// dead even when their gravestone couldn't be position-correlated; the raw
+    /// broadcast is persisted on the next tick (see `persist_death_broadcasts`).
+    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
+        self.tracker.on_remote_death(player_name, killer, time_ms);
     }
 
     /// Incoming `DamagePacket`: `attacker_id` dealt `amount` to `target_id`.
@@ -550,6 +579,7 @@ impl CombatManager {
     pub fn on_tick(&mut self, time_ms: i64) {
         #[cfg(feature = "latency-diagnostics")]
         let started = std::time::Instant::now();
+        self.persist_death_broadcasts();
         let finished = self.tracker.on_tick(time_ms);
         #[cfg(feature = "latency-diagnostics")]
         let fight_count = finished.len();
@@ -571,6 +601,43 @@ impl CombatManager {
                     participant_count
                 );
             }
+        }
+    }
+
+    /// Persist the death broadcasts observed since the last tick, then apply them
+    /// to already-stored fights.
+    ///
+    /// A broadcast can arrive after the fight containing the death was written:
+    /// concurrent phases are recorded up to a few hundred ms apart, so a burst of
+    /// deaths at the end of a clear can be announced in that gap. The repair pass
+    /// corrects those rows, and running it per drain also keeps the live session
+    /// consistent without waiting for a restart.
+    fn persist_death_broadcasts(&mut self) {
+        // Broadcasts stay queued while no database is open so nothing is lost
+        // before the account's history is available.
+        let Some(db) = self.database.as_mut() else {
+            return;
+        };
+        let pending = self.tracker.take_pending_death_broadcasts();
+        if pending.is_empty() {
+            return;
+        }
+        for broadcast in &pending {
+            if let Err(e) =
+                db.insert_death_broadcast(&broadcast.player, &broadcast.killer, broadcast.time)
+            {
+                tracing::error!("[COMBAT] Failed to persist death broadcast: {}", e);
+                return;
+            }
+        }
+        match db.repair_remote_deaths() {
+            Ok(0) => {}
+            Ok(repaired) => tracing::info!(
+                "[COMBAT] Applied {} stored death broadcast(s), repaired {} participant(s)",
+                pending.len(),
+                repaired
+            ),
+            Err(e) => tracing::error!("[COMBAT] Failed to repair remote deaths: {}", e),
         }
     }
 
@@ -688,6 +755,7 @@ impl CombatManager {
 mod tests {
     use super::super::types::{DamageProvenance, FightParticipant};
     use super::*;
+    use crate::combat::ParticipantEndStatus;
 
     fn fight(dungeon: &str, boss: &str, solo: bool) -> CompletedFight {
         let mut participants = vec![FightParticipant {
@@ -707,9 +775,16 @@ mod tests {
             pet: None,
             damage_taken: None,
             damage_taken_provenance: super::super::types::DamageTakenProvenance::Observed,
+            damage_taken_hits: None,
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
         }];
         if !solo {
             participants.push(FightParticipant {
@@ -729,9 +804,16 @@ mod tests {
                 pet: None,
                 damage_taken: None,
                 damage_taken_provenance: super::super::types::DamageTakenProvenance::Observed,
+                damage_taken_hits: None,
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
             });
         }
         CompletedFight {
@@ -759,6 +841,9 @@ mod tests {
             spectral_hm: false,
             shatters_hm: false,
             participants,
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 
@@ -912,6 +997,86 @@ mod tests {
                 .filter(|f| f.map_seed == 0)
                 .all(|f| !f.killed),
             "a bag outside an instance completes nothing"
+        );
+    }
+
+    /// A bag attributed to the boss itself proves the kill even when it holds no
+    /// Mark: the fight of a boss killed out of sight is suspended as a despawn and
+    /// stored Escaped, so the bag is the only evidence it ever died.
+    #[test]
+    fn a_boss_bag_without_a_mark_completes_its_escaped_fight() {
+        const CWF: i32 = 22_138;
+        let assets = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        let _ = assets.try_load();
+        if !assets.bag_attribution_proves_kill(CWF) {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+        let mut escaped = fight("Realm", "Crystal Worm Father", false);
+        escaped.map_seed = 42;
+        escaped.boss_object_type = CWF;
+        escaped.killed = false;
+        escaped.reached_zero = false;
+        escaped.started_at = 1_000;
+        escaped.ended_at = 61_000;
+        m.persist(vec![escaped]);
+
+        // The bag lands with an ordinary potion in it: nothing here is a Mark.
+        m.on_boss_loot(CWF, 42, 65_000, &[2_593]);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(
+            fights[0].killed,
+            "a bag attributed to the boss completes the fight it proves was killed"
+        );
+    }
+
+    /// A death broadcast that arrives after the fight containing the death was
+    /// written must still land on the stored participant: a burst of deaths at the
+    /// end of a clear is announced up to a few hundred ms after a concurrent phase
+    /// was already persisted, which used to leave those deaths recorded as nexuses.
+    #[test]
+    fn a_late_death_broadcast_repairs_the_stored_fight() {
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+        let mut f = fight("Oryx's Sanctuary", "Oryx the Mad God", false);
+        f.map_seed = 42;
+        f.started_at = 1_000_000;
+        f.ended_at = 1_060_000;
+        for p in &mut f.participants {
+            if !p.is_local {
+                p.end_status = ParticipantEndStatus::Nexused;
+            }
+        }
+        m.persist(vec![f]);
+        let id = m.database.as_ref().unwrap().recent_fights(1).unwrap()[0].id;
+
+        // The broadcast for a death inside the fight's window lands afterwards.
+        m.on_remote_death("Ally", "Oryx the Mad God", 1_030_000);
+        m.on_tick(1_040_000);
+
+        let record = m
+            .database
+            .as_ref()
+            .unwrap()
+            .fight_detail(id)
+            .unwrap()
+            .unwrap();
+        let ally = record
+            .participants
+            .iter()
+            .find(|p| p.name == "Ally")
+            .unwrap();
+        assert_eq!(
+            ally.end_status,
+            ParticipantEndStatus::Died { grave_type: 0 },
+            "the stored row is corrected from the broadcast"
         );
     }
 

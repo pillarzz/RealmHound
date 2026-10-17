@@ -7,12 +7,70 @@
 //! "theoretical" -- they assume out-of-combat regen and, unless a target
 //! defense is supplied, a defenseless target with every projectile landing.
 
+use crate::api::blood_ritual::BloodRitualDef;
 use crate::api::crucible::CrucibleDef;
 use crate::assets::{
     AbilityEffect, AssetManager, EnchantEffectKind, ProcEffect, ProcTrigger, ScalingStat,
     StatBonuses, StatKind,
 };
 use crate::combat::damage::damage_with_defense;
+
+/// The damage multipliers the game applies to a *rolled weapon shot* on top of
+/// the Attack stat: the class mastery earned from exaltations, and the season's
+/// challenge multipliers (the Crucible's damage bonus times the active Blood
+/// Ritual tier's).
+///
+/// These are not part of the packet stream, so both consumers have to be handed
+/// them: the theoretical DPS readout on the character page, and the live combat
+/// engine that reconstructs the player's own damage. They share
+/// [`shot_damage_bonus`] so the two cannot disagree -- which they did once: the
+/// page folded a +24% Blood Ritual and the mastery in while Combat History
+/// credited the raw roll, and every staff hit in a fight came out ~20% low.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShotDamageBonus {
+    /// `1 + mastery_dmg_pct / 100`: the Exaltation Mastery weapon-damage bonus.
+    pub mastery: f32,
+    /// Crucible damage multiplier times the Blood Ritual tier's (1.0 when
+    /// neither is active, so it is a no-op by default).
+    pub challenge: f32,
+}
+
+impl Default for ShotDamageBonus {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl ShotDamageBonus {
+    /// No multiplier at all: what an unknown character (or a pre-season one)
+    /// gets, and the neutral default for the combat engine.
+    pub fn none() -> Self {
+        Self {
+            mastery: 1.0,
+            challenge: 1.0,
+        }
+    }
+
+    /// Both factors together, as the single multiplier the shot's rolled range
+    /// is scaled by.
+    pub fn total(&self) -> f32 {
+        self.mastery * self.challenge
+    }
+}
+
+/// Resolve the shot damage multipliers from the character's mastery percentage
+/// and the seasonal definitions that apply to them.
+pub fn shot_damage_bonus(
+    mastery_dmg_pct: f32,
+    crucible: Option<&CrucibleDef>,
+    blood_ritual: Option<&BloodRitualDef>,
+) -> ShotDamageBonus {
+    ShotDamageBonus {
+        mastery: 1.0 + mastery_dmg_pct / 100.0,
+        challenge: crucible.map(|c| c.damage_mult).unwrap_or(1.0)
+            * blood_ritual.map(|r| r.damage_mult).unwrap_or(1.0),
+    }
+}
 
 /// The eight base character stats (leveled/pot stats, WITHOUT gear or enchants).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -52,19 +110,28 @@ pub struct Attribute {
     pub exalt: i32,
     /// Crucible flat stat modifier (integer per-stat), if crucible-active.
     pub crucible: i32,
+    /// Blood Ritual max-HP modifier (integer), if a ritual tier is active. Kept
+    /// separate from `crucible` so the readout can show each challenge's own
+    /// contribution.
+    pub blood_ritual: i32,
 }
 
 impl Attribute {
     /// Effective total. The relative-stat halving (e.g. Wretched Rags) can yield
     /// a `.5` fraction; the game rounds to nearest for display, so we do too.
     pub fn total(&self) -> i32 {
-        (self.base as f32 + self.gear + self.exalt as f32 + self.crucible as f32).round() as i32
+        (self.base as f32
+            + self.gear
+            + self.exalt as f32
+            + self.crucible as f32
+            + self.blood_ritual as f32)
+            .round() as i32
     }
 
     /// Gear bonus for display, derived so that `base + this + exalt + crucible
     /// == total()` (avoids a rounded gear bracket contradicting the total).
     pub fn gear_display(&self) -> i32 {
-        self.total() - self.base - self.exalt - self.crucible
+        self.total() - self.base - self.exalt - self.crucible - self.blood_ritual
     }
 }
 
@@ -129,7 +196,8 @@ pub struct PetAbilityContribution {
 pub struct WeaponProcReadout {
     /// Effect label (e.g. "Poison").
     pub label: &'static str,
-    /// Damage delivered per activation (grand total for poison: impact + DoT).
+    /// Damage delivered per activation (grand total for poison: impact + DoT; for
+    /// a ranged proc, the mean hit).
     pub damage_per_proc: i32,
     /// Cooldown between activations in seconds (0 = every trigger).
     pub cooldown: f32,
@@ -139,13 +207,33 @@ pub struct WeaponProcReadout {
     pub activations_per_sec: f32,
     /// DPS contribution (`damage_per_proc * activations_per_sec`).
     pub dps: f32,
-    /// Whether this proc ignores target defense (poison does).
+    /// Whether this proc ignores target defense (poison and bleeding do).
     pub armor_piercing: bool,
+    /// Per-activation damage range, used to apply target defense when the proc is
+    /// not armor-piercing. Equal values mean a fixed-damage proc. For a continuous
+    /// proc this is the per-second drain of a single stack.
+    pub min_damage: i32,
+    pub max_damage: i32,
     /// Whether this is a continuously-maintained DoT (e.g. Bleeding) rather than
     /// a discrete per-activation proc. When true, `damage_per_proc` is the
     /// per-second drain of a single stack and `activations_per_sec` is the
     /// steady-state number of concurrent stacks maintained under sustained fire.
     pub continuous: bool,
+}
+
+impl WeaponProcReadout {
+    /// This proc's DPS against a target with `target_def` defense.
+    ///
+    /// Armor-piercing procs (poison, bleeding) are defense-independent. Every
+    /// other proc is an ordinary projectile, so it takes the same per-roll defense
+    /// formula as a weapon hit, averaged over its damage range.
+    pub fn dps_vs(&self, target_def: i32) -> f32 {
+        if self.armor_piercing {
+            return self.dps;
+        }
+        avg_hit_with_defense(self.min_damage, self.max_damage, 1.0, false, target_def)
+            * self.activations_per_sec
+    }
 }
 
 /// Weapon damage/DPS breakdown at a defenseless target (baseline). Apply a
@@ -176,12 +264,27 @@ pub struct WeaponDamage {
     /// Exaltation Mastery weapon-damage bonus, in percent (0-10). Already folded
     /// into `min_damage`/`max_damage` and DPS; retained for display.
     pub mastery_pct: f32,
+    /// Combined seasonal challenge multiplier (Crucible damage bonus x Blood
+    /// Ritual tier damage bonus/penalty); 1.0 when neither is active. Already
+    /// folded into the damage figures, retained so the readout can attribute it.
+    pub challenge_mult: f32,
+    /// The Blood Ritual's own share of `challenge_mult`, in percent: negative on
+    /// the penalty tiers and 0.0 when no tier applies. Kept apart from the
+    /// combined multiplier so the readout can name the source.
+    pub blood_ritual_pct: f32,
+    /// Exaltation bonus damage (stat 113) as a percentage of a weapon's rolled
+    /// damage -- the exaltation axis that scales the shot rather than the stat,
+    /// so it is named in the damage readout alongside enchant and mastery.
+    pub exalt_damage_pct: f32,
     /// Native on-shoot/on-hit procs contributing to DPS (e.g. poison bursts),
     /// resolved at the current effective stats. Empty when the weapon has none.
     pub procs: Vec<WeaponProcReadout>,
-    /// Aggregate DPS from armor-piercing procs (currently all parsed procs are
-    /// poison, which ignores defense). Folded into `dps` and `dps_vs`.
+    /// Aggregate DPS from all procs, at a defenseless target. Folded into `dps`;
+    /// `dps_vs` re-evaluates each proc with the target's defense applied.
     pub proc_dps: f32,
+    /// Weapon fire-rate multiplier from enchantments (`MultiplyRateOfFire`);
+    /// 1.0 when none. Already folded into `shots_per_sec`, retained for display.
+    pub rate_mult: f32,
 }
 
 impl WeaponDamage {
@@ -198,26 +301,33 @@ impl WeaponDamage {
         for &(emin, emax, ap) in &self.extra_types {
             total += self.avg_hit_vs(emin, emax, ap, target_def) * self.num_projectiles as f32;
         }
-        // Poison procs are armor-piercing, so their DPS is defense-independent.
-        total * self.shots_per_sec + self.proc_dps
+        // Procs are evaluated per proc: the armor-piercing ones (poison, bleeding)
+        // are defense-independent, the rest lose damage to defense like a hit.
+        let proc_total: f32 = self.procs.iter().map(|p| p.dps_vs(target_def)).sum();
+        total * self.shots_per_sec + proc_total
     }
 
     /// Expected per-projectile damage vs a given DEF for one projectile type.
     fn avg_hit_vs(&self, min: i32, max: i32, ap: bool, target_def: i32) -> f32 {
-        let (lo, hi) = if max > min {
-            (min, max - 1)
-        } else {
-            (min, min)
-        };
-        let n = (hi - lo + 1) as f64;
-        let mut sum = 0.0f64;
-        for d in lo..=hi {
-            let shot = (d as f32 * self.stored_mult) as i32;
-            let after = damage_with_defense(shot, ap, target_def, 0, 0);
-            sum += after as f64;
-        }
-        (sum / n) as f32
+        avg_hit_with_defense(min, max, self.stored_mult, ap, target_def)
     }
+}
+
+/// Expected damage from one hit over a damage range, applying the game's per-roll
+/// integer truncation and, unless `ap`, the target's defense.
+fn avg_hit_with_defense(bmin: i32, bmax: i32, mult: f32, ap: bool, target_def: i32) -> f32 {
+    let (lo, hi) = if bmax > bmin {
+        (bmin, bmax - 1)
+    } else {
+        (bmin, bmin)
+    };
+    let n = (hi - lo + 1) as f64;
+    let mut sum = 0.0f64;
+    for d in lo..=hi {
+        let shot = (d as f32 * mult) as i32;
+        sum += damage_with_defense(shot, ap, target_def, 0, 0) as f64;
+    }
+    (sum / n) as f32
 }
 
 /// Theoretical self-computed damage from the equipped ability item (orb, etc.)
@@ -460,6 +570,9 @@ pub struct DerivedStats {
     /// Active Crucible definition applied to this loadout, if the character
     /// carries the crucible marker and a definition is known.
     pub crucible: Option<CrucibleDef>,
+    /// Active Blood Ritual tier applied to this loadout, if the character has one
+    /// and its id resolves against the tiers the feed delivered.
+    pub blood_ritual: Option<BloodRitualDef>,
 }
 
 impl DerivedStats {
@@ -500,6 +613,10 @@ pub struct Loadout {
     /// Active Crucible definition to apply, populated only when the character
     /// carries the crucible marker. Flat stat mods fold into effective stats.
     pub crucible: Option<CrucibleDef>,
+    /// Active Blood Ritual tier, populated when the `BloodRitual` stat names one.
+    /// Its max-HP multiplier folds into the effective stats, its damage
+    /// multiplier into weapon damage.
+    pub blood_ritual: Option<BloodRitualDef>,
 }
 
 // --- RotMG formula helpers -------------------------------------------------
@@ -683,6 +800,16 @@ const ATTACK_FAR_POWER: &[(i32, f32)] = &[
 const ELECTRIC_POWER: &[(i32, f32)] =
     &[(1, 5.0), (30, 20.0), (50, 54.0), (70, 117.0), (100, 200.0)];
 
+/// Whether a pet ability deals damage at all. The ids are the ability object
+/// types in `pets.xml`: `Attack Close` 0x192, `Attack Mid` 0x194, `Attack Far`
+/// 0x195 and `Electric` 0x196 (group `Shoot Attack` / `AOE Attack`). `Savage`
+/// (0x199) only runs the pet at nearby enemies -- its own base behavior declares
+/// tiles and frequency, no projectile and no damage -- so a pet whose abilities
+/// are Savage plus heals deals none.
+pub fn pet_ability_deals_damage(ability_type: i32) -> bool {
+    matches!(ability_type, 402 | 404 | 405 | 406)
+}
+
 fn pet_contribution(ability_type: i32, level: i32) -> PetAbilityContribution {
     let mut c = PetAbilityContribution {
         ability_type,
@@ -703,12 +830,25 @@ fn pet_contribution(ability_type: i32, level: i32) -> PetAbilityContribution {
             // Magic Heal
             c.mp_per_sec = interp(MAGIC_HEAL_AMOUNT, level) / interp(HEAL_DELAY, level);
         }
-        404 => c.dps = interp(ATTACK_CLOSE_POWER, level) / interp(ATTACK_FREQ, level),
-        405 => c.dps = interp(ATTACK_MID_POWER, level) / interp(ATTACK_FREQ, level),
-        409 => c.dps = interp(ATTACK_FAR_POWER, level) / interp(ATTACK_FREQ, level),
+        // Damage abilities, keyed by the ability object ids `pets.xml` declares
+        // (`Attack Close` 0x192, `Attack Mid` 0x194, `Attack Far` 0x195,
+        // `Electric` 0x196). Grouping follows each object's own description:
+        // Close deals heavy, Mid medium, Far light damage.
+        402 => c.dps = interp(ATTACK_CLOSE_POWER, level) / interp(ATTACK_FREQ, level),
+        404 => c.dps = interp(ATTACK_MID_POWER, level) / interp(ATTACK_FREQ, level),
+        405 => c.dps = interp(ATTACK_FAR_POWER, level) / interp(ATTACK_FREQ, level),
         406 => c.dps = interp(ELECTRIC_POWER, level) / interp(ATTACK_FREQ, level),
+        // 409 Savage, 410 Decoy and 407/408 carry no damage of their own: Savage
+        // only runs the pet at nearby enemies (`pets.xml`: "increase its frequency
+        // and range", base behavior parameters are tiles and frequency only), so a
+        // pet with no attack ability above deals nothing.
         _ => {}
     }
+    debug_assert_eq!(
+        c.dps > 0.0,
+        pet_ability_deals_damage(ability_type) && level > 0,
+        "damage abilities and the predicate must agree"
+    );
     c
 }
 
@@ -750,6 +890,9 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
     // Weapon damage-bonus enchant multipliers (min/max); 1.0 = none.
     let mut dmg_min_mult = 1.0f32;
     let mut dmg_max_mult = 1.0f32;
+    // Weapon fire-rate multiplier from enchants (MultiplyRateOfFire); 1.0 = none.
+    // It scales weapon DPS through `shots_per_sec`, not through damage.
+    let mut rate_mult = 1.0f32;
 
     // Enchant bonus-relative effects (relative to the BONUS portion), deferred.
     let mut enchant_relatives: Vec<(StatKind, f32, StatKind)> = Vec::new();
@@ -838,10 +981,19 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
                         },
                         EnchantEffectKind::MultiplyMinDamage => dmg_min_mult *= eff.amount,
                         EnchantEffectKind::MultiplyMaxDamage => dmg_max_mult *= eff.amount,
+                        // A sub-attack index (>= 0) targets a shot pattern we do not
+                        // model, so only the primary attack's rate is scaled.
+                        EnchantEffectKind::MultiplyRateOfFire => {
+                            if eff.projectile_id <= 0 {
+                                rate_mult *= eff.amount;
+                            }
+                        }
                         EnchantEffectKind::LootBonus => loot += eff.amount,
                         EnchantEffectKind::XpBonus => xp += eff.amount,
                         EnchantEffectKind::DustBonus => dust += eff.amount,
-                        EnchantEffectKind::Cosmetic | EnchantEffectKind::Other => {}
+                        EnchantEffectKind::Cosmetic
+                        | EnchantEffectKind::StatBoostSelf
+                        | EnchantEffectKind::Other => {}
                     }
                 }
             }
@@ -869,24 +1021,37 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
         gear[stat_index(*stat)] += reference * *pct / 100.0;
     }
 
-    // Crucible flat stat modifiers (applied only when the character carries the
-    // crucible marker; the caller sets `loadout.crucible` accordingly).
+    // Crucible stat modifiers (applied only when the character carries the
+    // crucible marker; the caller sets `loadout.crucible` accordingly). A season
+    // may express them flat (S30: "+5 ATT") or as a percentage (S31: "+30% VIT"),
+    // so both forms have to reach the totals -- percentage entries scale the base
+    // stat the character brought in, then fold into the same crucible column.
     let mut crucible_mods = [0.0f32; 8];
     if let Some(def) = &loadout.crucible {
         for i in 0..8 {
-            crucible_mods[i] = def.flat_stat_mod(i);
+            let pct = def.pct_stat_mult(i);
+            crucible_mods[i] = def.flat_stat_mod(i) + (base[i] * (pct - 1.0)).round();
         }
     }
 
+    // Blood Ritual: one max-HP multiplier over the base stat. Its tiers trade HP
+    // for damage, so it scales the stat the character brought in -- the same rule
+    // the Crucible's percentage mods follow -- and lands in its own bracket so the
+    // readout can attribute the change to the ritual rather than to gear.
+    let mut blood_mods = [0.0f32; 8];
+    if let Some(def) = &loadout.blood_ritual {
+        blood_mods[0] = (base[0] * (def.hp_mult - 1.0)).round();
+    }
+
     let attributes = Attributes {
-        max_hp: attr(&base, &gear, &exalt, &crucible_mods, 0),
-        max_mp: attr(&base, &gear, &exalt, &crucible_mods, 1),
-        attack: attr(&base, &gear, &exalt, &crucible_mods, 2),
-        defense: attr(&base, &gear, &exalt, &crucible_mods, 3),
-        speed: attr(&base, &gear, &exalt, &crucible_mods, 4),
-        dexterity: attr(&base, &gear, &exalt, &crucible_mods, 5),
-        vitality: attr(&base, &gear, &exalt, &crucible_mods, 6),
-        wisdom: attr(&base, &gear, &exalt, &crucible_mods, 7),
+        max_hp: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 0),
+        max_mp: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 1),
+        attack: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 2),
+        defense: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 3),
+        speed: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 4),
+        dexterity: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 5),
+        vitality: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 6),
+        wisdom: attr(&base, &gear, &exalt, &crucible_mods, &blood_mods, 7),
     };
 
     let effective = EffectiveStats {
@@ -900,7 +1065,14 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
         wisdom: attributes.wisdom.total(),
     };
 
-    let weapon = derive_weapon(assets, loadout, &effective, dmg_min_mult, dmg_max_mult);
+    let weapon = derive_weapon(
+        assets,
+        loadout,
+        &effective,
+        dmg_min_mult,
+        dmg_max_mult,
+        rate_mult,
+    );
     let ability = derive_ability(assets, loadout, &effective);
     let ability_readout = derive_ability_readout(assets, loadout, &effective);
 
@@ -942,6 +1114,7 @@ pub fn derive(assets: &AssetManager, loadout: &Loadout) -> DerivedStats {
         ability,
         ability_readout,
         crucible: loadout.crucible.clone(),
+        blood_ritual: loadout.blood_ritual.clone(),
     }
 }
 
@@ -950,6 +1123,7 @@ fn attr(
     gear: &[f32; 8],
     exalt: &[f32; 8],
     crucible: &[f32; 8],
+    blood_ritual: &[f32; 8],
     i: usize,
 ) -> Attribute {
     Attribute {
@@ -957,6 +1131,7 @@ fn attr(
         gear: gear[i],
         exalt: exalt[i] as i32,
         crucible: crucible[i] as i32,
+        blood_ritual: blood_ritual[i] as i32,
     }
 }
 
@@ -966,6 +1141,7 @@ fn derive_weapon(
     eff: &EffectiveStats,
     dmg_min_mult: f32,
     dmg_max_mult: f32,
+    rate_mult: f32,
 ) -> Option<WeaponDamage> {
     let weapon_id = *loadout.equipment.first()?;
     if weapon_id <= 0 {
@@ -974,12 +1150,39 @@ fn derive_weapon(
     let (min_damage, max_damage, armor_piercing, _slot) = assets.weapon_projectile(weapon_id, 0)?;
     let (rof, num) = assets.weapon_fire(weapon_id).unwrap_or((1.0, 1));
 
-    let mastery = 1.0 + loadout.mastery_dmg_pct / 100.0;
-    let bmin = ((min_damage as f32 * dmg_min_mult).round() * mastery).floor() as i32;
-    let bmax = ((max_damage as f32 * dmg_max_mult).round() * mastery).floor() as i32;
+    // Damage multipliers the game applies to the rolled shot on top of the
+    // Attack stat: the class mastery from exaltations, and the seasonal
+    // challenge multipliers (Crucible x Blood Ritual tier). Both this readout
+    // and the live combat engine take them from `shot_damage_bonus`, so Combat
+    // History can never credit a different number than the theoretical page.
+    let shot_bonus = shot_damage_bonus(
+        loadout.mastery_dmg_pct,
+        loadout.crucible.as_ref(),
+        loadout.blood_ritual.as_ref(),
+    );
+    let mastery = shot_bonus.mastery;
+    let challenge_mult = shot_bonus.challenge;
+    // The Blood Ritual's own share, kept apart so the readout can name it: it is
+    // negative on the penalty tiers.
+    let blood_ritual_pct = loadout
+        .blood_ritual
+        .as_ref()
+        .map(|r| r.damage_pct())
+        .unwrap_or(0.0);
+    // Exalt bonus damage is stored as points out of a neutral 1000/1000, the
+    // same convention `attack_multiplier` reads it with.
+    let exalt_damage_pct = loadout
+        .exalt_damage_bonus
+        .map(|points| (points as f32 / 1000.0 - 1.0) * 100.0)
+        .unwrap_or(0.0);
+    let bmin =
+        ((min_damage as f32 * dmg_min_mult).round() * mastery * challenge_mult).floor() as i32;
+    let bmax =
+        ((max_damage as f32 * dmg_max_mult).round() * mastery * challenge_mult).floor() as i32;
 
     let mult = attack_multiplier(eff.attack, loadout.exalt_damage_bonus);
-    let sps = shots_per_sec(eff.dexterity, rof);
+    // Fire-rate enchants scale the shot cadence, which is where their DPS lands.
+    let sps = shots_per_sec(eff.dexterity, rof * rate_mult);
 
     // Compute avg_hit for the primary (index 0) projectile type.
     let avg_hit = avg_hit_for_range(bmin, bmax, mult);
@@ -991,8 +1194,10 @@ fn derive_weapon(
     let mut total_avg_hit = avg_hit * num as f32;
     for i in 1..proj_types as usize {
         if let Some((pmin, pmax, ap, _)) = assets.weapon_projectile(weapon_id, i) {
-            let emin = ((pmin as f32 * dmg_min_mult).round() * mastery).floor() as i32;
-            let emax = ((pmax as f32 * dmg_max_mult).round() * mastery).floor() as i32;
+            let emin =
+                ((pmin as f32 * dmg_min_mult).round() * mastery * challenge_mult).floor() as i32;
+            let emax =
+                ((pmax as f32 * dmg_max_mult).round() * mastery * challenge_mult).floor() as i32;
             total_avg_hit += avg_hit_for_range(emin, emax, mult) * num as f32;
             extra_types.push((emin, emax, ap));
         }
@@ -1014,8 +1219,12 @@ fn derive_weapon(
         stored_mult: mult,
         damage_mult: dmg_max_mult,
         mastery_pct: loadout.mastery_dmg_pct,
+        challenge_mult,
+        blood_ritual_pct,
+        exalt_damage_pct,
         procs,
         proc_dps,
+        rate_mult,
     })
 }
 
@@ -1060,6 +1269,8 @@ fn derive_weapon_procs(
                     activations_per_sec: rate,
                     dps,
                     armor_piercing: true,
+                    min_damage: damage,
+                    max_damage: damage,
                     continuous: false,
                 });
             }
@@ -1089,6 +1300,8 @@ fn derive_weapon_procs(
                     activations_per_sec: stacks,
                     dps,
                     armor_piercing: true,
+                    min_damage: b.dmg_per_sec.round() as i32,
+                    max_damage: b.dmg_per_sec.round() as i32,
                     continuous: true,
                 });
             }
@@ -2282,6 +2495,83 @@ mod tests {
     }
 
     #[test]
+    fn crucible_percentage_mods_scale_the_base_stat() {
+        // S31's crucible expresses its restriction as a percentage
+        // ({"stat":"VIT","percent":1,"value":1.3} = +30% VIT). Applying only the
+        // flat accessor silently drops it, which is what shipped before: the
+        // season contributed nothing to the stats.
+        use crate::api::crucible::{CrucibleDef, CrucibleStatMod};
+        use crate::assets::StatKind;
+        let def = CrucibleDef {
+            id: "s31".into(),
+            title: "S31 Crucible".into(),
+            stat_mods: vec![
+                CrucibleStatMod {
+                    stat: StatKind::Vitality,
+                    value: 1.3,
+                    percent: true,
+                },
+                CrucibleStatMod {
+                    stat: StatKind::Wisdom,
+                    value: 1.1,
+                    percent: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let loadout = Loadout {
+            base: BaseStats {
+                vitality: 40,
+                wisdom: 60,
+                ..Default::default()
+            },
+            crucible: Some(def),
+            ..Default::default()
+        };
+        let d = derive(&AssetManager::new(), &loadout);
+        // +30% of base 40 = +12 VIT; +10% of base 60 = +6 WIS.
+        assert_eq!(d.attributes.vitality.crucible, 12);
+        assert_eq!(d.attributes.vitality.total(), 52);
+        assert_eq!(d.attributes.wisdom.crucible, 6);
+        assert_eq!(d.attributes.wisdom.total(), 66);
+        // Untouched stats stay clean.
+        assert_eq!(d.attributes.attack.crucible, 0);
+    }
+
+    #[test]
+    fn blood_ritual_scales_max_hp_in_its_own_bracket() {
+        // Tier 1 of the season's ritual: "−20% HP Penalty" (max HP x0.8). It must
+        // move the HP total while being attributable to the ritual rather than to
+        // gear, and it must not touch the other seven stats.
+        use crate::api::blood_ritual::BloodRitualDef;
+        let def = BloodRitualDef {
+            id: "5027802235043840".into(),
+            tier: 1,
+            hp_mult: 0.8,
+            damage_mult: 1.24,
+            loot_pct: 25.0,
+        };
+        let loadout = Loadout {
+            base: BaseStats {
+                max_hp: 700,
+                ..Default::default()
+            },
+            blood_ritual: Some(def),
+            ..Default::default()
+        };
+        let d = derive(&AssetManager::new(), &loadout);
+        assert_eq!(d.attributes.max_hp.blood_ritual, -140);
+        assert_eq!(d.attributes.max_hp.total(), 560);
+        assert_eq!(
+            d.attributes.max_hp.gear_display(),
+            0,
+            "the ritual must not appear as a gear bonus"
+        );
+        assert_eq!(d.attributes.attack.blood_ritual, 0);
+        assert_eq!(d.attributes.attack.total(), 0);
+    }
+
+    #[test]
     fn crucible_absent_leaves_stats_unchanged() {
         let loadout = Loadout {
             base: BaseStats {
@@ -2315,6 +2605,30 @@ mod tests {
         // Magic heal level 30 = 3 MP / 3.82s.
         let m = pet_contribution(408, 30);
         assert!((m.mp_per_sec - 3.0 / 3.82).abs() < 1e-3);
+    }
+
+    #[test]
+    fn pet_damage_abilities_use_the_game_ability_ids() {
+        // Ability ids are the object types in `pets.xml`: Attack Close 0x192,
+        // Attack Mid 0x194, Attack Far 0x195, Electric 0x196, Savage 0x199.
+        let close = pet_contribution(402, 90).dps;
+        let mid = pet_contribution(404, 90).dps;
+        let far = pet_contribution(405, 90).dps;
+        let electric = pet_contribution(406, 90).dps;
+        assert!(close > 0.0 && mid > 0.0 && far > 0.0 && electric > 0.0);
+        // Close deals heavy, mid medium, far light.
+        assert!(close > mid && mid > far);
+        // Savage only moves the pet at enemies, so it adds no damage of its own
+        // -- a pet whose other slots are heal/magic heal deals none at all.
+        assert_eq!(pet_contribution(409, 100).dps, 0.0);
+        assert_eq!(pet_contribution(409, 100).hp_per_sec, 0.0);
+        for ability in [407, 408, 409, 410] {
+            assert_eq!(pet_contribution(ability, 100).dps, 0.0, "ability {ability}");
+            assert!(!pet_ability_deals_damage(ability));
+        }
+        for ability in [402, 404, 405, 406] {
+            assert!(pet_ability_deals_damage(ability));
+        }
     }
 
     #[test]
@@ -2358,8 +2672,12 @@ mod tests {
             stored_mult: 1.0,
             damage_mult: 1.0,
             mastery_pct: 0.0,
+            challenge_mult: 1.0,
+            blood_ritual_pct: 0.0,
+            exalt_damage_pct: 0.0,
             procs: Vec::new(),
             proc_dps: 0.0,
+            rate_mult: 1.0,
         };
         // At 0 defense dps_vs equals the mean roll.
         assert!((w.dps_vs(0) - 11.5).abs() < 1e-4);
@@ -2383,8 +2701,12 @@ mod tests {
             stored_mult: 1.0,
             damage_mult: 1.0,
             mastery_pct: 0.0,
+            challenge_mult: 1.0,
+            blood_ritual_pct: 0.0,
+            exalt_damage_pct: 0.0,
             procs: Vec::new(),
             proc_dps: 0.0,
+            rate_mult: 1.0,
         };
         assert!((w.dps_vs(0) - 200.0).abs() < 1e-4);
     }
@@ -2397,6 +2719,76 @@ mod tests {
         let bmin = ((165.0f32 * 1.0).round() * mastery).floor() as i32;
         let bmax = ((205.0f32 * 1.0).round() * mastery).floor() as i32;
         assert_eq!((bmin, bmax), (181, 225));
+    }
+
+    /// The Blood Ritual's tier-1 definition ("+24% Damage"), the one the capture
+    /// evidence for the shot-bonus fix was measured against.
+    fn ritual_tier1() -> BloodRitualDef {
+        BloodRitualDef {
+            id: "5027802235043840".into(),
+            tier: 1,
+            hp_mult: 0.8,
+            damage_mult: 1.24,
+            loot_pct: 25.0,
+        }
+    }
+
+    #[test]
+    fn shot_damage_bonus_folds_mastery_and_challenge() {
+        // Nothing known: a neutral multiplier, so a character with no exalt
+        // mastery and no seasonal challenge keeps the raw roll.
+        assert_eq!(shot_damage_bonus(0.0, None, None), ShotDamageBonus::none());
+        assert_eq!(shot_damage_bonus(0.0, None, None).total(), 1.0);
+        // +10% mastery alone.
+        assert_eq!(shot_damage_bonus(10.0, None, None).mastery, 1.1);
+        // A Crucible with no damage bonus leaves the challenge factor to the
+        // ritual tier; the two compound when both apply.
+        let crucible = CrucibleDef {
+            damage_mult: 1.0,
+            ..Default::default()
+        };
+        let bonus = shot_damage_bonus(10.0, Some(&crucible), Some(&ritual_tier1()));
+        assert_eq!(bonus.mastery, 1.1);
+        assert!(
+            (bonus.challenge - 1.24).abs() < 1e-6,
+            "{:?}",
+            bonus.challenge
+        );
+        assert!((bonus.total() - 1.364).abs() < 1e-6, "{:?}", bonus.total());
+        let penalty = BloodRitualDef {
+            damage_mult: 0.78,
+            ..ritual_tier1()
+        };
+        assert!((shot_damage_bonus(0.0, None, Some(&penalty)).total() - 0.78).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shot_bonus_scales_the_readout_and_the_engine_alike() {
+        // Combat History credits a weapon hit by rolling inside the range the
+        // theoretical page prints, so both must scale it identically. They did
+        // not once: the page folded mastery and the seasonal multipliers in while
+        // the engine rolled the raw weapon range, and every staff hit in a fight
+        // came out ~25% low. Wand of Retribution 165-205 at +10% mastery and a
+        // +24% ritual thus reads 225-279 on both sides.
+        let bonus = shot_damage_bonus(10.0, None, Some(&ritual_tier1()));
+        let bmin = ((165.0f32 * 1.0).round() * bonus.mastery * bonus.challenge).floor() as i32;
+        let bmax = ((205.0f32 * 1.0).round() * bonus.mastery * bonus.challenge).floor() as i32;
+        assert_eq!((bmin, bmax), (225, 279));
+
+        let atk = crate::combat::damage::AttackerStats {
+            mastery_mult: bonus.mastery,
+            challenge_mult: bonus.challenge,
+            ..Default::default()
+        };
+        // A fixed-damage shot (min == max, no roll) is exactly the scaled
+        // endpoint, so the engine's arithmetic is comparable value for value.
+        // Ability slot 10 keeps the attack multiplier out of it.
+        let mut rng = crate::combat::damage::Rng::new(1);
+        for (base, expected) in [(165, bmin), (205, bmax)] {
+            let rolled =
+                crate::combat::damage::roll_base_damage(&mut rng, base, base, 1.0, 1.0, 10, &atk);
+            assert_eq!(rolled, expected, "engine disagrees at base {base}");
+        }
     }
 
     #[test]
@@ -2440,6 +2832,9 @@ mod tests {
             stored_mult: 1.0,
             damage_mult: 1.0,
             mastery_pct: 0.0,
+            challenge_mult: 1.0,
+            blood_ritual_pct: 0.0,
+            exalt_damage_pct: 0.0,
             procs: vec![WeaponProcReadout {
                 label: "Poison",
                 damage_per_proc: 1000,
@@ -2448,13 +2843,69 @@ mod tests {
                 activations_per_sec: 2.0 / 6.0,
                 dps: proc_dps,
                 armor_piercing: true,
+                min_damage: 1000,
+                max_damage: 1000,
                 continuous: false,
             }],
             proc_dps,
+            rate_mult: 1.0,
         };
         // At 0 DEF: projectile mean 11.5 + poison.
         assert!((w.dps_vs(0) - (11.5 + proc_dps)).abs() < 1e-3);
         // At 5 DEF the projectile part drops to 6.5 but poison is unchanged.
         assert!((w.dps_vs(5) - (6.5 + proc_dps)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn non_armor_piercing_procs_lose_damage_to_defense() {
+        // A BulletCreate-style proc is an ordinary projectile: it shrinks with the
+        // target's defense, unlike poison or bleeding.
+        let hits_per_sec = 0.5;
+        let ap = WeaponProcReadout {
+            label: "Poison",
+            damage_per_proc: 100,
+            cooldown: 0.0,
+            proc_rate: 1.0,
+            activations_per_sec: hits_per_sec,
+            dps: 100.0 * hits_per_sec,
+            armor_piercing: true,
+            min_damage: 100,
+            max_damage: 100,
+            continuous: false,
+        };
+        // Rolls 40..=49 -> mean 44.5 at 0 DEF, 39.5 at 5 DEF.
+        let regular = WeaponProcReadout {
+            label: "BulletCreate",
+            damage_per_proc: 44,
+            cooldown: 0.0,
+            proc_rate: 1.0,
+            activations_per_sec: hits_per_sec,
+            dps: 44.5 * hits_per_sec,
+            armor_piercing: false,
+            min_damage: 40,
+            max_damage: 50,
+            continuous: false,
+        };
+        // The defenseless number matches dps_vs(0) for both kinds.
+        assert!((ap.dps_vs(0) - ap.dps).abs() < 1e-4);
+        assert!((regular.dps_vs(0) - regular.dps).abs() < 1e-4);
+        // Poison is untouched by defense; the regular proc loses 5 per hit.
+        assert!((ap.dps_vs(5) - ap.dps).abs() < 1e-4);
+        assert!((regular.dps_vs(5) - 39.5 * hits_per_sec).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fire_rate_enchant_scales_shots_per_second() {
+        // Shots/sec is linear in the weapon's rate of fire, so a fire-rate enchant
+        // is a straight multiplier on weapon DPS.
+        let base = shots_per_sec(75, 1.0);
+        let boosted = shots_per_sec(75, 1.0 * 1.03);
+        assert!(
+            (boosted - base * 1.03).abs() < 1e-3,
+            "got {boosted} vs {base}"
+        );
+        // The penalty enchantments scale the same way.
+        let reduced = shots_per_sec(75, 1.0 * 0.95);
+        assert!((reduced - base * 0.95).abs() < 1e-3);
     }
 }

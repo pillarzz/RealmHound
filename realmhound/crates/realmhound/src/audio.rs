@@ -51,6 +51,7 @@ impl TimedCommand {
         match &self.cmd {
             AudioCommand::Play(_) => "play",
             AudioCommand::PlayForBag(_) => "play_for_bag",
+            AudioCommand::PlayForBagShiny(_) => "play_for_bag_shiny",
             AudioCommand::PlayEvent { .. } => "play_event",
             AudioCommand::SetVolume(_) => "set_volume",
         }
@@ -346,27 +347,28 @@ fn run(
                 // Resolve here (needs current sound settings) then coalesce on
                 // the resolved sound type, same as a direct `Play`.
                 if let Some(sound) = SoundType::from_bag_type(bag) {
-                    let (enabled, per_vol, custom_path) = settings
-                        .read()
-                        .map(|s| {
-                            let en = sound.is_enabled(&s.sound);
-                            let vol = s.sound.sound_volume(sound.settings_key());
-                            let cp = resolve_custom_sound(&s.sound, sound);
-                            (en, vol, cp)
-                        })
-                        .unwrap_or((false, 1.0, None));
-                    if enabled {
-                        let volume = engine.volume() * per_vol;
-                        play_coalesced(
-                            &engine,
-                            &mut last_played,
-                            sound,
-                            custom_path,
-                            volume,
-                            #[cfg(feature = "latency-diagnostics")]
-                            timed.dispatched_at,
-                        );
-                    }
+                    play_resolved_bag_sound(
+                        &engine,
+                        &settings,
+                        &mut last_played,
+                        sound,
+                        #[cfg(feature = "latency-diagnostics")]
+                        timed.dispatched_at,
+                    );
+                }
+            }
+            AudioCommand::PlayForBagShiny(bag) => {
+                // Same resolution/coalescing as `PlayForBag`, but for the shiny
+                // notification mapped from the shiny item's own bag tier.
+                if let Some(sound) = SoundType::for_shiny_bag_type(bag) {
+                    play_resolved_bag_sound(
+                        &engine,
+                        &settings,
+                        &mut last_played,
+                        sound,
+                        #[cfg(feature = "latency-diagnostics")]
+                        timed.dispatched_at,
+                    );
                 }
             }
             AudioCommand::PlayEvent {
@@ -406,6 +408,41 @@ fn run(
     }
 
     tracing::info!("[AUDIO] audio thread stopped");
+}
+
+/// Resolve a bag notification's enabled state, per-sound volume and custom file
+/// from current settings, then play it (coalesced) when enabled. Shared by the
+/// normal and shiny bag commands.
+fn play_resolved_bag_sound(
+    engine: &SoundEngine,
+    settings: &Arc<RwLock<Settings>>,
+    last_played: &mut HashMap<SoundType, Instant>,
+    sound: SoundType,
+    #[cfg(feature = "latency-diagnostics")] dispatched_at: Instant,
+) {
+    let (enabled, per_vol, custom_path) = settings
+        .read()
+        .map(|s| {
+            (
+                sound.is_enabled(&s.sound),
+                s.sound.sound_volume(sound.settings_key()),
+                resolve_custom_sound(&s.sound, sound),
+            )
+        })
+        .unwrap_or((false, 1.0, None));
+    if !enabled {
+        return;
+    }
+    let volume = engine.volume() * per_vol;
+    play_coalesced(
+        engine,
+        last_played,
+        sound,
+        custom_path,
+        volume,
+        #[cfg(feature = "latency-diagnostics")]
+        dispatched_at,
+    );
 }
 
 /// Play `sound` unless an identical sound played within [`COALESCE_WINDOW`].

@@ -59,22 +59,55 @@ pub fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: Option<&str>) {
     });
 }
 
-/// Resolve a living character's current sprite id and cloth dyes from the
-/// (live-updated) character cache. Returns `(icon_id, tex1, tex2)`, or `None`
-/// when the character is not in the living cache (dead/unknown) so callers can
-/// fall back to a per-row recorded snapshot. Keeps the local player's skin/dyes
-/// consistent across Loot History, Live Feed and Combat History.
+/// Resolve a character's sprite id and cloth dyes from the character cache,
+/// preferring the living roster and falling back to the graveyard so a deceased
+/// character keeps its last-seen skin and dyes. Returns `(icon_id, tex1, tex2)`,
+/// or `None` for an unknown character so callers can fall back to a per-row
+/// recorded snapshot. Keeps the local player's skin/dyes consistent across Loot
+/// History, Live Feed and Combat History.
 pub fn character_appearance(account_data: &AccountData, char_id: i32) -> Option<(i32, u32, u32)> {
     if char_id == 0 {
         return None;
     }
-    let c = account_data.find_character(char_id)?;
+    let c = account_data.find_any_character(char_id)?;
     let icon_id = if c.skin > 0 {
         c.skin
     } else {
         c.class_id as i32
     };
     Some((icon_id, c.tex1, c.tex2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn character_appearance_resolves_the_last_seen_skin_after_death() {
+        // A graveyard character must keep resolving its last-seen skin and dyes,
+        // so Loot/Combat History rows and their character filter pills don't fall
+        // back to a recorded snapshot (or render a "?" sprite) once the character
+        // leaves the living roster.
+        let mut account_data = AccountData::default();
+        account_data.add_new_character(2499, 784, 6043, true);
+        let live = character_appearance(&account_data, 2499);
+        assert_eq!(live, Some((6043, 0, 0)));
+
+        account_data.mark_character_dead(2499, "Oryx the Mad God 3", 12_000, Some(1837));
+        assert!(
+            account_data.find_character(2499).is_none(),
+            "the character is no longer in the living roster"
+        );
+        assert_eq!(
+            character_appearance(&account_data, 2499),
+            live,
+            "the graveyard keeps the last-seen appearance"
+        );
+
+        // Unknown characters still resolve to nothing, so callers can fall back.
+        assert_eq!(character_appearance(&account_data, 0), None);
+        assert_eq!(character_appearance(&account_data, 4242), None);
+    }
 }
 
 /// Like [`empty_state`] but styled as a warning: a ⚠ glyph and amber text,

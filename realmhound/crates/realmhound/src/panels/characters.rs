@@ -45,6 +45,13 @@ use crate::tab_icons::{
 /// value column and stays aligned with the earned rows' fame icon.
 const FAME_PLUS_GUTTER: f32 = 11.0;
 
+/// Margin between a character card's border and its rows, on the left and right
+/// only. The card is this much wider than its slot grid on each side, which is
+/// the room a row needing more than the grid -- a long name beside the LIVE
+/// badge, or the loot readout -- grows into. Vertical padding stays
+/// [`CARD_PADDING`], so the card's height does not change with it.
+const CARD_FRAME_PADDING_X: i8 = (CARD_PADDING as i8) + 4;
+
 /// Biome display names, in the order shown in the BIOME ENEMY KILLS column.
 /// Used to size the MISC STATS label cell so its value column lines up with
 /// the biome kill counts above it.
@@ -411,6 +418,19 @@ pub struct CharactersPanel {
     /// for the currently playing character. A missing entry means no active
     /// boost is known for that character.
     loot_boost_by_char: std::collections::HashMap<i32, u32>,
+    /// When each stored loot-boost value was last reported by the server, so the
+    /// card can count down from it. The boost ticks only while a character is
+    /// loaded, and the server re-reports on zone changes, which re-syncs this.
+    loot_boost_at: std::collections::HashMap<i32, std::time::Instant>,
+    /// The last loot-boost seconds the server actually reported for a character,
+    /// kept apart from the value on display: the session hands back the same
+    /// number every frame, so only a change is a real report (see
+    /// [`Self::observe_live_loot_boost`]).
+    loot_boost_reported: std::collections::HashMap<i32, u32>,
+    /// Whether the loaded character is standing somewhere the boost timer is
+    /// paused (a safe area, or a map not seen yet). Set every frame from the map
+    /// the game reports; while set, the displayed value is held still.
+    loot_boost_paused: bool,
     /// Whether a character label is being edited
     editing_label: Option<i32>,
     /// Persistent open state for the label edit dialog. Kept in sync with the
@@ -518,11 +538,22 @@ impl CharactersPanel {
         let exaltation_stats = cache.exaltation_stats.clone();
 
         Self {
+            // Seeded as the first field because the cache is moved into the struct a
+            // few fields below: this reads it before the move, so the last known value
+            // shows on launch, before the game has mentioned the boost again.
+            loot_boost_by_char: cache
+                .characters
+                .iter()
+                .filter_map(|c| c.loot_boost_secs.map(|secs| (c.char_id, secs)))
+                .collect(),
             cache,
             fetch_state: CharactersFetchState::Idle,
             api_result_rx: None,
             live_char_id: None,
-            loot_boost_by_char: std::collections::HashMap::new(),
+            loot_boost_at: std::collections::HashMap::new(),
+            loot_boost_reported: std::collections::HashMap::new(),
+            // Nothing is counted down until the map is known to allow it.
+            loot_boost_paused: true,
             editing_label: None,
             label_dialog_open: false,
             label_dialog_focus: false,
@@ -633,17 +664,94 @@ impl CharactersPanel {
     /// authoritative, so this writes the value into the per-character map for
     /// the live character (removing the entry when the boost ends). When no
     /// character is live the map keeps each card's last-known value.
-    pub fn observe_live_loot_boost(&mut self, live: Option<u32>, live_char_id: Option<i32>) {
-        if let Some(id) = live_char_id {
-            match live {
-                Some(secs) => {
-                    self.loot_boost_by_char.insert(id, secs);
-                }
-                None => {
-                    self.loot_boost_by_char.remove(&id);
+    /// Record the live loot-drop boost for the character being played.
+    ///
+    /// An unknown value (`None`) leaves the last known one alone: it means the game
+    /// has not reported the boost yet, which is the case until a zone change
+    /// re-sends the player's status. Treating it as "no boost" deleted the value
+    /// the character list had seeded from `<LDTimer>`, so the timer only appeared
+    /// after the player changed zones. A zero is the game saying the boost has run
+    /// out, and clears it.
+    ///
+    /// The countdown is anchored locally, so it must only be re-anchored when the
+    /// value *moves*: this is called every frame, and the session keeps handing
+    /// back the last value the server sent, so re-anchoring on each call pinned
+    /// the clock at the reported value and the timer never ticked down.
+    ///
+    /// `paused` says the loaded character is somewhere the game holds the timer
+    /// still (a safe area, or a map not yet seen).
+    pub fn observe_live_loot_boost(
+        &mut self,
+        live: Option<u32>,
+        live_char_id: Option<i32>,
+        paused: bool,
+    ) {
+        let Some(id) = live_char_id else {
+            self.loot_boost_paused = paused;
+            return;
+        };
+
+        // Crossing into or out of a safe area freezes / resumes the local clock.
+        // Entering one commits what the card currently reads, so the value holds
+        // still there instead of snapping back to the server's last report or
+        // draining away; leaving one restarts the countdown from that value.
+        if paused != self.loot_boost_paused {
+            if paused {
+                if let Some(remaining) = self.loot_boost_remaining(id) {
+                    self.loot_boost_by_char.insert(id, remaining);
                 }
             }
+            self.loot_boost_at.insert(id, std::time::Instant::now());
+            self.loot_boost_paused = paused;
         }
+
+        match live {
+            Some(0) => {
+                self.loot_boost_by_char.remove(&id);
+                self.loot_boost_at.remove(&id);
+                self.loot_boost_reported.remove(&id);
+            }
+            Some(secs) => {
+                // The session re-reports the same number every frame, so only a
+                // *change* is a fresh report: that is what may move the displayed
+                // value and re-anchor the clock. Anything else is the echo of a
+                // report already accounted for -- treating it as fresh would both
+                // pin the countdown and refill a frozen safe-area value from the
+                // server's now-stale number.
+                if self.loot_boost_reported.get(&id).copied() == Some(secs) {
+                    // Let a running clock keep ticking; give a cache-seeded entry
+                    // its first anchor.
+                    self.loot_boost_at
+                        .entry(id)
+                        .or_insert_with(std::time::Instant::now);
+                } else {
+                    self.loot_boost_reported.insert(id, secs);
+                    self.loot_boost_by_char.insert(id, secs);
+                    self.loot_boost_at.insert(id, std::time::Instant::now());
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The loot-drop boost to show for a character: the last value the server
+    /// reported, less the time since, but only for the character being played.
+    /// The boost ticks only while a character is loaded, so a non-live one keeps
+    /// the value it held when it was last seen -- which is also why counting down
+    /// is safe: the server re-reports on every zone change and re-syncs it.
+    fn loot_boost_remaining(&self, char_id: i32) -> Option<u32> {
+        let secs = self.loot_boost_by_char.get(&char_id).copied()?;
+        // Only the loaded character's boost runs down, and only outside a safe
+        // area: the game pauses the timer there, so the display holds still.
+        if self.live_char_id != Some(char_id) || self.loot_boost_paused {
+            return Some(secs);
+        }
+        let elapsed = self
+            .loot_boost_at
+            .get(&char_id)
+            .map(|at| at.elapsed().as_secs() as u32)
+            .unwrap_or(0);
+        Some(secs.saturating_sub(elapsed))
     }
 
     /// Build the Current-Character widget data for `char_id`: the (dyed) sprite
@@ -689,10 +797,12 @@ impl CharactersPanel {
             } else {
                 None
             },
-            title: format!("{} Lv.{}", label, char.level),
+            title: label.clone(),
+            // The level belongs with the id/class/maxed line, in that line's own
+            // font and ahead of the maxed count, rather than in the title.
             subtitle: format!(
-                "#{} • {} • {}/8",
-                char.char_id, class_name, char.maxed_count
+                "#{} • {} • Lv.{} • {}/8",
+                char.char_id, class_name, char.level, char.maxed_count
             ),
             base_fame: char.fame,
             killed_by: if char.is_dead {
@@ -819,9 +929,18 @@ impl CharactersPanel {
                             match c.loot_boost_secs {
                                 Some(secs) => {
                                     self.loot_boost_by_char.insert(c.char_id, secs);
+                                    self.loot_boost_at
+                                        .insert(c.char_id, std::time::Instant::now());
+                                    if let Some(cached) = self.cache.find_character_mut(c.char_id) {
+                                        cached.loot_boost_secs = Some(secs);
+                                    }
                                 }
                                 None => {
                                     self.loot_boost_by_char.remove(&c.char_id);
+                                    self.loot_boost_at.remove(&c.char_id);
+                                    if let Some(cached) = self.cache.find_character_mut(c.char_id) {
+                                        cached.loot_boost_secs = None;
+                                    }
                                 }
                             }
                         }
@@ -1830,8 +1949,8 @@ impl CharactersPanel {
             1.0_f32
         };
 
-        // Card width = content + padding*2 + stroke*2
-        let card_width = CARD_CONTENT_WIDTH + CARD_PADDING * 2.0 + 4.0;
+        // Card width = rows + the frame's side padding + the stroke
+        let card_width = CARD_CONTENT_WIDTH + CARD_FRAME_PADDING_X as f32 * 2.0 + 4.0;
 
         // Use allocate_ui to reserve fixed width while allowing dynamic height.
         // This ensures wrapping works correctly while tall cards don't overlap.
@@ -1841,9 +1960,19 @@ impl CharactersPanel {
                     .fill(fill)
                     .stroke(egui::Stroke::new(stroke_width, stroke_color))
                     .corner_radius(8.0)
-                    .inner_margin(CARD_PADDING)
+                    // Wider at the sides than above and below: the extra is room
+                    // the rows can grow into (a long name, the loot readout) and
+                    // it must not change the card's height.
+                    .inner_margin(egui::Margin {
+                        left: CARD_FRAME_PADDING_X,
+                        right: CARD_FRAME_PADDING_X,
+                        top: CARD_PADDING as i8,
+                        bottom: CARD_PADDING as i8,
+                    })
                     .show(ui, |ui| {
-                        // Constrain content width
+                        // Constrain the rows to the slot grid's width. The frame's
+                        // padding is what makes the card wider than the grid, so
+                        // the grid stays centred on every card.
                         ui.set_min_width(CARD_CONTENT_WIDTH);
                         ui.set_max_width(CARD_CONTENT_WIDTH);
 
@@ -1862,8 +1991,9 @@ impl CharactersPanel {
                             let widget = widget
                                 .with_stat_display(stat_display)
                                 .with_pet(pet_info.clone())
-                                .with_loot_boost(
-                                    self.loot_boost_by_char.get(&char.char_id).copied(),
+                                .with_loot_boost(self.loot_boost_remaining(char.char_id))
+                                .with_blood_ritual(
+                                    self.cache.blood_ritual_for_char(char.char_id).is_some(),
                                 )
                                 .with_sections(show_inv, show_bp, show_ext, show_belt);
                             widget.render(
@@ -4136,5 +4266,191 @@ impl Panel for CharactersPanel {
         } else {
             vec![]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The session hands back the last value the server sent on every frame, so
+    /// an unchanged report must not re-anchor the countdown -- re-anchoring each
+    /// time pinned the clock at the reported value and the timer never ticked.
+    #[test]
+    fn an_unchanged_live_loot_boost_keeps_counting_down() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        // Pretend 30s have passed since that report.
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+    }
+
+    /// A fresh server report (a zone change re-syncs the stat) does re-anchor.
+    #[test]
+    fn a_moved_live_loot_boost_re_anchors_the_countdown() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+        panel.observe_live_loot_boost(Some(500), Some(2537), false);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(500));
+    }
+
+    /// An absent stat carries no information: the boost must not be cleared.
+    #[test]
+    fn an_absent_live_value_keeps_the_last_known_boost() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        panel.observe_live_loot_boost(None, Some(2537), false);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(600));
+    }
+
+    /// Zero is the game saying the boost has run out.
+    #[test]
+    fn a_zero_live_value_ends_the_boost() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        panel.observe_live_loot_boost(Some(0), Some(2537), false);
+
+        assert_eq!(panel.loot_boost_remaining(2537), None);
+    }
+
+    /// A safe area holds the timer still: the game pauses it in the Nexus, so the
+    /// local clock must not drain it. The session keeps re-reporting the number it
+    /// last sent, which must not refill the frozen value either.
+    #[test]
+    fn a_safe_area_holds_the_loot_boost_still() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        // 30s of play, then the character nexuses.
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        // Freezes where it stood, not back at the server's stale 600.
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+
+        // Another minute in the safe area must not eat into it.
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+    }
+
+    /// Leaving the safe area resumes from the frozen value.
+    #[test]
+    fn leaving_a_safe_area_resumes_the_countdown() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(30);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        panel.observe_live_loot_boost(Some(600), Some(2537), false);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(570));
+    }
+
+    /// Before the first `MapInfo` the map is unknown, so nothing may be spent --
+    /// that also covers a loading screen.
+    #[test]
+    fn an_unknown_map_holds_the_loot_boost_still() {
+        let mut panel = CharactersPanel::with_cache(CharacterCache::default());
+        panel.live_char_id = Some(2537);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        *panel.loot_boost_at.get_mut(&2537).unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(45);
+        panel.observe_live_loot_boost(Some(600), Some(2537), true);
+
+        assert_eq!(panel.loot_boost_remaining(2537), Some(600));
+    }
+
+    /// Cards flow in rows, so every card in a row must share a top edge.
+    ///
+    /// This pins the frame's *structure*, not just its numbers. Insetting the
+    /// card's content behind an extra `ui.horizontal` (the first attempt at giving
+    /// the rows more room than the slot grid) made each card's top land on the
+    /// previous card's bottom, so a page of cards came out as a ladder -- egui
+    /// advances vertically inside a wrapped row by the tallest item it has placed.
+    /// The drift only showed once cards differed in height, so the content here
+    /// differs per card on purpose.
+    #[test]
+    fn cards_in_a_row_share_a_top_edge() {
+        let ctx = egui::Context::default();
+        let mut tops: Vec<f32> = Vec::new();
+        let mut lefts: Vec<f32> = Vec::new();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1920.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(CARD_SPACING, CARD_SPACING);
+                            for i in 0..3 {
+                                let card_width =
+                                    CARD_CONTENT_WIDTH + CARD_FRAME_PADDING_X as f32 * 2.0 + 4.0;
+                                let r = ui.allocate_ui(
+                                    egui::vec2(card_width, ui.available_height()),
+                                    |ui| {
+                                        egui::Frame::NONE
+                                            .inner_margin(egui::Margin {
+                                                left: CARD_FRAME_PADDING_X,
+                                                right: CARD_FRAME_PADDING_X,
+                                                top: CARD_PADDING as i8,
+                                                bottom: CARD_PADDING as i8,
+                                            })
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(CARD_CONTENT_WIDTH);
+                                                ui.set_max_width(CARD_CONTENT_WIDTH);
+                                                ui.vertical(|ui| {
+                                                    for _ in 0..(2 + i * 4) {
+                                                        ui.label("a row of card content");
+                                                    }
+                                                });
+                                            });
+                                    },
+                                );
+                                tops.push(r.response.rect.min.y);
+                                lefts.push(r.response.rect.min.x);
+                            }
+                        });
+                    });
+            });
+        });
+
+        assert_eq!(tops.len(), 3);
+        assert!(
+            tops.windows(2).all(|w| w[0] == w[1]),
+            "cards in a row drifted apart vertically: {tops:?}"
+        );
+        assert!(
+            lefts.windows(2).all(|w| w[0] < w[1]),
+            "cards did not advance along their row: {lefts:?}"
+        );
     }
 }

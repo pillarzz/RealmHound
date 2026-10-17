@@ -90,6 +90,12 @@ pub struct AttackerStats {
     /// Raw `ExaltationBonusDamage` (id 113), per-mille; [`DEFAULT_EXALT_BONUS`]
     /// when unknown.
     pub exalt_bonus: i32,
+    /// Exaltation Mastery weapon-damage bonus (`1 + mastery_dmg_pct/100`); 1.0
+    /// when unknown. Comes from [`crate::stats::derived::ShotDamageBonus`].
+    pub mastery_mult: f32,
+    /// Seasonal challenge multiplier (Crucible x Blood Ritual damage); 1.0 when
+    /// neither applies. Comes from [`crate::stats::derived::ShotDamageBonus`].
+    pub challenge_mult: f32,
 }
 
 impl Default for AttackerStats {
@@ -98,7 +104,17 @@ impl Default for AttackerStats {
             attack: 0,
             condition: 0,
             exalt_bonus: DEFAULT_EXALT_BONUS,
+            mastery_mult: 1.0,
+            challenge_mult: 1.0,
         }
+    }
+}
+
+impl AttackerStats {
+    /// The multiplier the game applies to the weapon's rolled damage range on
+    /// top of the Attack stat: mastery times the seasonal challenge multipliers.
+    pub fn shot_mult(&self) -> f32 {
+        self.mastery_mult * self.challenge_mult
     }
 }
 
@@ -122,14 +138,15 @@ fn attack_multiplier(atk: &AttackerStats) -> f32 {
 /// Roll a shot's pre-defense damage.
 ///
 /// `min_mult` / `max_mult` are the products of the weapon's `MultiplyMinDamage`
-/// / `MultiplyMaxDamage` enchant mutators (`1.0` when none). To stay in lockstep
-/// with the client's per-map RNG, the decision to consume an RNG step is made on
-/// the *original* `min != max` (never on the scaled endpoints), so an enchanted
-/// weapon advances the generator exactly as the unscaled roll would. The random
-/// value is then spread across the enchant-scaled endpoints, and the attack-stat
-/// multiplier is applied for main-weapon slots. Passing `(1.0, 1.0)` reproduces
-/// the unenchanted roll bit-for-bit. Armor-piercing is carried through to
-/// [`damage_with_defense`].
+/// / `MultiplyMaxDamage` enchant mutators (`1.0` when none). `atk.shot_mult()`
+/// (mastery x challenge) scales the endpoints alongside them. To stay in
+/// lockstep with the client's per-map RNG, the decision to consume an RNG step
+/// is made on the *original* `min != max` (never on the scaled endpoints), so an
+/// enchanted or mastery-scaled weapon advances the generator exactly as the
+/// unscaled roll would. The random value is then spread across the scaled
+/// endpoints, and the attack-stat multiplier is applied for main-weapon slots.
+/// Passing `(1.0, 1.0)` reproduces the unenchanted, unmasteried roll bit-for-bit.
+/// Armor-piercing is carried through to [`damage_with_defense`].
 pub fn roll_base_damage(
     rng: &mut Rng,
     min: i32,
@@ -139,8 +156,14 @@ pub fn roll_base_damage(
     slot_type: i32,
     atk: &AttackerStats,
 ) -> i32 {
-    let emin = (min as f32 * min_mult) as i32;
-    let emax = (max as f32 * max_mult) as i32;
+    // The game scales the weapon's whole damage range by the mastery and the
+    // seasonal challenge multipliers before it rolls the shot (the in-game
+    // tooltip shows exactly that scaled range), so the endpoints are scaled here
+    // too and the roll lands inside them. A neutral 1.0 leaves the old numbers
+    // bit-identical, which is why `x * 1.0` is written out rather than skipped.
+    let shot_mult = atk.shot_mult();
+    let emin = ((min as f32 * min_mult) * shot_mult) as i32;
+    let emax = ((max as f32 * max_mult) * shot_mult) as i32;
     let mut dmg = emin;
     if min != max {
         let r = rng.next();
@@ -377,6 +400,7 @@ mod tests {
             attack: 75,
             condition: 0,
             exalt_bonus: 1000,
+            ..Default::default()
         };
         let dmg = roll_base_damage(&mut rng, 200, 200, 1.0, 1.0, 10, &atk);
         assert_eq!(dmg, 200);
@@ -390,6 +414,7 @@ mod tests {
             attack: 75,
             condition: 0,
             exalt_bonus: 1000,
+            ..Default::default()
         };
         let dmg = roll_base_damage(&mut rng, 100, 100, 1.0, 1.0, 1, &atk);
         assert_eq!(dmg, 200);
@@ -402,6 +427,7 @@ mod tests {
             attack: 75,
             condition: COND_WEAK,
             exalt_bonus: 1000,
+            ..Default::default()
         };
         let dmg = roll_base_damage(&mut rng, 100, 100, 1.0, 1.0, 1, &atk);
         assert_eq!(dmg, 50); // flat 0.5 regardless of attack
@@ -415,6 +441,7 @@ mod tests {
             attack: 75,
             condition: COND_DAMAGING,
             exalt_bonus: 1000,
+            ..Default::default()
         };
         let dmg = roll_base_damage(&mut rng, 100, 100, 1.0, 1.0, 1, &atk);
         assert_eq!(dmg, 250);
@@ -468,6 +495,7 @@ mod tests {
             attack: 75,
             condition: 0,
             exalt_bonus: 1000,
+            ..Default::default()
         };
         let mut a = Rng::new(12345);
         let mut b = Rng::new(12345);
@@ -476,6 +504,91 @@ mod tests {
             let plain = roll_base_damage(&mut b, 50, 150, 1.0, 1.0, 1, &atk);
             assert_eq!(scaled, plain);
         }
+    }
+
+    #[test]
+    fn shot_bonus_scales_fixed_damage_range() {
+        // Mastery (1.10) x the seasonal challenge (1.24) scale the weapon's rolled
+        // range, exactly as the client's tooltip shows it and as the theoretical
+        // page floors it. The ability slot (10) isolates the scaling from the
+        // attack multiplier: 100 * 1.1 * 1.24 = 136.4 -> 136.
+        let atk = AttackerStats {
+            attack: 0,
+            exalt_bonus: 1000,
+            mastery_mult: 1.1,
+            challenge_mult: 1.24,
+            ..Default::default()
+        };
+        let mut rng = Rng::new(1);
+        assert_eq!(
+            roll_base_damage(&mut rng, 100, 100, 1.0, 1.0, 10, &atk),
+            136
+        );
+    }
+
+    #[test]
+    fn shot_bonus_keeps_rng_step_count_and_scaled_range() {
+        // A scaled range must still consume exactly one RNG step, or every later
+        // roll in the map drifts out of sync with the client.
+        let atk = AttackerStats {
+            attack: 0,
+            exalt_bonus: 1000,
+            mastery_mult: 1.1,
+            challenge_mult: 1.24,
+            ..Default::default()
+        };
+        let mut rng = Rng::new(777);
+        let mut reference = rng.clone();
+        let dmg = roll_base_damage(&mut rng, 100, 200, 1.0, 1.0, 10, &atk);
+        reference.next(); // one step consumed, same as the unscaled roll
+        assert_eq!(rng.next(), reference.next());
+        // Scaled endpoints are [136, 272); the roll must fall within.
+        assert!((136..272).contains(&dmg), "dmg {dmg} outside scaled range");
+    }
+
+    #[test]
+    fn neutral_shot_bonus_reproduces_unscaled_roll() {
+        // 1.0/1.0 is the pre-multiplier behaviour and must stay bit-identical:
+        // this is what a character with no exalt mastery and no seasonal
+        // challenge gets, and what every pre-fix fight was credited with.
+        let neutral = AttackerStats {
+            attack: 75,
+            exalt_bonus: 1000,
+            ..Default::default()
+        };
+        let explicit = AttackerStats {
+            mastery_mult: 1.0,
+            challenge_mult: 1.0,
+            ..neutral
+        };
+        let mut a = Rng::new(4242);
+        let mut b = Rng::new(4242);
+        for _ in 0..20 {
+            assert_eq!(
+                roll_base_damage(&mut a, 75, 130, 1.0, 1.0, 1, &neutral),
+                roll_base_damage(&mut b, 75, 130, 1.0, 1.0, 1, &explicit)
+            );
+        }
+    }
+
+    #[test]
+    fn shot_mult_matches_the_shared_shot_damage_bonus() {
+        // Combat History and the theoretical DPS page must agree on these
+        // multipliers: the page scales the readout range with `total()`, the
+        // engine rolls inside a range scaled by `shot_mult()`. They disagreed
+        // once -- the engine folded in neither -- and every staff hit in a fight
+        // came out ~25% low.
+        let bonus = crate::stats::ShotDamageBonus {
+            mastery: 1.1,
+            challenge: 1.24,
+        };
+        let atk = AttackerStats {
+            mastery_mult: bonus.mastery,
+            challenge_mult: bonus.challenge,
+            ..Default::default()
+        };
+        assert_eq!(atk.shot_mult(), bonus.total());
+        assert!((atk.shot_mult() - 1.364).abs() < 1e-6);
     }
 
     #[test]
@@ -503,6 +616,19 @@ mod tests {
     fn armored_increases_defense() {
         // def 40 * 1.5 = 60 => 100 - 60 = 40.
         assert_eq!(damage_with_defense(100, false, 40, COND_ARMORED, 0), 40);
+    }
+
+    #[test]
+    fn armor_condition_bits_pin_the_capture_verified_values() {
+        // The bit assignment follows the game as observed in a live capture: the
+        // frequent state on a Dead Church Death Knight (0x04000000) zeroes its
+        // defence, and 0x02000000 raises it. Swapping them made a real Death
+        // Knight kill *worse* on replay (93.6% -> 85.3% of the removed HP), so
+        // the values are pinned here against the raw bits.
+        assert_eq!(COND_ARMORBROKEN, 0x0400_0000);
+        assert_eq!(COND_ARMORED, 0x0200_0000);
+        assert_eq!(damage_with_defense(100, false, 35, 0x0400_0000, 0), 100);
+        assert_eq!(damage_with_defense(100, false, 35, 0x0200_0000, 0), 48);
     }
 
     #[test]

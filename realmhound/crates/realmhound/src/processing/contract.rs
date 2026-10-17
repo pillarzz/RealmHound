@@ -167,6 +167,9 @@ pub enum AudioCommand {
     Play(SoundType),
     /// Play the configured notification sound for a loot bag tier.
     PlayForBag(LootBagType),
+    /// Play the shiny-loot notification sound for the shiny item's own bag tier
+    /// (see [`realmhound_core::loot::shiny_bag_tier`]).
+    PlayForBagShiny(LootBagType),
     /// Play a realm-event notification sound at a specific volume (already the
     /// per-event level; the audio thread scales it by master). `custom_key`
     /// selects a per-boss custom override from `SoundSettings::custom_sounds`.
@@ -209,6 +212,8 @@ pub enum ControlMsg {
     Shutdown,
     /// Clear the reassembler's ignored-connection set.
     ClearIgnored,
+    /// Start/stop recording raw packets to a `.rhcap` file (Debug settings).
+    SetCaptureRecording(bool),
     /// Update loot-tracking capture settings.
     SetLootTrackingSettings(LootTrackingSettings),
     /// Update Combat History tracking settings (which boss groups are recorded).
@@ -420,6 +425,10 @@ pub struct ViewState {
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
     pub loot_boost_secs: Option<u32>,
+    /// Whether the current map pauses the boost timers: a safe area (the Nexus,
+    /// Vault, Pet Yard, Guild Hall, Bazaar, Chess, Tinkerer Cave), or no map seen
+    /// yet. The card must not count the loot boost down while this is set.
+    pub map_pauses_boost_timers: bool,
 }
 
 impl ViewState {
@@ -443,6 +452,8 @@ impl ViewState {
             capture_queue_drops: 0,
             mission_view_gen: 0,
             loot_boost_secs: None,
+            // Nothing heard yet, so nothing may be counted down.
+            map_pauses_boost_timers: true,
         }
     }
 }

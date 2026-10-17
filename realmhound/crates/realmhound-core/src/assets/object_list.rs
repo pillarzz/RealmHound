@@ -729,7 +729,8 @@ impl DamageNovaEffect {
     }
 }
 
-/// A self stat buff (`StatBoostSelf`): grants `amount` of `stat` for `duration`
+/// A self stat buff (`StatBoostSelf`) or a range stat buff (`StatBoostAura`,
+/// which consumable treats use): grants `amount` of `stat` for `duration`
 /// seconds. `amount` may be negative (debuff trade-offs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatBoostEffect {
@@ -769,6 +770,89 @@ pub struct SummonProjectile {
     pub armor_piercing: bool,
 }
 
+/// What activates a summoned creature: the item's own use, or one of the
+/// `On*Activate` procs the item carries. Mirrors the XML element names, so the
+/// UI can say where a summon came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummonTrigger {
+    Use,
+    OnAbilityUse,
+    OnShoot,
+    OnAbilitySwitch,
+    OnHitTaken,
+    OnEnemyHit,
+    OnHexDetonate,
+}
+
+impl SummonTrigger {
+    /// Short human-readable label for tooltips.
+    pub fn label(self) -> &'static str {
+        match self {
+            SummonTrigger::Use => "on use",
+            SummonTrigger::OnAbilityUse => "on ability use",
+            SummonTrigger::OnShoot => "on shoot",
+            SummonTrigger::OnAbilitySwitch => "on ability switch",
+            SummonTrigger::OnHitTaken => "when hit",
+            SummonTrigger::OnEnemyHit => "on hitting an enemy",
+            SummonTrigger::OnHexDetonate => "on hex detonate",
+        }
+    }
+
+    /// The XML element that carries this trigger.
+    fn from_element(name: &[u8]) -> Option<Self> {
+        match name {
+            b"Activate" => Some(SummonTrigger::Use),
+            b"OnPlayerAbilityActivate" => Some(SummonTrigger::OnAbilityUse),
+            b"OnPlayerShootActivate" => Some(SummonTrigger::OnShoot),
+            b"OnSwitchAbilityActivate" => Some(SummonTrigger::OnAbilitySwitch),
+            b"OnPlayerHitActivate" => Some(SummonTrigger::OnHitTaken),
+            b"OnEnemyHitActivate" => Some(SummonTrigger::OnEnemyHit),
+            b"OnDetonateHexActivate" => Some(SummonTrigger::OnHexDetonate),
+            // The `Add`-prefixed variants stack a summon rather than replacing it,
+            // which is the same trigger with a different bookkeeping rule.
+            b"AddOnPlayerAbilityActivate" => Some(SummonTrigger::OnAbilityUse),
+            b"AddOnPlayerShootActivate" => Some(SummonTrigger::OnShoot),
+            b"AddOnPlayerHitActivate" => Some(SummonTrigger::OnHitTaken),
+            b"AddOnEnemyHitActivate" => Some(SummonTrigger::OnEnemyHit),
+            _ => None,
+        }
+    }
+}
+
+/// One item that spawns a given summoned creature, as declared by the item's own
+/// `<Activate>` or `On*Activate` element.
+///
+/// A summoned creature's object type is its identity, so this is the reverse
+/// lookup that names the source of a credited summon: `Summon Bear` (`0x89b1`)
+/// comes from Sovereign Mace, `MV Kimono Summon` (`0x500a`) from Flowering Kimono.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummonSource {
+    /// Object type of the item that spawns the creature.
+    pub item_type: i32,
+    /// The item's display name, or its object id when it has none.
+    pub item_name: String,
+    /// How the item spawns it.
+    pub trigger: SummonTrigger,
+    /// Proc chance when the XML declares one (`proc`), otherwise 1.0 for a use.
+    pub chance: f32,
+    /// Whether the item's own effect text says this summon deals damage.
+    ///
+    /// The game states a summon's damage in prose, not in an attribute: Sage's
+    /// Wakibiki reads "Summon a Friendly Spirit which slows enemies and zaps them
+    /// for 150 damage/sec", where the Marble Seal's Eye of Marble is only
+    /// "Summon an Eye of Marble for 4.5 seconds" because it buffs allies instead
+    /// of hurting anything. This flag is what keeps a buffing totem from taking
+    /// credit for a spirit's hits. A summon whose text never claims damage is
+    /// simply not credited packet damage -- its figure stays in the fight's
+    /// unattributed packet total rather than landing on a row that cannot deal
+    /// it.
+    pub deals_damage: bool,
+    /// How long the summoned creature lives, from the spawning element's own
+    /// `lifeTime` (seconds): a Sovereign Mace's bear lives 10, a spirit 6. 0 when
+    /// the element does not say, in which case a caller falls back to the shortest
+    /// documented lifetime.
+    pub lifetime_ms: i64,
+}
 /// A summoned creature (`SpawnCreep`): spawns an entity that attacks enemies
 /// for its lifetime (Summoner maces, some UTs).
 #[derive(Debug, Clone, PartialEq)]
@@ -881,6 +965,37 @@ impl AbilityEffects {
     /// Whether this item produced any readable effect (damage, heal, buff, etc.).
     pub fn has_readout(&self) -> bool {
         self.deals_damage() || !self.effects.is_empty()
+    }
+
+    /// How long after an activation this ability can still be the source of a
+    /// bulletless `DamagePacket`, or `None` when the ability declares no
+    /// server-applied damage at all -- in which case any packet credited to it
+    /// would be a misattribution.
+    ///
+    /// The wire carries no ability id, so this declared duration is the only
+    /// honest way to decide which activation owns a packet: a `DamageNova`
+    /// (Sporous Spray's mushroom, for one) runs `activation_count` waves `time`
+    /// seconds apart, and a poison ticks for its own duration.
+    pub fn server_applied_damage_window_ms(&self) -> Option<i64> {
+        /// Grace for network/packet latency beyond the last declared wave.
+        const GRACE_MS: i64 = 600;
+
+        let mut window: Option<i64> = None;
+        for effect in &self.effects {
+            let AbilityEffect::DamageNova(nova) = effect else {
+                continue;
+            };
+            let span = (nova.activation_count.max(1.0) * nova.time.max(0.0) * 1000.0) as i64;
+            window = Some(window.unwrap_or(0).max(span));
+        }
+        for grenade in &self.poison_grenades {
+            let span = (grenade.duration_s.max(0.0) * 1000.0) as i64;
+            window = Some(window.unwrap_or(0).max(span));
+        }
+        if self.detonate_hex.is_some() || !self.on_detonate_poison.is_empty() {
+            window = Some(window.unwrap_or(0));
+        }
+        window.map(|ms| ms + GRACE_MS)
     }
 }
 
@@ -1123,6 +1238,22 @@ pub struct ObjectList {
     /// each `(stat, percent, stat_relative_to)`: adds `percent`% of the wearer's
     /// `stat_relative_to` value to `stat`. Only items with such effects appear.
     stat_relatives: HashMap<i32, Vec<(StatKind, f32, StatKind)>>,
+    /// Map from a weapon's object ID to the ordered `<Projectile>` index each of
+    /// its `<Subattack>` patterns fires (equip.xml `projectileId` attribute). The
+    /// client's `PlayerShoot.projectileId` is the *subattack* index, so weapons
+    /// with more subattacks than projectiles (longbows: 3 patterns, all firing
+    /// projectile 0) need this mapping to resolve their damage. Only weapons
+    /// whose subattack list is present and non-trivial appear.
+    subattack_projectiles: HashMap<i32, Vec<i32>>,
+    /// Map from a summoned creature's object type to the items that spawn it, from
+    /// every item's <Activate> / On*Activate summon effect. One creature can
+    /// have several sources (base + (SB) or shiny variants of one item, or a
+    /// handful of items sharing a generic summon), so the value is a list.
+    summon_sources: HashMap<i32, Vec<SummonSource>>,
+    /// Display name per summoned creature, read from the spawning item's effect
+    /// text because the creature's own object entry has none (see
+    /// [`summon_name_from_text`]).
+    summon_names: HashMap<i32, String>,
 }
 
 impl ObjectList {
@@ -1137,6 +1268,9 @@ impl ObjectList {
             pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
+            subattack_projectiles: HashMap::new(),
+            summon_sources: HashMap::new(),
+            summon_names: HashMap::new(),
         }
     }
 
@@ -1283,6 +1417,9 @@ impl ObjectList {
             pet_skin_unlock: HashMap::new(),
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
+            subattack_projectiles: HashMap::new(),
+            summon_sources: HashMap::new(),
+            summon_names: HashMap::new(),
         })
     }
 
@@ -1684,6 +1821,20 @@ impl ObjectList {
             .unwrap_or(&[])
     }
 
+    /// Resolve a weapon's `PlayerShoot.projectileId` to a `<Projectile>` index.
+    ///
+    /// The client reports the *subattack* index, which for most weapons equals
+    /// the projectile index, but not for longbows (3 subattack patterns that all
+    /// fire projectile 0). Returns the projectile index the given subattack
+    /// fires, or `None` when the weapon has no subattack table or the index is
+    /// out of range.
+    pub fn subattack_projectile_index(&self, id: i32, subattack_index: usize) -> Option<usize> {
+        self.subattack_projectiles
+            .get(&id)
+            .and_then(|subs| subs.get(subattack_index))
+            .and_then(|&proj| usize::try_from(proj).ok())
+    }
+
     /// Every object ID whose display name matches `display_name`
     /// (case-insensitive). Used to group biome / re-skinned variants of the
     /// same encounter (e.g. the old and "New" Skull Shrine both display as
@@ -1889,6 +2040,7 @@ impl ObjectList {
         let mut np_seen = false;
         let mut current_stat_bonuses = StatBonuses::default();
         let mut current_stat_relatives: Vec<(StatKind, f32, StatKind)> = Vec::new();
+        let mut current_subattacks: Vec<i32> = Vec::new();
 
         // Element tracking
         let mut in_tier = false;
@@ -1981,6 +2133,7 @@ impl ObjectList {
                             np_seen = false;
                             current_stat_bonuses = StatBonuses::default();
                             current_stat_relatives = Vec::new();
+                            current_subattacks = Vec::new();
                             pending_proj = None;
                             in_projectile = false;
                             in_proj_min = false;
@@ -2020,6 +2173,18 @@ impl ObjectList {
                         b"Projectile" => {
                             in_projectile = true;
                             proj_ap = false;
+                        }
+                        // A firing pattern; records which `<Projectile>` it fires.
+                        // The client's PlayerShoot.projectileId indexes these.
+                        b"Subattack" => {
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == b"projectileId" {
+                                    let v = String::from_utf8_lossy(&attr.value);
+                                    if let Ok(id) = v.trim().parse::<i32>() {
+                                        current_subattacks.push(id);
+                                    }
+                                }
+                            }
                         }
                         b"MinDamage" if in_projectile => in_proj_min = true,
                         b"MaxDamage" if in_projectile => in_proj_max = true,
@@ -2388,7 +2553,9 @@ impl ObjectList {
                         if !is_mechanic_only {
                             pending_shuriken = Some(pending_attrs.clone());
                         }
-                    } else if in_activate && text.as_ref() == "StatBoostSelf" {
+                    } else if in_activate
+                        && (text.as_ref() == "StatBoostSelf" || text.as_ref() == "StatBoostAura")
+                    {
                         current_ability
                             .effects
                             .push(AbilityEffect::StatBoost(StatBoostEffect {
@@ -2509,6 +2676,10 @@ impl ObjectList {
                                         type_id,
                                         std::mem::take(&mut current_stat_relatives),
                                     );
+                                }
+                                if !current_subattacks.is_empty() {
+                                    self.subattack_projectiles
+                                        .insert(type_id, std::mem::take(&mut current_subattacks));
                                 }
                                 if let Some(target) = current_unlock_target.take() {
                                     unlock_map.insert(type_id, target);
@@ -2806,6 +2977,313 @@ impl ObjectList {
 
         Ok(updated)
     }
+
+    /// Index every item that spawns a summoned creature, from the item files'
+    /// own `<Activate>` / `On*Activate` elements.
+    ///
+    /// The summoned entity is referenced by name (`objectId` for `SpawnCreep` and
+    /// `Pet`, `undeadId` for `RaiseDead`), so the files are read twice: once to
+    /// learn every object name -> type in them (the creature is usually defined in
+    /// `allies.xml`, the item in `equip.xml`), then once to collect each item's
+    /// summons. Returns the number of item -> creature links added.
+    pub fn merge_summon_sources_xml<P: AsRef<Path>>(
+        &mut self,
+        paths: &[P],
+    ) -> Result<usize, String> {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        // Pass 1: name -> type across the files, so a creature referenced by name
+        // resolves wherever it is defined.
+        let mut name_to_type: HashMap<String, i32> = HashMap::new();
+        for path in paths {
+            let file = File::open(path.as_ref())
+                .map_err(|e| format!("Failed to open summon XML: {}", e))?;
+            let mut reader = Reader::from_reader(BufReader::new(file));
+            reader.config_mut().trim_text(true);
+            let mut buf = Vec::new();
+            loop {
+                match reader.read_event_into(&mut buf) {
+                    Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                        if e.name().as_ref() == b"Object" =>
+                    {
+                        let mut id = None;
+                        let mut typ = None;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"id" => {
+                                    id = Some(String::from_utf8_lossy(&attr.value).to_string())
+                                }
+                                b"type" => {
+                                    typ = parse_hex_type(&String::from_utf8_lossy(&attr.value))
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let (Some(id), Some(typ)) = (id, typ) {
+                            name_to_type.entry(id.trim().to_string()).or_insert(typ);
+                        }
+                    }
+                    Ok(Event::Eof) => break,
+                    Err(e) => return Err(format!("Summon XML parse error: {}", e)),
+                    _ => {}
+                }
+                buf.clear();
+            }
+        }
+
+        // Pass 2: the items and what they summon.
+        let mut added = 0usize;
+        for path in paths {
+            let file = File::open(path.as_ref())
+                .map_err(|e| format!("Failed to open summon XML: {}", e))?;
+            let mut reader = Reader::from_reader(BufReader::new(file));
+            reader.config_mut().trim_text(true);
+            let mut buf = Vec::new();
+
+            let mut in_object = false;
+            let mut item_type: Option<i32> = None;
+            let mut is_item = false;
+            let mut item_name = String::new();
+            let mut in_display_id = false;
+            // Whether the item's own effect text claims its summon deals damage
+            // (see `SummonSource::deals_damage`). Applied to every link this
+            // object declares when it ends, so element order cannot matter.
+            let mut mentions_damage = false;
+            // The creature's own display name, likewise read from that prose.
+            let mut summoned_name: Option<String> = None;
+            // Trigger, proc chance and the entity name of the activate element the
+            // reader is inside, whose text names the effect, plus that element's
+            // own `lifeTime` when it declares one.
+            let mut pending: Option<(SummonTrigger, f32, String)> = None;
+            let mut pending_lifetime_ms = 0i64;
+            // Item -> creature links found for the object being read, applied when
+            // the object ends so a name that arrives later cannot be missed.
+            let mut found: Vec<(i32, SummonSource)> = Vec::new();
+
+            loop {
+                match reader.read_event_into(&mut buf) {
+                    Ok(Event::Start(ref e)) => match e.name().as_ref() {
+                        b"Object" => {
+                            in_object = true;
+                            is_item = false;
+                            item_type = None;
+                            item_name.clear();
+                            found.clear();
+                            mentions_damage = false;
+                            for attr in e.attributes().flatten() {
+                                match attr.key.as_ref() {
+                                    b"id" => {
+                                        item_name = String::from_utf8_lossy(&attr.value).to_string()
+                                    }
+                                    b"type" => {
+                                        item_type =
+                                            parse_hex_type(&String::from_utf8_lossy(&attr.value))
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        b"DisplayId" => in_display_id = true,
+                        b"SlotType" => is_item = true,
+                        b"EffectInfo" => {
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() != b"description" {
+                                    continue;
+                                }
+                                let text = String::from_utf8_lossy(&attr.value);
+                                if text.to_ascii_lowercase().contains("damage") {
+                                    mentions_damage = true;
+                                }
+                                if let Some(name) = summon_name_from_text(&text) {
+                                    summoned_name = Some(name);
+                                }
+                            }
+                        }
+                        name => {
+                            if in_object {
+                                if let Some(trigger) = SummonTrigger::from_element(name) {
+                                    let mut chance = 1.0f32;
+                                    let mut entity = String::new();
+                                    let mut lifetime_ms = 0i64;
+                                    for attr in e.attributes().flatten() {
+                                        match attr.key.as_ref() {
+                                            b"proc" => {
+                                                chance = String::from_utf8_lossy(&attr.value)
+                                                    .parse()
+                                                    .unwrap_or(1.0)
+                                            }
+                                            b"objectId" | b"undeadId" => {
+                                                entity =
+                                                    String::from_utf8_lossy(&attr.value).to_string()
+                                            }
+                                            // `lifeTime` is in seconds and may be
+                                            // fractional ("10.0", "0.5").
+                                            b"lifeTime" => {
+                                                lifetime_ms = String::from_utf8_lossy(&attr.value)
+                                                    .parse::<f64>()
+                                                    .map(|s| (s * 1000.0).round() as i64)
+                                                    .unwrap_or(0)
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    pending = Some((trigger, chance, entity));
+                                    pending_lifetime_ms = lifetime_ms;
+                                }
+                            }
+                        }
+                    },
+                    Ok(Event::Empty(ref e)) if e.name().as_ref() == b"EffectInfo" => {
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() != b"description" {
+                                continue;
+                            }
+                            let text = String::from_utf8_lossy(&attr.value);
+                            if text.to_ascii_lowercase().contains("damage") {
+                                mentions_damage = true;
+                            }
+                            if let Some(name) = summon_name_from_text(&text) {
+                                summoned_name = Some(name);
+                            }
+                        }
+                    }
+                    Ok(Event::Text(ref t)) => {
+                        let text = t.unescape().unwrap_or_default().to_string();
+                        if in_display_id {
+                            item_name = text.trim().to_string();
+                        } else if let Some((trigger, chance, entity)) = pending.take() {
+                            // The element's text names the effect; only the summon
+                            // effects are indexed here. A `Pet`/`RaiseDead` with no
+                            // entity name (a necromancer skull raising whatever it
+                            // killed) has nothing to resolve and is skipped.
+                            if matches!(text.trim(), "SpawnCreep" | "RaiseDead" | "Pet") {
+                                if let (Some(item_type), Some(entity_type)) =
+                                    (item_type, name_to_type.get(entity.trim()).copied())
+                                {
+                                    found.push((
+                                        entity_type,
+                                        SummonSource {
+                                            item_type,
+                                            item_name: item_name.clone(),
+                                            trigger,
+                                            chance,
+                                            deals_damage: false,
+                                            lifetime_ms: pending_lifetime_ms,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::End(ref e)) => match e.name().as_ref() {
+                        b"DisplayId" => in_display_id = false,
+                        b"Object" => {
+                            in_object = false;
+                            pending = None;
+                            pending_lifetime_ms = 0;
+                            if is_item {
+                                for (entity_type, mut source) in found.drain(..) {
+                                    source.deals_damage = mentions_damage;
+                                    if let Some(name) = summoned_name.take() {
+                                        self.summon_names.entry(entity_type).or_insert(name);
+                                    }
+                                    let list = self.summon_sources.entry(entity_type).or_default();
+                                    if !list.contains(&source) {
+                                        list.push(source);
+                                        added += 1;
+                                    }
+                                }
+                            }
+                            mentions_damage = false;
+                            summoned_name = None;
+                        }
+                        _ => {}
+                    },
+                    Ok(Event::Eof) => break,
+                    Err(e) => return Err(format!("Summon XML parse error: {}", e)),
+                    _ => {}
+                }
+                buf.clear();
+            }
+        }
+
+        Ok(added)
+    }
+
+    /// The items that spawn the given summoned creature, in declaration order.
+    /// Empty for anything that is not an item-declared summon (pets, and creatures
+    /// the game spawns on its own).
+    pub fn summon_sources(&self, object_type: i32) -> &[SummonSource] {
+        self.summon_sources
+            .get(&object_type)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The summoned creature's own display name, as the spawning item's effect
+    /// text states it ("Friendly Spirit", "Eye of Marble"). `None` for a creature
+    /// no item names, whose row falls back to the object id's own name.
+    pub fn summon_name(&self, object_type: i32) -> Option<&str> {
+        self.summon_names.get(&object_type).map(|s| s.as_str())
+    }
+
+    /// The reverse of [`Self::summon_sources`]: the creatures `item_type` spawns,
+    /// each with the entry describing how it does. Lets a summon be traced from an
+    /// item that is missing a shoot packet of its own -- a creature spawned by an
+    /// ability activation is named only by the item, never by the creature.
+    pub fn summoned_by_item(&self, item_type: i32) -> Vec<(i32, SummonSource)> {
+        let mut out: Vec<(i32, SummonSource)> = self
+            .summon_sources
+            .iter()
+            .flat_map(|(&creature, sources)| {
+                sources
+                    .iter()
+                    .filter(|s| s.item_type == item_type)
+                    .map(move |s| (creature, s.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(creature, _)| *creature);
+        out
+    }
+}
+
+/// The summoned creature's display name, read out of the spawning item's own
+/// effect text.
+///
+/// A summon's object entry carries no `DisplayId` -- `MV Kimono Summon`,
+/// `MV Wakibiki Summon` and `MV Happi Summon` are internal ids -- so the only
+/// place the game names one is the prose: "Summon a Friendly Spirit which slows
+/// enemies and zaps them for 150 damage/sec", "Summon an Eye of Marble for 4.5
+/// seconds". Only a sentence that *is* a summon statement counts: a set bonus
+/// that merely mentions summoning ("Wearing X along with this ring allows you to
+/// summon Blizzard") must not rename the item's real summon.
+fn summon_name_from_text(description: &str) -> Option<String> {
+    let text = description.trim_start();
+    if !text.to_ascii_lowercase().starts_with("summon") {
+        return None;
+    }
+    let mut rest = text["summon".len()..].trim_start();
+    // "Summons a mind minion" -- the plural verb reads the same way.
+    rest = rest.strip_prefix('s').unwrap_or(rest).trim_start();
+    rest = rest
+        .strip_prefix("a ")
+        .or_else(|| rest.strip_prefix("an "))
+        .or_else(|| rest.strip_prefix("the "))
+        .unwrap_or(rest);
+    let stop = rest.find(['.', ',', '!', ';']).unwrap_or(rest.len());
+    let rest = &rest[..stop];
+    // Cut at the earliest clause boundary, so "Summon a Friendly Spirit which
+    // slows..." yields the name and not the sentence.
+    let cut = [
+        " which", " that", " who", " for", " to ", " and ", " when", " in ", " with",
+    ]
+    .iter()
+    .filter_map(|c| rest.find(c))
+    .min()
+    .unwrap_or(rest.len());
+    let name = rest[..cut].trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Parse hex type string (e.g., "0xa00" -> 2560).
@@ -3171,6 +3649,107 @@ mod tests {
         // Back-compat: an 8-field line has no defense field and defaults to 0.
         let old = "2827;Sword of the Colossus;Equipment;Weapon;1,200,275,1;0,lofiObj5,;UT;SwordOfTheColossus";
         assert_eq!(ObjectList::parse_object_line(old).unwrap().defense, 0);
+    }
+
+    #[test]
+    fn summon_sources_indexes_items_and_their_triggers() {
+        // The summoned entity is referenced by name, so the pass has to resolve
+        // names across the files it is given (the creature lives in allies.xml,
+        // the item in equip.xml) and keep the trigger and proc chance.
+        let mut list = ObjectList::new();
+        let equip = r#"<Objects>
+  <Object type="0x3849" id="Sovereign Mace">
+    <DisplayId>Sovereign Mace</DisplayId>
+    <Class>Equipment</Class>
+    <SlotType>19</SlotType>
+    <Activate objectId="Summon Bear" summonCost="60" lifeTime="45">SpawnCreep</Activate>
+    <EffectInfo description="Summons a Bear that deals damage." name="On Use" />
+  </Object>
+  <Object type="0x9581" id="Sovereign Mace (SB)">
+    <DisplayId>Sovereign Mace</DisplayId>
+    <Class>Equipment</Class>
+    <SlotType>19</SlotType>
+    <Activate objectId="Summon Bear">SpawnCreep</Activate>
+  </Object>
+  <Object type="0x6102" id="Soul's Guidance">
+    <DisplayId>Soul's Guidance</DisplayId>
+    <Class>Equipment</Class>
+    <SlotType>8</SlotType>
+    <Projectile></Projectile>
+    <AddOnPlayerShootActivate cooldown="0.4" objectId="Guided Forgotten Soul" proc="0.15">Pet</AddOnPlayerShootActivate>
+  </Object>
+  <Object type="0xb2b" id="Bloodsucker Skull">
+    <DisplayId>Bloodsucker Skull</DisplayId>
+    <Class>Equipment</Class>
+    <SlotType>19</SlotType>
+    <Activate numDead="1" undeadId="Bloodsucker Undead">RaiseDead</Activate>
+  </Object>
+  <Object type="0x1111" id="Plain Ring">
+    <DisplayId>Plain Ring</DisplayId>
+    <Class>Equipment</Class>
+    <SlotType>9</SlotType>
+    <Activate amount="5" stat="ATT">IncrementStat</Activate>
+  </Object>
+</Objects>"#;
+        let allies = r#"<Objects>
+  <Object type="0x89b1" id="Summon Bear">
+    <DisplayId>Bear</DisplayId>
+    <Class>Summon</Class>
+  </Object>
+  <Object type="0x6101" id="Guided Forgotten Soul">
+    <DisplayId>Guided Forgotten Soul</DisplayId>
+    <Class>Summon</Class>
+  </Object>
+  <Object type="0x16b0" id="Bloodsucker Undead">
+    <DisplayId>Bloodsucker Undead</DisplayId>
+    <Class>Undead</Class>
+  </Object>
+</Objects>"#;
+        let dir = std::env::temp_dir().join(format!("rh_summon_sources_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let equip_path = dir.join("equip.xml");
+        let allies_path = dir.join("allies.xml");
+        std::fs::write(&equip_path, equip).unwrap();
+        std::fs::write(&allies_path, allies).unwrap();
+
+        let added = list
+            .merge_summon_sources_xml(&[equip_path.clone(), allies_path.clone()])
+            .expect("the fixture parses");
+        assert_eq!(added, 4, "two maces, one kick proc and one skull raise");
+
+        let bear = list.summon_sources(0x89b1);
+        assert_eq!(bear.len(), 2);
+        assert!(bear.iter().all(|s| s.item_name == "Sovereign Mace"));
+        assert_eq!(bear[0].item_type, 0x3849);
+        assert_eq!(bear[0].trigger, SummonTrigger::Use);
+        assert_eq!(bear[0].chance, 1.0);
+        // The item's own effect text claims damage, and it says so in an element
+        // *after* the Activate that names the creature: the flag is applied to
+        // every link an object declares, so element order cannot matter.
+        assert!(bear[0].deals_damage);
+        // The second mace declares no effect text at all.
+        assert!(!bear[1].deals_damage);
+
+        let soul = list.summon_sources(0x6101);
+        assert_eq!(soul.len(), 1);
+        assert_eq!(soul[0].item_name, "Soul's Guidance");
+        assert_eq!(soul[0].trigger, SummonTrigger::OnShoot);
+        assert!((soul[0].chance - 0.15).abs() < 1e-6);
+        // Nothing claims it deals damage, so it is not credited packet damage.
+        assert!(!soul[0].deals_damage);
+
+        let undead = list.summon_sources(0x16b0);
+        assert_eq!(undead.len(), 1);
+        assert_eq!(undead[0].trigger, SummonTrigger::Use);
+        assert!(undead[0].item_name.contains("Bloodsucker"));
+
+        // A non-summon activate contributes nothing, and an object with no
+        // `<SlotType>` is not an item even if it spawns something.
+        assert!(list.summon_sources(0x1111).is_empty());
+        // A creature nothing declares has no source.
+        assert!(list.summon_sources(0x4683).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3615,6 +4194,43 @@ mod tests {
         assert_eq!(list.blueprint_unlocked_id(200), Some(100));
         // A non-blueprint item's Shoot activate must not create a mapping.
         assert_eq!(list.blueprint_unlocked_id(100), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_records_subattack_projectile_index() {
+        // The client's PlayerShoot.projectileId is the *subattack* index. A
+        // longbow has 3 firing patterns (center/left/right) that all fire its
+        // single projectile, so indices 1 and 2 must resolve to projectile 0
+        // instead of reporting "no data" (which kills self-compute for the map).
+        let mut list = ObjectList::new();
+        let xml = r#"<Objects>
+  <Object type="0x7010" id="Longbow of the Endless Sky">
+    <Class>Equipment</Class>
+    <Item />
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Projectile id="0">
+      <MinDamage>100</MinDamage>
+      <MaxDamage>125</MaxDamage>
+    </Projectile>
+  </Object>
+</Objects>"#;
+
+        let dir = std::env::temp_dir().join(format!("rh_subattack_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("equip.xml");
+        std::fs::write(&path, xml).unwrap();
+        list.merge_equipment_xml(&path).unwrap();
+
+        // 0x7010 == 28688 (Longbow of the Endless Sky).
+        assert_eq!(list.subattack_projectile_index(28688, 0), Some(0));
+        assert_eq!(list.subattack_projectile_index(28688, 1), Some(0));
+        assert_eq!(list.subattack_projectile_index(28688, 2), Some(0));
+        assert_eq!(list.subattack_projectile_index(28688, 3), None);
+        assert_eq!(list.subattack_projectile_index(1234, 0), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

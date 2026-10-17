@@ -15,8 +15,10 @@
 //! `ts_nanos` is nanoseconds since the Unix epoch. `data` is the raw captured
 //! bytes (link-layer through TCP payload), identical to what capture delivers.
 
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -37,10 +39,21 @@ pub fn captures_dir() -> PathBuf {
 }
 
 /// Streaming writer for a `.rhcap` capture file.
+///
+/// The most recent frames are held back instead of being written straight away, so
+/// the caller can still drop them: whether a frame carries credentials is only known
+/// after its packet is parsed, which happens after the frame was handed over (see
+/// [`CaptureWriter::discard_pending_flow`]).
 pub struct CaptureWriter {
     inner: BufWriter<File>,
     count: u64,
+    pending: VecDeque<RawPacket>,
 }
+
+/// How many frames are held back before they are committed to the file. A handshake
+/// can span a couple of TCP segments, so the frame that completes reassembly is not
+/// necessarily the frame that started it.
+const HELD_FRAMES: usize = 4;
 
 impl CaptureWriter {
     /// Create a capture file at `path`, writing the magic header.
@@ -50,11 +63,63 @@ impl CaptureWriter {
         }
         let mut inner = BufWriter::new(File::create(path)?);
         inner.write_all(MAGIC)?;
-        Ok(Self { inner, count: 0 })
+        Ok(Self {
+            inner,
+            count: 0,
+            pending: VecDeque::with_capacity(HELD_FRAMES),
+        })
     }
 
-    /// Append one raw packet frame.
+    /// Append one raw packet frame. It is held for a few frames, so
+    /// [`Self::discard_pending_flow`] can still drop it.
     pub fn write(&mut self, packet: &RawPacket) -> io::Result<()> {
+        self.pending.push_back(packet.clone());
+        while self.pending.len() > HELD_FRAMES {
+            if let Some(packet) = self.pending.pop_front() {
+                self.write_frame(&packet)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the held frames that belong to the same TCP flow as `handshake`.
+    ///
+    /// The client's `Hello` (74) carries the session ticket in its `access_token`.
+    /// Captures get shared for debugging, and the packet cipher is keyed by the packet
+    /// tick rather than by a secret, so a ticket inside a capture is readable by anyone
+    /// holding the file -- these frames never reach the disk.
+    ///
+    /// Every held frame of that flow *and direction* goes, not only the one that
+    /// completed reassembly, because the handshake bytes may be split across TCP
+    /// segments. Two kinds of frame are deliberately kept:
+    /// - anything the server sent on that connection (its `Hello` reply, and the
+    ///   `MapInfo` whose `fp` seeds the damage model): the ticket only travels
+    ///   client to server, so those carry nothing worth hiding;
+    /// - frames of other connections: dropping them would leave a hole in a stream
+    ///   that has nothing to do with the credentials.
+    pub fn discard_pending_flow(&mut self, handshake: &RawPacket) {
+        let Some((src_ip, src_port, dst_ip, dst_port)) = endpoints(handshake) else {
+            self.pending.clear();
+            return;
+        };
+        self.pending.retain(|packet| match endpoints(packet) {
+            Some((sip, sport, dip, dport)) => {
+                !(sip == src_ip && sport == src_port && dip == dst_ip && dport == dst_port)
+            }
+            // Unparsable now, parsable later: keep it rather than guess.
+            None => true,
+        });
+    }
+
+    /// Write the frames held from earlier calls.
+    fn write_pending(&mut self) -> io::Result<()> {
+        while let Some(packet) = self.pending.pop_front() {
+            self.write_frame(&packet)?;
+        }
+        Ok(())
+    }
+
+    fn write_frame(&mut self, packet: &RawPacket) -> io::Result<()> {
         let ts_nanos = packet.timestamp.timestamp_nanos_opt().unwrap_or(0);
         self.inner.write_all(&ts_nanos.to_le_bytes())?;
         self.inner.write_all(&[packet.packet_format as u8])?;
@@ -70,16 +135,28 @@ impl CaptureWriter {
         self.count
     }
 
-    /// Flush buffered bytes to disk.
+    /// Flush buffered bytes to disk, including the held frames.
     pub fn flush(&mut self) -> io::Result<()> {
+        self.write_pending()?;
         self.inner.flush()
     }
 }
 
 impl Drop for CaptureWriter {
     fn drop(&mut self) {
-        let _ = self.inner.flush();
+        let _ = self.flush();
     }
+}
+
+/// `(src_ip, src_port, dst_ip, dst_port)` of a captured frame, if it carries TCP.
+fn endpoints(packet: &RawPacket) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
+    let segment = crate::stream::parse_tcp_segment(packet)?;
+    Some((
+        segment.src_ip,
+        segment.src_port,
+        segment.dst_ip,
+        segment.dst_port,
+    ))
 }
 
 /// Read every frame from a `.rhcap` capture file into raw packets.
@@ -146,6 +223,70 @@ pub fn read_capture(path: &Path) -> io::Result<Vec<RawPacket>> {
 mod tests {
     use super::*;
 
+    /// A minimal IPv4/TCP frame for `port -> 2050`, carrying `payload`.
+    fn frame(port: u16, payload: &[u8]) -> RawPacket {
+        let mut data = Vec::new();
+        etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 2], 64)
+            .tcp(port, 2050, 1, 32768)
+            .ack(1)
+            .psh()
+            .write(&mut data, payload)
+            .unwrap();
+        RawPacket {
+            timestamp: Utc::now(),
+            packet_format: PacketFormat::RawIp,
+            #[cfg(feature = "latency-diagnostics")]
+            enqueued_at: None,
+            data,
+        }
+    }
+
+    /// The server's side of the same connection: `2050 -> port`.
+    fn reply(port: u16, payload: &[u8]) -> RawPacket {
+        let mut data = Vec::new();
+        etherparse::PacketBuilder::ipv4([198, 51, 100, 2], [192, 0, 2, 1], 64)
+            .tcp(2050, port, 32768, 1)
+            .ack(1)
+            .psh()
+            .write(&mut data, payload)
+            .unwrap();
+        RawPacket {
+            timestamp: Utc::now(),
+            packet_format: PacketFormat::RawIp,
+            #[cfg(feature = "latency-diagnostics")]
+            enqueued_at: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn a_discarded_frame_never_reaches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redacted.rhcap");
+        {
+            let mut w = CaptureWriter::create(&path).unwrap();
+            let hello = frame(45678, &[1]);
+            w.write(&hello).unwrap();
+            w.write(&frame(45678, &[2])).unwrap(); // held
+            w.write(&frame(45678, &[3])).unwrap(); // held
+            w.write(&reply(45678, &[9])).unwrap(); // held, server -> client
+                                                   // The caller decided the frame was a handshake after parsing it: it takes
+                                                   // out every held frame sent on that connection in that direction, and
+                                                   // leaves the server's frames (MapInfo among them) alone.
+            w.discard_pending_flow(&hello);
+            assert_eq!(w.count(), 0);
+            w.write(&frame(45678, &[4])).unwrap();
+            w.write(&frame(45679, &[8])).unwrap(); // other connection
+            w.flush().unwrap();
+            assert_eq!(w.count(), 3);
+        }
+        let read = read_capture(&path).unwrap();
+        assert_eq!(read.len(), 3);
+        assert_eq!(endpoints(&read[0]).map(|e| e.1), Some(2050)); // the server's frame
+        assert_eq!(endpoints(&read[1]).map(|e| e.1), Some(45678)); // after the Hello
+        assert_eq!(endpoints(&read[2]).map(|e| e.1), Some(45679)); // other connection
+    }
+
     #[test]
     fn round_trips_packets() {
         let dir = tempfile::tempdir().unwrap();
@@ -187,6 +328,7 @@ mod tests {
             for p in &original {
                 w.write(p).unwrap();
             }
+            w.flush().unwrap();
             assert_eq!(w.count(), original.len() as u64);
         }
 

@@ -80,6 +80,15 @@ pub enum SoundType {
     BlueBag,
     GoldBag,
     EggBag,
+    /// Plays when a loot bag holds a shiny item whose own bag tier is white.
+    /// Placeholder audio is the white bag sound.
+    ShinyWhiteBag,
+    /// Plays when a loot bag holds a shiny item whose own bag tier is teal.
+    /// Placeholder audio is the white bag sound.
+    ShinyTealBag,
+    /// Plays when a loot bag holds a shiny pet stone. Placeholder audio is the
+    /// white bag sound.
+    ShinyGoldBag,
     KeyPop,
     /// Key pop in a Rookie-tier dungeon (own volume/custom sound).
     KeyPopRookie,
@@ -116,6 +125,9 @@ impl SoundType {
             Self::BlueBag => BLUEBAG_WAV,
             Self::GoldBag => GOLDBAG_WAV,
             Self::EggBag => EGGBAG_WAV,
+            // Placeholder audio until dedicated shiny sounds are sourced; the
+            // settings row lets the user point each one at their own file.
+            Self::ShinyWhiteBag | Self::ShinyTealBag | Self::ShinyGoldBag => WHITEBAG_WAV,
             Self::KeyPop => KEYPOP_WAV,
             Self::KeyPopRookie => KEYPOP_WAV,
             Self::KeyPopAdept => KEYPOP_WAV,
@@ -143,6 +155,9 @@ impl SoundType {
             Self::BlueBag => settings.bluebag,
             Self::GoldBag => settings.goldbag,
             Self::EggBag => settings.eggbag,
+            Self::ShinyWhiteBag => settings.shiny_whitebag,
+            Self::ShinyTealBag => settings.shiny_tealbag,
+            Self::ShinyGoldBag => settings.shiny_goldbag,
             Self::KeyPop => settings.keypop,
             Self::KeyPopRookie => settings.keypop && settings.keypop_tiers.rookie,
             Self::KeyPopAdept => settings.keypop && settings.keypop_tiers.adept,
@@ -173,6 +188,20 @@ impl SoundType {
         }
     }
 
+    /// Get the shiny-loot notification sound for a bag tier.
+    ///
+    /// The tier is the shiny item's own bag tier (see
+    /// [`realmhound_core::loot::shiny_bag_tier`]), not the physical bag colour.
+    /// Only white, teal and gold have dedicated shiny notifications.
+    pub fn for_shiny_bag_type(bag_type: LootBagType) -> Option<Self> {
+        match bag_type {
+            LootBagType::White | LootBagType::BoostedWhite => Some(Self::ShinyWhiteBag),
+            LootBagType::Teal | LootBagType::BoostedTeal => Some(Self::ShinyTealBag),
+            LootBagType::Gold | LootBagType::BoostedGold => Some(Self::ShinyGoldBag),
+            _ => None,
+        }
+    }
+
     /// Map a key-pop difficulty tier to its dedicated sound type so per-tier
     /// volume and custom-sound overrides apply. Unknown-tier pops (`None`) fall
     /// back to the base [`Self::KeyPop`].
@@ -196,6 +225,9 @@ impl SoundType {
             Self::BlueBag => "bluebag",
             Self::GoldBag => "goldbag",
             Self::EggBag => "eggbag",
+            Self::ShinyWhiteBag => "shiny_whitebag",
+            Self::ShinyTealBag => "shiny_tealbag",
+            Self::ShinyGoldBag => "shiny_goldbag",
             Self::KeyPop => "keypop",
             Self::KeyPopRookie => "keypop_rookie",
             Self::KeyPopAdept => "keypop_adept",
@@ -396,7 +428,7 @@ impl PlaybackLatencyDiagnostics {
         let summary = self.roll_health_window(now);
         match command_kind {
             "play" => self.health_play_commands += 1,
-            "play_for_bag" => self.health_bag_commands += 1,
+            "play_for_bag" | "play_for_bag_shiny" => self.health_bag_commands += 1,
             "play_event" => self.health_event_commands += 1,
             "set_volume" => self.health_volume_commands += 1,
             _ => {}
@@ -928,6 +960,50 @@ mod tests {
 
         settings.custom_chat = true;
         assert!(SoundType::CustomChat.is_enabled(&settings));
+    }
+
+    #[test]
+    fn shiny_bag_sounds_are_off_by_default_and_follow_their_toggles() {
+        let mut settings = SoundSettings::default();
+        assert!(!SoundType::ShinyWhiteBag.is_enabled(&settings));
+        assert!(!SoundType::ShinyTealBag.is_enabled(&settings));
+        assert!(!SoundType::ShinyGoldBag.is_enabled(&settings));
+
+        settings.shiny_whitebag = true;
+        assert!(SoundType::ShinyWhiteBag.is_enabled(&settings));
+        assert!(!SoundType::ShinyTealBag.is_enabled(&settings));
+
+        settings.shiny_tealbag = true;
+        settings.shiny_goldbag = true;
+        assert!(SoundType::ShinyTealBag.is_enabled(&settings));
+        assert!(SoundType::ShinyGoldBag.is_enabled(&settings));
+    }
+
+    #[test]
+    fn shiny_bag_sounds_map_from_their_tier_and_use_white_bag_audio() {
+        assert_eq!(
+            SoundType::for_shiny_bag_type(LootBagType::White),
+            Some(SoundType::ShinyWhiteBag)
+        );
+        assert_eq!(
+            SoundType::for_shiny_bag_type(LootBagType::Teal),
+            Some(SoundType::ShinyTealBag)
+        );
+        assert_eq!(
+            SoundType::for_shiny_bag_type(LootBagType::Gold),
+            Some(SoundType::ShinyGoldBag)
+        );
+        // Purple (and other) tiers have no shiny notification.
+        assert_eq!(SoundType::for_shiny_bag_type(LootBagType::Purple), None);
+
+        // Placeholder audio is the white bag sound.
+        assert_eq!(SoundType::ShinyWhiteBag.audio_data(), WHITEBAG_WAV);
+        assert_eq!(SoundType::ShinyTealBag.audio_data(), WHITEBAG_WAV);
+        assert_eq!(SoundType::ShinyGoldBag.audio_data(), WHITEBAG_WAV);
+
+        assert_eq!(SoundType::ShinyWhiteBag.settings_key(), "shiny_whitebag");
+        assert_eq!(SoundType::ShinyTealBag.settings_key(), "shiny_tealbag");
+        assert_eq!(SoundType::ShinyGoldBag.settings_key(), "shiny_goldbag");
     }
 
     #[test]

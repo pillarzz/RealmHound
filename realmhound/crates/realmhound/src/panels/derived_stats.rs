@@ -16,7 +16,11 @@ use crate::panels::character_card::{
 };
 use crate::rendering::{EmbeddedIcon, SpriteRenderer};
 
-const HEADER_COLOR: Color32 = Color32::from_rgb(150, 200, 255);
+/// Section-header colour across the stat cards: the light blue the ATTRIBUTES
+/// block titles its sections with.
+pub(crate) const HEADER_COLOR: Color32 = Color32::from_rgb(150, 200, 255);
+/// Section-header font size, matching [`HEADER_COLOR`]'s block.
+pub(crate) const HEADER_SIZE: f32 = 15.0;
 /// Font size for the base-fame and fame-on-death lines folded into the top of
 /// the ATTRIBUTES block (slightly smaller than the old footer fame).
 const FAME_FONT_SIZE: f32 = 14.0;
@@ -88,15 +92,22 @@ const NOTE_COLOR: Color32 = Color32::from_rgb(220, 180, 120);
 /// so they read as secondary next to the white value.
 const ANNOT_COLOR: Color32 = Color32::from_rgb(150, 150, 150);
 /// Stat value at its class cap (gold), matching the character card.
-const MAXED_COLOR: Color32 = Color32::from_rgb(255, 215, 0);
+pub(crate) const MAXED_COLOR: Color32 = Color32::from_rgb(255, 215, 0);
 /// Stat value not yet at cap (green), matching the character card.
-const UNMAXED_COLOR: Color32 = Color32::from_rgb(100, 220, 100);
+pub(crate) const UNMAXED_COLOR: Color32 = Color32::from_rgb(100, 220, 100);
 
 /// Dimmed gear/exalt/crucible column colors so the bright Total column stands
 /// out. Applied to the Gear / Exalts / Crucible headers and stat brackets.
-const GEAR_DIM: Color32 = Color32::from_rgb(165, 145, 65);
-const EXALT_DIM: Color32 = Color32::from_rgb(70, 120, 185);
-const CRUCIBLE_DIM: Color32 = Color32::from_rgb(150, 95, 170);
+pub(crate) const GEAR_DIM: Color32 = Color32::from_rgb(165, 145, 65);
+pub(crate) const EXALT_DIM: Color32 = Color32::from_rgb(70, 120, 185);
+pub(crate) const CRUCIBLE_DIM: Color32 = Color32::from_rgb(150, 95, 170);
+/// Blood Ritual column and annotations. This one is the in-game ritual panel's
+/// own orange rather than a dimmed variant: it is the season's headline modifier,
+/// and it needs to read apart from the crucible's magenta at a glance.
+pub(crate) const BLOOD_RITUAL_COLOR: Color32 = Color32::from_rgb(0xe7, 0x7b, 0x00);
+/// Exaltation-derived damage annotations, matching the Exalts column so an
+/// exalt-sourced figure reads as an exalt at a glance.
+pub(crate) const EXALT_COLOR: Color32 = Color32::from_rgb(0x04, 0x97, 0xff);
 
 /// Highest enemy defense in the game (5000), so the Enemy-DEF input caps at a
 /// 4-digit number.
@@ -110,6 +121,9 @@ const MAX_ENEMY_DEF: i32 = 5000;
 pub struct BonusContext {
     pub loot_boost_active: bool,
     pub crucible_active: bool,
+    /// Whether a Blood Ritual is in effect for this character. Read off the
+    /// character, which mirrors the recorded tier resolved against the feed.
+    pub blood_ritual_active: bool,
     pub seasonal: bool,
     /// False when this is a last-seen (not currently live) character; the
     /// readout is then dimmed with a "log in to update" note.
@@ -118,6 +132,10 @@ pub struct BonusContext {
     pub weapon_dr_pct: f32,
     /// Exaltation Fast Learner XP bonus, in percent (0/5/10/15/20).
     pub fast_learner_xp_pct: f32,
+    /// Exaltation Mastery weapon-damage bonus, in percent (0/2.5/…/10). Multiplies
+    /// the weapon's rolled damage alongside the seasonal challenge multipliers, so
+    /// the Bonuses "Damage mult." row names it as a source.
+    pub mastery_dmg_pct: f32,
     /// Exaltation Armor Proficiency in-combat exit reduction, in seconds.
     pub armor_ic_secs: f32,
     /// The four equipped gear slots (weapon, ability, armor, ring) for the
@@ -157,6 +175,12 @@ pub fn build_context(
         .get(&(char.class_id as i32))
         .map(realmhound_core::stats::exalt_proficiency::fast_learner_xp_pct)
         .unwrap_or(0) as f32;
+    let mastery_dmg_pct = cache
+        .exaltation_stats
+        .get(&(char.class_id as i32))
+        .map(realmhound_core::stats::exalt_proficiency::mastery_dmg_tenths)
+        .unwrap_or(0) as f32
+        / 10.0;
     let armor_ic_secs = realmhound_core::stats::exalt_proficiency::armor_ic_tenths(
         &cache.exaltation_stats,
         char.class_id as i32,
@@ -166,10 +190,15 @@ pub fn build_context(
     BonusContext {
         loot_boost_active,
         crucible_active: char.crucible_active,
+        // Read the tier the cache holds for this character rather than the flag
+        // mirrored onto it: the map is the persisted source of truth and resolves
+        // against the feed, so the readout is right even before a refresh has run.
+        blood_ritual_active: cache.blood_ritual_for_char(char.char_id).is_some(),
         seasonal: char.seasonal,
         is_live,
         weapon_dr_pct,
         fast_learner_xp_pct,
+        mastery_dmg_pct,
         armor_ic_secs,
         equipment: char.equipment.clone(),
         account_dust_boost,
@@ -277,6 +306,10 @@ pub fn build_loadout(char: &CachedCharacter, cache: &CharacterCache) -> Loadout 
     } else {
         None
     };
+    // The Blood Ritual is a live, per-character toggle that the server reports for
+    // the loaded character only, so a character that is not the live one shows
+    // whatever tier was last observed -- usually none.
+    let blood_ritual = cache.blood_ritual_for_char(char.char_id);
 
     Loadout {
         base,
@@ -287,6 +320,7 @@ pub fn build_loadout(char: &CachedCharacter, cache: &CharacterCache) -> Loadout 
         exalt_bonus,
         mastery_dmg_pct,
         crucible,
+        blood_ritual,
     }
 }
 
@@ -473,10 +507,26 @@ fn weapon_dps_tooltip(ui: &mut egui::Ui, w: &WeaponDamage) {
                         .color(ANNOT_COLOR),
                     );
                 }
+                // Mastery and bonus damage are both exaltation axes, so both
+                // carry the exalt colour rather than the generic annotation grey.
                 if w.mastery_pct > 0.001 {
                     ui.label(
                         RichText::new(format!("  (+{:.0}% mastery)", w.mastery_pct))
-                            .color(ANNOT_COLOR),
+                            .color(EXALT_COLOR),
+                    );
+                }
+                if w.exalt_damage_pct.abs() > 0.001 {
+                    ui.label(
+                        RichText::new(format!("  ({:+.0}% exalt damage)", w.exalt_damage_pct))
+                            .color(EXALT_COLOR),
+                    );
+                }
+                // The Blood Ritual's own damage bonus/penalty is already folded
+                // into the range above, so it is annotated rather than added.
+                if w.blood_ritual_pct.abs() > 0.001 {
+                    ui.label(
+                        RichText::new(format!("  ({:+.0}% Blood Ritual)", w.blood_ritual_pct))
+                            .color(BLOOD_RITUAL_COLOR),
                     );
                 }
             };
@@ -516,6 +566,17 @@ fn weapon_dps_tooltip(ui: &mut egui::Ui, w: &WeaponDamage) {
                 }
             }
             label_row(ui, "Shots / sec", format!("{:.2}", w.shots_per_sec));
+            if (w.rate_mult - 1.0).abs() > 0.0005 {
+                ui.label(RichText::new("").color(LABEL_COLOR));
+                ui.label(
+                    RichText::new(format!(
+                        "{:+.1}% fire rate from enchant",
+                        (w.rate_mult - 1.0) * 100.0
+                    ))
+                    .color(ANNOT_COLOR),
+                );
+                ui.end_row();
+            }
             if w.total_projectiles > 1 {
                 label_row(ui, "Projectiles", w.total_projectiles.to_string());
             }
@@ -547,10 +608,12 @@ fn weapon_dps_tooltip(ui: &mut egui::Ui, w: &WeaponDamage) {
                         } else {
                             "every shot".to_string()
                         };
-                        ui.label(
-                            RichText::new(format!("  ({} dmg {}", p.damage_per_proc, cadence))
-                                .color(ANNOT_COLOR),
-                        );
+                        let detail = if p.min_damage != p.max_damage {
+                            format!("  ({}-{} dmg {}", p.min_damage, p.max_damage, cadence)
+                        } else {
+                            format!("  ({} dmg {}", p.damage_per_proc, cadence)
+                        };
+                        ui.label(RichText::new(detail).color(ANNOT_COLOR));
                         if p.proc_rate < 0.999 {
                             ui.label(
                                 RichText::new(format!(", {:.0}% proc", p.proc_rate * 100.0))
@@ -578,7 +641,7 @@ fn fmt_secs(secs: f32) -> String {
 }
 
 /// Pet ability list (name + fed power / dps) for the pet hover tooltip.
-fn pet_abilities_tooltip(ui: &mut egui::Ui, pet: &[PetAbilityContribution]) {
+pub fn pet_abilities_tooltip(ui: &mut egui::Ui, pet: &[PetAbilityContribution]) {
     use realmhound_core::api::pet_ability_name;
     egui::Grid::new(ui.next_auto_id())
         .num_columns(2)
@@ -628,13 +691,14 @@ fn label_row_segments(ui: &mut egui::Ui, label: &str, segments: &[AbilitySegment
     ui.end_row();
 }
 
-/// Reserved pixel widths for the four attribute columns, so switching gear
+/// Reserved pixel widths for the five attribute columns, so switching gear
 /// (e.g. HP crossing 1000) never resizes the grid and shifts the labels.
-struct ColW {
-    total: f32,
-    gear: f32,
-    exalt: f32,
-    crucible: f32,
+pub(crate) struct ColW {
+    pub(crate) total: f32,
+    pub(crate) gear: f32,
+    pub(crate) exalt: f32,
+    pub(crate) crucible: f32,
+    pub(crate) blood_ritual: f32,
 }
 
 /// Width of `text` rendered with `font`, used to reserve fixed column widths.
@@ -647,8 +711,8 @@ fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
 
 /// Compute the reserved column widths from the widest of the header label and a
 /// max-digit sample value: Total 4 digits (+ potion icon), Gear 3, Exalts 2,
-/// Crucible 3. Signs/parens are included in the samples.
-fn attr_col_widths(ui: &egui::Ui) -> ColW {
+/// Crucible 3, Blood Ritual 3. Signs/parens are included in the samples.
+pub(crate) fn attr_col_widths(ui: &egui::Ui) -> ColW {
     let body = egui::TextStyle::Body.resolve(ui.style());
     let hdr = egui::FontId::proportional(10.0);
     let pad = 8.0;
@@ -662,7 +726,12 @@ fn attr_col_widths(ui: &egui::Ui) -> ColW {
         gear: text_width(ui, "(+000)", body.clone()).max(text_width(ui, "Gear", hdr.clone())) + pad,
         exalt: text_width(ui, "(+00)", body.clone()).max(text_width(ui, "Exalts", hdr.clone()))
             + pad,
-        crucible: text_width(ui, "(+000)", body).max(text_width(ui, "Crucible", hdr)) + pad,
+        crucible: text_width(ui, "(+000)", body.clone()).max(text_width(
+            ui,
+            "Crucible",
+            hdr.clone(),
+        )) + pad,
+        blood_ritual: text_width(ui, "(+000)", body).max(text_width(ui, "Blood Ritual", hdr)) + pad,
     }
 }
 
@@ -701,18 +770,31 @@ fn attr_cell(
         if let Some(id) = stat_potion_id(potion_label) {
             sr.draw_outlined_sprite_in_rect(ui, id, rect);
         }
-        let value_color = if is_maxed { MAXED_COLOR } else { UNMAXED_COLOR };
-        ui.label(
-            RichText::new(a.total().to_string())
-                .color(value_color)
-                .strong(),
-        );
+        attr_total_label(ui, a, is_maxed);
     });
     // With the breakdown off, only the Total column is shown.
     if !breakdown {
         return;
     }
-    // Cell 2: gear bracket (yellow), fixed 3-digit width.
+    attr_bracket_cells(ui, a, show_crucible, w);
+}
+
+/// The colored total value: gold at the class cap, green below it, matching the
+/// character card and the fight-detail Stats table.
+fn attr_total_label(ui: &mut egui::Ui, a: &Attribute, is_maxed: bool) {
+    let value_color = if is_maxed { MAXED_COLOR } else { UNMAXED_COLOR };
+    ui.label(
+        RichText::new(a.total().to_string())
+            .color(value_color)
+            .strong(),
+    );
+}
+
+/// The Gear / Exalts / Crucible bracket cells, in their dimmed column colors and
+/// fixed widths so the columns stay aligned. An empty bonus emits an empty cell
+/// rather than a placeholder.
+fn attr_bracket_cells(ui: &mut egui::Ui, a: &Attribute, show_crucible: bool, w: &ColW) {
+    // Gear bracket (yellow), fixed 3-digit width.
     fixed_cell(ui, w.gear, |ui| {
         let g = a.gear_display();
         if g != 0 {
@@ -720,14 +802,14 @@ fn attr_cell(
             ui.label(RichText::new(format!("({}{})", sign, g)).color(GEAR_DIM));
         }
     });
-    // Cell 3: exalt bracket (blue), fixed 2-digit width.
+    // Exalt bracket (blue), fixed 2-digit width.
     fixed_cell(ui, w.exalt, |ui| {
         if a.exalt != 0 {
             ui.label(RichText::new(format!("(+{})", a.exalt)).color(EXALT_DIM));
         }
     });
-    // Cell 4: crucible bracket (magenta), fixed 3-digit width, only when the
-    // grid reserves it.
+    // Crucible bracket (magenta), fixed 3-digit width, only when the grid
+    // reserves it.
     if show_crucible {
         fixed_cell(ui, w.crucible, |ui| {
             if a.crucible != 0 {
@@ -736,6 +818,26 @@ fn attr_cell(
             }
         });
     }
+    // Blood Ritual bracket (orange), fixed 3-digit width. A separate column from
+    // the Crucible's even though both are seasonal challenges, so each one's own
+    // contribution to the stat stays readable.
+    fixed_cell(ui, w.blood_ritual, |ui| {
+        if a.blood_ritual != 0 {
+            let sign = if a.blood_ritual > 0 { "+" } else { "" };
+            ui.label(
+                RichText::new(format!("({}{})", sign, a.blood_ritual)).color(BLOOD_RITUAL_COLOR),
+            );
+        }
+    });
+}
+
+/// The four value cells of one attribute row, without the potion icon: Total
+/// (gold when maxed, green otherwise) then the Gear / Exalts / Crucible
+/// breakdown. This is the Character Stats page's own rendering, shared with the
+/// fight-detail Stats table so the two read identically.
+pub(crate) fn attr_value_cells(ui: &mut egui::Ui, a: &Attribute, is_maxed: bool, w: &ColW) {
+    fixed_cell(ui, w.total, |ui| attr_total_label(ui, a, is_maxed));
+    attr_bracket_cells(ui, a, true, w);
 }
 
 /// Draws a 16px stat-potion / pet icon; the cell is reserved even when `id` is
@@ -765,25 +867,31 @@ fn status_pill(ui: &mut egui::Ui, text: &str, r: u8, g: u8, b: u8) {
     crate::ui_ext::status_pill(ui, text, Color32::from_rgb(r, g, b));
 }
 
-/// Seasonal / Crucible marker pills. Drawn just below the ATTRIBUTES header.
-/// When `subtitle` is set (the `#ID • Class • ?/8` line), it is rendered inline
-/// on the same row as the pills to keep the card narrow.
+/// Seasonal / Crucible / Blood Ritual marker pills, on their own line just below
+/// the ATTRIBUTES header, with the `#ID • Class • Lv • ?/8` line under them.
 fn render_status_pills(ui: &mut egui::Ui, ctx: &BonusContext, subtitle: Option<&str>) {
-    if !ctx.seasonal && !ctx.crucible_active && subtitle.is_none() {
+    let any_pill = ctx.seasonal || ctx.crucible_active || ctx.blood_ritual_active;
+    if !any_pill && subtitle.is_none() {
         return;
     }
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        if ctx.seasonal {
-            status_pill(ui, "SEASONAL", 0x15, 0xdc, 0xa6);
-        }
-        if ctx.crucible_active {
-            status_pill(ui, "CRUCIBLE", 0xdc, 0x21, 0x15);
-        }
-        if let Some(sub) = subtitle {
-            ui.label(RichText::new(sub).color(Color32::GRAY));
-        }
-    });
+    if any_pill {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ctx.seasonal {
+                status_pill(ui, "SEASONAL", 0x15, 0xdc, 0xa6);
+            }
+            if ctx.crucible_active {
+                status_pill(ui, "CRUCIBLE", 0xdc, 0x21, 0x15);
+            }
+            if ctx.blood_ritual_active {
+                status_pill(ui, "BLOOD RITUAL", 0xe7, 0x7b, 0x00);
+            }
+        });
+    }
+    // The identity line keeps its own row so the pills can't push it out of view.
+    if let Some(sub) = subtitle {
+        ui.label(RichText::new(sub).color(Color32::GRAY));
+    }
     ui.add_space(3.0);
 }
 
@@ -812,8 +920,6 @@ fn render_gear_row(
     if ctx.equipment.is_empty() && lead.is_none() {
         return;
     }
-    let gear = crate::panels::character_card::CharacterCardWidget::compact();
-    let empty = CharacterItem::empty();
     ui.horizontal(|ui| {
         if let Some(id) = lead {
             // Character skin, sized to match the equipment slots.
@@ -851,17 +957,27 @@ fn render_gear_row(
                 ui.add_space(SLOT_SPACING);
             }
         }
-        for i in 0..4 {
-            let item = ctx.equipment.get(i).unwrap_or(&empty);
-            gear.render_item_slot(ui, item, sr);
-            ui.add_space(crate::panels::character_card::SLOT_SPACING);
-        }
+        gear_cells(ui, sr, &ctx.equipment);
     });
     ui.add_space(4.0);
 }
 
+/// The four gear cells (weapon, ability, armor, ring), drawn left to right in
+/// the caller's layout as large inventory cells. Shared so the fight-detail Gear
+/// section and the Character Stats page cannot drift apart; an item's name and
+/// enchantments appear on hover only.
+pub(crate) fn gear_cells(ui: &mut egui::Ui, sr: &mut SpriteRenderer, items: &[CharacterItem]) {
+    let gear = crate::panels::character_card::CharacterCardWidget::compact();
+    let empty = CharacterItem::empty();
+    for i in 0..4 {
+        let item = items.get(i).unwrap_or(&empty);
+        gear.render_item_slot(ui, item, sr);
+        ui.add_space(crate::panels::character_card::SLOT_SPACING);
+    }
+}
+
 /// A column-header cell for the attribute grid.
-fn attr_header_cell(ui: &mut egui::Ui, width: f32, text: &str, color: Color32) {
+pub(crate) fn attr_header_cell(ui: &mut egui::Ui, width: f32, text: &str, color: Color32) {
     fixed_cell(ui, width, |ui| {
         ui.label(RichText::new(text).size(10.0).color(color));
     });
@@ -936,24 +1052,28 @@ pub fn render_readout(
         ui.label(
             RichText::new("ATTRIBUTES")
                 .strong()
-                .size(15.0)
+                .size(HEADER_SIZE)
                 .color(HEADER_COLOR),
         );
     }
     ui.add_space(3.0);
-    render_status_pills(ui, ctx, identity.map(|id| id.subtitle.as_str()));
+    render_status_pills(ui, ctx, None);
 
-    // Character identity folded into the ATTRIBUTES block: name line (the
-    // #id/class/maxed subtitle now rides on the status-pills row above), then
-    // base fame, then (dead) a killed-by line -- all sitting between the status
-    // pills and the gear row.
+    // Character identity folded into the ATTRIBUTES block: the label and the
+    // #id/class/level/maxed line share one row under the pills, then base fame,
+    // then (dead) a killed-by line -- all sitting between the status pills and
+    // the gear row.
     if let Some(id) = identity {
-        ui.label(
-            RichText::new(&id.title)
-                .strong()
-                .size(16.0)
-                .color(Color32::WHITE),
-        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(&id.title)
+                    .strong()
+                    .size(16.0)
+                    .color(Color32::WHITE),
+            );
+            ui.label(RichText::new(&id.subtitle).small().color(Color32::GRAY));
+        });
         fame_line(ui, sr, "Base fame:", id.base_fame);
         if let Some(killed_by) = &id.killed_by {
             ui.horizontal(|ui| {
@@ -983,13 +1103,14 @@ pub fn render_readout(
         ui.add_space(2.0);
     }
 
-    // Two stats per row. With the breakdown on, each stat is 4 aligned cells
-    // (total, gear, exalt, crucible) under repeated column headers. With it off,
-    // only the bright Total column shows, and the card shrinks to that width.
+    // Two stats per row. With the breakdown on, each stat is 5 aligned cells
+    // (total, gear, exalt, crucible, blood ritual) under repeated column headers.
+    // With it off, only the bright Total column shows, and the card shrinks to
+    // that width.
     let a = &d.attributes;
     let w = attr_col_widths(ui);
     egui::Grid::new(ui.next_auto_id())
-        .num_columns(if show_breakdown { 8 } else { 2 })
+        .num_columns(if show_breakdown { 10 } else { 2 })
         .spacing([8.0, 3.0])
         .show(ui, |ui| {
             for _ in 0..2 {
@@ -998,6 +1119,7 @@ pub fn render_readout(
                     attr_header_cell(ui, w.gear, "Gear", GEAR_DIM);
                     attr_header_cell(ui, w.exalt, "Exalts", EXALT_DIM);
                     attr_header_cell(ui, w.crucible, "Crucible", CRUCIBLE_DIM);
+                    attr_header_cell(ui, w.blood_ritual, "Blood Ritual", BLOOD_RITUAL_COLOR);
                 }
             }
             ui.end_row();
@@ -1570,6 +1692,67 @@ fn regen_row_icons(
     ui.end_row();
 }
 
+/// Width reserved for a Bonuses row. Fixed so the tags form a left column and
+/// the values a right one: each value is drawn against the row's right edge,
+/// which puts every percent sign on the same x however long its tag is.
+const BONUS_ROW_W: f32 = 178.0;
+
+/// One icon slot width for every Bonuses row. The rows draw their icons at
+/// different sizes, so without a shared slot the tags would start at different x
+/// (the Damage-mult. row's larger icon pushed its tag right of the others).
+const BONUS_ICON_W: f32 = 20.0;
+
+/// One Bonuses row: the source icon and tag on the left, the value right-aligned
+/// against the row's right edge so the values read as a second column. `hover`
+/// fills the value's tooltip, and `draw_icon` gets the icon cell so each row can
+/// use a game sprite or an embedded one.
+fn bonus_row(
+    ui: &mut egui::Ui,
+    tag: &str,
+    value: String,
+    draw_icon: impl FnOnce(&mut egui::Ui),
+    hover: impl FnOnce(&mut egui::Ui),
+) {
+    fixed_cell(ui, BONUS_ROW_W, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            // Fixed icon slot, so every tag starts at the same x whatever size
+            // this row's icon is drawn at.
+            fixed_cell(ui, BONUS_ICON_W, |ui| draw_icon(ui));
+            ui.label(RichText::new(tag).color(LABEL_COLOR));
+            // Spend the row's leftover width on the way to the value, so the
+            // value ends at the row's right edge on every row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(value).color(VALUE_COLOR).strong())
+                    .on_hover_ui(hover);
+            });
+        });
+    });
+}
+
+/// The weapon-damage multiplier and the sources that make it up, in the order the
+/// Bonuses hover lists them: Exaltation Mastery, the Crucible's damage bonus and
+/// the active Blood Ritual tier. The three *compound* (the game scales the
+/// weapon's rolled range by all of them), so the returned total is their product,
+/// not their sum, and sources that contribute nothing are dropped.
+fn weapon_damage_multiplier(
+    mastery_pct: f32,
+    crucible_pct: f32,
+    ritual_pct: f32,
+) -> (f32, Vec<(&'static str, f32)>) {
+    let total =
+        (1.0 + mastery_pct / 100.0) * (1.0 + crucible_pct / 100.0) * (1.0 + ritual_pct / 100.0);
+    let sources: Vec<(&'static str, f32)> = [
+        ("mastery (exaltations)", mastery_pct),
+        ("crucible", crucible_pct),
+        ("blood ritual", ritual_pct),
+    ]
+    .into_iter()
+    .filter(|(_, pct)| pct.abs() > 0.001)
+    .collect();
+    (total, sources)
+}
+
 /// Bonuses: Loot Boost broken down by source (gear + exalts + crucible + active
 /// clover, shown as separate components since the exact in-game stacking formula
 /// is unknown), XP Boost, Dust Boost, and Battle-pass XP. Loot/XP/Dust rows are
@@ -1592,29 +1775,29 @@ fn render_bonuses(
     let gear_loot = d.loot_boost_pct;
     let exalt_loot = ctx.weapon_dr_pct;
     let crucible_loot = d.crucible.as_ref().map(|c| c.loot_pct).unwrap_or(0.0);
+    let ritual_loot = d.blood_ritual.as_ref().map(|r| r.loot_pct).unwrap_or(0.0);
     let clover_loot = if ctx.loot_boost_active { 50.0 } else { 0.0 };
 
     // Lucky Clover (0xcc2), XP Booster 20 min (0xc6b), Acc Dust Chance Day (0x2ef).
     // Loot Boost as a single approximate additive figure (the exact in-game
     // stacking formula is unknown, hence the "~"); components in the hover.
-    let loot_total = gear_loot + exalt_loot + crucible_loot + clover_loot;
+    let loot_total = gear_loot + exalt_loot + crucible_loot + ritual_loot + clover_loot;
     let loot_components = [
         ("gear", gear_loot),
         ("exalts", exalt_loot),
         ("crucible", crucible_loot),
+        ("blood ritual", ritual_loot),
         ("clover", clover_loot),
     ];
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        object_icon(ui, sr, 0xcc2, 16.0);
-        ui.label(RichText::new("Loot Boost:").color(LABEL_COLOR));
-        ui.label(
-            RichText::new(format!("~+{:.1}%", loot_total))
-                .color(VALUE_COLOR)
-                .strong(),
-        )
-        .on_hover_ui(|ui| bonus_components_tooltip(ui, &loot_components));
-    });
+    bonus_row(
+        ui,
+        "Loot Boost:",
+        format!("~+{:.0}%", loot_total),
+        |ui| {
+            object_icon(ui, sr, 0xcc2, 16.0);
+        },
+        |ui| bonus_components_tooltip(ui, &loot_components),
+    );
 
     // Fold the base per-item XP bonus (equip.xml `<XPBonus>`) into the gear
     // line alongside gear-enchant XP so the total reflects both. Components fold
@@ -1627,17 +1810,58 @@ fn render_bonuses(
         ("exalts", exalt_xp),
         ("crucible", crucible_xp),
     ];
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        object_icon(ui, sr, 0xc6b, 16.0);
-        ui.label(RichText::new("XP Boost:").color(LABEL_COLOR));
-        ui.label(
-            RichText::new(format!("+{:.1}%", gear_xp + crucible_xp + exalt_xp))
-                .color(VALUE_COLOR)
-                .strong(),
-        )
-        .on_hover_ui(|ui| bonus_components_tooltip(ui, &xp_components));
-    });
+    bonus_row(
+        ui,
+        "XP Boost:",
+        format!("+{:.0}%", gear_xp + crucible_xp + exalt_xp),
+        |ui| {
+            object_icon(ui, sr, 0xc6b, 16.0);
+        },
+        |ui| bonus_components_tooltip(ui, &xp_components),
+    );
+
+    // Weapon-damage multiplier: everything the game multiplies the weapon's rolled
+    // range by before it rolls. Exaltation Mastery, the Crucible's damage bonus and
+    // the active Blood Ritual tier all compound, so the row shows the combined
+    // factor and the hover names every source, the way the damage rows in
+    // My Performance do. Shown only while something is actually in play, since
+    // x1.00 is noise.
+    let crucible_dmg_pct = d
+        .crucible
+        .as_ref()
+        .map(|c| (c.damage_mult - 1.0) * 100.0)
+        .unwrap_or(0.0);
+    let ritual_dmg_pct = d
+        .blood_ritual
+        .as_ref()
+        .map(|r| r.damage_pct())
+        .unwrap_or(0.0);
+    let (damage_mult, damage_components) =
+        weapon_damage_multiplier(ctx.mastery_dmg_pct, crucible_dmg_pct, ritual_dmg_pct);
+    let damage_pct = (damage_mult - 1.0) * 100.0;
+    if damage_pct.abs() > 0.001 {
+        bonus_row(
+            ui,
+            "Damage mult.:",
+            format!("{:+.0}%", damage_pct),
+            |ui| {
+                // "Damaging" while the multiplier raises damage, "Weak" while it
+                // reduces it. The icons ship embedded because the effects have no
+                // object type to look them up by; they are drawn through the same
+                // outlined path as the battle-pass icon so they read as crisply as
+                // the game sprites beside them, at the same 16px.
+                let condition = if damage_pct > 0.0 {
+                    crate::rendering::EmbeddedIcon::Damaging
+                } else {
+                    crate::rendering::EmbeddedIcon::Weak
+                };
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                sr.draw_outlined_embedded_icon(ui, condition, rect);
+            },
+            |ui| bonus_components_tooltip(ui, &damage_components),
+        );
+    }
 
     // Dust Boost: total (gear + account potion). The component breakdown folds
     // into a hover tooltip on the total (bullet text white; the potion's
@@ -1645,29 +1869,34 @@ fn render_bonuses(
     let dust_gear = d.dust_boost_pct;
     let dust_potion = ctx.account_dust_boost.map(|b| b.bonus_pct).unwrap_or(0.0);
     let account_boost = ctx.account_dust_boost;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        object_icon(ui, sr, 0x2ef, 16.0);
-        ui.label(RichText::new("Dust Boost:").color(LABEL_COLOR));
-        ui.label(
-            RichText::new(format!("+{:.1}%", dust_gear + dust_potion))
-                .color(VALUE_COLOR)
-                .strong(),
-        )
-        .on_hover_ui(|ui| {
-            ui.label(RichText::new(format!("•  gear: {:.1}%", dust_gear)).color(Color32::WHITE));
+    bonus_row(
+        ui,
+        "Dust Boost:",
+        format!("+{:.0}%", dust_gear + dust_potion),
+        |ui| {
+            object_icon(ui, sr, 0x2ef, 16.0);
+        },
+        |ui| {
+            ui.label(
+                RichText::new(format!("\u{2022}  gear: {:.0}%", dust_gear)).color(Color32::WHITE),
+            );
             match account_boost {
                 Some(boost) => {
                     let time_str = format!(
                         "{}{} left",
                         if boost.estimated { "~" } else { "" },
-                        crate::panels::character_card::format_loot_boost(boost.remaining_secs as u64)
+                        crate::panels::character_card::format_loot_boost(
+                            boost.remaining_secs as u64
+                        )
                     );
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.label(
-                            RichText::new(format!("•  account potion: {:.0}%", boost.bonus_pct))
-                                .color(Color32::WHITE),
+                            RichText::new(format!(
+                                "\u{2022}  account potion: {:.0}%",
+                                boost.bonus_pct
+                            ))
+                            .color(Color32::WHITE),
                         );
                         ui.label(RichText::new(format!("({})", time_str)).color(LABEL_COLOR));
                     });
@@ -1684,31 +1913,77 @@ fn render_bonuses(
                 None => {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(RichText::new("•  account potion: ").color(Color32::WHITE));
-                        ui.label(RichText::new("(none)").italics().color(NOTE_COLOR).size(11.0));
+                        ui.label(RichText::new("\u{2022}  account potion: ").color(Color32::WHITE));
+                        ui.label(
+                            RichText::new("(none)")
+                                .italics()
+                                .color(NOTE_COLOR)
+                                .size(11.0),
+                        );
                     });
                 }
             }
-        });
-    });
+        },
+    );
     if account_boost.is_some() && ctx.is_live {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
     }
 
-    // Battle-pass XP (crucible bonus), with the embedded battle-pass sprite.
+    // Battle-pass XP: the active Crucible season's battle-pass bonus, with the
+    // embedded battle-pass sprite. The hover names the source, since the row's
+    // value on its own gives no clue where the bonus comes from.
     let bxp = d.crucible.as_ref().map(|c| c.bxp_pct).unwrap_or(0.0);
     if bxp != 0.0 {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
-            sr.draw_outlined_embedded_icon(ui, EmbeddedIcon::Bxp, rect);
-            ui.label(RichText::new("BXP:").color(LABEL_COLOR));
-            ui.label(
-                RichText::new(format!("+{:.0}%", bxp))
-                    .color(VALUE_COLOR)
-                    .strong(),
-            );
-        });
+        bonus_row(
+            ui,
+            "BXP:",
+            format!("+{:.0}%", bxp),
+            |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(16.0), egui::Sense::hover());
+                sr.draw_outlined_embedded_icon(ui, EmbeddedIcon::Bxp, rect);
+            },
+            |ui| bonus_components_tooltip(ui, &[("crucible", bxp)]),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::weapon_damage_multiplier;
+
+    /// The Bonuses "Damage mult." row: Exaltation Mastery, the Crucible's damage
+    /// bonus and the active Blood Ritual tier compound, so a mastery-only
+    /// character sees a multiplier of its own and an active ritual multiplies it
+    /// rather than adding to it.
+    #[test]
+    fn damage_multiplier_compounds_mastery_with_the_seasonal_challenges() {
+        // A fully-exalted class (+10%) holding the season's tier-1 ritual (+24%),
+        // with a Crucible that grants no damage of its own: 1.10 x 1.24.
+        let (total, sources) = weapon_damage_multiplier(10.0, 0.0, 24.0);
+        assert!((total - 1.364).abs() < 1e-6, "{total}");
+        assert_eq!(
+            sources,
+            vec![("mastery (exaltations)", 10.0), ("blood ritual", 24.0)],
+            "the Crucible is dropped when it grants no damage"
+        );
+        // Multiplying is not adding: +34% would be the sum.
+        assert!((total - 1.0) * 100.0 > 34.0);
+
+        // A penalty tier reduces the multiplier below one, mastery included.
+        let (total, sources) = weapon_damage_multiplier(10.0, 0.0, -22.0);
+        assert!((total - 0.858).abs() < 1e-6, "{total}");
+        assert_eq!(sources.len(), 2);
+
+        // Nothing in play: neutral, and no sources to list.
+        let (total, sources) = weapon_damage_multiplier(0.0, 0.0, 0.0);
+        assert_eq!(total, 1.0);
+        assert!(sources.is_empty());
+
+        // Mastery alone still applies, and is named.
+        let (total, sources) = weapon_damage_multiplier(5.0, 0.0, 0.0);
+        assert!((total - 1.05).abs() < 1e-6, "{total}");
+        assert_eq!(sources, vec![("mastery (exaltations)", 5.0)]);
     }
 }

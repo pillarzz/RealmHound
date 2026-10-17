@@ -36,9 +36,17 @@ pub enum EnchantEffectKind {
     MultiplyMinDamage,
     /// Multiplies the weapon's maximum damage by `amount` (e.g. `1.05`).
     MultiplyMaxDamage,
-    /// A recognized but purely cosmetic/proc mutator (e.g. on-shoot self buffs)
-    /// that grants no persistent stat effect. Modeled so its presence does not
-    /// downgrade provenance to Partial.
+    /// Multiplies the primary attack's fire rate by `amount` (e.g. `1.02`), which
+    /// scales weapon DPS directly. `amount` may be below `1.0` for the
+    /// fire-rate *penalty* enchantments.
+    MultiplyRateOfFire,
+    /// An on-shoot / on-hit self buff (`AddOnPlayerShootActivate` /
+    /// `AddOnEnemyHitActivate` with `StatBoostSelf`, e.g. "OnShoot Attack Boost
+    /// IV"): a temporary stat proc, not a persistent stat, but named so an
+    /// observed stat change can be attributed back to the item that caused it.
+    StatBoostSelf,
+    /// A recognized but purely cosmetic mutator that grants no stat effect at
+    /// all. Modeled so its presence does not downgrade provenance to Partial.
     Cosmetic,
     /// Any other mutator kind we don't model.
     Other,
@@ -54,9 +62,13 @@ impl EnchantEffectKind {
             "DustBonus" => Self::DustBonus,
             "FlatRegen" => Self::FlatRegen,
             "PercentageRegen" => Self::PercentageRegen,
+            // The mutator's element name is normally the kind (see the XML parser),
+            // so this covers only a text-form payload.
+            "MultiplyRateOfFire" => Self::MultiplyRateOfFire,
             // On-shoot / proc self-buffs (e.g. OnShoot Wisdom Boost): recognized
-            // but not a persistent stat, so treated as cosmetic.
-            "StatBoostSelf" => Self::Cosmetic,
+            // as their own kind so an observed stat change can be traced back to
+            // the item that proc'd it.
+            "StatBoostSelf" => Self::StatBoostSelf,
             _ => Self::Other,
         }
     }
@@ -384,6 +396,23 @@ impl EnchantmentList {
                             }
                             in_mutator_effect = true;
                         }
+                        // Fire-rate multiplier: the tag name is the kind and the
+                        // text content is the multiplier (e.g. 1.02). Its
+                        // `subAttackIndex` is -1 for the primary attack; a
+                        // sub-attack rate change is not modeled (the calc ignores
+                        // a positive index).
+                        b"MultiplyRateOfFire" if in_mutators => {
+                            in_mult_damage = Some(EnchantEffectKind::MultiplyRateOfFire);
+                            pending_mult_projectile = -1;
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == b"subAttackIndex" {
+                                    pending_mult_projectile = String::from_utf8_lossy(&attr.value)
+                                        .trim()
+                                        .parse()
+                                        .unwrap_or(-1);
+                                }
+                            }
+                        }
                         // Damage-multiplier mutators: the tag name is the kind and
                         // the text content is the multiplier (e.g. 1.05).
                         b"MultiplyMinDamage" if in_mutators => {
@@ -448,7 +477,7 @@ impl EnchantmentList {
                     b"AddOnPlayerShootActivate" => {
                         in_mutator_effect = false;
                     }
-                    b"MultiplyMinDamage" | b"MultiplyMaxDamage" => {
+                    b"MultiplyMinDamage" | b"MultiplyMaxDamage" | b"MultiplyRateOfFire" => {
                         in_mult_damage = None;
                     }
                     _ => {}
@@ -665,6 +694,12 @@ mod tests {
       <AddOnPlayerShootActivate amount="7" stat="WIS">StatBoostSelf</AddOnPlayerShootActivate>
     </Mutators>
   </Enchantment>
+  <Enchantment id="Rate_Of_Fire_2" type="0x1A2">
+    <DisplayId>Fire Rate Bonus II</DisplayId>
+    <Mutators>
+      <MultiplyRateOfFire subAttackIndex="-1">1.03</MultiplyRateOfFire>
+    </Mutators>
+  </Enchantment>
 </Enchantments>"#;
         let list = EnchantmentList::parse_xml(xml.as_bytes()).unwrap();
 
@@ -688,10 +723,21 @@ mod tests {
         assert_eq!(pct[0].stat, Some(StatKind::MaxMp));
         assert!((pct[0].amount - 0.015).abs() < 1e-4);
 
-        // On-shoot self buff is recognized as cosmetic (present, no downgrade).
-        let cos = list.effects(0x4D);
-        assert_eq!(cos.len(), 1);
-        assert_eq!(cos[0].kind, EnchantEffectKind::Cosmetic);
+        // On-shoot self buff: its own kind (a proc the boost log can attribute),
+        // with the stat and amount it grants.
+        let procs = list.effects(0x4D);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].kind, EnchantEffectKind::StatBoostSelf);
+        assert_eq!(procs[0].stat, Some(StatKind::Wisdom));
+        assert!((procs[0].amount - 7.0).abs() < 1e-4);
+
+        // Fire-rate multiplier: kind from the tag name, amount from the text, and
+        // `subAttackIndex` held like the damage multipliers' `projectileId`.
+        let rof = list.effects(0x1A2);
+        assert_eq!(rof.len(), 1);
+        assert_eq!(rof[0].kind, EnchantEffectKind::MultiplyRateOfFire);
+        assert!((rof[0].amount - 1.03).abs() < 1e-4);
+        assert_eq!(rof[0].projectile_id, -1);
     }
 
     #[test]

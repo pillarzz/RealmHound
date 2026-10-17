@@ -42,6 +42,7 @@ fn main() {
             assets_dir.display()
         );
     }
+    let manager = realmhound_core::assets::get_asset_manager();
 
     let raw = match read_capture(&path) {
         Ok(r) => r,
@@ -54,7 +55,55 @@ fn main() {
 
     let mut reassembler = TcpReassembler::new();
     let mut tracker = CombatTracker::new();
+    // Summon-source creature spawns seen, by object type: (count, first, last).
+    let mut summon_spawns: std::collections::HashMap<i32, (u32, i64, i64)> =
+        std::collections::HashMap::new();
+
+    // Optional: the shot multipliers the client applies to its own weapon rolls
+    // (exaltation mastery x the seasonal challenge multipliers). In the live app
+    // they come from the character cache; an offline replay has no cache, so pass
+    // them here -- `combat_replay <capture> [mastery] [challenge]`.
+    if let (Some(mastery), Some(challenge)) = (
+        std::env::args().nth(2).and_then(|v| v.parse::<f32>().ok()),
+        std::env::args().nth(3).and_then(|v| v.parse::<f32>().ok()),
+    ) {
+        println!("shot_damage_bonus: mastery={mastery} challenge={challenge}");
+        tracker
+            .set_shot_damage_bonus(realmhound_core::stats::ShotDamageBonus { mastery, challenge });
+    }
     let mut finished: Vec<CompletedFight> = Vec::new();
+
+    // What the client saw around the damage only packets can explain. Several
+    // dungeons have mechanics that damage the boss *for* the player (Parasite
+    // Chambers' barrels, the Galleon's cannonballs): the server credits the pusher,
+    // so the hit arrives as a plain owner-credited `DamagePacket` with nothing else
+    // pointing at it. Logging the objects that appeared or vanished as each such
+    // packet landed is what names the source.
+    let mut local_object_id: i32 = 0;
+    let mut object_types: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    let mut recent_objects: std::collections::VecDeque<(i64, i32, i32, bool)> =
+        std::collections::VecDeque::new();
+    let mut credited: Vec<(i64, u16, u16, i32)> = Vec::new();
+    // Handshakes carry credentials: Hello's key is the session ticket, and a
+    // Reconnect carries the next one. Counting them says whether a capture holds
+    // credentials at all -- which matters before one is shared for debugging.
+    let mut hello_packets: u32 = 0;
+    let mut reconnect_packets: u32 = 0;
+    // Every object type seen, with a count and its first/last clock.
+    let mut seen_types: std::collections::HashMap<i32, (u32, i64, i64)> =
+        std::collections::HashMap::new();
+    // Barrel-shaped objects: (clock, type, id, spawned, x, y). Positions come from
+    // the spawn packet, and a removal reuses the last position seen for the id, so a
+    // hit can be matched to the barrel that made it.
+    let mut barrels: Vec<(i64, i32, i32, bool, f32, f32)> = Vec::new();
+    let mut object_positions: std::collections::HashMap<i32, (f32, f32)> =
+        std::collections::HashMap::new();
+    let is_barrel = |name: &str| {
+        let lower = name.to_lowercase();
+        ["barrel", "cannon", "bomb", "gunpowder"]
+            .iter()
+            .any(|key| lower.contains(key))
+    };
 
     // Synthetic monotonic clock (ms). Real timestamps are per-packet but the
     // tracker only needs monotonic ordering + a coarse tick cadence.
@@ -76,13 +125,59 @@ fn main() {
                     } else {
                         m.display_name.clone()
                     };
+                    // `fp` is the map seed the damage model's RNG runs on, so it has
+                    // to survive into the capture for the replay to match the live
+                    // fight.
+                    println!(
+                        "map change: {name} (fp={}, {}x{}, clock={clock})",
+                        m.fp, m.width, m.height
+                    );
                     finished.extend(tracker.on_map_change(&name, m.fp, clock));
                 }
                 Some(ParsedPacket::CreateSuccess(c)) => {
+                    local_object_id = c.object_id;
                     tracker.on_player_loaded(c.object_id, c.char_id);
                 }
                 Some(ParsedPacket::Update(u)) => {
                     for obj in &u.new_objects {
+                        object_types.insert(obj.object_id(), obj.object_type as i32);
+                        let (px, py) = (obj.status.pos.x, obj.status.pos.y);
+                        object_positions.insert(obj.object_id(), (px, py));
+                        if manager
+                            .object_name(obj.object_type as i32)
+                            .is_some_and(|n| is_barrel(&n))
+                        {
+                            barrels.push((
+                                clock,
+                                obj.object_type as i32,
+                                obj.object_id(),
+                                true,
+                                px,
+                                py,
+                            ));
+                        }
+                        let entry = seen_types
+                            .entry(obj.object_type as i32)
+                            .or_insert((0, clock, clock));
+                        entry.0 += 1;
+                        entry.2 = clock;
+                        recent_objects.push_back((
+                            clock,
+                            obj.object_type as i32,
+                            obj.object_id(),
+                            true,
+                        ));
+                        // Creatures an item declares (a Kimono's spirits, a
+                        // Summoner mace's bear) are spawned as ordinary objects;
+                        // logging them shows whether RH ever saw the summon whose
+                        // damage reaches it only as an owner-credited packet.
+                        if !manager.summon_sources(obj.object_type as i32).is_empty() {
+                            let entry = summon_spawns
+                                .entry(obj.object_type as i32)
+                                .or_insert((0u32, clock, clock));
+                            entry.0 += 1;
+                            entry.2 = clock;
+                        }
                         tracker.on_object_spawn(
                             obj.object_id(),
                             obj.object_type as i32,
@@ -91,9 +186,21 @@ fn main() {
                         );
                     }
                     for &object_id in &u.drops {
+                        let otype = object_types.remove(&object_id).unwrap_or(0);
+                        let (px, py) = object_positions.remove(&object_id).unwrap_or((0.0, 0.0));
+                        if manager.object_name(otype).is_some_and(|n| is_barrel(&n)) {
+                            barrels.push((clock, otype, object_id, false, px, py));
+                        }
+                        recent_objects.push_back((clock, otype, object_id, false));
                         if let Some(cf) = tracker.on_object_removed(object_id, clock) {
                             finished.push(cf);
                         }
+                    }
+                    while recent_objects
+                        .front()
+                        .is_some_and(|(t, ..)| clock - t > 2_000)
+                    {
+                        recent_objects.pop_front();
                     }
                 }
                 Some(ParsedPacket::NewTick(t)) => {
@@ -104,6 +211,9 @@ fn main() {
                     finished.extend(tracker.on_tick(clock));
                 }
                 Some(ParsedPacket::Damage(d)) if incoming => {
+                    if d.object_id == local_object_id && local_object_id != 0 {
+                        credited.push((clock, d.damage_amount, d.bullet_id, d.target_id));
+                    }
                     tracker.on_damage(d.target_id, d.object_id, d.damage_amount as i64, clock);
                 }
                 // Incoming summon/ally shots carry server-precomputed damage.
@@ -166,13 +276,175 @@ fn main() {
                         clock,
                     );
                 }
+                Some(ParsedPacket::Hello(_)) => hello_packets += 1,
+                Some(ParsedPacket::Reconnect(_)) => reconnect_packets += 1,
                 _ => {}
             }
         }
     }
 
+    // Objects whose names look like a mechanic that damages the boss *for* the
+    // player (Parasite Chambers' barrels, the Galleon's cannons): if they are
+    // ordinary world objects, they are spawned with the map and show up here.
+    let mut mechanics: Vec<(i32, u32, i64, i64, String)> = seen_types
+        .iter()
+        .filter_map(|(&otype, &(count, first, last))| {
+            let name = manager.object_name(otype)?;
+            let lower = name.to_lowercase();
+            ["barrel", "cannon", "bomb", "gunpowder"]
+                .iter()
+                .any(|key| lower.contains(key))
+                .then_some((otype, count, first, last, name))
+        })
+        .collect();
+    mechanics.sort_by(|a, b| b.1.cmp(&a.1));
+    if !mechanics.is_empty() {
+        println!(
+            "\n=== objects that look like a boss-damaging mechanic ({} object types seen in total) ===",
+            seen_types.len()
+        );
+        for (otype, count, first, last, name) in &mechanics {
+            println!("     {name} (0x{otype:04X}) x{count}  first={first} last={last}");
+        }
+    }
+
+    // Does a barrel-scale hit land as a barrel moves or is consumed?
+    if !barrels.is_empty() {
+        let spawns = barrels
+            .iter()
+            .filter(|(_, _, _, spawned, _, _)| *spawned)
+            .count();
+        println!(
+            "\n=== barrel-like objects: {} spawns, {} removals ===",
+            spawns,
+            barrels.len() - spawns
+        );
+        for (clock, otype, id, spawned, x, y) in barrels.iter().take(14) {
+            println!(
+                "     t={clock:<8} {} 0x{otype:04X} id={id:<8} pos=({x:.0}, {y:.0})",
+                if *spawned { "spawn " } else { "remove" }
+            );
+        }
+        let big: Vec<&(i64, u16, u16, i32)> = credited
+            .iter()
+            .filter(|(_, amount, ..)| *amount >= 700)
+            .collect();
+        let mut with_barrel = 0;
+        let mut shown = 0;
+        for (clock, amount, bullet, target) in big.iter() {
+            let nearest = barrels
+                .iter()
+                .map(|e| ((e.0 - clock).abs(), e))
+                .filter(|(d, _)| *d <= 2_000)
+                .min_by_key(|(d, _)| *d);
+            match nearest {
+                Some((delta, (t, otype, id, spawned, x, y))) => {
+                    with_barrel += 1;
+                    if shown < 12 {
+                        println!(
+                            "     packet t={clock:<8} dmg={amount:<6} bullet={bullet} -> {} 0x{otype:04X} id={id} delta={}ms pos=({x:.0}, {y:.0})",
+                            if *spawned { "spawn" } else { "remove" },
+                            t - clock,
+                        );
+                        shown += 1;
+                    }
+                }
+                None => {
+                    if shown < 12 {
+                        println!(
+                            "     packet t={clock:<8} dmg={amount:<6} bullet={bullet} target={target} -> no barrel within 2s"
+                        );
+                        shown += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "     barrel-scale packets (>=700): {} of which {} had a barrel event within 2s",
+            big.len(),
+            with_barrel
+        );
+    }
+
     // Flush anything still in progress at end of capture.
     finished.extend(tracker.on_disconnect(now_ms()));
+
+    if hello_packets > 0 || reconnect_packets > 0 {
+        println!(
+            "\n=== handshakes in this capture: {} Hello (session ticket), {} Reconnect (next ticket) ===",
+            hello_packets, reconnect_packets
+        );
+    } else {
+        println!("\n=== handshakes in this capture: none (no Hello / Reconnect seen) ===");
+    }
+
+    // The damage no row explains -- and what the client saw as it landed (see the
+    // note where `credited` is filled).
+    if !credited.is_empty() {
+        let total: i64 = credited.iter().map(|(_, amount, ..)| *amount as i64).sum();
+        println!(
+            "\n=== owner-credited damage packets: {} totalling {} ===",
+            credited.len(),
+            total
+        );
+        println!(
+            "     (the server attributed these to the local player with no shot, \
+             ability activation or creature of theirs behind them)"
+        );
+        let mut tally: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+        for (i, (clock, amount, bullet, target)) in credited.iter().enumerate() {
+            let mut types: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+            for (t, otype, _id, _spawned) in recent_objects.iter() {
+                if (t - clock).abs() <= 600 && *otype != 0 {
+                    types.insert(*otype);
+                }
+            }
+            for otype in &types {
+                *tally.entry(*otype).or_insert(0) += 1;
+            }
+            if i < 8 {
+                let names: Vec<String> = types
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{} (0x{:X})",
+                            manager
+                                .object_name(*t)
+                                .unwrap_or_else(|| "unnamed".to_string()),
+                            *t
+                        )
+                    })
+                    .collect();
+                println!(
+                    "     #{:<3} t={:<8} dmg={:<6} bullet={:<3} target={:<6} objects nearby: {}",
+                    i + 1,
+                    clock,
+                    amount,
+                    bullet,
+                    target,
+                    if names.is_empty() {
+                        "-".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+            }
+        }
+        let mut rows: Vec<(i32, u32)> = tally.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!("     objects seen within 600ms of a credited packet (by packet count):");
+        for (otype, count) in rows.iter().take(10) {
+            println!(
+                "       in {}/{} packets: {} (0x{:04X})",
+                count,
+                credited.len(),
+                manager
+                    .object_name(*otype)
+                    .unwrap_or_else(|| "unnamed".to_string()),
+                *otype
+            );
+        }
+    }
 
     println!("\n=== Reconstructed boss fights: {} ===", finished.len());
     for (i, f) in finished.iter().enumerate() {
@@ -215,6 +487,52 @@ fn main() {
                 p.provenance,
                 if p.is_local { " (local)" } else { "" },
             );
+            if !p.summons.is_empty() {
+                let rows: Vec<String> = p
+                    .summons
+                    .iter()
+                    .map(|s| {
+                        let who = if s.is_pet {
+                            format!("pet 0x{:X}", s.pet_type)
+                        } else {
+                            format!("summon 0x{:X}", s.object_type)
+                        };
+                        let from = if s.source_item != 0 {
+                            let name = manager
+                                .object_name(s.source_item)
+                                .unwrap_or_else(|| format!("0x{:X}", s.source_item));
+                            format!(" from {name}")
+                        } else {
+                            String::new()
+                        };
+                        format!("{who}{from} dmg={} hits={}", s.damage, s.hits)
+                    })
+                    .collect();
+                println!(
+                    "          summon_damage={} summon_hits={} [{}]",
+                    p.summon_damage,
+                    p.summon_hits,
+                    rows.join(", ")
+                );
+            }
+            if p.packet_damage > 0 {
+                println!(
+                    "          packet_damage={} packet_hits={}",
+                    p.packet_damage, p.packet_hits
+                );
+            }
+        }
+    }
+
+    if !summon_spawns.is_empty() {
+        println!("\n=== summon-source creatures spawned (type: count, first..last clock) ===");
+        let mut rows: Vec<(i32, (u32, i64, i64))> = summon_spawns.into_iter().collect();
+        rows.sort_by_key(|&(_, (count, _, _))| std::cmp::Reverse(count));
+        for (obj_type, (count, first, last)) in rows {
+            let name = manager
+                .object_name(obj_type)
+                .unwrap_or_else(|| format!("0x{obj_type:X}"));
+            println!("   {name} (0x{obj_type:X}): {count} spawns, {first}..{last}ms");
         }
     }
 }

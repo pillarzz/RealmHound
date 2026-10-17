@@ -37,25 +37,129 @@ pub const FAME_SPRITE_ID: i32 = 24102;
 /// Object ID for the "Gold Shop Icon Object" sprite used as the gold coin icon.
 pub const GOLD_SPRITE_ID: i32 = 0x67FF;
 
-/// Draw a small red "CRUCIBLE" pill, roughly half the size of the Missions-tab
-/// badge. Used inline on the character info line to mark crucible characters.
-fn draw_crucible_pill(ui: &mut egui::Ui) {
-    const TEXT: &str = "CRUCIBLE";
+/// The lightning glyph and green the card uses for its loot-boost readout.
+const LOOT_BOOST_GLYPH: &str = "\u{26a1}";
+const LOOT_BOOST_COLOR: Color32 = Color32::from_rgb(100, 255, 100);
+/// Width of the painted loot-boost readout, used only for its hover target: the
+/// readout is painted, never laid out, so it cannot affect anything else.
+/// The slot is the run from the readout's left edge to the id column.
+const LOOT_SLOT_W: f32 = CARD_TEXT_INDENT - LOOT_BOOST_LEFT;
+/// Distance from the card's content edge to its text column: the 32px sprite box
+/// plus the gap after it. The loot readout is painted back at the content edge so
+/// it sits under the sprite, and this is the only place that offset is used -- as
+/// a paint coordinate, not as layout spacing.
+const CARD_TEXT_INDENT: f32 = 40.0;
+/// Offset of the duration text past the painted glyph.
+const LOOT_GLYPH_W: f32 = 12.0;
+/// The loot readout's left edge, this far left of the card's content edge, so the
+/// pair sits under the sprite.
+///
+/// Anchoring it to the content edge rather than to the text column is what keeps
+/// a long timer clear of the id line: the column is 40px in from that edge, which
+/// leaves the readout 51px to grow into, and `⚡10:45:48` measures 48.6px. The
+/// card's side padding is what the 11px of the offset sits in.
+const LOOT_BOOST_LEFT: f32 = -11.0;
+
+/// The name row's font size and item spacing. Pinned as constants because the
+/// row's width cap is computed from them: the cap has to hold for the same
+/// metrics the text is drawn with.
+const NAME_FONT_SIZE: f32 = 13.0;
+const NAME_ROW_SPACING: f32 = 4.0;
+
+/// Width of `text` laid out as a single line at `font`. Used by the rows that
+/// have to fit a fixed card width, so the cap is computed from the real font
+/// rather than from a guess at how wide the text is.
+fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_string(), font, Color32::WHITE)
+        .size()
+        .x
+}
+
+/// Draw a small pill, roughly half the size of the Missions-tab badge. The text
+/// gets a 1px black outline so it stays legible over any card background.
+fn draw_pill(ui: &mut egui::Ui, text: &str, background: Color32) {
     let font = egui::FontId::proportional(8.0);
     let galley = ui
         .painter()
-        .layout_no_wrap(TEXT.to_string(), font.clone(), Color32::WHITE);
+        .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE);
     let size = galley.size() + egui::vec2(6.0, 2.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 2.0, Color32::from_rgb(0xdc, 0x21, 0x15));
-    ui.painter().text(
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, background);
+    for offset in [
+        egui::vec2(-1.0, 0.0),
+        egui::vec2(1.0, 0.0),
+        egui::vec2(0.0, -1.0),
+        egui::vec2(0.0, 1.0),
+    ] {
+        painter.text(
+            rect.center() + offset,
+            egui::Align2::CENTER_CENTER,
+            text,
+            font.clone(),
+            Color32::BLACK,
+        );
+    }
+    painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        TEXT,
+        text,
         font,
         Color32::WHITE,
     );
+}
+
+/// Allocate a pill's exact footprint without drawing anything, so a card with no
+/// challenges reserves precisely the row a card with them occupies.
+fn draw_pill_invisible(ui: &mut egui::Ui, text: &str) {
+    let font = egui::FontId::proportional(8.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font, Color32::WHITE);
+    ui.allocate_exact_size(galley.size() + egui::vec2(6.0, 2.0), Sense::hover());
+}
+
+/// Crucible marker on the character card.
+fn draw_crucible_pill(ui: &mut egui::Ui) {
+    draw_pill(ui, "CRUCIBLE", Color32::from_rgb(0xdc, 0x21, 0x15));
+}
+
+/// Blood Ritual marker, in the ritual panel's own orange so it reads apart from
+/// the crucible's red at a glance.
+fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
+    draw_pill(ui, "BLOOD RITUAL", Color32::from_rgb(0xe7, 0x7b, 0x00));
+}
+
+/// The season-challenge pills a character carries, on one line.
+///
+/// With `reserve` set, a character carrying no challenge still draws an
+/// *invisible* pill, so the row is the same height as one holding two. Going
+/// through the same allocation is the only exact way to do it: a spacer is laid
+/// out slightly differently (the vertical spacing between rows is applied to a
+/// spacer and a pill differently), which left cards without challenges a couple
+/// of pixels short in the grid. [#64]
+fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool, reserve: bool) {
+    if !crucible && !blood_ritual {
+        if reserve {
+            // The same row structure the pills use below, so the reserved row is
+            // identical in height rather than merely close to it.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                draw_pill_invisible(ui, "CRUCIBLE");
+            });
+        }
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if crucible {
+            draw_crucible_pill(ui);
+        }
+        if blood_ritual {
+            draw_blood_ritual_pill(ui);
+        }
+    });
 }
 
 /// Format a fame value with a comma every three digits (e.g. `280087` ->
@@ -81,14 +185,18 @@ pub fn format_fame(value: i64) -> String {
 /// Format a loot-drop-boost countdown. Under one hour it reads `Mm Ss`
 /// (minutes + seconds); at or above one hour it rolls to `Hh Mm`.
 pub fn format_loot_boost(remaining_secs: u64) -> String {
-    if remaining_secs >= 3600 {
-        let h = remaining_secs / 3600;
-        let m = (remaining_secs % 3600) / 60;
-        format!("{}h {}m", h, m)
+    // A clock reads as seconds-accurate without spending the card's narrow left
+    // column on "m"/"s" units, and its width is fixed by the format: five
+    // characters up to an hour, seven beyond it.
+    let (h, m, s) = (
+        remaining_secs / 3600,
+        (remaining_secs % 3600) / 60,
+        remaining_secs % 60,
+    );
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
     } else {
-        let m = remaining_secs / 60;
-        let s = remaining_secs % 60;
-        format!("{}m {}s", m, s)
+        format!("{}:{:02}", m, s)
     }
 }
 
@@ -194,6 +302,10 @@ pub struct CharacterCardWidget {
     /// game in safe areas/loading). Only rendered on the live card; `None`
     /// hides the boost line.
     pub loot_boost_secs: Option<u32>,
+    /// Whether this character has a Blood Ritual in effect, resolved by the caller
+    /// against the tiers the feed delivered. Passed in rather than read off the
+    /// character so the pill is right regardless of refresh timing.
+    blood_ritual_active: bool,
     /// Whether to render the main inventory section.
     pub show_inventory: bool,
     /// Whether to render the backpack section.
@@ -218,6 +330,7 @@ impl CharacterCardWidget {
             stat_display: StatDisplay::None,
             pet: None,
             loot_boost_secs: None,
+            blood_ritual_active: false,
             show_inventory: true,
             show_backpack: true,
             show_extender: true,
@@ -237,6 +350,7 @@ impl CharacterCardWidget {
             stat_display: StatDisplay::None,
             pet: None,
             loot_boost_secs: None,
+            blood_ritual_active: false,
             show_inventory: true,
             show_backpack: true,
             show_extender: true,
@@ -259,6 +373,7 @@ impl CharacterCardWidget {
             stat_display: StatDisplay::None,
             pet: None,
             loot_boost_secs: None,
+            blood_ritual_active: false,
             show_inventory: true,
             show_backpack: true,
             show_extender: true,
@@ -292,6 +407,11 @@ impl CharacterCardWidget {
     }
 
     /// Set the live loot-drop-boost remaining seconds shown on the live card.
+    pub fn with_blood_ritual(mut self, blood_ritual_active: bool) -> Self {
+        self.blood_ritual_active = blood_ritual_active;
+        self
+    }
+
     pub fn with_loot_boost(mut self, loot_boost_secs: Option<u32>) -> Self {
         self.loot_boost_secs = loot_boost_secs;
         self
@@ -592,17 +712,22 @@ impl CharacterCardWidget {
             ui.add_space(8.0);
 
             if self.compact {
-                // Compact mode: name on line 1, crucible pill on line 2 (stacked
-                // in a vertical so a long 20-char name can't stretch the card).
-                // Small top/bottom padding keeps the two lines within the 32px
-                // sprite box.
+                // Compact mode: name on line 1, the season-challenge pills on
+                // line 2 (stacked in a vertical so a long 20-char name can't
+                // stretch the card). Small top/bottom padding keeps the two lines
+                // within the 32px sprite box.
                 let display_name = custom_label.unwrap_or(char.class_name());
                 let name_color = if char.seasonal { SEASONAL_COLOR } else { REGULAR_COLOR };
                 ui.vertical(|ui| {
                     ui.add_space(2.0);
                     ui.label(RichText::new(display_name).strong().size(14.0).color(name_color));
-                    if char.crucible_active {
-                        draw_crucible_pill(ui);
+                    if char.crucible_active || self.blood_ritual_active {
+                        draw_season_pills(
+                            ui,
+                            char.crucible_active,
+                            self.blood_ritual_active,
+                            false,
+                        );
                         ui.add_space(2.0);
                     }
                 });
@@ -610,30 +735,60 @@ impl CharacterCardWidget {
                 // Full mode: name, badges, level, maxed, fame
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    // Label and badges
+                    // Label and badges. The name is the widest text on the card
+                    // and the only row whose content is not fixed, so it is capped
+                    // to whatever the badges leave: a name too long for the card
+                    // clips with an ellipsis instead of stretching this one card
+                    // wider than its neighbours.
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = NAME_ROW_SPACING;
                         let display_name = custom_label.unwrap_or(char.class_name());
                         let name_color = if char.seasonal { SEASONAL_COLOR } else { REGULAR_COLOR };
-                        ui.label(RichText::new(display_name).strong().size(14.0).color(name_color));
 
                         // A live character is flagged with a small green dot +
                         // LIVE right after the name. (The old lightning glyph was
                         // borrowed from Muledump, where it actually means an
                         // active loot boost, not "currently playing".)
+                        let mut badges: Vec<(&str, Color32)> = Vec::new();
                         if is_live {
-                            ui.label(
-                                RichText::new("\u{25cf} LIVE")
-                                    .small()
-                                    .color(Color32::from_rgb(100, 255, 100)),
-                            );
+                            badges.push(("\u{25cf} LIVE", Color32::from_rgb(100, 255, 100)));
+                        }
+                        if char.is_dead && !self.is_graveyard {
+                            badges.push(("\u{1f480} DEAD", Color32::from_rgb(255, 80, 80)));
                         }
 
-                        if char.is_dead && !self.is_graveyard {
-                            ui.label(
-                                RichText::new("💀 DEAD")
-                                    .small()
-                                    .color(Color32::from_rgb(255, 80, 80)),
+                        let small = {
+                            let style = ui.style();
+                            style
+                                .text_styles
+                                .get(&egui::TextStyle::Small)
+                                .cloned()
+                                .unwrap_or_else(|| egui::FontId::proportional(10.0))
+                        };
+                        let badges_w: f32 = badges
+                            .iter()
+                            .map(|(text, _)| {
+                                text_width(ui, text, small.clone()) + NAME_ROW_SPACING
+                            })
+                            .sum();
+                        let name_room =
+                            (CARD_CONTENT_WIDTH - CARD_TEXT_INDENT - badges_w).max(0.0);
+
+                        ui.scope(|ui| {
+                            ui.set_max_width(name_room);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(display_name)
+                                        .strong()
+                                        .size(NAME_FONT_SIZE)
+                                        .color(name_color),
+                                )
+                                .truncate(),
                             );
+                        });
+
+                        for (text, color) in badges {
+                            ui.label(RichText::new(text).small().color(color));
                         }
                     });
 
@@ -658,26 +813,11 @@ impl CharacterCardWidget {
                             });
                         }
 
-                        // Fame + crucible pill on their own row (row 2). Fame
-                        // is always shown (0 when none) so the card height stays
-                        // consistent and a long value can't stretch the card.
+                        // Identity line (row 2): id, level, maxed. Always present,
+                        // so the row under the name is never blank -- the optional
+                        // readouts all sit lower down instead.
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            render_fame_icon(ui, sprite_renderer, 13.0, false);
-                            ui.add_space(-2.0);
-                            ui.label(
-                                RichText::new(format_fame(char.fame))
-                                    .size(12.5)
-                                    .color(Color32::from_rgb(255, 200, 100)),
-                            );
-                            if char.crucible_active {
-                                ui.add_space(6.0);
-                                draw_crucible_pill(ui);
-                            }
-                        });
-
-                        // Id, level, maxed - dot-separated (row 3).
-                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             ui.label(
                                 RichText::new(format!("#{} • Lv.{}", char.char_id, char.level))
                                     .small()
@@ -699,41 +839,95 @@ impl CharacterCardWidget {
                             );
                         });
 
-                        // Loot-drop boost row (row 4, classic ⚡). Always
-                        // reserved -- even when empty -- so cards without an
-                        // active boost keep the same height as boosted ones.
+                        // Fame on its own row (row 3). Always shown (0 when none)
+                        // so the card height stays consistent and a long value
+                        // can't stretch the card.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            render_fame_icon(ui, sprite_renderer, 13.0, false);
+                            ui.add_space(-2.0);
+                            ui.label(
+                                RichText::new(format_fame(char.fame))
+                                    .size(12.5)
+                                    .color(Color32::from_rgb(255, 200, 100)),
+                            );
+                        });
+
+                        // Season-challenge pills and the loot readout share the last
+                        // row (row 4). Both are optional, so pairing them keeps every
+                        // card's name, identity line and fame in the same place, and a
+                        // card carrying neither is blank at the bottom rather than in
+                        // the middle. The pills reserve the row even when empty, so the
+                        // height stays steady either way.
+                        //
+                        // The readout is painted rather than laid out: it belongs to
+                        // the card's left column, under the pet sprite, while the pills
+                        // sit in the text column. Laying it out would consume width here
+                        // and push the pills across, so a running timer moved the row.
+                        // Its font is fixed at 10px so the pair cannot set the row's
+                        // height -- the pill alone does that.
+                        //
                         // The remaining seconds are server-driven, so the timer
                         // naturally freezes when the game pauses it
-                        // (Nexus/vault/loading/offline). The panel pins the
-                        // value to the boosted character, so its card keeps
-                        // showing the last-known timer even when not live.
+                        // (Nexus/vault/loading/offline). The panel pins the value
+                        // to the boosted character, so its card keeps showing the
+                        // last-known timer even when not live.
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            match self.loot_boost_secs {
-                                Some(secs) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "\u{26a1} {}",
-                                            format_loot_boost(secs as u64)
-                                        ))
-                                        .small()
-                                        .color(Color32::from_rgb(100, 255, 100)),
-                                    )
-                                    .on_hover_text(
-                                        "Loot-drop boost remaining. Pauses in safe areas (Nexus, vault, etc.) and while loading.",
-                                    );
-                                    if is_live {
-                                        ui.ctx().request_repaint_after(
-                                            std::time::Duration::from_millis(500),
-                                        );
-                                    }
-                                }
-                                None => {
-                                    // Reserve the line height with an empty
-                                    // small label so the card stays as tall.
-                                    ui.label(RichText::new(" ").small());
+                            // The loot boost reads from the card's left column, under the pet sprite,
+                            // while the id line keeps the row's own x. It is painted rather than laid
+                            // out for exactly that reason: laying it out would consume width here and
+                            // push the id across, so a running timer moved the whole line.
+                            if let Some(secs) = self.loot_boost_secs {
+                                const HINT: &str = "Loot-drop boost remaining. Pauses in safe areas (Nexus, vault, etc.) and while loading.";
+                                // 10px so the five-character clock fits the column the sprite occupies.
+                                let font = egui::FontId::proportional(10.0);
+                                let area = ui.available_rect_before_wrap();
+                                // The row starts at the text column, one inset in
+                                // from the content edge; the readout is painted
+                                // back at that edge so it sits under the sprite.
+                                let content_left =
+                                    area.left() - CARD_TEXT_INDENT;
+                                // Nudged off the column and the row's middle by eye
+                                // (7px left, 2px down): the glyph's own bearings push
+                                // the pair right of the column and high of the text's
+                                // centre.
+                                let left = content_left + LOOT_BOOST_LEFT;
+                                let centre = area.top() + 9.0;
+                                ui.painter().text(
+                                    egui::pos2(left, centre),
+                                    egui::Align2::LEFT_CENTER,
+                                    LOOT_BOOST_GLYPH,
+                                    font.clone(),
+                                    LOOT_BOOST_COLOR,
+                                );
+                                ui.painter().text(
+                                    egui::pos2(left + LOOT_GLYPH_W, centre),
+                                    egui::Align2::LEFT_CENTER,
+                                    format_loot_boost(secs as u64),
+                                    font,
+                                    LOOT_BOOST_COLOR,
+                                );
+                                // Painted text has no response of its own, so the hover hangs off the rect
+                                // it was drawn in -- also paint-only, so it cannot shift the row either.
+                                let hit = egui::Rect::from_min_size(
+                                    egui::pos2(left, centre - 7.0),
+                                    egui::vec2(LOOT_SLOT_W, 14.0),
+                                );
+                                ui.interact(hit, ui.id().with("loot_boost"), Sense::hover())
+                                    .on_hover_text(HINT);
+                                if is_live {
+                                    ui.ctx()
+                                        .request_repaint_after(std::time::Duration::from_millis(500));
                                 }
                             }
+
+                            draw_season_pills(
+                                ui,
+                                char.crucible_active,
+                                self.blood_ritual_active,
+                                true,
+                            );
                         });
                     }
                 });
@@ -993,20 +1187,102 @@ pub(crate) fn stat_potion_id(label: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_loot_boost;
+    use super::*;
+
+    /// Run `f` inside a real egui pass, so text is measured with the fonts the
+    /// card actually draws with rather than a guess at how wide it is.
+    fn measure<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let mut f = Some(f);
+        let mut out = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(f) = f.take() {
+                    out = Some(f(ui));
+                }
+            });
+        });
+        out.expect("egui pass ran")
+    }
+
+    /// The small-text font the card's badges use.
+    fn small_font(ui: &egui::Ui) -> egui::FontId {
+        ui.style()
+            .text_styles
+            .get(&egui::TextStyle::Small)
+            .cloned()
+            .unwrap_or_else(|| egui::FontId::proportional(10.0))
+    }
 
     #[test]
     fn loot_boost_uses_minutes_seconds_under_one_hour() {
-        assert_eq!(format_loot_boost(0), "0m 0s");
-        assert_eq!(format_loot_boost(5), "0m 5s");
-        assert_eq!(format_loot_boost(65), "1m 5s");
-        assert_eq!(format_loot_boost(3599), "59m 59s");
+        assert_eq!(format_loot_boost(0), "0:00");
+        assert_eq!(format_loot_boost(5), "0:05");
+        assert_eq!(format_loot_boost(65), "1:05");
+        assert_eq!(format_loot_boost(3599), "59:59");
     }
 
     #[test]
     fn loot_boost_rolls_to_hours_minutes_at_one_hour() {
-        assert_eq!(format_loot_boost(3600), "1h 0m");
-        assert_eq!(format_loot_boost(3660), "1h 1m");
-        assert_eq!(format_loot_boost(7325), "2h 2m");
+        assert_eq!(format_loot_boost(3600), "1:00:00");
+        assert_eq!(format_loot_boost(3660), "1:01:00");
+        assert_eq!(format_loot_boost(7325), "2:02:05");
+    }
+
+    /// The loot readout is painted between the card's content edge and the id
+    /// column beside it, and a timer past ten hours is the longest the server
+    /// sends. This is the slot that has to hold it: a boost of an hour or more
+    /// (`1:45:48`, `10:45:48`) is what used to run into the id line.
+    #[test]
+    fn the_loot_readout_fits_beside_the_id_line() {
+        let (slot, longest) = measure(|ui| {
+            let longest = format!(
+                "{}{}",
+                LOOT_BOOST_GLYPH,
+                format_loot_boost(10 * 3600 + 45 * 60 + 48)
+            );
+            (
+                LOOT_SLOT_W,
+                text_width(ui, &longest, egui::FontId::proportional(10.0)),
+            )
+        });
+
+        assert!(
+            longest < slot,
+            "the longest readout ({longest:.1}px) does not fit the {slot:.1}px slot"
+        );
+    }
+
+    /// The cap only helps if it holds in a real pass: the row is built the way the
+    /// card builds it, and a name far too long for the card must still leave the
+    /// row inside the card's width rather than stretching it.
+    #[test]
+    fn a_long_name_cannot_widen_the_name_row() {
+        let row_w = measure(|ui| {
+            ui.set_max_width(CARD_CONTENT_WIDTH);
+            let badge = "\u{25cf} LIVE";
+            let badges_w = text_width(ui, badge, small_font(ui)) + NAME_ROW_SPACING;
+            let room = CARD_CONTENT_WIDTH - CARD_TEXT_INDENT - badges_w;
+            let mut row_w = 0.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = NAME_ROW_SPACING;
+                ui.scope(|ui| {
+                    ui.set_max_width(room);
+                    ui.add(
+                        egui::Label::new(RichText::new("New Mystic NPE").size(NAME_FONT_SIZE))
+                            .truncate(),
+                    );
+                });
+                ui.label(RichText::new(badge).small());
+                row_w = ui.min_rect().width();
+            });
+            row_w
+        });
+
+        let row_budget = CARD_CONTENT_WIDTH - CARD_TEXT_INDENT;
+        assert!(
+            row_w <= row_budget,
+            "the row came to {row_w:.1}px of its {row_budget:.1}px budget"
+        );
     }
 }

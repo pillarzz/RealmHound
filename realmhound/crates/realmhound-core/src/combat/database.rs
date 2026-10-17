@@ -9,12 +9,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{
-    CompletedFight, DamageProvenance, DamageTakenProvenance, FightParticipant, FightSelection,
-    ParticipantEndStatus, PetInfo,
+    AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
+    FightParticipant, FightSelection, ParticipantEndStatus, PetInfo, SummonContribution,
+    WeaponContribution,
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 58;
+pub const SCHEMA_VERSION: i32 = 64;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -92,6 +93,16 @@ pub struct FightRecord {
     /// are revealed only in hard mode). False for every other dungeon and for
     /// rows recorded before the mode was tracked.
     pub shatters_hm: bool,
+    /// Time the boss was vulnerable and taking damage, in ms. `0` means unknown
+    /// (rows recorded before this was tracked), so damage-per-minute falls back
+    /// to the whole fight duration.
+    pub boss_uptime_ms: i64,
+    /// The local player's stat/condition boost windows during this fight, in time
+    /// order. Empty for rows recorded before this was tracked.
+    pub boosts: Vec<BoostWindow>,
+    /// The local player's ability activations during this fight, in time order.
+    /// Empty for rows recorded before this was tracked.
+    pub abilities: Vec<AbilityActivation>,
     /// Participants (sorted by damage descending as stored).
     pub participants: Vec<ParticipantRecord>,
 }
@@ -275,6 +286,24 @@ pub struct ParticipantRecord {
     /// Hits landed on Oryx 3 while Guarded (subset of `hits`), or `None` for
     /// pre-feature rows.
     pub guarded_hits: Option<i64>,
+    /// Incoming hits that were valued into `damage_taken` ("shots tanked"), or
+    /// `None` for rows recorded before this was tracked.
+    pub damage_taken_hits: Option<i64>,
+    /// Summon/pet-sourced damage included in `damage` (0 for pre-feature rows).
+    pub summon_damage: i64,
+    /// Summon/pet-sourced hits included in `hits` (0 for pre-feature rows).
+    pub summon_hits: i64,
+    /// Per-summon/pet breakdown; empty for pre-feature rows.
+    pub summons: Vec<SummonContribution>,
+    /// The local player's damage split per weapon (highest damage first). Empty
+    /// for remote players and for rows recorded before this was tracked.
+    pub weapons: Vec<WeaponContribution>,
+    /// Damage the server attributed to this player directly in a damage packet
+    /// (ability/DoT/proc), separate from the self-computed weapon rows. 0 for
+    /// remote players and for rows recorded before this was tracked.
+    pub packet_damage: i64,
+    /// Number of local damage packets behind `packet_damage`.
+    pub packet_hits: u64,
 }
 
 /// Combat history database manager.
@@ -380,6 +409,12 @@ pub struct FightSummary {
     /// Whether the run was played in The Shatters' hard mode. False for every
     /// other dungeon; set for the whole run when any of its phases recorded it.
     pub shatters_hm: bool,
+    /// Object type whose current name and sprite represent this encounter in the
+    /// UI: one variant per encounter (the most recently recorded one), so a
+    /// history that spans a seasonal reskin reads and draws uniformly. Equal to
+    /// `boss_object_type` when the encounter has no reskin. Kept separate from
+    /// `boss_object_type` so filtering and detection keep using the stored id.
+    pub display_object_type: i32,
 }
 
 impl FightSummary {
@@ -541,7 +576,46 @@ impl CombatDatabase {
         // dragons are defeated, so an Ivory Wyvern fight proves the preceding
         // Lair run was a full clear. Complete such runs from that evidence.
         self.backfill_legacy_lod_from_ivory()?;
+        // A captured death broadcast is authoritative, but it can arrive after the
+        // fight containing the death was already written (a burst of deaths at the
+        // end of a clear). Apply the stored broadcasts to those rows here, both
+        // live (see `insert_death_broadcast`) and for anything a previous session
+        // observed but could not apply.
+        self.repair_remote_deaths()?;
+        // The local player's own row: a fight completed after it was written still
+        // carries the nexus its unfinished state earned it.
+        self.repair_local_nexus_on_completed_fights()?;
         Ok(())
+    }
+
+    /// Clear a `nexused` local row on a fight the boss is now known to have died
+    /// in.
+    ///
+    /// The local player is scored `nexused` only when the map change that closed
+    /// the fight found it unfinished (`local_departing && !killed`, see
+    /// `CombatTracker::resolve_end_statuses`), so a fight stored as killed can
+    /// never carry a `nexused` local row. Such a row was written before its kill
+    /// proof arrived -- a bag that proves the boss died in that instance, applied
+    /// by [`Self::mark_boss_killed_by_loot`] or [`Self::complete_bosses_from_loot`],
+    /// both of which need the local player in the instance to be seen at all. The
+    /// departure it recorded therefore did not happen.
+    ///
+    /// Local rows only: a remote participant can genuinely nexus out of a fight
+    /// the group still cleared. Idempotent, and cheap enough to run on every open.
+    pub fn repair_local_nexus_on_completed_fights(&mut self) -> SqlResult<usize> {
+        // Databases predating the status column (and the synthetic schemas the
+        // migration tests build) hold no statuses to repair.
+        if !self.column_exists("fight_participants", "end_status")?
+            || !self.column_exists("fight_participants", "is_local")?
+        {
+            return Ok(0);
+        }
+        self.conn.execute(
+            "UPDATE fight_participants SET end_status = 'present'
+             WHERE is_local = 1 AND end_status = 'nexused'
+               AND fight_id IN (SELECT id FROM fights WHERE killed = 1)",
+            [],
+        )
     }
 
     /// Group already-recorded fights whose boss belongs to a curated multi-phase
@@ -597,8 +671,17 @@ impl CombatDatabase {
         let mut open: HashMap<(String, i32, String, i32), Run> = HashMap::new();
         let mut runs: Vec<Run> = Vec::new();
         for row in rows {
-            let Some(enc) = crate::assets::encounter_for_boss_type(row.otype) else {
-                continue;
+            // A curated encounter keeps its id so its members fold into one card;
+            // any other boss in a groupable dungeon uses the "dungeon_run"
+            // sentinel, exactly as it would when recorded live. Hand-written or
+            // legacy rows (e.g. realm-spawned Oryx's Castle bosses stored before
+            // the canonical-dungeon fix) are thus grouped on open like a fresh run.
+            let enc_id = match crate::assets::encounter_for_boss_type(row.otype) {
+                Some(enc) => enc.id.to_string(),
+                None if super::tracker::is_groupable_dungeon(&row.dungeon) => {
+                    "dungeon_run".to_string()
+                }
+                None => continue,
             };
             if row.char_id == 0
                 || row.seed == 0
@@ -606,12 +689,7 @@ impl CombatDatabase {
             {
                 continue;
             }
-            let key = (
-                enc.id.to_string(),
-                row.char_id,
-                row.dungeon.clone(),
-                row.seed,
-            );
+            let key = (enc_id.clone(), row.char_id, row.dungeon.clone(), row.seed);
             let start_new = match open.get(&key) {
                 Some(r) => row.started - r.end > RUN_GAP_MS,
                 None => true,
@@ -623,8 +701,11 @@ impl CombatDatabase {
                 open.insert(
                     key,
                     Run {
-                        run_id: format!("bf-{}-{:x}", enc.id, row.started),
-                        enc_id: enc.id.to_string(),
+                        run_id: format!(
+                            "bf-{}-{}-{}-{:x}",
+                            enc_id, row.seed, row.char_id, row.started
+                        ),
+                        enc_id,
                         dungeon: row.dungeon,
                         ids: vec![row.id],
                         start: row.started,
@@ -1377,6 +1458,141 @@ impl CombatDatabase {
             // bumping re-runs it and fixes fights already stored as Escaped.
             self.conn.execute_batch("PRAGMA user_version = 58")?;
         }
+        if from_version < 59 {
+            // v58 -> v59: relabel legacy realm-recorded Janus the Doorwarden and
+            // Stone Guardian fights as "Oryx's Castle". These bosses are
+            // realm-spawned but belong to Oryx's Castle; the canonical-dungeon
+            // table only covered the classic object ids, so the Season 31 reskins
+            // (46385/46390/46391) were stored under the raw realm map name and
+            // never classified or grouped with the dungeon. Fixing the table only
+            // affects new records, so repair the already-stored rows here.
+            self.conn.execute_batch(
+                "UPDATE fights SET dungeon = 'Oryx''s Castle'
+                 WHERE dungeon = 'Realm'
+                   AND boss_object_type IN (8200, 3448, 3449, 46385, 46390, 46391);",
+            )?;
+            // Rebuild the synthetic `bf-` runs so they pick up the widened
+            // grouping rule (non-curated bosses in a groupable dungeon now group
+            // under "dungeon_run", like a live run) and the seed/char-scoped run
+            // id that prevents two instances from colliding. Live
+            // "{nonce}-{counter}" ids are authoritative and left untouched; the
+            // backfill that runs right after migration rebuilds these.
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "UPDATE fights SET encounter_id = NULL, encounter_run_id = NULL
+                 WHERE encounter_run_id LIKE 'bf-%'",
+                [],
+            )?;
+            tx.execute("DELETE FROM encounter_runs WHERE run_id LIKE 'bf-%'", [])?;
+            tx.commit()?;
+            self.conn.execute_batch("PRAGMA user_version = 59")?;
+        }
+        if from_version < 60 {
+            // v59 -> v60: relabel the remaining realm-locked dungeon bosses now
+            // that the canonical-dungeon table covers the reskinned Oryx the Mad
+            // God 1 / 2 (Oryx's Chamber / Wine Cellar). Idempotent, so re-running
+            // over rows v59 already fixed is harmless.
+            self.conn.execute_batch(
+                "UPDATE fights SET dungeon = 'Oryx''s Chamber'
+                     WHERE dungeon = 'Realm' AND boss_object_type = 45973;
+                 UPDATE fights SET dungeon = 'Wine Cellar'
+                     WHERE dungeon = 'Realm' AND boss_object_type = 28989;",
+            )?;
+            self.conn.execute_batch("PRAGMA user_version = 60")?;
+        }
+        if from_version < 61 {
+            // v60 -> v61: the death broadcasts we observe. Persisting them lets a
+            // death that was confirmed after the battle containing it was already
+            // written still be applied to that battle (concurrent phases are
+            // recorded up to a few hundred ms apart, so a burst of deaths at the
+            // end of a fight can land in the gap), and keeps the raw signal around
+            // for diagnosing a death that was never captured. No historical rows
+            // are touched: nothing was stored before this version.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS death_broadcasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    player TEXT NOT NULL,
+                    killer TEXT NOT NULL DEFAULT '',
+                    occurred_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_death_broadcasts_time
+                    ON death_broadcasts(occurred_at);
+                PRAGMA user_version = 61;
+                "#,
+            )?;
+        }
+        if from_version < 62 {
+            // v61 -> v62: per-fight boss uptime and the summon/pet split on each
+            // participant. Uptime is the time the boss was both vulnerable and
+            // taking damage, so damage-per-minute can divide by actual fight
+            // uptime instead of wall-clock duration; 0 on legacy rows means
+            // "unknown", and consumers fall back to the whole duration. The split
+            // keeps pet damage out of the owner's per-hit average and per-loadout
+            // buckets while still counting it in the owner's totals.
+            if !self.column_exists("fights", "boss_uptime_ms")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN boss_uptime_ms INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "damage_taken_hits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN damage_taken_hits INTEGER;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "summon_damage")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN summon_damage INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "summon_hits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN summon_hits INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "summons")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fight_participants ADD COLUMN summons TEXT;")?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 62")?;
+        }
+        if from_version < 63 {
+            // v62 -> v63: the local player's "My Performance" detail -- the boost
+            // windows observed on them, their ability activations, and their damage
+            // split per weapon. All three are JSON blobs (mirroring how enchants and
+            // summons are stored); NULL/absent on legacy rows means "not recorded".
+            if !self.column_exists("fights", "boosts")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fights ADD COLUMN boosts TEXT;")?;
+            }
+            if !self.column_exists("fights", "abilities")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fights ADD COLUMN abilities TEXT;")?;
+            }
+            if !self.column_exists("fight_participants", "weapons")? {
+                self.conn
+                    .execute_batch("ALTER TABLE fight_participants ADD COLUMN weapons TEXT;")?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 63")?;
+        }
+        if from_version < 64 {
+            // v63 -> v64: split local damage packets away from the self-computed
+            // weapon rows. The weapon rows are reconstructed from the player's own
+            // shot packets; a figure the server reported for them directly (an
+            // ability, DoT or proc) is a different thing and must not be presented as
+            // a weapon's contribution, so it gets its own total.
+            if !self.column_exists("fight_participants", "packet_damage")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN packet_damage INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !self.column_exists("fight_participants", "packet_hits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fight_participants ADD COLUMN packet_hits INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 64")?;
+        }
         Ok(())
     }
 
@@ -2068,11 +2284,13 @@ impl CombatDatabase {
     ///
     /// Mirrors [`Self::complete_legacy_lod_dragons_from_loot`]: it reads the paired
     /// loot DB (best-effort, a no-op when it is absent or unreadable) for bags that
-    /// prove the kill — those holding a boss Mark, and those of the bosses whose
+    /// prove the kill — those holding a boss Mark, those of the bosses whose
     /// guaranteed bag is itself proof (see [`crate::assets::bag_proves_boss_killed`])
-    /// — and latches the closest still-escaped fight of the bag's attributed boss
-    /// type in the same instance. Idempotent, so it runs on every open; the
-    /// schema-version bump is what forces one pass over existing history.
+    /// and those attributed to a boss at all (see
+    /// [`crate::assets::AssetManager::bag_attribution_proves_kill`]) — and latches
+    /// the closest still-escaped fight of the bag's attributed boss type in the
+    /// same instance. Idempotent, so it runs on every open; the schema-version bump
+    /// is what forces one pass over existing history.
     fn complete_bosses_from_loot(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
         let Some(path) = loot_path else {
             return Ok(());
@@ -2085,7 +2303,20 @@ impl CombatDatabase {
             .into_iter()
             .collect();
         let bag_types = crate::assets::bag_proves_kill_boss_types();
-        if marks.is_empty() && bag_types.is_empty() {
+        // Every boss with a still-escaped fight: a bag attributed to one of them
+        // proves that boss died (see `AssetManager::bag_attribution_proves_kill`),
+        // so those bags are looked up directly rather than by scanning every drop.
+        let attributed: Vec<i32> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT boss_object_type FROM fights
+                 WHERE killed = 0 AND boss_object_type > 0",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, i32>(0))?;
+            rows.filter_map(Result::ok)
+                .filter(|t| crate::assets::get_asset_manager().bag_attribution_proves_kill(*t))
+                .collect()
+        };
+        if marks.is_empty() && bag_types.is_empty() && attributed.is_empty() {
             return Ok(());
         }
         let loot = match Connection::open_with_flags(
@@ -2121,6 +2352,13 @@ impl CombatDatabase {
                 placeholders.join(", ")
             ));
             binds.extend_from_slice(&marks);
+        }
+        if !attributed.is_empty() {
+            let placeholders: Vec<String> = (binds.len() + 1..=binds.len() + attributed.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            clauses.push(format!("mob_type IN ({})", placeholders.join(", ")));
+            binds.extend_from_slice(&attributed);
         }
         let sql = format!(
             "SELECT map_seed, mob_type, timestamp FROM loot_drops
@@ -2461,7 +2699,10 @@ impl CombatDatabase {
                 leisurely INTEGER NOT NULL DEFAULT 0,
                 petless INTEGER NOT NULL DEFAULT 0,
                 spectral_hm INTEGER NOT NULL DEFAULT 0,
-                shatters_hm INTEGER NOT NULL DEFAULT 0
+                shatters_hm INTEGER NOT NULL DEFAULT 0,
+                boss_uptime_ms INTEGER NOT NULL DEFAULT 0,
+                boosts TEXT,
+                abilities TEXT
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -2508,6 +2749,13 @@ impl CombatDatabase {
                 guarded_damage INTEGER,
                 guarded_hits INTEGER,
                 damage_blocked INTEGER,
+                damage_taken_hits INTEGER,
+                summon_damage INTEGER NOT NULL DEFAULT 0,
+                summon_hits INTEGER NOT NULL DEFAULT 0,
+                summons TEXT,
+                weapons TEXT,
+                packet_damage INTEGER NOT NULL DEFAULT 0,
+                packet_hits INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (fight_id) REFERENCES fights(id) ON DELETE CASCADE
             );
 
@@ -2517,15 +2765,106 @@ impl CombatDatabase {
                 completions INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS death_broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player TEXT NOT NULL,
+                killer TEXT NOT NULL DEFAULT '',
+                occurred_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_fights_started ON fights(started_at);
             CREATE INDEX IF NOT EXISTS idx_fights_run ON fights(encounter_run_id);
             CREATE INDEX IF NOT EXISTS idx_fights_group ON fights(boss_group);
             CREATE INDEX IF NOT EXISTS idx_participants_fight ON fight_participants(fight_id);
+            CREATE INDEX IF NOT EXISTS idx_death_broadcasts_time ON death_broadcasts(occurred_at);
             CREATE INDEX IF NOT EXISTS idx_encounter_runs_recent
                 ON encounter_runs(ended_at DESC, started_at DESC);
             "#,
         )?;
         Ok(())
+    }
+
+    /// Record an observed server death broadcast (`s.death`) so a death confirmed
+    /// after its fight was already stored can still be applied to that fight, and
+    /// so the raw signal survives for diagnosing a death that was never captured.
+    pub fn insert_death_broadcast(
+        &mut self,
+        player: &str,
+        killer: &str,
+        occurred_at: i64,
+    ) -> SqlResult<()> {
+        let player = player.trim();
+        if player.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO death_broadcasts (player, killer, occurred_at) VALUES (?1, ?2, ?3)",
+            params![player, killer.trim(), occurred_at],
+        )?;
+        Ok(())
+    }
+
+    /// Mark stored participants as `died` when a captured death broadcast names
+    /// them inside their fight's window.
+    ///
+    /// The live finalize pass can only use a broadcast that has already arrived.
+    /// Concurrent phases are written up to a few hundred ms apart, so a burst of
+    /// deaths at the end of a clear can be broadcast after the phase containing
+    /// them was stored, which left those deaths recorded as a nexus even though
+    /// they were announced. The broadcast is authoritative, so the stored row is
+    /// corrected here.
+    ///
+    /// Only a `nexused` row with no grave is touched -- exactly the rule the live
+    /// pass applies (death evidence beats a departure, but never presence) -- and
+    /// the grave tier is left at 0, which the UI renders as the default
+    /// gravestone. Idempotent: repaired rows no longer match.
+    pub fn repair_remote_deaths(&mut self) -> SqlResult<usize> {
+        let broadcasts: Vec<(String, i64)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT player, occurred_at FROM death_broadcasts")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<SqlResult<Vec<_>>>()?
+        };
+        if broadcasts.is_empty() {
+            return Ok(0);
+        }
+
+        let mut repaired = 0;
+        for (player, occurred_at) in broadcasts {
+            let key = super::tracker::sanitize_player_name(&player).to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            // Candidate departures whose fight window contains the broadcast.
+            let candidates: Vec<(i64, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT fp.id, fp.name FROM fight_participants fp
+                     JOIN fights f ON f.id = fp.fight_id
+                     WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
+                       AND f.started_at <= ?2 AND f.ended_at >= ?1",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        occurred_at - super::tracker::GRAVE_MATCH_WINDOW_MS,
+                        occurred_at + super::tracker::GRAVE_MATCH_WINDOW_MS
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                rows.collect::<SqlResult<Vec<_>>>()?
+            };
+            for (id, name) in candidates {
+                if super::tracker::sanitize_player_name(&name).to_ascii_lowercase() != key {
+                    continue;
+                }
+                repaired += self.conn.execute(
+                    "UPDATE fight_participants SET end_status = 'died'
+                     WHERE id = ?1 AND end_status = 'nexused'",
+                    params![id],
+                )?;
+            }
+        }
+        Ok(repaired)
     }
 
     /// Add one dungeon run's elapsed time (and, when the boss was killed, one
@@ -2587,8 +2926,8 @@ impl CombatDatabase {
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
                 dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, petless, spectral_hm,
-                shatters_hm)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"#,
+                shatters_hm, boss_uptime_ms, boosts, abilities)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -2614,6 +2953,9 @@ impl CombatDatabase {
                 fight.petless as i32,
                 fight.spectral_hm as i32,
                 fight.shatters_hm as i32,
+                fight.boss_uptime_ms,
+                serialize_boosts(&fight.boosts),
+                serialize_abilities(&fight.abilities),
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -2647,8 +2989,10 @@ impl CombatDatabase {
                    (fight_id, object_id, object_type, name, equip0, equip1, equip2, equip3,
                     enchants, damage, hits, is_local, provenance, skin_id, tex1, tex2,
                     end_status, grave_type, pet_type, pet_abilities, damage_taken,
-                    damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"#,
+                    damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked,
+                    damage_taken_hits, summon_damage, summon_hits, summons, weapons,
+                    packet_damage, packet_hits)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)"#,
                 params![
                     fight_id,
                     p.object_id,
@@ -2675,6 +3019,13 @@ impl CombatDatabase {
                     p.guarded_damage,
                     p.guarded_hits.map(|h| h as i64),
                     p.damage_blocked,
+                    p.damage_taken_hits.map(|h| h as i64),
+                    p.summon_damage,
+                    p.summon_hits as i64,
+                    serialize_summons(&p.summons),
+                    serialize_weapons(&p.weapons),
+                    p.packet_damage,
+                    p.packet_hits as i64,
                 ],
             )?;
         }
@@ -2696,7 +3047,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -2729,6 +3081,9 @@ impl CombatDatabase {
             petless: row.get::<_, i32>(17)? != 0,
             spectral_hm: row.get::<_, i32>(18)? != 0,
             shatters_hm: row.get::<_, i32>(19)? != 0,
+            boss_uptime_ms: row.get(20)?,
+            boosts: parse_boosts(row.get::<_, Option<String>>(21)?.as_deref()),
+            abilities: parse_abilities(row.get::<_, Option<String>>(22)?.as_deref()),
             participants: Vec::new(),
         })
     }
@@ -3141,10 +3496,12 @@ impl CombatDatabase {
 
     /// Whether an Exaltation card earns the "flawless" marker: at
     /// least one participant who finished the fight (never died/nexused) dealt at
-    /// least [`FLAWLESS_MIN_BOSS_DAMAGE_FRACTION`] of the boss's HP and took zero
-    /// observed damage across every tracked entity in the card. `damage_taken`
-    /// of `None`/`Some(0)` counts as "took zero" (a positive value is required to
-    /// disqualify), since remote players who are never hit record no value.
+    /// least [`FLAWLESS_MIN_BOSS_DAMAGE_FRACTION`] of the boss's HP, took zero
+    /// observed damage across every tracked entity in the card and was never hit.
+    /// `damage_taken` of `None`/`Some(0)` counts as "took zero" (a positive value
+    /// is required to disqualify), since remote players who are never hit record
+    /// no value; hits taken disqualify only when the row recorded any, so a card
+    /// from before hits-taken tracking keeps the damage-only reading.
     fn card_is_flawless(&self, s: &FightSummary) -> SqlResult<bool> {
         if s.boss_max_hp <= 0 {
             return Ok(false);
@@ -3182,16 +3539,17 @@ impl CombatDatabase {
             return Ok(false);
         }
         // Per participant across the whole card: (boss damage, took any positive
-        // damage, finished the fight everywhere). `any_taken_recorded` guards
-        // against legacy rows (recorded before damage-taken tracking) whose
-        // all-NULL values would otherwise read as a factual zero taken.
-        let mut acc: std::collections::HashMap<i32, (i64, bool, bool)> =
+        // damage, finished the fight everywhere, was ever hit, hits recorded).
+        // `any_taken_recorded` guards against legacy rows (recorded before
+        // damage-taken tracking) whose all-NULL values would otherwise read as a
+        // factual zero taken.
+        let mut acc: std::collections::HashMap<i32, (i64, bool, bool, bool, bool)> =
             std::collections::HashMap::new();
         let mut any_taken_recorded = false;
         for (fid, _) in &fights {
             let is_boss_fight = boss_ids.contains(fid);
             let mut stmt = self.conn.prepare(
-                "SELECT object_id, damage, damage_taken, end_status
+                "SELECT object_id, damage, damage_taken, end_status, damage_taken_hits
                  FROM fight_participants WHERE fight_id = ?1",
             )?;
             let rows = stmt.query_map(params![fid], |r| {
@@ -3200,11 +3558,12 @@ impl CombatDatabase {
                     r.get::<_, i64>(1)?,
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
                 ))
             })?;
             for row in rows {
-                let (oid, damage, taken, status) = row?;
-                let e = acc.entry(oid).or_insert((0, false, true));
+                let (oid, damage, taken, status, hits_taken) = row?;
+                let e = acc.entry(oid).or_insert((0, false, true, false, false));
                 if is_boss_fight {
                     e.0 += damage;
                 }
@@ -3217,6 +3576,12 @@ impl CombatDatabase {
                 if status != "present" {
                     e.2 = false;
                 }
+                if let Some(hits) = hits_taken {
+                    e.4 = true;
+                    if hits > 0 {
+                        e.3 = true;
+                    }
+                }
             }
         }
         if !any_taken_recorded {
@@ -3224,9 +3589,16 @@ impl CombatDatabase {
         }
         let threshold =
             (s.boss_max_hp as f64 * Self::FLAWLESS_MIN_BOSS_DAMAGE_FRACTION).ceil() as i64;
-        Ok(acc.values().any(|(boss_dmg, took_positive, finished)| {
-            *finished && !*took_positive && *boss_dmg >= threshold
-        }))
+        Ok(acc.values().any(
+            |(boss_dmg, took_positive, finished, was_hit, hits_recorded)| {
+                *finished
+                    && !*took_positive
+                    // A recorded hit disqualifies; unknown hits (a card from before
+                    // hits-taken tracking) leave the damage-only reading.
+                    && !(*hits_recorded && *was_hit)
+                    && *boss_dmg >= threshold
+            },
+        ))
     }
 
     /// Summaries for standalone (non-grouped) fights only.
@@ -3278,10 +3650,14 @@ impl CombatDatabase {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref()));
+        // One display variant per encounter, so a history stored under both the
+        // classic and the reskin id reads with one name and one portrait.
+        let variants = self.display_variants()?;
         let rows = stmt.query_map(params, |row| {
             let boss_object_type: i32 = row.get(4)?;
             let stored_name: String = row.get(5)?;
-            let boss_name = display_boss_name(boss_object_type, &stored_name);
+            let display_object_type = display_variant_of(&variants, boss_object_type);
+            let boss_name = display_boss_name(display_object_type, &stored_name);
             Ok(FightSummary {
                 id: row.get(0)?,
                 started_at: row.get(1)?,
@@ -3289,6 +3665,7 @@ impl CombatDatabase {
                 dungeon: row.get(3)?,
                 map_seed: row.get(16)?,
                 boss_object_type,
+                display_object_type,
                 boss_name: boss_name.clone(),
                 boss_max_hp: row.get(6)?,
                 boss_start_hp: row.get(7)?,
@@ -3304,7 +3681,7 @@ impl CombatDatabase {
                 encounter_run_id: None,
                 encounter_id: None,
                 phase_count: 1,
-                killed_bosses: vec![(boss_object_type, boss_name)],
+                killed_bosses: vec![(display_object_type, boss_name)],
                 flawless: false,
                 lone_fighter: false,
                 last_hero_standing: false,
@@ -3316,6 +3693,47 @@ impl CombatDatabase {
             })
         })?;
         rows.collect()
+    }
+
+    /// The object type that represents each reskinned encounter for display: the
+    /// variant this database recorded most recently, keyed by canonical type.
+    ///
+    /// Resolved once per list load so every card for one encounter shows a single
+    /// name and sprite, whichever variant's id each row was stored under (the
+    /// stored ids are never changed). Encounters without a reskin are absent:
+    /// their own type is already the display type.
+    fn display_variants(&self) -> SqlResult<HashMap<i32, i32>> {
+        let groups = crate::assets::encounter_reskin_groups();
+        let tracked: Vec<i32> = groups
+            .iter()
+            .flat_map(|group| group.iter().copied())
+            .collect();
+        if tracked.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", tracked.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT boss_object_type, MAX(started_at) FROM fights
+             WHERE boss_object_type IN ({placeholders}) GROUP BY boss_object_type"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let latest: HashMap<i32, i64> = stmt
+            .query_map(rusqlite::params_from_iter(tracked.iter()), |row| {
+                Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<SqlResult<_>>()?;
+        let mut out: HashMap<i32, i32> = HashMap::new();
+        for group in groups {
+            let observed = group
+                .iter()
+                .filter_map(|t| latest.get(t).map(|recency| (*t, *recency)));
+            if let Some(display) = crate::assets::encounter_display_variant(observed) {
+                out.insert(crate::assets::encounter_canonical_type(display), display);
+            }
+        }
+        Ok(out)
     }
 
     /// The anchor phase of a run: the last real (non-aux) boss engaged, which is
@@ -3367,6 +3785,10 @@ impl CombatDatabase {
         if limit <= 0 || run_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
         }
+        // One display variant per encounter (see `display_variants`), so a run
+        // stored under the classic id and one under its seasonal reskin are both
+        // titled and pictured by the same variant.
+        let variants = self.display_variants()?;
 
         let mut sql = String::from(
             "SELECT r.run_id, r.encounter_id, r.dungeon, r.started_at, r.ended_at, r.killed
@@ -3603,15 +4025,19 @@ impl CombatDatabase {
             // "Realm" map name); a multi-boss dungeon run is headlined by its
             // dungeon; a lone boss keeps its own name.
             let object_types: Vec<i32> = phases.iter().map(|p| p.0).collect();
-            let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
-                name.to_string()
+            let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
+                // Realm-grouped encounter: title by the anchor boss's *current*
+                // name so a seasonally-reskinned fight reads uniformly.
+                display_boss_name(display_variant_of(&variants, boss_object_type), headline)
             } else if raw_phase_count > 1 {
                 dungeon.clone()
             } else {
                 phases
                     .iter()
                     .max_by_key(|phase| phase.4)
-                    .map(|phase| display_boss_name(phase.0, &phase.5))
+                    .map(|phase| {
+                        display_boss_name(display_variant_of(&variants, phase.0), &phase.5)
+                    })
                     .unwrap_or_else(|| dungeon.clone())
             };
             let local_char_id = phases
@@ -3630,20 +4056,23 @@ impl CombatDatabase {
             ordered.sort_by_key(|phase| (phase.7, phase.4));
             for phase in &ordered {
                 let is_real = crate::assets::aux_target_for_type(phase.0).is_none();
-                if is_real && phase.3 && !killed_bosses.iter().any(|(t, _)| *t == phase.0) {
+                let display_type = display_variant_of(&variants, phase.0);
+                if is_real && phase.3 && !killed_bosses.iter().any(|(t, _)| *t == display_type) {
                     killed_bosses.push((
-                        phase.0,
-                        strip_boss_phase_suffix(&display_boss_name(phase.0, &phase.5)).to_string(),
+                        display_type,
+                        strip_boss_phase_suffix(&display_boss_name(display_type, &phase.5))
+                            .to_string(),
                     ));
                 }
             }
             if killed_bosses.is_empty() {
                 for phase in &ordered {
                     let is_real = crate::assets::aux_target_for_type(phase.0).is_none();
-                    if is_real && !killed_bosses.iter().any(|(t, _)| *t == phase.0) {
+                    let display_type = display_variant_of(&variants, phase.0);
+                    if is_real && !killed_bosses.iter().any(|(t, _)| *t == display_type) {
                         killed_bosses.push((
-                            phase.0,
-                            strip_boss_phase_suffix(&display_boss_name(phase.0, &phase.5))
+                            display_type,
+                            strip_boss_phase_suffix(&display_boss_name(display_type, &phase.5))
                                 .to_string(),
                         ));
                     }
@@ -3667,7 +4096,10 @@ impl CombatDatabase {
                 .find_map(|phase| crate::assets::encounter_for_boss_type(phase.0));
             if let Some(enc) = real_enc {
                 if crate::assets::encounter_headline_only(enc.id) {
-                    killed_bosses = vec![(enc.anchor_type, enc.display_name.to_string())];
+                    killed_bosses = vec![(
+                        display_variant_of(&variants, enc.anchor_type),
+                        enc.display_name.to_string(),
+                    )];
                     // The card's picture is always the headline boss's, even when
                     // only escaping segments took damage and the anchor phase was
                     // never recorded (e.g. Towering Perfection's core).
@@ -3682,6 +4114,7 @@ impl CombatDatabase {
                 dungeon,
                 map_seed: phases.first().map(|p| p.8).unwrap_or(0),
                 boss_object_type,
+                display_object_type: display_variant_of(&variants, boss_object_type),
                 boss_name: display_name,
                 boss_max_hp,
                 boss_start_hp,
@@ -3717,7 +4150,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -3746,7 +4180,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -3789,7 +4224,8 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, petless, spectral_hm, shatters_hm
+                      leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
+                      boosts, abilities
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -3812,14 +4248,15 @@ impl CombatDatabase {
             // Moonlight Village is cleared by its three dancers; the anchor can
             // land on an escaped Kitsune Umi fought afterwards.
             || mv_dancers_cleared(phases.iter().map(|p| (p.boss_object_type, p.killed)));
-        let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
-            name.to_string()
+        let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
+            // Title by the anchor boss's current (seasonal) name.
+            display_boss_name(anchor_object_type, headline)
         } else if phases.len() > 1 {
             dungeon.clone()
         } else {
             phases
                 .first()
-                .map(|p| p.boss_name.clone())
+                .map(|p| display_boss_name(p.boss_object_type, &p.boss_name))
                 .unwrap_or_else(|| dungeon.clone())
         };
         let roster = aggregate_roster(&phases);
@@ -4010,27 +4447,46 @@ impl CombatDatabase {
         // A self-destructing boss's loot is emitted by a proxy chest (Legacy Lair
         // of Draconis dragons). Resolve the chest's drops back to the boss fight.
         let mob_type = crate::assets::boss_for_loot_emitter(mob_type).unwrap_or(mob_type);
+        // A seasonal reskin is a separate object type, but its anonymously emitted
+        // loot is attributed to the canonical boss (e.g. Janus the Doorwarden
+        // 8200 vs its Season 31 "Infested" reskin 46385), so match the whole
+        // reskin family, not just the exact type.
+        let mut types: Vec<i32> = vec![mob_type];
+        types.extend(crate::assets::boss_loot_family(mob_type).iter().copied());
+        types.sort_unstable();
+        types.dedup();
+
         let lo = timestamp - LOOT_LINK_POST_MS;
         let hi = timestamp + LOOT_LINK_PRE_MS;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, encounter_run_id FROM fights
-             WHERE killed = 1 AND map_seed = ?1 AND boss_object_type = ?2
-               AND ended_at >= ?3 AND started_at <= ?4
-             ORDER BY ABS(ended_at - ?5) ASC, id ASC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![map_seed, mob_type, lo, hi, timestamp], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        match rows.next() {
-            Some(row) => {
-                let (id, run) = row?;
-                Ok(Some(match run {
-                    Some(run) => FightSelection::Encounter(run),
-                    None => FightSelection::Single(id),
-                }))
+        // Nearest killing fight across the family; ties broken by the older id.
+        let mut best: Option<(i64, i64, Option<String>)> = None;
+        for candidate in types {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, encounter_run_id, ended_at FROM fights
+                 WHERE killed = 1 AND map_seed = ?1 AND boss_object_type = ?2
+                   AND ended_at >= ?3 AND started_at <= ?4
+                 ORDER BY ABS(ended_at - ?5) ASC, id ASC LIMIT 1",
+            )?;
+            let mut rows =
+                stmt.query_map(params![map_seed, candidate, lo, hi, timestamp], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+            let Some(row) = rows.next() else { continue };
+            let (id, run, ended) = row?;
+            let distance = (ended - timestamp).abs();
+            if best.as_ref().map_or(true, |(d, _, _)| distance < *d) {
+                best = Some((distance, id, run));
             }
-            None => Ok(None),
         }
+
+        Ok(best.map(|(_, id, run)| match run {
+            Some(run) => FightSelection::Encounter(run),
+            None => FightSelection::Single(id),
+        }))
     }
 
     /// Latch `killed = 1` on the encounter run(s) of a loot-completed realm
@@ -4127,6 +4583,15 @@ impl CombatDatabase {
             return Ok(None);
         };
         tx.execute("UPDATE fights SET killed = 1 WHERE id = ?1", params![id])?;
+        // The bag proves the boss died with the local player in the instance, so a
+        // nexus recorded against this fight was a departure they did not make (see
+        // `repair_local_nexus_on_completed_fights`). Done here rather than only on
+        // the next open, so a card open at the time loses the stale icon at once.
+        tx.execute(
+            "UPDATE fight_participants SET end_status = 'present'
+             WHERE fight_id = ?1 AND is_local = 1 AND end_status = 'nexused'",
+            params![id],
+        )?;
         tx.commit()?;
         Ok(Some(match encounter_run_id {
             Some(run_id) => FightSelection::Encounter(run_id),
@@ -4232,12 +4697,19 @@ impl CombatDatabase {
             binds.push(Box::new(count));
         }
         if let Some(boss) = query.boss_object_type {
-            conds.push(
+            // Any variant of the encounter counts, so a reskin suggestion matches
+            // a run recorded under the base id (and vice versa).
+            let variants = crate::assets::encounter_variant_types(boss);
+            conds.push(format!(
                 "EXISTS (SELECT 1 FROM fights f
-                 WHERE f.encounter_run_id = r.run_id AND f.boss_object_type = ?)"
-                    .to_string(),
-            );
-            binds.push(Box::new(boss));
+                 WHERE f.encounter_run_id = r.run_id AND f.boss_object_type IN ({}))",
+                std::iter::repeat_n("?", variants.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for v in variants {
+                binds.push(Box::new(v));
+            }
         }
         if let Some(groups) = query.groups.as_ref().filter(|g| !g.is_empty()) {
             let placeholders = std::iter::repeat_n("?", groups.len())
@@ -4260,15 +4732,31 @@ impl CombatDatabase {
         {
             let like = format!("%{}%", text.to_lowercase());
             let canonical_ids = crate::assets::encounter_ids_matching_name(text);
+            // Match a reskinned encounter by either name: searching the base name
+            // must also surface runs stored under the reskin name and vice versa.
+            let mut boss_name_parts = vec![
+                "LOWER(f.boss_name) LIKE ?".to_string(),
+                "LOWER(f.dungeon) LIKE ?".to_string(),
+            ];
+            let mut inner_binds: Vec<String> = vec![like.clone(), like.clone()];
+            for alias in crate::assets::encounter_alias_names_matching(text) {
+                boss_name_parts.push("LOWER(f.boss_name) LIKE ?".to_string());
+                inner_binds.push(format!("%{}%", alias.to_lowercase()));
+            }
             let mut text_conds = vec![
                 "LOWER(r.dungeon) LIKE ?".to_string(),
-                "EXISTS (SELECT 1 FROM fights f WHERE f.encounter_run_id = r.run_id
-                 AND (LOWER(f.boss_name) LIKE ? OR LOWER(f.dungeon) LIKE ?))"
-                    .to_string(),
+                format!(
+                    "EXISTS (SELECT 1 FROM fights f WHERE f.encounter_run_id = r.run_id
+                     AND ({}))",
+                    boss_name_parts.join(" OR ")
+                ),
             ];
+            // Binds must follow the placeholder order in the SQL: the run's
+            // dungeon, then the EXISTS subquery's inner matches, then the ids.
             binds.push(Box::new(like.clone()));
-            binds.push(Box::new(like.clone()));
-            binds.push(Box::new(like));
+            for b in inner_binds {
+                binds.push(Box::new(b));
+            }
             if !canonical_ids.is_empty() {
                 text_conds.push(format!(
                     "r.encounter_id IN ({})",
@@ -4290,27 +4778,43 @@ impl CombatDatabase {
         binds: &mut Vec<Box<dyn rusqlite::ToSql>>,
         prefix: &str,
     ) {
+        let p = prefix;
         if let Some(text) = query
             .text
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            conds.push(format!(
-                "({p}boss_name LIKE ? OR {p}dungeon LIKE ?)",
-                p = prefix
-            ));
             let like = format!("%{}%", text);
+            let mut parts = vec![format!("{p}boss_name LIKE ?"), format!("{p}dungeon LIKE ?")];
             binds.push(Box::new(like.clone()));
             binds.push(Box::new(like));
+            // Match a reskinned encounter by either of its names: searching the
+            // base name must also surface fights stored under the reskin name and
+            // vice versa.
+            for alias in crate::assets::encounter_alias_names_matching(text) {
+                parts.push(format!("{p}boss_name LIKE ?"));
+                binds.push(Box::new(format!("%{}%", alias)));
+            }
+            conds.push(format!("({})", parts.join(" OR ")));
         }
         if let Some(dungeon) = &query.dungeon {
             conds.push(format!("{}dungeon = ?", prefix));
             binds.push(Box::new(dungeon.clone()));
         }
         if let Some(boss) = query.boss_object_type {
-            conds.push(format!("{}boss_object_type = ?", prefix));
-            binds.push(Box::new(boss));
+            // Filter the whole encounter, not just the selected variant, so one
+            // suggestion matches fights recorded under either reskin.
+            let variants = crate::assets::encounter_variant_types(boss);
+            conds.push(format!(
+                "{p}boss_object_type IN ({})",
+                std::iter::repeat_n("?", variants.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for v in variants {
+                binds.push(Box::new(v));
+            }
         }
         if let Some(char_id) = query.char_id {
             // Unknown-identity fights (0) are excluded from the character filter.
@@ -4370,7 +4874,9 @@ impl CombatDatabase {
             r#"SELECT object_id, object_type, name, equip0, equip1, equip2, equip3,
                       enchants, damage, hits, is_local, provenance, skin_id, tex1, tex2,
                       end_status, grave_type, pet_type, pet_abilities, damage_taken,
-                      damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked
+                      damage_taken_provenance, guarded_damage, guarded_hits, damage_blocked,
+                      damage_taken_hits, summon_damage, summon_hits, summons, weapons,
+                    packet_damage, packet_hits
                FROM fight_participants WHERE fight_id = ?1 ORDER BY damage DESC, hits DESC"#,
         )?;
         let rows = stmt.query_map(params![fight_id], |row| {
@@ -4391,6 +4897,9 @@ impl CombatDatabase {
             let guarded_damage: Option<i64> = row.get(21)?;
             let guarded_hits: Option<i64> = row.get(22)?;
             let damage_blocked: Option<i64> = row.get(23)?;
+            let damage_taken_hits: Option<i64> = row.get(24)?;
+            let summon_damage: i64 = row.get(25)?;
+            let summon_hits: i64 = row.get(26)?;
             Ok(ParticipantRecord {
                 object_id: row.get(0)?,
                 object_type: row.get(1)?,
@@ -4411,9 +4920,16 @@ impl CombatDatabase {
                 pet,
                 damage_taken,
                 damage_taken_provenance,
+                damage_taken_hits,
                 damage_blocked,
                 guarded_damage,
                 guarded_hits,
+                summon_damage,
+                summon_hits,
+                summons: parse_summons(row.get::<_, Option<String>>(27)?.as_deref()),
+                weapons: parse_weapons(row.get::<_, Option<String>>(28)?.as_deref()),
+                packet_damage: row.get(29)?,
+                packet_hits: row.get::<_, i64>(30)? as u64,
             })
         })?;
         rows.collect()
@@ -4450,24 +4966,51 @@ impl CombatDatabase {
 
     /// Distinct bosses `(object_type, name)` across all recorded fights.
     pub fn distinct_bosses(&self) -> SqlResult<Vec<(i32, String)>> {
+        // Each (object_type, name) with when it was last fought, so the seasonal
+        // reskin variants of one encounter collapse to a single suggestion,
+        // labelled by the most recently fought variant (the season actually in
+        // play). The Marble Colossus survival phases share an object type and so
+        // collapse too, with the phase suffix stripped.
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT boss_object_type, boss_name FROM fights \
-             WHERE boss_object_type <> 0 AND boss_name <> '' ORDER BY boss_name",
+            "SELECT boss_object_type, boss_name, MAX(started_at) AS latest \
+             FROM fights WHERE boss_object_type <> 0 AND boss_name <> '' \
+             GROUP BY boss_object_type, boss_name",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
-        // Collapse the Marble Colossus survival phases (which share an object
-        // type) into a single "Marble Colossus" suggestion. Filtering is by
-        // object type, so the unified suggestion still matches both phases.
-        let mut out: Vec<(i32, String)> = Vec::new();
+        // (latest_started, variant object_type, stored name)
+        let mut by_canonical: std::collections::HashMap<i32, (i64, i32, String)> =
+            std::collections::HashMap::new();
         for row in rows {
-            let (obj_type, name) = row?;
+            let (obj_type, name, latest) = row?;
             let name = strip_boss_phase_suffix(&name).to_string();
-            if !out.iter().any(|(t, n)| *t == obj_type && *n == name) {
-                out.push((obj_type, name));
-            }
+            let canonical = crate::assets::encounter_canonical_type(obj_type);
+            by_canonical
+                .entry(canonical)
+                .and_modify(|entry| {
+                    if latest > entry.0 {
+                        *entry = (latest, obj_type, name.clone());
+                    }
+                })
+                .or_insert((latest, obj_type, name));
         }
+        let manager = crate::assets::get_asset_manager();
+        let mut out: Vec<(i32, String)> = by_canonical
+            .into_iter()
+            .map(|(_, (_, obj_type, stored))| {
+                // Key by the most recently fought variant so its sprite (the
+                // reskin during the season) is shown; name it from the live asset
+                // so the tag carries the current seasonal name.
+                let name = manager.object_name(obj_type).unwrap_or(stored);
+                (obj_type, name)
+            })
+            .collect();
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         Ok(out)
     }
 
@@ -4575,6 +5118,311 @@ fn serialize_pet_abilities(abilities: &[i32]) -> String {
         .join(",")
 }
 
+/// Serialize the per-summon breakdown as one compact line per summon:
+/// `object_id,pet_type,is_pet,damage,hits,object_type,source_item,source_enchants`,
+/// joined by `;` (enchants `:`-joined). Kept as text rather than JSON so a legacy
+/// value or a partial write can never fail to parse into the participant row.
+/// `object_type` and then the source are appended last so rows written before
+/// each existed still read: a short line leaves it 0.
+fn serialize_summons(summons: &[SummonContribution]) -> Option<String> {
+    if summons.is_empty() {
+        return None;
+    }
+    Some(
+        summons
+            .iter()
+            .map(|s| {
+                format!(
+                    "{},{},{},{},{},{},{},{}",
+                    s.object_id,
+                    s.pet_type,
+                    s.is_pet as i32,
+                    s.damage,
+                    s.hits,
+                    s.object_type,
+                    s.source_item,
+                    s.source_enchants
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(":")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored summon string back into a breakdown. Malformed or missing
+/// values yield an empty list rather than an error, so old rows read cleanly.
+fn parse_summons(data: Option<&str>) -> Vec<SummonContribution> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let mut parts = entry.split(',');
+            let object_id = parts.next()?.trim().parse::<i32>().ok()?;
+            let pet_type = parts.next()?.trim().parse::<i32>().unwrap_or(0);
+            let is_pet = parts.next()?.trim() != "0";
+            let damage = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let hits = parts.next()?.trim().parse::<u64>().unwrap_or(0);
+            // Absent in rows written before the entity's own type was stored.
+            let object_type = parts
+                .next()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            // The item that created it, and its enchants (": "-free, `:` joined),
+            // absent in rows written before the source was resolved.
+            let source_item = parts
+                .next()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            let source_enchants = parts
+                .next()
+                .map(|v| {
+                    v.trim()
+                        .split(':')
+                        .filter_map(|e| e.trim().parse::<u16>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(SummonContribution {
+                object_id,
+                pet_type,
+                is_pet,
+                object_type,
+                source_item,
+                source_enchants,
+                damage,
+                hits,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod summon_codec_tests {
+    use super::{parse_summons, serialize_summons};
+    use crate::combat::types::SummonContribution;
+
+    /// The entity's own object type rides along with the rest of the row, so the
+    /// UI can name and draw a summoned creature ("Summon Pocket Rat", 0x4683)
+    /// instead of labelling every row "Summon"; the item that created it rides
+    /// along too, so a row names one source rather than the catalog's list.
+    #[test]
+    fn the_object_type_and_source_round_trip() {
+        let summons = vec![SummonContribution {
+            object_id: 157,
+            pet_type: 0,
+            is_pet: false,
+            object_type: 0x4683,
+            source_item: 0x3849,
+            source_enchants: vec![338, 1457],
+            damage: 1530,
+            hits: 45,
+        }];
+        let encoded = serialize_summons(&summons).expect("a non-empty list encodes");
+        assert_eq!(encoded, "157,0,0,1530,45,18051,14409,338:1457");
+        let decoded = parse_summons(Some(&encoded));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].object_type, 0x4683);
+        assert_eq!(decoded[0].source_item, 0x3849);
+        assert_eq!(decoded[0].source_enchants, vec![338, 1457]);
+        assert_eq!(decoded[0].damage, 1530);
+        assert_eq!(decoded[0].hits, 45);
+    }
+
+    /// Rows written before the type was stored are five fields wide and must keep
+    /// parsing: the missing sixth reads as 0, which is what the UI treats as "no
+    /// type to show" and falls back to the generic label.
+    #[test]
+    fn a_legacy_row_without_the_type_still_parses() {
+        let decoded = parse_summons(Some("157,12345,1,1530,45"));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].object_id, 157);
+        assert_eq!(decoded[0].pet_type, 12_345);
+        assert!(decoded[0].is_pet);
+        assert_eq!(decoded[0].object_type, 0);
+        // Six fields: the type is there but the source is not.
+        let typed = parse_summons(Some("157,0,0,1530,45,18051"));
+        assert_eq!(typed[0].object_type, 0x4683);
+        assert_eq!(typed[0].source_item, 0);
+        assert!(typed[0].source_enchants.is_empty());
+    }
+}
+
+/// Serialize the per-weapon breakdown as one compact line per weapon:
+/// `weapon_id,damage,hits,enchant:enchant:...`, joined by `;`. Same rationale as
+/// the summon string: text that can never fail to parse.
+fn serialize_weapons(weapons: &[WeaponContribution]) -> Option<String> {
+    if weapons.is_empty() {
+        return None;
+    }
+    Some(
+        weapons
+            .iter()
+            .map(|w| {
+                let enchants = w
+                    .enchants
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(":");
+                format!("{},{},{},{}", w.weapon_id, w.damage, w.hits, enchants)
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored weapon breakdown. Malformed or missing values yield an empty
+/// list rather than an error, so old rows read cleanly.
+fn parse_weapons(data: Option<&str>) -> Vec<WeaponContribution> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let mut parts = entry.split(',');
+            let weapon_id = parts.next()?.trim().parse::<i32>().ok()?;
+            let damage = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let hits = parts.next()?.trim().parse::<u64>().unwrap_or(0);
+            let enchants = parts
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .filter_map(|e| e.trim().parse::<u16>().ok())
+                .collect();
+            Some(WeaponContribution {
+                weapon_id,
+                enchants,
+                damage,
+                hits,
+            })
+        })
+        .collect()
+}
+
+/// Serialize the local player's boost windows as one compact line per window:
+/// `start,end,stat,from,to,source`, joined by `;`. The stat and source are free
+/// text, so both are escaped (`\t` for the field separator inside them is not
+/// needed: the stat never contains a comma and the source is ours).
+fn serialize_boosts(boosts: &[BoostWindow]) -> Option<String> {
+    if boosts.is_empty() {
+        return None;
+    }
+    Some(
+        boosts
+            .iter()
+            .map(|b| {
+                // A seventh field carries the resolved source item id when there is
+                // one; rows written before it existed simply end at the source.
+                let mut line = format!(
+                    "{},{},{},{},{},{}",
+                    b.start_offset_ms,
+                    b.end_offset_ms,
+                    b.stat.replace(',', " "),
+                    b.from,
+                    b.to,
+                    b.source.replace(',', " ")
+                );
+                if let Some(id) = b.source_item {
+                    line.push_str(&format!(",{id}"));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored boost windows. Malformed lines are skipped rather than
+/// failing the read, so a partially written row cannot hide the whole fight.
+fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.splitn(7, ',').collect();
+            if parts.len() < 6 {
+                return None;
+            }
+            Some(BoostWindow {
+                start_offset_ms: parts[0].trim().parse::<i64>().ok()?,
+                end_offset_ms: parts[1].trim().parse::<i64>().ok()?,
+                stat: parts[2].to_string(),
+                from: parts[3].trim().parse::<i32>().unwrap_or(0),
+                to: parts[4].trim().parse::<i32>().unwrap_or(0),
+                source: parts[5].to_string(),
+                source_item: parts.get(6).and_then(|v| v.trim().parse::<i32>().ok()),
+            })
+        })
+        .collect()
+}
+
+/// Serialize the local player's ability activations as one compact line each:
+/// `start,window,item_id,damage,hits,enchant:enchant:...`.
+fn serialize_abilities(abilities: &[AbilityActivation]) -> Option<String> {
+    if abilities.is_empty() {
+        return None;
+    }
+    Some(
+        abilities
+            .iter()
+            .map(|a| {
+                let enchants = a
+                    .enchants
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(":");
+                format!(
+                    "{},{},{},{},{},{}",
+                    a.start_offset_ms, a.window_ms, a.item_id, a.damage, a.hits, enchants
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+/// Parse the stored ability activations, skipping malformed lines.
+fn parse_abilities(data: Option<&str>) -> Vec<AbilityActivation> {
+    let data = match data {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    data.split(';')
+        .filter_map(|entry| {
+            let mut parts = entry.split(',');
+            let start_offset_ms = parts.next()?.trim().parse::<i64>().ok()?;
+            let window_ms = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let item_id = parts.next()?.trim().parse::<i32>().ok()?;
+            let damage = parts.next()?.trim().parse::<i64>().unwrap_or(0);
+            let hits = parts.next()?.trim().parse::<u64>().unwrap_or(0);
+            let enchants = parts
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .filter_map(|e| e.trim().parse::<u16>().ok())
+                .collect();
+            Some(AbilityActivation {
+                item_id,
+                enchants,
+                start_offset_ms,
+                window_ms,
+                damage,
+                hits,
+            })
+        })
+        .collect()
+}
+
 /// Parse the stored pet ability string back into ability type ids. A
 /// `None`/empty value yields an empty vec; unparseable ids are skipped.
 fn parse_pet_abilities(data: Option<&str>) -> Vec<i32> {
@@ -4627,6 +5475,8 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
         taken_any: bool,
         taken_partial: bool,
         taken_estimated: bool,
+        hits_taken_sum: i64,
+        hits_taken_any: bool,
         blocked_sum: i64,
         blocked_any: bool,
         guarded_dmg_sum: i64,
@@ -4661,9 +5511,16 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                     pet: p.pet.clone(),
                     damage_taken: None,
                     damage_taken_provenance: DamageTakenProvenance::Observed,
+                    damage_taken_hits: None,
                     damage_blocked: None,
                     guarded_damage: None,
                     guarded_hits: None,
+                    summon_damage: 0,
+                    summon_hits: 0,
+                    summons: Vec::new(),
+                    weapons: Vec::new(),
+                    packet_damage: 0,
+                    packet_hits: 0,
                 },
                 best_equip_damage: i64::MIN,
                 self_pending: 0,
@@ -4676,6 +5533,8 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                 taken_any: false,
                 taken_partial: false,
                 taken_estimated: false,
+                hits_taken_sum: 0,
+                hits_taken_any: false,
                 blocked_sum: 0,
                 blocked_any: false,
                 guarded_dmg_sum: 0,
@@ -4684,6 +5543,57 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
             });
             entry.rec.damage += p.damage;
             entry.rec.hits += p.hits;
+            entry.rec.summon_damage += p.summon_damage;
+            entry.rec.summon_hits += p.summon_hits;
+            entry.rec.packet_damage += p.packet_damage;
+            entry.rec.packet_hits += p.packet_hits;
+            // Summons are keyed by object id, which is stable across the phases of
+            // one run for the same pet; summons of different ids (gear summons
+            // resummoned per phase) accumulate separately and are re-ranked below.
+            for s in &p.summons {
+                match entry
+                    .rec
+                    .summons
+                    .iter_mut()
+                    .find(|e| e.object_id == s.object_id)
+                {
+                    Some(existing) => {
+                        existing.damage += s.damage;
+                        existing.hits += s.hits;
+                        existing.is_pet = existing.is_pet || s.is_pet;
+                        if s.pet_type != 0 {
+                            existing.pet_type = s.pet_type;
+                        }
+                        if s.object_type != 0 {
+                            existing.object_type = s.object_type;
+                        }
+                        // The item that created it does not change between phases.
+                        if s.source_item != 0 {
+                            existing.source_item = s.source_item;
+                            if !s.source_enchants.is_empty() {
+                                existing.source_enchants = s.source_enchants.clone();
+                            }
+                        }
+                    }
+                    None => entry.rec.summons.push(s.clone()),
+                }
+            }
+            // Weapons are keyed by item id + its enchants, which is stable across
+            // a run's phases, so the same weapon's phases accumulate into one row.
+            for w in &p.weapons {
+                match entry
+                    .rec
+                    .weapons
+                    .iter_mut()
+                    .find(|e| e.weapon_id == w.weapon_id && e.enchants == w.enchants)
+                {
+                    Some(existing) => {
+                        existing.damage += w.damage;
+                        existing.hits += w.hits;
+                    }
+                    None => entry.rec.weapons.push(w.clone()),
+                }
+            }
             // Combine end-status across phases with priority Died > Present >
             // Nexused. A participant present at the end of any phase was there
             // (side objects such as Nest hives finalize by timeout ~10s after the
@@ -4729,6 +5639,12 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                     DamageTakenProvenance::Estimated => entry.taken_estimated = true,
                     DamageTakenProvenance::Observed => {}
                 }
+            }
+            // Hits taken add up across the run's phases, so a player who was
+            // never hit in one phase is not read as never hit in the run.
+            if let Some(h) = p.damage_taken_hits {
+                entry.hits_taken_sum += h as i64;
+                entry.hits_taken_any = true;
             }
             if let Some(db) = p.damage_blocked {
                 entry.blocked_sum += db;
@@ -4780,6 +5696,9 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
             } else {
                 a.rec.damage_taken = None;
             }
+            if a.hits_taken_any {
+                a.rec.damage_taken_hits = Some(a.hits_taken_sum.max(0));
+            }
             a.rec.damage_blocked = if a.blocked_any {
                 Some(a.blocked_sum)
             } else {
@@ -4789,6 +5708,12 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
                 a.rec.guarded_damage = Some(a.guarded_dmg_sum);
                 a.rec.guarded_hits = Some(a.guarded_hits_sum);
             }
+            a.rec
+                .summons
+                .sort_by(|x, y| y.damage.cmp(&x.damage).then(y.hits.cmp(&x.hits)));
+            a.rec
+                .weapons
+                .sort_by(|x, y| y.damage.cmp(&x.damage).then(y.hits.cmp(&x.hits)));
             a.rec
         })
         .collect();
@@ -4803,6 +5728,49 @@ fn aggregate_roster(phases: &[FightRecord]) -> Vec<ParticipantRecord> {
 fn is_addon_phase(p: &FightRecord) -> bool {
     crate::assets::aux_target_for_type(p.boss_object_type).is_some()
         || crate::assets::is_treasure_crate_type(p.boss_object_type)
+}
+
+/// Merge several phases' boost windows into one record's timebase, shifting each
+/// phase's offsets by its start relative to the merged start (so a merged row's
+/// timeline reads against its own start, not a phase's).
+fn merge_boost_windows(started_at: i64, group: &[FightRecord]) -> Vec<BoostWindow> {
+    let mut out: Vec<BoostWindow> = Vec::new();
+    for g in group {
+        let shift = (g.started_at - started_at).max(0);
+        for b in &g.boosts {
+            out.push(BoostWindow {
+                start_offset_ms: b.start_offset_ms + shift,
+                end_offset_ms: b.end_offset_ms + shift,
+                stat: b.stat.clone(),
+                from: b.from,
+                to: b.to,
+                source: b.source.clone(),
+                source_item: b.source_item,
+            });
+        }
+    }
+    out.sort_by_key(|b| (b.start_offset_ms, b.end_offset_ms));
+    out
+}
+
+/// Merge several phases' ability activations, shifted like the boost windows.
+fn merge_ability_activations(started_at: i64, group: &[FightRecord]) -> Vec<AbilityActivation> {
+    let mut out: Vec<AbilityActivation> = Vec::new();
+    for g in group {
+        let shift = (g.started_at - started_at).max(0);
+        for a in &g.abilities {
+            out.push(AbilityActivation {
+                item_id: a.item_id,
+                enchants: a.enchants.clone(),
+                start_offset_ms: a.start_offset_ms + shift,
+                window_ms: a.window_ms,
+                damage: a.damage,
+                hits: a.hits,
+            });
+        }
+    }
+    out.sort_by_key(|a| a.start_offset_ms);
+    out
 }
 
 /// Collapse phases that map to the same aggregated aux target (e.g. every Royal
@@ -4886,6 +5854,9 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             spectral_hm: group.iter().any(|g| g.spectral_hm),
             shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
+            boss_uptime_ms: group.iter().map(|g| g.boss_uptime_ms).sum(),
+            boosts: merge_boost_windows(started_at, &group),
+            abilities: merge_ability_activations(started_at, &group),
         });
     }
     out
@@ -4969,6 +5940,9 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             spectral_hm: group.iter().any(|g| g.spectral_hm),
             shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
+            boss_uptime_ms: group.iter().map(|g| g.boss_uptime_ms).sum(),
+            boosts: merge_boost_windows(started_at, &group),
+            abilities: merge_ability_activations(started_at, &group),
         });
     }
     out
@@ -5107,8 +6081,15 @@ impl From<&FightParticipant> for ParticipantRecord {
             damage_taken: p.damage_taken,
             damage_taken_provenance: p.damage_taken_provenance,
             damage_blocked: p.damage_blocked,
+            damage_taken_hits: p.damage_taken_hits.map(|h| h as i64),
             guarded_damage: p.guarded_damage,
             guarded_hits: p.guarded_hits.map(|h| h as i64),
+            summon_damage: p.summon_damage,
+            summon_hits: p.summon_hits as i64,
+            summons: p.summons.clone(),
+            weapons: p.weapons.clone(),
+            packet_damage: p.packet_damage,
+            packet_hits: p.packet_hits,
         }
     }
 }
@@ -5250,10 +6231,28 @@ fn pick_anchor(phases: &[PhaseStat]) -> Option<(i32, i32, i32, bool)> {
     Some((best.0, best.1, best.2, run_killed(enc_id, phases, best.3)))
 }
 
+/// The display variant of `object_type`'s encounter per a [`CombatDatabase`]
+/// `display_variants` lookup, falling back to `object_type` itself for an
+/// encounter with no reskin (or none recorded yet).
+fn display_variant_of(variants: &HashMap<i32, i32>, object_type: i32) -> i32 {
+    variants
+        .get(&crate::assets::encounter_canonical_type(object_type))
+        .copied()
+        .unwrap_or(object_type)
+}
+
 /// Display name for a boss phase: restores the Prismimic Attacker/Defender
 /// distinction (both share the game DisplayId "Prismimic") so the two mirror
 /// rows read clearly; every other boss keeps its stored name.
 fn display_boss_name(object_type: i32, stored: &str) -> String {
+    // A seasonally-reskinned encounter is named by its *current* asset name (the
+    // reskin's name while the season is live, the base name otherwise), so every
+    // card for the encounter reads uniformly regardless of when it was recorded.
+    if crate::assets::encounter_variant_types(object_type).len() > 1 {
+        if let Some(name) = crate::assets::get_asset_manager().object_name(object_type) {
+            return name;
+        }
+    }
     crate::assets::prismimic_display_name(object_type)
         .map(str::to_string)
         .unwrap_or_else(|| stored.to_string())
@@ -5313,6 +6312,41 @@ mod tests {
         assert_eq!(combine_end_status(Nexused, Nexused), Nexused);
     }
 
+    #[test]
+    fn reskinned_encounter_history_reads_with_one_display_variant() {
+        // A classic Sphinx fight and a "Withered Sphinx" (its seasonal reskin) are
+        // the same encounter. The list must label and picture both rows with the
+        // variant the player fought most recently -- not each row's own stored id,
+        // which is what made one history show two different boss names.
+        fn sphinx(object_type: i32, name: &str, started_at: i64) -> CompletedFight {
+            let mut fight = sample_fight();
+            fight.boss_object_type = object_type;
+            fight.boss_name = name.to_string();
+            fight.started_at = started_at;
+            fight.ended_at = started_at + 10_000;
+            fight
+        }
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        db.insert_fight(&sphinx(3412, "Grand Sphinx", 1_000))
+            .unwrap();
+        db.insert_fight(&sphinx(22000, "Withered Sphinx", 50_000))
+            .unwrap();
+
+        let rows = db
+            .standalone_summaries(&FightQuery::default(), 10, None)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Stored ids are untouched (newest fight first) ...
+        assert_eq!(rows[0].boss_object_type, 22000);
+        assert_eq!(rows[1].boss_object_type, 3412);
+        // ... while both rows share the encounter's one display variant (the most
+        // recently fought one). The name and portrait are resolved from that
+        // variant, so every row for the encounter reads and draws identically: a
+        // classic row can no longer say "Grand Sphinx" beside a reskin row.
+        assert_eq!(rows[0].display_object_type, 22000);
+        assert_eq!(rows[1].display_object_type, 22000);
+    }
+
     fn sample_fight() -> CompletedFight {
         CompletedFight {
             started_at: 1000,
@@ -5359,9 +6393,16 @@ mod tests {
                     }),
                     damage_taken: Some(5_000),
                     damage_taken_provenance: DamageTakenProvenance::Observed,
+                    damage_taken_hits: None,
                     damage_blocked: None,
                     guarded_damage: None,
                     guarded_hits: None,
+                    summon_damage: 0,
+                    summon_hits: 0,
+                    summons: Vec::new(),
+                    weapons: Vec::new(),
+                    packet_damage: 0,
+                    packet_hits: 0,
                 },
                 FightParticipant {
                     object_id: 1000,
@@ -5383,8 +6424,18 @@ mod tests {
                     damage_blocked: None,
                     guarded_damage: None,
                     guarded_hits: None,
+                    summon_damage: 0,
+                    summon_hits: 0,
+                    summons: Vec::new(),
+                    weapons: Vec::new(),
+                    packet_damage: 0,
+                    packet_hits: 0,
+                    damage_taken_hits: None,
                 },
             ],
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 
@@ -5415,6 +6466,13 @@ mod tests {
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
+            damage_taken_hits: None,
         }
     }
 
@@ -5448,6 +6506,9 @@ mod tests {
             spectral_hm: false,
             shatters_hm: false,
             participants,
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 
@@ -5527,28 +6588,78 @@ mod tests {
     fn flawless_marker_set_when_finisher_takes_no_damage() {
         // Fungal Cavern (Crystal Worm Mother) is an Exaltation dungeon boss.
         let mut db = CombatDatabase::open_in_memory().unwrap();
-        db.insert_fight(&flawless_fight(
-            "Fungal Cavern",
-            45712,
-            vec![
-                // Present, 40k damage (>= 5% of 100k), no observed damage taken.
-                flawless_part(600, "Alice", 40_000, None, ParticipantEndStatus::Present),
-                // Present and high damage, but took damage -> not itself flawless.
-                flawless_part(
-                    601,
-                    "Bob",
-                    40_000,
-                    Some(3_000),
-                    ParticipantEndStatus::Present,
-                ),
-            ],
-        ))
-        .unwrap();
+        // Alice took nothing and was never hit; Bob took damage and was hit.
+        let mut alice = flawless_part(600, "Alice", 40_000, None, ParticipantEndStatus::Present);
+        alice.damage_taken_hits = Some(0);
+        let mut bob = flawless_part(
+            601,
+            "Bob",
+            40_000,
+            Some(3_000),
+            ParticipantEndStatus::Present,
+        );
+        bob.damage_taken_hits = Some(4);
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![alice, bob]))
+            .unwrap();
         let list = db.list_fights(&FightQuery::default(), 50).unwrap();
         assert_eq!(list.len(), 1);
         assert!(
             list[0].flawless,
             "Alice qualifies: heavy damage, zero taken"
+        );
+    }
+
+    #[test]
+    fn flawless_marker_needs_a_finisher_who_was_never_hit() {
+        // Zero damage taken is not enough any more: a player who was hit but
+        // blocked (or had every hit valued at zero) did not finish untouched.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut hit_but_unharmed =
+            flawless_part(600, "Alice", 40_000, Some(0), ParticipantEndStatus::Present);
+        hit_but_unharmed.damage_taken_hits = Some(3);
+        db.insert_fight(&flawless_fight(
+            "Fungal Cavern",
+            45712,
+            vec![hit_but_unharmed],
+        ))
+        .unwrap();
+        let list = db.list_fights(&FightQuery::default(), 50).unwrap();
+        assert!(
+            !list[0].flawless,
+            "a finisher who took hits is not flawless even at zero damage"
+        );
+        drop(db);
+
+        // Same card, but the hits were recorded as none: flawless.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut untouched =
+            flawless_part(600, "Alice", 40_000, Some(0), ParticipantEndStatus::Present);
+        untouched.damage_taken_hits = Some(0);
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![untouched]))
+            .unwrap();
+        let list = db.list_fights(&FightQuery::default(), 50).unwrap();
+        assert!(list[0].flawless, "never hit, never damaged");
+
+        // And a card from before hits-taken tracking (no count recorded) keeps the
+        // damage-only reading rather than losing the marker.
+        let mut legacy = CombatDatabase::open_in_memory().unwrap();
+        legacy
+            .insert_fight(&flawless_fight(
+                "Fungal Cavern",
+                45712,
+                vec![flawless_part(
+                    600,
+                    "Alice",
+                    40_000,
+                    Some(0),
+                    ParticipantEndStatus::Present,
+                )],
+            ))
+            .unwrap();
+        let list = legacy.list_fights(&FightQuery::default(), 50).unwrap();
+        assert!(
+            list[0].flawless,
+            "a legacy card keeps the damage-only reading"
         );
     }
 
@@ -5617,6 +6728,13 @@ mod tests {
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
+            damage_taken_hits: None,
         }
     }
 
@@ -6373,6 +7491,75 @@ mod tests {
     }
 
     #[test]
+    fn distinct_bosses_and_filter_coalesce_reskin_variants() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Base variant fought earlier, reskin variant later in the same history.
+        let mut base = flawless_fight("Realm", 3412, vec![]);
+        base.boss_name = "Grand Sphinx".to_string();
+        base.started_at = 1_000;
+        base.ended_at = 2_000;
+        db.insert_fight(&base).unwrap();
+        let mut reskin = flawless_fight("Realm", 22000, vec![]);
+        reskin.boss_name = "Withered Sphinx".to_string();
+        reskin.started_at = 3_000;
+        reskin.ended_at = 4_000;
+        db.insert_fight(&reskin).unwrap();
+
+        // One suggestion for the encounter, labelled by the latest variant.
+        let bosses = db.distinct_bosses().unwrap();
+        let sphinx: Vec<_> = bosses
+            .iter()
+            .filter(|(t, _)| *t == 3412 || *t == 22000)
+            .collect();
+        assert_eq!(sphinx.len(), 1, "one suggestion per encounter");
+        assert_eq!(
+            sphinx[0].0, 22000,
+            "keyed by the most recently fought variant (its sprite)"
+        );
+        assert_eq!(
+            sphinx[0].1, "Withered Sphinx",
+            "labelled by the most recently fought variant"
+        );
+
+        // Filtering the canonical encounter matches the reskin fight too.
+        let q = FightQuery {
+            boss_object_type: Some(3412),
+            ..Default::default()
+        };
+        let hits = db.list_fights(&q, 50).unwrap();
+        let types: std::collections::HashSet<i32> =
+            hits.iter().map(|f| f.boss_object_type).collect();
+        assert!(hits.len() >= 2, "both variants returned: {types:?}");
+    }
+
+    #[test]
+    fn find_killed_fight_links_reskin_variant() {
+        // Season 31 records Janus fights against the "Infested" reskin (46385)
+        // while the bag is attributed to canonical Janus (8200, via the Mark of
+        // Janus rule). The two must still link so the bag surfaces on the card.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let id = db
+            .insert_fight(&flawless_fight(
+                "Realm",
+                46385,
+                vec![flawless_part(
+                    600,
+                    "Alice",
+                    40_000,
+                    None,
+                    ParticipantEndStatus::Present,
+                )],
+            ))
+            .unwrap();
+        assert_eq!(
+            db.find_killed_fight(1, 8200, 61_000).unwrap(),
+            Some(FightSelection::Single(id))
+        );
+        // An unrelated type in the same instance/window still misses.
+        assert_eq!(db.find_killed_fight(1, 99999, 61_000).unwrap(), None);
+    }
+
+    #[test]
     fn find_killed_fight_ignores_escaped_runs() {
         let mut db = CombatDatabase::open_in_memory().unwrap();
         let mut escaped = flawless_fight(
@@ -6580,6 +7767,117 @@ mod tests {
         fight
     }
 
+    /// The local player's stored end status, by name.
+    fn participant_status(db: &CombatDatabase, fight_id: i64, name: &str) -> String {
+        db.conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE fight_id = ?1 AND name = ?2",
+                params![fight_id, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// An escaped fight closed by a map change, so the local player is scored as
+    /// having left it (`local_departing && !killed`) -- the shape a boss that bags
+    /// without its death ever being observed leaves behind. An ally left too, and
+    /// a third participant died.
+    fn escaped_by_nexus_fight(dungeon: &str, boss_type: i32, map_seed: i32) -> CompletedFight {
+        let mut fight = escaped_fight(dungeon, boss_type, map_seed);
+        let mut me = flawless_part(10, "Me", 5_000, None, ParticipantEndStatus::Nexused);
+        me.is_local = true;
+        fight.participants = vec![
+            me,
+            flawless_part(11, "Ally", 4_000, None, ParticipantEndStatus::Nexused),
+            flawless_part(
+                12,
+                "Fallen",
+                3_000,
+                None,
+                ParticipantEndStatus::Died { grave_type: 0 },
+            ),
+        ];
+        fight
+    }
+
+    /// The local row of a fight that a loot bag completed after it was written must
+    /// not keep the nexus the unfinished state earned it: the bag proves the boss
+    /// died in that instance, and the local player is only there to see it while
+    /// they are still in the fight.
+    #[test]
+    fn a_loot_completed_fight_clears_the_local_nexus() {
+        const BOSS: i32 = 40_166;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = escaped_by_nexus_fight("Ice Citadel", BOSS, 7);
+        fight.started_at = 350_000;
+        fight.ended_at = 395_000;
+        let id = db.insert_fight(&fight).unwrap();
+        assert_eq!(participant_status(&db, id, "Me"), "nexused");
+
+        assert_eq!(
+            db.mark_boss_killed_by_loot(7, BOSS, 400_000).unwrap(),
+            Some(FightSelection::Single(id))
+        );
+
+        assert_eq!(killed_flag(&db, id), 1, "the bag proves the kill");
+        assert_eq!(
+            participant_status(&db, id, "Me"),
+            "present",
+            "the local player was in the instance when the boss died"
+        );
+        // Only the local row: an ally can genuinely nexus out of a fight the group
+        // still cleared, and a death is terminal either way.
+        assert_eq!(participant_status(&db, id, "Ally"), "nexused");
+        assert_eq!(participant_status(&db, id, "Fallen"), "died");
+    }
+
+    /// A fight completed by a path that does not touch its participants (a Legacy
+    /// LoD chest bag, or a bag applied by a later session) is repaired when the
+    /// database is next opened, so cards recorded before this repair existed are
+    /// corrected too.
+    #[test]
+    fn opening_the_database_clears_a_local_nexus_on_a_completed_fight() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat_history.db");
+        let id;
+        {
+            let mut db = CombatDatabase::open_writer(&path).unwrap();
+            let mut completed = escaped_by_nexus_fight("Ice Citadel", 40_166, 7);
+            completed.killed = true;
+            id = db.insert_fight(&completed).unwrap();
+            // A still-escaped fight keeps the departure it recorded.
+            db.insert_fight(&escaped_by_nexus_fight("Ice Citadel", 40_166, 8))
+                .unwrap();
+        }
+
+        let db = CombatDatabase::open_writer(&path).unwrap();
+        assert_eq!(
+            participant_status(&db, id, "Me"),
+            "present",
+            "a completed fight cannot carry a departed local row"
+        );
+        assert_eq!(participant_status(&db, id, "Ally"), "nexused");
+        let escaped_local: String = db
+            .conn
+            .query_row(
+                "SELECT fp.end_status FROM fight_participants fp
+                 JOIN fights f ON f.id = fp.fight_id
+                 WHERE fp.is_local = 1 AND f.killed = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            escaped_local, "nexused",
+            "an escaped fight keeps the departure it recorded"
+        );
+        drop(db);
+
+        // Idempotent: a second open changes nothing.
+        let db = CombatDatabase::open_writer(&path).unwrap();
+        assert_eq!(participant_status(&db, id, "Me"), "present");
+    }
+
     #[test]
     fn mark_boss_killed_by_loot_completes_only_the_closest_escaped_fight() {
         // An Exaltation boss, so the completed card's awards can be reconciled.
@@ -6725,6 +8023,65 @@ mod tests {
         assert_eq!(killed_in_other_instance, 0, "another instance is untouched");
     }
 
+    /// A bag attributed to a boss proves that boss died even without a Mark: a bag
+    /// only spawns where its dropper died, and the loot tracker pins it to the
+    /// entity the local player hit that left the map nearest the bag. A boss killed
+    /// out of sight is stored Escaped (its removal reads as "left view"), which is
+    /// the case this repairs.
+    #[test]
+    fn a_boss_attributed_bag_completes_its_escaped_fight_on_open() {
+        // Ice Citadel's Esben-style shape, with the Realm's Crystal Worm Father: a
+        // catalogued MINIBOSS whose bag holds no Mark.
+        const CWF: i32 = 22_138;
+        let mgr = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            mgr.set_assets_dir(&dir);
+        }
+        let _ = mgr.try_load();
+        if !mgr.bag_attribution_proves_kill(CWF) {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        // A crate is not a boss, so its own bag proves nothing (its loot is what
+        // the local player took from it, not a death).
+        assert!(
+            !mgr.bag_attribution_proves_kill(34_599),
+            "a crate proves nothing"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let combat_path = temp.path().join("combat_history.db");
+        let loot_path = temp.path().join("loot_history.db");
+        // The bag carries an ordinary potion, never a Mark.
+        write_loot_db_with_drop(&loot_path, 7, CWF, 45_000, &[2_593]);
+
+        let hit_id;
+        {
+            let mut db = CombatDatabase::open_writer(&combat_path).unwrap();
+            let mut escaped = escaped_fight("Realm", CWF, 7);
+            escaped.started_at = 1_000;
+            escaped.ended_at = 61_000;
+            hit_id = db.insert_fight(&escaped).unwrap();
+            // A same-type escaped fight in another instance must stay escaped.
+            db.insert_fight(&escaped_fight("Realm", CWF, 99)).unwrap();
+            assert_eq!(killed_flag(&db, hit_id), 0);
+        }
+
+        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(
+            killed_flag(&db, hit_id),
+            1,
+            "the boss's own bag completes its fight"
+        );
+        let killed_in_other_instance: i64 = db
+            .conn
+            .query_row("SELECT killed FROM fights WHERE map_seed = 99", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(killed_in_other_instance, 0, "another instance is untouched");
+    }
+
     #[test]
     fn mark_loot_completes_the_escaped_boss_on_open() {
         let Some(mark) = a_boss_mark_id() else {
@@ -6780,7 +8137,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_loot_is_ignored_without_a_mark_or_a_usable_loot_db() {
+    fn loot_kill_proofs_ignore_a_non_boss_bag_and_an_unreadable_db() {
         let Some(mark) = a_boss_mark_id() else {
             eprintln!("skipping: game assets not available");
             return;
@@ -6802,15 +8159,11 @@ mod tests {
         assert_eq!(killed_flag(&db, escaped_id), 0);
         drop(db);
 
-        // A bag that holds no Mark proves nothing.
+        // A bag attributed to a mob that is not a boss cannot prove any boss died,
+        // Mark or not: the bag is pinned to whatever dropped it.
+        const NOT_A_BOSS: i32 = 53_007;
         let no_mark_path = temp.path().join("no_mark.db");
-        write_loot_db_with_drop(
-            &no_mark_path,
-            7,
-            boss,
-            65_000,
-            &[mark.saturating_add(1_000_000)],
-        );
+        write_loot_db_with_drop(&no_mark_path, 7, NOT_A_BOSS, 65_000, &[mark]);
         let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&no_mark_path)).unwrap();
         assert_eq!(killed_flag(&db, escaped_id), 0);
         drop(db);
@@ -8179,6 +9532,115 @@ mod tests {
         assert_eq!(dead.local_tex2, 0x0100_ff00);
     }
 
+    #[test]
+    fn death_broadcast_repairs_a_stored_nexused_participant() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = fight_with_players("Oryx's Sanctuary", 1_000_000, &["Pillar", "Bystander"]);
+        for p in &mut fight.participants {
+            p.end_status = ParticipantEndStatus::Nexused;
+        }
+        db.insert_fight(&fight).unwrap();
+
+        // The broadcast for a death inside the fight's window arrives afterwards.
+        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_020_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 1);
+
+        // The named participant is corrected with a generic grave (the tier was
+        // never captured); everyone else keeps the nexus verdict.
+        let repaired: (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT end_status, grave_type FROM fight_participants WHERE name = 'Pillar'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired, ("died".to_string(), 0));
+        let bystander: String = db
+            .conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE name = 'Bystander'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bystander, "nexused");
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn death_broadcast_repair_ignores_other_names_and_windows() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = fight_with_players("Mad Lab", 10_000, &["Pillar"]);
+        fight.participants[0].end_status = ParticipantEndStatus::Nexused;
+        db.insert_fight(&fight).unwrap();
+        // Ten minutes later: outside the fight window.
+        db.insert_death_broadcast("Pillar", "a Spider", 610_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+        // In the window, but another player died.
+        db.insert_death_broadcast("Someone", "a Spider", 20_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+        let status: String = db
+            .conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE name = 'Pillar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "nexused");
+    }
+
+    #[test]
+    fn death_broadcast_repair_leaves_presence_alone() {
+        // Presence is not overridden by a broadcast: the same rule the live
+        // finalize pass applies (death evidence beats a departure, not presence).
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let fight = fight_with_players("Mad Lab", 1_000, &["Present"]);
+        db.insert_fight(&fight).unwrap();
+        db.insert_death_broadcast("Present", "a Spider", 20_000)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+    }
+
+    #[test]
+    fn death_broadcast_repair_runs_on_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat_history.db");
+        {
+            let mut db = CombatDatabase::open_writer(&path).unwrap();
+            let mut fight = fight_with_players("Oryx's Sanctuary", 1_000_000, &["Pillar"]);
+            fight.participants[0].end_status = ParticipantEndStatus::Nexused;
+            db.insert_fight(&fight).unwrap();
+            // Stored, but not applied yet: only the open pass (or the live drain)
+            // repairs stored rows.
+            db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_030_000)
+                .unwrap();
+            let before: String = db
+                .conn
+                .query_row(
+                    "SELECT end_status FROM fight_participants WHERE name = 'Pillar'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(before, "nexused");
+        }
+        let db = CombatDatabase::open_writer(&path).unwrap();
+        let after: String = db
+            .conn
+            .query_row(
+                "SELECT end_status FROM fight_participants WHERE name = 'Pillar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, "died", "the on-open pass applies stored broadcasts");
+    }
+
     /// Build a standalone fight with an explicit set of participant IGNs.
     fn fight_with_players(dungeon: &str, started: i64, names: &[&str]) -> CompletedFight {
         let mut f = sample_fight();
@@ -8210,6 +9672,13 @@ mod tests {
                 damage_blocked: None,
                 guarded_damage: None,
                 guarded_hits: None,
+                summon_damage: 0,
+                summon_hits: 0,
+                summons: Vec::new(),
+                weapons: Vec::new(),
+                packet_damage: 0,
+                packet_hits: 0,
+                damage_taken_hits: None,
             })
             .collect();
         f
@@ -8379,6 +9848,13 @@ mod tests {
             damage_blocked: None,
             guarded_damage: None,
             guarded_hits: None,
+            summon_damage: 0,
+            summon_hits: 0,
+            summons: Vec::new(),
+            weapons: Vec::new(),
+            packet_damage: 0,
+            packet_hits: 0,
+            damage_taken_hits: None,
         }
     }
 
@@ -10111,6 +11587,167 @@ mod tests {
     }
 
     #[test]
+    fn v58_to_v59_relabels_reskinned_janus_and_stone_guardians() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A database written before the canonical-dungeon table covered the
+        // Season 31 reskins stored their realm-spawned Oryx's Castle bosses under
+        // the raw realm map name.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (12, 130, 'Realm', 7, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (150, 155, 'Realm', 7, 46390, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (200, 210, 'Realm', 7, 4000, 'Some Realm Boss', 90000, 90000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        // Re-run migrations from v58.
+        db.conn.execute_batch("PRAGMA user_version = 58").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let relocated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND boss_object_type IN (46385, 46390)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(relocated, 2, "reskinned realm bosses relabelled");
+        // A genuine realm boss keeps its Realm label.
+        let realm: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE dungeon = 'Realm' AND boss_object_type = 4000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(realm, 1, "unrelated realm boss untouched");
+    }
+
+    #[test]
+    fn backfill_groups_legacy_oryxs_castle_bosses() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // Legacy realm-locked rows (no synthetic run) for the same instance: the
+        // Stone Guardians and Janus must fold into one Oryx's Castle card on open,
+        // like a live run, rather than three separate "Realm" cards.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (1000, 2000, 'Oryx''s Castle', 7, 46390, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (1100, 2100, 'Oryx''s Castle', 7, 46391, 'Stone Guardian', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (1200, 3000, 'Oryx''s Castle', 7, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        db.initialize(None).unwrap();
+
+        let runs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND encounter_run_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "same-instance bosses group into one run");
+
+        // A different instance (seed) stays separate.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (1000, 2000, 'Oryx''s Castle', 8, 46385, 'Janus the Doorwarden', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+        db.initialize(None).unwrap();
+        let runs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights
+                 WHERE dungeon = 'Oryx''s Castle' AND encounter_run_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 2, "a different instance is its own run");
+    }
+
+    #[test]
+    fn v59_to_v60_relabels_reskinned_oryx() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group)
+              VALUES
+              (12, 130, 'Realm', 7, 45973, 'Oryx the Mad God', 60000, 60000, 9, 55, 1, NULL, NULL),
+              (150, 155, 'Realm', 8, 28989, 'Oryx the Mad God', 60000, 60000, 9, 55, 1, NULL, NULL);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 59").unwrap();
+        db.initialize(None).unwrap();
+
+        let chamber: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE boss_object_type = 45973 AND dungeon = 'Oryx''s Chamber'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chamber, 1, "infested Oryx 1 relabelled to Oryx's Chamber");
+        let cellar: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fights WHERE boss_object_type = 28989 AND dungeon = 'Wine Cellar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cellar, 1, "infested Oryx 2 relabelled to Wine Cellar");
+    }
+
+    #[test]
     fn v39_to_v40_purges_turret_left_behind_by_v38() {
         let mut db = CombatDatabase {
             conn: Connection::open_in_memory().unwrap(),
@@ -11043,6 +12680,9 @@ mod tests {
             spectral_hm: false,
             shatters_hm: false,
             participants: vec![],
+            boss_uptime_ms: 0,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
         }
     }
 

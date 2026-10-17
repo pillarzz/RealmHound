@@ -157,6 +157,9 @@ impl LootEntry {
             loot_tier_active: false,
             bag_type: self.bag_type.id(),
             mob_type: self.mob_type,
+            // A live entry is the encounter's most recent observation by
+            // definition, so it is its own display variant.
+            display_object_type: self.mob_type,
             mob_name: self.mob_name.clone(),
             items: self
                 .items

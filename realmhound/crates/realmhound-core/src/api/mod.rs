@@ -3,6 +3,7 @@
 //! This module provides functions to call RotMG's web API using an access token
 //! captured from game traffic.
 
+pub mod blood_ritual;
 pub mod character;
 mod client;
 pub mod crucible;
@@ -11,6 +12,7 @@ pub mod pet_skins;
 pub mod season;
 pub mod token;
 
+pub use blood_ritual::{parse_blood_ritual_defs, BloodRitualDef};
 pub use character::{
     accelerator_info, debug_order_alignment, decode_pcstats, decode_pcstats_debug,
     get_unmapped_pcstats, parse_accelerators, parse_account_data, parse_char_list,

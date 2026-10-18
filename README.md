@@ -105,8 +105,12 @@ All platforms need the stable [Rust](https://rustup.rs/) toolchain, plus:
 
 | Platform | Additional prerequisites |
 | --- | --- |
-| Windows | [Npcap SDK](https://npcap.com/#download), with its `Lib\x64` directory on `LIB` |
+| Windows | Visual Studio Build Tools with **Desktop development with C++**, MSVC tools, and a Windows SDK; use Rust's MSVC toolchain |
 | macOS | Xcode Command Line Tools (`xcode-select --install`) - these supply `libpcap` |
+
+Windows builds generate the `wpcap.lib` import library automatically; the Npcap
+SDK is not required. Running the app or tests still requires
+[Npcap](https://npcap.com/#download) with WinPcap compatibility mode.
 
 ### Build
 

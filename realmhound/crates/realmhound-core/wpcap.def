@@ -1,0 +1,54 @@
+; Function names from rust-pcap 1.3.0's src/raw.rs (MIT).
+; https://github.com/rust-pcap/pcap/blob/v1.3.0/src/raw.rs
+; See THIRD-PARTY-LICENSES.md for attribution. No Npcap SDK files are used.
+; Keep this list in sync with the Windows API used by the pcap dependency.
+LIBRARY wpcap.dll
+EXPORTS
+    pcap_activate
+    pcap_breakloop
+    pcap_close
+    pcap_compile
+    pcap_create
+    pcap_datalink
+    pcap_datalink_name_to_val
+    pcap_datalink_val_to_description
+    pcap_datalink_val_to_name
+    pcap_dump
+    pcap_dump_close
+    pcap_dump_flush
+    pcap_dump_open
+    pcap_dump_open_append
+    pcap_findalldevs
+    pcap_free_datalinks
+    pcap_freealldevs
+    pcap_freecode
+    pcap_geterr
+    pcap_getevent
+    pcap_list_datalinks
+    pcap_loop
+    pcap_major_version
+    pcap_minor_version
+    pcap_next_ex
+    pcap_offline_filter
+    pcap_open_dead
+    pcap_open_dead_with_tstamp_precision
+    pcap_open_offline
+    pcap_open_offline_with_tstamp_precision
+    pcap_sendpacket
+    pcap_sendqueue_alloc
+    pcap_sendqueue_destroy
+    pcap_sendqueue_queue
+    pcap_sendqueue_transmit
+    pcap_set_buffer_size
+    pcap_set_datalink
+    pcap_set_immediate_mode
+    pcap_set_promisc
+    pcap_set_snaplen
+    pcap_set_timeout
+    pcap_set_tstamp_precision
+    pcap_set_tstamp_type
+    pcap_setdirection
+    pcap_setfilter
+    pcap_setmintocopy
+    pcap_setnonblock
+    pcap_stats

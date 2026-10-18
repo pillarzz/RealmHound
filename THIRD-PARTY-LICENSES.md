@@ -12,14 +12,14 @@ This audio is not licensed under RealmHound's MIT license.
 ## Npcap
 
 RealmHound uses Npcap as an external Windows runtime dependency for packet
-capture. The released executable links against Npcap SDK import libraries and
-loads `wpcap.dll` from the user's Npcap installation at runtime.
+capture. The released executable links against a locally generated import
+library and loads `wpcap.dll` from the user's Npcap installation at runtime.
 
 RealmHound does not include or redistribute the Npcap installer, driver,
 runtime DLLs, or SDK. Users must download and install Npcap separately from
-the official website. RealmHound's CI and release workflows download the
-Npcap SDK temporarily for linking; the SDK is not committed to this repository
-or included in release assets.
+the official website. Windows MSVC builds generate an import-only `wpcap.lib`
+using Microsoft's build tools and function names from the Rust `pcap` bindings.
+No Npcap SDK files are needed or downloaded by the build.
 
 Npcap is proprietary software governed by its own end-user license agreement,
 not RealmHound's MIT license. Projects that want to bundle or redistribute
@@ -31,6 +31,37 @@ Project.
 - Npcap license: https://github.com/nmap/npcap/blob/master/LICENSE
 - OEM and redistribution licensing: https://npcap.com/oem/
 - Npcap SDK downloads: https://npcap.com/#download
+
+## Rust pcap bindings
+
+The function names in `realmhound/crates/realmhound-core/wpcap.def` are derived
+from the Rust `pcap` crate's API declarations, not from the Npcap SDK.
+The bindings are available under MIT or Apache-2.0; this list uses the MIT license.
+
+- Source: https://github.com/rust-pcap/pcap/blob/v1.3.0/src/raw.rs
+- License: https://github.com/rust-pcap/pcap/blob/v1.3.0/LICENSE-MIT
+
+```text
+Copyright (c) 2015 The pcap Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ## Noto fonts
 

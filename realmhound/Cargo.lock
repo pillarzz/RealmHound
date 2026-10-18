@@ -4213,6 +4213,7 @@ dependencies = [
  "criterion",
  "dirs",
  "etherparse",
+ "find-msvc-tools",
  "fs2",
  "hex",
  "image",

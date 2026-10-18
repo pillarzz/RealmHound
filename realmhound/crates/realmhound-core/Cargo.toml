@@ -64,6 +64,9 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.build-dependencies]
+find-msvc-tools = "0.1"
+
 [features]
 # Enable puffin profiling scopes in the packet pipeline.
 profiling = ["dep:puffin"]

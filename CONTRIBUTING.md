@@ -19,15 +19,13 @@ RealmHound targets 64-bit Windows and macOS. Both need the stable
 
 ### Windows
 
-- [Npcap](https://npcap.com/#download) with WinPcap compatibility mode
-- The [Npcap SDK](https://npcap.com/#download) for development
+- Visual Studio Build Tools with **Desktop development with C++**, including
+  the MSVC compiler tools and a Windows SDK (use Rust's MSVC toolchain).
+- [Npcap](https://npcap.com/#download) with WinPcap compatibility mode to run
+  the app or tests, but not to compile them.
 
-Extract the Npcap SDK and add its 64-bit library directory to the current
-PowerShell session before building:
-
-```powershell
-$env:LIB = "C:\path\to\npcap-sdk\Lib\x64;$env:LIB"
-```
+The build automatically generates a `wpcap.lib` import library using Microsoft's
+`lib.exe`. The Npcap SDK and manual `LIB` configuration are not needed.
 
 ### macOS
 

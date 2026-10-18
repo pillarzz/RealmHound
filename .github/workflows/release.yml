@@ -168,14 +168,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Npcap SDK
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "npcap-sdk.zip"
-          Expand-Archive -Path "npcap-sdk.zip" -DestinationPath "npcap-sdk"
-          $sdkPath = "${{ github.workspace }}\npcap-sdk\Lib\x64"
-          "LIB=$sdkPath;$env:LIB" >> $env:GITHUB_ENV
-
       - name: Download official sounds
         shell: pwsh
         env:

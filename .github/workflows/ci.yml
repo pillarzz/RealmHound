@@ -37,17 +37,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Install Npcap SDK
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "npcap-sdk.zip"
-          Expand-Archive -Path "npcap-sdk.zip" -DestinationPath "npcap-sdk"
-          $sdkPath = "${{ github.workspace }}\npcap-sdk\Lib\x64"
-          if (-not (Test-Path $sdkPath)) {
-            throw "Npcap SDK library directory not found: $sdkPath"
-          }
-          "LIB=$sdkPath;$env:LIB" >> $env:GITHUB_ENV
-
       - name: Check formatting
         working-directory: realmhound
         run: cargo fmt --all -- --check

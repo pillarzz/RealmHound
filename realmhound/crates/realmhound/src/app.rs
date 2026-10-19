@@ -2102,7 +2102,7 @@ impl RealmHoundApp {
                         }
                         if join.clicked() {
                             ui.ctx()
-                                .open_url(egui::OpenUrl::new_tab("https://discord.gg/zXAbEATmy"));
+                                .open_url(egui::OpenUrl::new_tab("https://discord.gg/4zdy5Z4Sfd"));
                         }
 
                         ui.add_space(10.0);

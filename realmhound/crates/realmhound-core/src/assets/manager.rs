@@ -2615,10 +2615,11 @@ pub struct AssetManager {
     last_error: RwLock<Option<String>>,
 }
 
-/// Equipment XML files that define items. `equip_lo.xml` is a supplemental
-/// catalog for newer items (for example `HDruidST0`, "Aeonic Talon") that the
-/// game does not duplicate in `equip.xml`.
-const EQUIPMENT_XML_FILES: &[&str] = &["equip.xml", "equip_lo.xml"];
+/// Equipment XML files that define items. `equip_lo.xml` and
+/// `equip_design.xml` are supplemental catalogs for newer items (for example
+/// `HDruidST0`, "Aeonic Talon", and the Heirlooms set) that the game does not
+/// duplicate in `equip.xml`.
+const EQUIPMENT_XML_FILES: &[&str] = &["equip.xml", "equip_lo.xml", "equip_design.xml"];
 
 /// Merge every available equipment catalog into `list`. Returns the number of
 /// objects enriched. Missing files are skipped so older asset packs still load.
@@ -4804,16 +4805,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_supplemental_equip_lo_catalog() {
+    fn loads_supplemental_equipment_catalogs() {
         // Aeonic Talon (HDruidST0, 0xF98C) is defined only in equip_lo.xml.
         // Its five firing patterns all use projectile 0; without the subattack
         // table the first non-zero pattern disables self-compute for the map.
-        let dir = std::env::temp_dir().join(format!("rh_equip_lo_test_{}", std::process::id()));
+        // Teratoma (0xBEFA) is defined only in equip_design.xml; without that
+        // file its DetonateHex ability has no self-computed damage.
+        let dir = std::env::temp_dir().join(format!("rh_equip_extra_test_{}", std::process::id()));
         let xml_dir = dir.join("xml");
         std::fs::create_dir_all(&xml_dir).unwrap();
         std::fs::write(
             dir.join("ObjectID.list"),
-            "63884;Aeonic Talon;Equipment;;80:110:0;lofiObj6:1090;EQUIPMENT,WEAPON,WAND,ST;HDruidST0;;;;8;0;1\n",
+            concat!(
+                "63884;Aeonic Talon;Equipment;;80:110:0;lofiObj6:1090;EQUIPMENT,WEAPON,WAND,ST;HDruidST0;;;;8;0;1\n",
+                "48890;;Equipment;;;memoriesObjects8x8:18;EQUIPMENT,ABILITY,ORB,UT,TAB_UT,POWERTIER_A,XPBONUS,COOLDOWN,STATMOD;Teratoma;;;;21;0;1\n",
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -4832,9 +4838,21 @@ mod tests {
 </Objects>"#,
         )
         .unwrap();
+        std::fs::write(
+            xml_dir.join("equip_design.xml"),
+            r#"<Objects>
+  <Object id="Teratoma" type="0xBEFA">
+    <Class>Equipment</Class>
+    <Item />
+    <OnEnemyHitActivate effect="Hex" duration="3">ApplyCondition</OnEnemyHitActivate>
+    <Activate radius="4.5" baseDamage="500" stackDamage="10">DetonateHex</Activate>
+  </Object>
+</Objects>"#,
+        )
+        .unwrap();
 
         let mut list = ObjectList::load_from_file(dir.join("ObjectID.list")).unwrap();
-        assert_eq!(merge_equipment_xml_files(&mut list, &dir), 1);
+        assert_eq!(merge_equipment_xml_files(&mut list, &dir), 2);
         for index in 0..5 {
             assert_eq!(list.subattack_projectile_index(0xF98C, index), Some(0));
         }
@@ -4844,6 +4862,10 @@ mod tests {
         assert_eq!(asset.projectiles.len(), 1);
         assert_eq!(asset.projectiles[0].min_damage, 80);
         assert_eq!(asset.projectiles[0].max_damage, 110);
+
+        let teratoma = list.ability_effects(0xBEFA).expect("Teratoma effects parsed");
+        assert!(teratoma.applies_hex);
+        assert_eq!(teratoma.detonate_hex.unwrap().base_damage, 500.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

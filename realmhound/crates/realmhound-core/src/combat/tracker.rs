@@ -4624,7 +4624,7 @@ impl CombatTracker {
         // player's share stays honest. This is one general policy, not a list of
         // per-boss exceptions; it also covers Moonlight Village mechanics bosses,
         // whose nominal max HP is never removed.
-        if fight.killed {
+        if fight.killed && !crate::assets::is_mv_boss(fight.boss_object_type) {
             trim_plausible_overkill(&fight, &mut participants);
         }
 
@@ -5905,9 +5905,11 @@ const OVERKILL_MAX_PLAUSIBLE_FACTOR: i64 = 2;
 /// plausibly just overkill for the pool this fight actually removed.
 ///
 /// This is the general gate for "boss HP is not the damage the boss absorbed":
-/// healers (the pool includes healed HP), phase HP resets, phase-gate caps, and
-/// invulnerable-finish/mechanics bosses (their pool is 0 because they never
-/// lost HP) all bypass the proportional cap. No boss identity is consulted.
+/// healers (the pool includes healed HP), phase HP resets, and phase-gate caps
+/// all bypass the proportional cap. Moonlight Village mechanics bosses are
+/// excluded at the call site instead: their fight is scored by completion, not
+/// HP depletion, so their nominal HP is not a damage pool even if an HP dip is
+/// observed.
 fn trim_plausible_overkill(fight: &FightState, participants: &mut [FightParticipant]) {
     let pool = fight.effective_damage_pool();
     if pool <= 0 {
@@ -10478,6 +10480,73 @@ mod tests {
             done[0].total_damage(),
             450_000,
             "raw damage kept, not capped to the nominal 180000 HP"
+        );
+    }
+
+    #[test]
+    fn mv_boss_hp_dip_does_not_reintroduce_hp_capping() {
+        // MV bosses are scored by completion, not HP depletion. Even if the
+        // observed HP dips below its start, the nominal pool must not cap the
+        // party -- including the "slightly over max HP" range that would pass
+        // the plausibility bound for an ordinary HP boss.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 180_000),
+                    stat(StatType::HP, 180_000),
+                    stat(StatType::Condition, COND_INVULNERABLE),
+                ],
+            ),
+            100,
+        );
+        // An invulnerable shot creates the fight at the nominal 180k pool
+        // without recording damage.
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 110);
+        assert_eq!(
+            t.fights.get(&500).expect("fight live").boss_start_hp,
+            180_000
+        );
+        // An observed HP dip would make `effective_damage_pool` non-zero.
+        t.on_object_status(
+            500,
+            &status(
+                500,
+                vec![stat(StatType::HP, 120_000), stat(StatType::Condition, 0)],
+            ),
+            120,
+        );
+        // 200k is only 1.11x the nominal 180k pool -- within the 2x
+        // plausibility bound, so an ordinary boss would be capped to 180k.
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 200_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 11, 1000, 1000, 130);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].killed);
+        assert_eq!(
+            done[0].total_damage(),
+            200_000,
+            "MV damage stays raw even after an HP dip"
         );
     }
 

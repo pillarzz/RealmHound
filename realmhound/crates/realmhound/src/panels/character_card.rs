@@ -200,6 +200,11 @@ pub fn format_loot_boost(remaining_secs: u64) -> String {
     }
 }
 
+/// Loot-boost seconds to display, or `None` when the boost has expired.
+fn visible_loot_boost(remaining_secs: Option<u32>) -> Option<u32> {
+    remaining_secs.filter(|&secs| secs > 0)
+}
+
 /// Draw the fame icon (sprite 24102) into a `size`×`size` cell. When `faded` is
 /// true the icon is drawn semi-transparent (for potential/estimated values).
 /// Adds trailing spacing when the icon is drawn.
@@ -878,7 +883,7 @@ impl CharacterCardWidget {
                             // while the id line keeps the row's own x. It is painted rather than laid
                             // out for exactly that reason: laying it out would consume width here and
                             // push the id across, so a running timer moved the whole line.
-                            if let Some(secs) = self.loot_boost_secs {
+                            if let Some(secs) = visible_loot_boost(self.loot_boost_secs) {
                                 const HINT: &str = "Loot-drop boost remaining. Pauses in safe areas (Nexus, vault, etc.) and while loading.";
                                 // 10px so the five-character clock fits the column the sprite occupies.
                                 let font = egui::FontId::proportional(10.0);
@@ -1227,6 +1232,13 @@ mod tests {
         assert_eq!(format_loot_boost(3600), "1:00:00");
         assert_eq!(format_loot_boost(3660), "1:01:00");
         assert_eq!(format_loot_boost(7325), "2:02:05");
+    }
+
+    #[test]
+    fn expired_loot_boost_is_hidden() {
+        assert_eq!(visible_loot_boost(Some(0)), None);
+        assert_eq!(visible_loot_boost(Some(1)), Some(1));
+        assert_eq!(visible_loot_boost(None), None);
     }
 
     /// The loot readout is painted between the card's content edge and the id

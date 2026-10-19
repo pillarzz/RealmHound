@@ -4863,7 +4863,9 @@ mod tests {
         assert_eq!(asset.projectiles[0].min_damage, 80);
         assert_eq!(asset.projectiles[0].max_damage, 110);
 
-        let teratoma = list.ability_effects(0xBEFA).expect("Teratoma effects parsed");
+        let teratoma = list
+            .ability_effects(0xBEFA)
+            .expect("Teratoma effects parsed");
         assert!(teratoma.applies_hex);
         assert_eq!(teratoma.detonate_hex.unwrap().base_damage, 500.0);
 

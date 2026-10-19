@@ -2737,7 +2737,10 @@ impl ObjectList {
             buf.clear();
         }
 
-        self.blueprint_unlock = unlock_map;
+        // Extend rather than replace: equipment catalogs are merged in
+        // sequence (equip.xml, equip_lo.xml, equip_design.xml), and replacing
+        // here would drop every blueprint/ability parsed from earlier files.
+        self.blueprint_unlock.extend(unlock_map);
         // Extend rather than replace: pet stones are split across equip.xml and
         // pets.xml, and the latter is merged by `merge_pet_skin_unlocks`.
         self.pet_skin_unlock.extend(pet_skin_map);
@@ -2873,7 +2876,9 @@ impl ObjectList {
                 }));
         }
 
-        self.ability_effects = ability_map;
+        // Extend rather than replace: later supplemental catalogs must not wipe
+        // the ability data parsed from equip.xml.
+        self.ability_effects.extend(ability_map);
         Ok(merged_count)
     }
 
@@ -4194,6 +4199,56 @@ mod tests {
         assert_eq!(list.blueprint_unlocked_id(200), Some(100));
         // A non-blueprint item's Shoot activate must not create a mapping.
         assert_eq!(list.blueprint_unlocked_id(100), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_equipment_catalogs_extend_blueprints_and_abilities() {
+        // Supplemental catalogs are merged after equip.xml. Their local maps
+        // must extend the catalog rather than replace it, or every blueprint
+        // and ability parsed from equip.xml disappears.
+        let mut list = ObjectList::new();
+        let dir =
+            std::env::temp_dir().join(format!("rh_catalog_extend_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = dir.join("equip.xml");
+        std::fs::write(
+            &base,
+            r#"<Objects>
+  <Object type="0x00c8" id="Base Blueprint">
+    <Class>Equipment</Class>
+    <Activate id="Divinity">UnlockForgeBlueprint</Activate>
+  </Object>
+  <Object type="0x00c9" id="Base Ability">
+    <Class>Equipment</Class>
+    <Activate radius="4" baseDamage="500">DetonateHex</Activate>
+  </Object>
+</Objects>"#,
+        )
+        .unwrap();
+
+        let extra = dir.join("equip_lo.xml");
+        std::fs::write(
+            &extra,
+            r#"<Objects>
+  <Object type="0x00ca" id="Extra Blueprint">
+    <Class>Equipment</Class>
+    <Activate id="Divinity">UnlockForgeBlueprint</Activate>
+  </Object>
+</Objects>"#,
+        )
+        .unwrap();
+
+        list.merge_equipment_xml(&base).unwrap();
+        list.merge_equipment_xml(&extra).unwrap();
+        list.name_to_id.insert("Divinity".to_string(), 100);
+
+        assert_eq!(list.blueprint_unlocked_id(0x00c8), Some(100));
+        assert_eq!(list.blueprint_unlocked_id(0x00ca), Some(100));
+        let ability = list.ability_effects(0x00c9).expect("base ability survives");
+        assert!(ability.detonate_hex.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

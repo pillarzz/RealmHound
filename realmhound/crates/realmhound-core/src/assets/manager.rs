@@ -2615,6 +2615,31 @@ pub struct AssetManager {
     last_error: RwLock<Option<String>>,
 }
 
+/// Equipment XML files that define items. `equip_lo.xml` is a supplemental
+/// catalog for newer items (for example `HDruidST0`, "Aeonic Talon") that the
+/// game does not duplicate in `equip.xml`.
+const EQUIPMENT_XML_FILES: &[&str] = &["equip.xml", "equip_lo.xml"];
+
+/// Merge every available equipment catalog into `list`. Returns the number of
+/// objects enriched. Missing files are skipped so older asset packs still load.
+fn merge_equipment_xml_files(list: &mut ObjectList, assets_dir: &Path) -> usize {
+    let mut merged = 0;
+    for name in EQUIPMENT_XML_FILES {
+        let path = assets_dir.join("xml").join(name);
+        if !path.exists() {
+            continue;
+        }
+        match list.merge_equipment_xml(&path) {
+            Ok(count) => {
+                merged += count;
+                tracing::info!("Merged equipment data for {} items from {:?}", count, path);
+            }
+            Err(e) => tracing::warn!("Failed to merge equipment XML {:?}: {}", path, e),
+        }
+    }
+    merged
+}
+
 impl AssetManager {
     /// Create a new asset manager.
     pub fn new() -> Self {
@@ -2727,22 +2752,12 @@ impl AssetManager {
                     }
                 }
 
-                // Merge equipment XML data (tier, feed_power, fame_bonus, bag_type)
-                let equip_xml_path = assets_dir.join("xml").join("equip.xml");
-                if equip_xml_path.exists() {
-                    match list.merge_equipment_xml(&equip_xml_path) {
-                        Ok(count) => {
-                            tracing::info!(
-                                "Merged equipment data for {} items from {:?}",
-                                count,
-                                equip_xml_path
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to merge equipment XML: {}", e);
-                        }
-                    }
-                }
+                // Merge equipment XML data (tier, feed_power, fame_bonus,
+                // bag_type, subattack tables). The game splits newer items into
+                // `equip_lo.xml`; without it those items have no `<Subattack>`
+                // mapping, and a multi-pattern weapon disables self-compute for
+                // the map on its first non-zero pattern.
+                merge_equipment_xml_files(&mut list, &assets_dir);
 
                 // Index which items spawn which summoned creatures, so a credited
                 // summon can be traced back to its source (Pocket Rat, Summoner
@@ -4787,6 +4802,51 @@ pub fn find_assets_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loads_supplemental_equip_lo_catalog() {
+        // Aeonic Talon (HDruidST0, 0xF98C) is defined only in equip_lo.xml.
+        // Its five firing patterns all use projectile 0; without the subattack
+        // table the first non-zero pattern disables self-compute for the map.
+        let dir = std::env::temp_dir().join(format!("rh_equip_lo_test_{}", std::process::id()));
+        let xml_dir = dir.join("xml");
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        std::fs::write(
+            dir.join("ObjectID.list"),
+            "63884;Aeonic Talon;Equipment;;80:110:0;lofiObj6:1090;EQUIPMENT,WEAPON,WAND,ST;HDruidST0;;;;8;0;1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            xml_dir.join("equip_lo.xml"),
+            r#"<Objects>
+  <Object id="HDruidST0" type="0xF98C">
+    <Class>Equipment</Class>
+    <Item />
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Subattack projectileId="0"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Projectile id="0"><MinDamage>80</MinDamage><MaxDamage>110</MaxDamage></Projectile>
+  </Object>
+</Objects>"#,
+        )
+        .unwrap();
+
+        let mut list = ObjectList::load_from_file(dir.join("ObjectID.list")).unwrap();
+        assert_eq!(merge_equipment_xml_files(&mut list, &dir), 1);
+        for index in 0..5 {
+            assert_eq!(list.subattack_projectile_index(0xF98C, index), Some(0));
+        }
+        assert_eq!(list.subattack_projectile_index(0xF98C, 5), None);
+
+        let asset = list.get(0xF98C).unwrap();
+        assert_eq!(asset.projectiles.len(), 1);
+        assert_eq!(asset.projectiles[0].min_damage, 80);
+        assert_eq!(asset.projectiles[0].max_damage, 110);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_asset_manager_new() {

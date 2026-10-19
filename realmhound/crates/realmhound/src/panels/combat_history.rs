@@ -4466,12 +4466,14 @@ impl CombatHistoryPanel {
         player_click: &mut Option<(String, i32, u32, u32)>,
     ) -> f32 {
         let attributed: i64 = participants.iter().map(|p| p.damage).sum();
-        // On a kill the core capped every participant so their damage sums to
-        // the boss HP that was removed; the residual is damage we saw the boss
-        // lose but couldn't attribute to an observed player. Reconciling lets
-        // the table's Total row equal the boss HP (proving nothing is "lowered",
-        // just overkill excluded). Off a kill we keep the plain tracked total.
-        let reconcile = killed && boss_hp > 0;
+        // On a kill the core trims plausible death-tick overkill, so participant
+        // damage sums to the HP the boss actually lost; any residual is damage we
+        // saw the boss lose but couldn't attribute. A boss that healed, reset, or
+        // gated damage can legitimately have a raw total above its starting HP --
+        // the core deliberately keeps that raw damage rather than scaling the
+        // party down. Those fights are shown against the tracked total instead,
+        // so the table never shows >100% of a pool that isn't the real one.
+        let reconcile = killed && boss_hp > 0 && attributed <= boss_hp;
         let unattributed = if reconcile {
             (boss_hp - attributed).max(0)
         } else {

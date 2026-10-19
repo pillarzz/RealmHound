@@ -1143,6 +1143,11 @@ struct FightState {
     /// to ~0 then reset to full HP for a new phase under the same object id, so
     /// the HP at removal is misleadingly high. The minimum captures the death.
     min_hp_seen: i64,
+    /// Total HP the boss regained after it had already taken damage. A healing
+    /// boss's real damage pool is its starting HP plus everything it healed
+    /// back; phase HP resets count the same way. The overkill cap uses this so a
+    /// heal is not mistaken for overkill.
+    healed_hp: i64,
     /// Local player's char id when this fight began (0 if unknown then).
     local_char_id: i32,
     /// Count of local-player "close calls" (HP dropped below 20% of max,
@@ -1181,6 +1186,23 @@ struct FightState {
 const MAX_UPTIME_GAP_MS: i64 = 5_000;
 
 impl FightState {
+    /// The damage pool this fight actually removed, or 0 when the boss's nominal
+    /// max HP is not a damage pool at all.
+    ///
+    /// A boss that never lost HP (Moonlight Village mechanics, invulnerable
+    /// finish) absorbed damage the HP bar never reflected. A boss that healed or
+    /// reset its HP at a phase transition absorbed its starting pool plus every
+    /// point it regained, so `boss_start_hp` alone would understate it. This is
+    /// deliberately data-driven -- no per-boss list.
+    fn effective_damage_pool(&self) -> i64 {
+        let removed = self.boss_start_hp as i64 - self.min_hp_seen;
+        if removed <= 0 {
+            0
+        } else {
+            (self.boss_start_hp as i64).saturating_add(self.healed_hp.max(0))
+        }
+    }
+
     /// Accrue boss uptime up to `now_ms`, counting the elapsed slice only while
     /// the boss is vulnerable. Call on every boss damage event and on every boss
     /// condition change (with the state that applied *before* the change).
@@ -2128,6 +2150,19 @@ impl CombatTracker {
                 }
             }
 
+            // Track HP the boss regained after it had already been damaged. This
+            // is the general healer case: the fight's real pool is the starting
+            // HP plus every heal/reset, not the starting HP alone. Gate on prior
+            // damage so a first sighting at full (or a spawn packet) is not a
+            // heal, and on a stable max HP so an HP rescale is not either.
+            if previous_hp > 0
+                && new_hp > previous_hp
+                && fight.min_hp_seen < fight.boss_start_hp as i64
+                && obj_max_hp as i64 == fight.boss_max_hp as i64
+            {
+                fight.healed_hp = fight.healed_hp.saturating_add(new_hp - previous_hp);
+            }
+
             let max_hp = fight.boss_max_hp as i64;
             // Second-coming split, HP fallback for a culled taunt: the Marble
             // Colossus enters an invulnerable survival phase near 10% HP, then
@@ -2447,6 +2482,7 @@ impl CombatTracker {
                 last_activity: time_ms,
                 killed: false,
                 min_hp_seen: max_hp as i64,
+                healed_hp: 0,
                 local_char_id: self.local_char_id,
                 local_close_calls: 0,
                 attackers: HashMap::new(),
@@ -4209,6 +4245,7 @@ impl CombatTracker {
                 last_activity: time_ms,
                 killed: false,
                 min_hp_seen: start_hp as i64,
+                healed_hp: 0,
                 local_char_id: self.local_char_id,
                 local_close_calls: carried_close_calls,
                 attackers: HashMap::new(),
@@ -4273,6 +4310,7 @@ impl CombatTracker {
                 last_activity: time_ms,
                 killed: false,
                 min_hp_seen: 0,
+                healed_hp: 0,
                 local_char_id,
                 local_close_calls: 0,
                 attackers: HashMap::new(),
@@ -4571,21 +4609,23 @@ impl CombatTracker {
         // trimming so an over-full total is scaled with everyone else.
         let masked_is_local = self.reconcile_masked_local(&fight, &mut participants);
 
-        // Trim overkill: when the boss is killed, the sum of attributed damage
-        // must not exceed the HP it actually lost (its start HP). The final
-        // volley routinely lands several projectiles in the death tick that each
-        // roll full damage, overshooting the HP pool. Scale participant damage
-        // down proportionally so shares are preserved and the total matches the
-        // boss HP (exact for a solo kill). Only shrinks totals, never inflates,
-        // so it is a no-op for crowded fights where we saw less than the full HP.
+        // Trim only *plausible* death-tick overkill. The final volley routinely
+        // lands several projectiles in the death tick that each roll full damage,
+        // overshooting the HP pool; scaling those down keeps a normal kill at
+        // 100% without under-reporting anyone.
         //
-        // Moonlight Village mechanics bosses are exempt: they never lose HP (the
-        // run is scored by its clear, not by a death), so their nominal max HP is
-        // not the damage they absorbed. Capping there would truncate the party's
-        // real output, so raw damage is kept as-is and shares are later taken
-        // against the tracked total.
-        if fight.killed && !crate::assets::is_mv_boss(fight.boss_object_type) {
-            cap_overkill(&mut participants, fight.boss_start_hp as i64);
+        // Boss HP is not a safe cap in general. Bosses that heal, reset HP at a
+        // phase transition, or gate damage behind phase thresholds absorb far
+        // more than their starting pool, and the server still reports those hits.
+        // `effective_damage_pool` accounts for the first two by adding the HP the
+        // boss regained; the plausibility bound catches the third (and any other
+        // "the HP bar didn't tell the whole story" mechanic). Beyond the bound,
+        // the excess is not overkill, so the party's raw damage is kept and each
+        // player's share stays honest. This is one general policy, not a list of
+        // per-boss exceptions; it also covers Moonlight Village mechanics bosses,
+        // whose nominal max HP is never removed.
+        if fight.killed {
+            trim_plausible_overkill(&fight, &mut participants);
         }
 
         // Solo HP-gap reconciliation: in an effectively-solo, fully-observed kill,
@@ -5753,6 +5793,7 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
     dst.started_at = dst.started_at.min(src.started_at);
     dst.last_activity = dst.last_activity.max(src.last_activity);
     dst.min_hp_seen = dst.min_hp_seen.min(src.min_hp_seen);
+    dst.healed_hp = dst.healed_hp.saturating_add(src.healed_hp);
     dst.killed = dst.killed || src.killed;
     dst.joined_late = dst.joined_late || src.joined_late;
     dst.local_close_calls += src.local_close_calls;
@@ -5853,10 +5894,53 @@ fn drop_unresolved(participants: &mut Vec<FightParticipant>) {
     participants.retain(|p| !(p.provenance == DamageProvenance::Unresolved && !p.is_local));
 }
 
-/// Scale participant damage so the total does not exceed `cap` (the boss HP the
-/// fight removed). Preserves each participant's share and integer exactness
-/// (largest-remainder distribution). A no-op when the total is already within
-/// the cap, so it only ever removes overkill, never inflates undercounted fights.
+/// How far above the effective damage pool a raw total may sit before it stops
+/// looking like a final-volley overshoot. The death tick can add a whole volley
+/// (or several), but not multiples of the boss's pool. Past this bound the
+/// excess is healed/gated/absorbed damage that the HP bar never reflected, and
+/// proportionally scaling the party to the pool would under-report everyone.
+const OVERKILL_MAX_PLAUSIBLE_FACTOR: i64 = 2;
+
+/// Trim the final volley's overshoot when -- and only when -- the raw total is
+/// plausibly just overkill for the pool this fight actually removed.
+///
+/// This is the general gate for "boss HP is not the damage the boss absorbed":
+/// healers (the pool includes healed HP), phase HP resets, phase-gate caps, and
+/// invulnerable-finish/mechanics bosses (their pool is 0 because they never
+/// lost HP) all bypass the proportional cap. No boss identity is consulted.
+fn trim_plausible_overkill(fight: &FightState, participants: &mut [FightParticipant]) {
+    let pool = fight.effective_damage_pool();
+    if pool <= 0 {
+        return;
+    }
+    let raw_total = participants
+        .iter()
+        .fold(0i64, |sum, p| sum.saturating_add(p.damage.max(0)));
+    let plausible_bound = pool.saturating_mul(OVERKILL_MAX_PLAUSIBLE_FACTOR);
+    if raw_total <= plausible_bound {
+        cap_overkill(participants, pool);
+    } else {
+        // Not a death-tick overshoot: the boss absorbed/healed/gated damage the
+        // HP bar never reflected. Keep raw shares and leave a breadcrumb so
+        // affected encounters can be identified without a per-boss list.
+        tracing::debug!(
+            "[COMBAT] overkill cap skipped: type={} raw={} pool={} healed={} \
+             min_hp={} start_hp={}",
+            fight.boss_object_type,
+            raw_total,
+            pool,
+            fight.healed_hp,
+            fight.min_hp_seen,
+            fight.boss_start_hp
+        );
+    }
+}
+
+/// Scale participant damage so the total does not exceed `cap` (the effective
+/// damage pool the fight removed). Preserves each participant's share and
+/// integer exactness (largest-remainder distribution). A no-op when the total is
+/// already within the cap. Callers must only pass a plausible death-tick
+/// overshoot; see [`trim_plausible_overkill`].
 fn cap_overkill(participants: &mut [FightParticipant], cap: i64) {
     if cap <= 0 {
         return;
@@ -6310,6 +6394,7 @@ mod tests {
             last_activity: started_at,
             killed: false,
             min_hp_seen: 300_000,
+            healed_hp: 0,
             local_char_id: 42,
             local_close_calls,
             attackers: HashMap::new(),
@@ -6324,13 +6409,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_fight_into_sums_close_calls() {
+    fn merge_fight_into_sums_close_calls_and_healing() {
         // A wandering boss re-detected under a new segment must not drop the
-        // close calls recorded on either segment.
+        // close calls or healing recorded on either segment.
         let mut dst = fight_state(1, 100);
-        let src = fight_state(2, 200);
+        dst.healed_hp = 40;
+        let mut src = fight_state(2, 200);
+        src.healed_hp = 60;
         merge_fight_into(&mut dst, src);
         assert_eq!(dst.local_close_calls, 3);
+        assert_eq!(dst.healed_hp, 100);
     }
 
     #[test]
@@ -10305,6 +10393,54 @@ mod tests {
     }
 
     #[test]
+    fn healing_boss_damage_is_not_capped_to_starting_hp() {
+        // Track the real damage pool: start 100k, heal 30k back after damage,
+        // then kill. The party dealt 130k, which is exactly the pool -- without
+        // counting the heal it would look like 1.3x overkill and be trimmed.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 100_000), stat(StatType::HP, 100_000)],
+            ),
+            0,
+        );
+        fn hit(t: &mut CombatTracker, bullet: i16, base: i32, hp: i32, at: i64) {
+            t.pending_shots.insert(
+                bullet,
+                PendingShot {
+                    base_damage: base,
+                    armor_piercing: true,
+                    ..Default::default()
+                },
+            );
+            t.on_local_hit(500, bullet, 1000, 1000, at);
+            t.on_object_status(500, &status(500, vec![stat(StatType::HP, hp)]), at + 1);
+        }
+        hit(&mut t, 10, 60_000, 40_000, 10);
+        // Heal back to 70k: 30k of the pool above the starting HP.
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 70_000)]), 20);
+        assert_eq!(
+            t.fights.get(&500).expect("fight live").healed_hp,
+            30_000,
+            "upward HP delta after damage is tracked as healing"
+        );
+        hit(&mut t, 11, 60_000, 10_000, 30);
+        hit(&mut t, 12, 10_000, 0, 40);
+        let done = t.on_tick(40);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].total_damage(),
+            130_000,
+            "raw damage kept: start HP plus the tracked heal"
+        );
+    }
+
+    #[test]
     fn mv_boss_damage_is_not_capped_to_nominal_hp() {
         // Moonlight Village mechanics bosses floor invulnerable -- their nominal
         // max HP is not the damage they absorbed -- so the party's raw damage must
@@ -10640,6 +10776,76 @@ mod tests {
         cap_overkill(&mut ps, 100_000);
         assert_eq!(ps[0].damage, 3000);
         assert_eq!(ps[1].damage, 2000);
+    }
+
+    #[test]
+    fn effective_pool_adds_healed_hp_after_damage() {
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        fight.healed_hp = 60_000;
+        assert_eq!(fight.effective_damage_pool(), 360_000);
+    }
+
+    #[test]
+    fn effective_pool_is_zero_when_boss_never_lost_hp() {
+        // Nominal max HP is not a damage pool if no HP was removed.
+        let fight = fight_state(0, 0);
+        assert_eq!(fight.effective_damage_pool(), 0);
+    }
+
+    #[test]
+    fn healing_pool_is_not_treated_as_overkill() {
+        // Start 300k + 60k healed: the party's 360k is exactly the pool.
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        fight.healed_hp = 60_000;
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 300_000;
+        ps[1].damage = 60_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 300_000);
+        assert_eq!(ps[1].damage, 60_000);
+    }
+
+    #[test]
+    fn gated_damage_is_not_proportionally_capped() {
+        // HP 300k but 900k recorded: phase-gated/absorbed damage, not a
+        // final-volley overshoot. Every player keeps their real share.
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 600_000;
+        ps[1].damage = 300_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 600_000);
+        assert_eq!(ps[1].damage, 300_000);
+    }
+
+    #[test]
+    fn plausible_death_tick_overkill_is_still_trimmed() {
+        // 330k raw against a 300k pool is a plausible last-volley overshoot.
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 220_000;
+        ps[1].damage = 110_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 200_000);
+        assert_eq!(ps[1].damage, 100_000);
+        assert_eq!(ps.iter().map(|p| p.damage).sum::<i64>(), 300_000);
+    }
+
+    #[test]
+    fn boss_that_never_lost_hp_is_not_capped() {
+        // General form of the Moonlight Village case, with no boss identity
+        // check: a nominal pool is meaningless when no HP was removed.
+        let fight = fight_state(0, 0);
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 300_000;
+        ps[1].damage = 150_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 300_000);
+        assert_eq!(ps[1].damage, 150_000);
     }
 
     #[test]

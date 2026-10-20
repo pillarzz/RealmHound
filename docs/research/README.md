@@ -1,5 +1,11 @@
 # Research documents
 
+## Combat History accounting design
+
+- `combat-history-design.md` — how fight totals, percentages, the boss HP bar,
+  rescaling/healing, overkill, invulnerability, solo diagnostics, and the
+  Marble Colossus / Moonlight Village special cases are defined.
+
 ## Player damage sources: implementation status
 
 - `damage-sources-status.md` — source of truth; GitHub also renders it as Markdown.

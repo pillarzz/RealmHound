@@ -45,20 +45,6 @@ const CARD_HEIGHT: f32 = 52.0;
 /// excluded since guard damage is only tracked on the main O3 body.
 const O3_BOSS_TYPE: i32 = 45363;
 
-/// Boss starting HP a fight's damage shares reconcile against, or 0 when the HP
-/// is not a real damage pool. Moonlight Village mechanics bosses floor
-/// invulnerable and are cleared by the run's own completion instead of a death,
-/// so their nominal max HP is never removed; a 0 pool makes the participant
-/// table show each player's raw share of the tracked total rather than a
-/// fraction of that fake pool (and suppresses the "Unattributed" HP-gap row).
-fn share_hp_pool(boss_object_type: i32, boss_start_hp: i32) -> i64 {
-    if is_mv_boss(boss_object_type) {
-        0
-    } else {
-        boss_start_hp as i64
-    }
-}
-
 /// The overlaid text on a boss HP bar. An uncapped boss (Moonlight Village
 /// mechanics boss) has no finite pool, so it reads `<party damage> / ∞`;
 /// ordinary bosses read `<start HP> / <max HP>`, or nothing when no HP was ever
@@ -3179,8 +3165,6 @@ impl CombatHistoryPanel {
                 ctx,
                 &fight.participants,
                 "combat_detail_table",
-                share_hp_pool(fight.boss_object_type, fight.boss_start_hp),
-                fight.killed,
                 !fight.killed,
                 fight.boss_object_type == O3_BOSS_TYPE,
                 &mut player_click,
@@ -4445,7 +4429,9 @@ impl CombatHistoryPanel {
              mechanic -- so its HP is effectively infinite. The number shown is \
              the total damage dealt by the party."
         } else {
-            "Boss's HP at the start of the fight / Boss's max HP registered during the fight"
+            "Boss's HP when the fight was registered / the max HP adopted for the \
+             fight. The max follows pre-damage rescaling (e.g. player-count \
+             scaling); once real damage lands the pool is frozen."
         });
 
         bar_inset
@@ -4459,27 +4445,16 @@ impl CombatHistoryPanel {
         ctx: &mut PanelContext,
         participants: &[ParticipantRecord],
         salt: &str,
-        boss_hp: i64,
-        killed: bool,
         local_escaped: bool,
         show_guarded: bool,
         player_click: &mut Option<(String, i32, u32, u32)>,
     ) -> f32 {
         let attributed: i64 = participants.iter().map(|p| p.damage).sum();
-        // On a kill the core trims plausible death-tick overkill, so participant
-        // damage sums to the HP the boss actually lost; any residual is damage we
-        // saw the boss lose but couldn't attribute. A boss that healed, reset, or
-        // gated damage can legitimately have a raw total above its starting HP --
-        // the core deliberately keeps that raw damage rather than scaling the
-        // party down. Those fights are shown against the tracked total instead,
-        // so the table never shows >100% of a pool that isn't the real one.
-        let reconcile = killed && boss_hp > 0 && attributed <= boss_hp;
-        let unattributed = if reconcile {
-            (boss_hp - attributed).max(0)
-        } else {
-            0
-        };
-        let grand_total = attributed + unattributed;
+        // Shares are taken against the damage we tracked, never against boss HP.
+        // Boss HP is not a reliable damage denominator: it rescales with the
+        // player count and it can be healed, reset, or gated by the encounter.
+        // Reconciling to it would invent "damage" nobody dealt -- for example,
+        // HP the game removes when players leave and the boss downscales.
         let total_hits: i64 = participants.iter().map(|p| p.hits).sum();
         let total_taken: Option<i64> = {
             let vals: Vec<i64> = participants.iter().filter_map(|p| p.damage_taken).collect();
@@ -4529,8 +4504,8 @@ impl CombatHistoryPanel {
         } else {
             None
         };
-        // Denominator for the "%" column: boss HP on a kill, else tracked total.
-        let pct_base = if reconcile { grand_total } else { attributed };
+        // Denominator for the "%" column: the tracked total, always.
+        let pct_base = attributed;
         let denom = pct_base.max(1);
 
         let mut col1_x: f32 = ui.min_rect().left();
@@ -4547,22 +4522,14 @@ impl CombatHistoryPanel {
                 col1_x = ui.label(RichText::new("Teammates").strong()).rect.left();
                 if self.show_dmg {
                     ui.label(RichText::new("Raw DMG").strong());
-                    let (pct_header, pct_hover) = if reconcile {
-                        (
-                            "% of boss HP",
-                            "Share of the boss's starting HP. Players plus \
-                             Unattributed sum to 100% because damage is capped \
-                             at boss HP (overkill excluded).",
-                        )
-                    } else {
-                        (
-                            "% of tracked dmg",
+                    ui.label(RichText::new("% of tracked dmg").strong())
+                        .hover_tip(
                             "Share of damage tracked by RealmHound, not absolute \
-                             raid DPS (visibility gaps exist).",
-                        )
-                    };
-                    ui.label(RichText::new(pct_header).strong())
-                        .hover_tip(pct_hover);
+                             raid DPS (visibility gaps exist). Boss HP is not used \
+                             as the denominator because it rescales with the \
+                             player count and can be healed, reset, or gated by \
+                             the fight.",
+                        );
                 }
                 if self.show_hits {
                     ui.label(RichText::new("Hits landed").strong()).hover_tip(
@@ -4937,58 +4904,22 @@ impl CombatHistoryPanel {
                         .set(bg_idx, egui::Shape::rect_filled(band, 4.0, fill));
                 }
 
-                // Footer: reconcile the damage columns to the boss HP so it's
-                // clear RealmHound caps at HP (excludes overkill) rather than
-                // arbitrarily lowering numbers.
+                // Footer: the total is the tracked damage, never a reconciled
+                // boss-HP figure. Boss HP is not a damage denominator.
                 if self.show_dmg {
-                    if reconcile && unattributed > 0 {
-                        ui.label("");
-                        ui.label(RichText::new("Unattributed").italics().color(Color32::GRAY))
-                            .hover_tip(
-                                "Boss HP that was removed but couldn't be attributed \
-                             to an observed player (out-of-range or untracked \
-                             sources).",
-                            );
-                        ui.label(RichText::new(format!("{}", unattributed)).color(Color32::GRAY));
-                        let pct = (unattributed as f64 / denom as f64) * 100.0;
-                        ui.label(RichText::new(format!("{:.1}%", pct)).color(Color32::GRAY));
-                        if self.show_hits {
-                            ui.label("");
-                        }
-                        if self.show_damage_taken {
-                            ui.label("");
-                        }
-                        if self.show_hits_taken {
-                            ui.label("");
-                        }
-                        if self.show_damage_blocked {
-                            ui.label("");
-                        }
-                        if show_guarded {
-                            ui.label("");
-                        }
-                        ui.label("");
-                        ui.label("");
-                        ui.end_row();
-                    }
-
                     ui.label("");
                     ui.label(RichText::new("Total").strong());
-                    ui.label(RichText::new(format!("{}", grand_total)).strong());
+                    ui.label(RichText::new(format!("{}", attributed)).strong());
                     let pct_label = if pct_base > 0 {
-                        format!("{:.1}%", (grand_total as f64 / denom as f64) * 100.0)
+                        "100.0%".to_string()
                     } else {
                         "-".to_string()
                     };
-                    let total_tip = if reconcile {
-                        "Damage is capped at the boss's HP; overkill beyond its \
-                         HP isn't counted. Players plus Unattributed reconcile to \
-                         the boss's starting HP."
-                    } else {
-                        "Sum of tracked damage across the shown players."
-                    };
-                    ui.label(RichText::new(pct_label).strong())
-                        .hover_tip(total_tip);
+                    ui.label(RichText::new(pct_label).strong()).hover_tip(
+                        "Sum of tracked damage across the shown players. Not \
+                         reconciled to boss HP: rescaling, healing, and damage \
+                         gating make boss HP an unreliable damage denominator.",
+                    );
                     if self.show_hits {
                         ui.label(RichText::new(format!("{}", total_hits)).strong());
                     }
@@ -5577,8 +5508,6 @@ impl CombatHistoryPanel {
                         ctx,
                         &phase.participants,
                         &format!("phase_table_{}", phase.id),
-                        share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
-                        phase.killed,
                         // Scope the "you left" nexus marker to escaped *sections*
                         // of an escaped run: a completed mini-boss like Beisa
                         // must not read as nexused just because O3 was escaped,
@@ -5683,7 +5612,7 @@ mod tests {
     use super::{
         assign_drops_exclusive, boost_source_with, boss_bar_label, boss_row_hp_label,
         boss_row_stats_parts, condensed_boosts, dungeon_display_name, fight_ritual_id,
-        share_hp_pool, spirit_total_label, BoostIcon, RunModes, SourceOracle,
+        spirit_total_label, BoostIcon, RunModes, SourceOracle,
     };
     use realmhound_core::assets::get_dungeon_portal_map;
     use realmhound_core::combat::BoostWindow;
@@ -6166,17 +6095,6 @@ mod tests {
             dungeon_display_name(portal_map, "The Shatters", modes(true, true, true)),
             "The Shatters (Leisure, Petless, HM)"
         );
-    }
-
-    #[test]
-    fn mv_bosses_share_against_tracked_total() {
-        // Moonlight Village mechanics bosses have no real HP pool: the share
-        // denominator is 0 so the table uses the tracked total, not the boss HP.
-        for boss in [20450, 20451, 20452, 20493] {
-            assert_eq!(share_hp_pool(boss, 720_000), 0);
-        }
-        // Ordinary bosses keep reconciling against their starting HP.
-        assert_eq!(share_hp_pool(0x10E4, 12_000), 12_000);
     }
 
     #[test]

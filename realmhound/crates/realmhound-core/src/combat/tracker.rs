@@ -1133,7 +1133,14 @@ struct FightState {
     boss_object_type: i32,
     /// The stable damage destination this fight owns (see [`FightDestination`]).
     destination: FightDestination,
+    /// The boss's max HP adopted for this fight. Before any real damage is
+    /// recorded it follows the authoritative rescale (dungeon player-count
+    /// scaling), so observers who loaded at different times agree on the pool;
+    /// once positive damage lands it is frozen.
     boss_max_hp: i32,
+    /// The HP pool the fight started with: the boss's HP when the fight was
+    /// registered, or the last pre-damage rescaled max. The overkill cap uses
+    /// this plus `healed_hp`.
     boss_start_hp: i32,
     started_at: i64,
     last_activity: i64,
@@ -2129,25 +2136,50 @@ impl CombatTracker {
             fight.last_activity = time_ms;
             fight.min_hp_seen = fight.min_hp_seen.min(new_hp);
 
-            // Post-survival second coming: the boss heals to full, and its max HP
-            // may have rescaled while the survival phase ran (players died /
-            // nexused, so dungeon HP-scaling readjusted). Read the authoritative
-            // current max from the status packet and keep the segment's pool
-            // pinned to that full value until the rage phase takes real damage,
-            // then freeze it. This makes the post card's denominator match the
-            // true rescaled pool even though the split fired before the heal
-            // completed (taunt) or below the peak (HP fallback).
-            if fight.segment_label == Some("Post-survival") && obj_max_hp > 0 {
-                // Freeze on the first *positive* damage only. The boss is
-                // Invulnerable while it heals, so any local shots that land
-                // during the revive resolve to 0 damage (they still register as
-                // hits) -- gating on hits would freeze a stale, pre-rescale pool
-                // before the authoritative rescaled MaxHP packet arrives.
-                let damage_started = fight.attackers.values().any(|a| a.damage > 0);
-                if !damage_started {
-                    fight.boss_max_hp = obj_max_hp;
-                    fight.boss_start_hp = obj_max_hp;
-                }
+            // Keep the fight's damage pool aligned with the boss's authoritative
+            // HP until this observer records real damage. Dungeon bosses rescale
+            // as players load in or leave, and the local observer may register
+            // the fight at an earlier scale or arrive after it has already been
+            // damaged. Freezing the first-seen numbers would make two observers
+            // of the same kill show different pools (and would let the card
+            // reconcile to HP the game removed by downscaling). While no
+            // positive damage is recorded, the pool follows the current HP and
+            // the authoritative max; a MaxHP-only packet that catches the boss
+            // at its old full pool adopts the new full max immediately.
+            //
+            // Pre-survival is skipped: its own heal-back split owns the rescaled
+            // revive pool. Post-survival pins the full rescaled max while the
+            // boss revives. Near-zero HP is death/reconciliation territory, not
+            // a new pool.
+            //
+            // Freeze on the first *positive* damage. Invulnerable-phase shots
+            // resolve to 0 damage (they may still register as hits), so gating
+            // on hits would freeze a stale, pre-rescale pool.
+            let no_damage_recorded = !fight.attackers.values().any(|a| a.damage > 0);
+            let near_zero = new_hp <= obj_max_hp as i64 / 100;
+            let is_pre_survival = fight.segment_label == Some("Pre-survival");
+            if obj_max_hp > 0 && no_damage_recorded && !near_zero && !is_pre_survival {
+                let max_changed = obj_max_hp as i64 != fight.boss_max_hp as i64;
+                let has_max_hp_stat = status
+                    .stats
+                    .iter()
+                    .any(|s| s.stat_type_id == StatType::MaxHP as u8);
+                // A MaxHP-only packet can arrive before the matching HP packet.
+                // If the boss was at its old full pool and this packet did not
+                // report HP loss, the new full max is the new pool.
+                let was_full_old_pool = has_max_hp_stat
+                    && max_changed
+                    && previous_hp > 0
+                    && previous_hp >= fight.boss_max_hp as i64
+                    && new_hp >= previous_hp;
+                let start = if fight.segment_label == Some("Post-survival") || was_full_old_pool {
+                    obj_max_hp as i64
+                } else {
+                    new_hp
+                };
+                fight.boss_max_hp = obj_max_hp;
+                fight.boss_start_hp = start as i32;
+                fight.min_hp_seen = start;
             }
 
             // Track HP the boss regained after it had already been damaged. This
@@ -4624,7 +4656,7 @@ impl CombatTracker {
         // player's share stays honest. This is one general policy, not a list of
         // per-boss exceptions; it also covers Moonlight Village mechanics bosses,
         // whose nominal max HP is never removed.
-        if fight.killed && !crate::assets::is_mv_boss(fight.boss_object_type) {
+        if fight.killed {
             trim_plausible_overkill(&fight, &mut participants);
         }
 
@@ -5905,11 +5937,9 @@ const OVERKILL_MAX_PLAUSIBLE_FACTOR: i64 = 2;
 /// plausibly just overkill for the pool this fight actually removed.
 ///
 /// This is the general gate for "boss HP is not the damage the boss absorbed":
-/// healers (the pool includes healed HP), phase HP resets, and phase-gate caps
-/// all bypass the proportional cap. Moonlight Village mechanics bosses are
-/// excluded at the call site instead: their fight is scored by completion, not
-/// HP depletion, so their nominal HP is not a damage pool even if an HP dip is
-/// observed.
+/// healers (the pool includes healed HP), phase HP resets, phase-gate caps, and
+/// invulnerable-finish/mechanics bosses (their pool is 0 because they never
+/// lost HP) all bypass the proportional cap. No boss identity is consulted.
 fn trim_plausible_overkill(fight: &FightState, participants: &mut [FightParticipant]) {
     let pool = fight.effective_damage_pool();
     if pool <= 0 {
@@ -10443,6 +10473,155 @@ mod tests {
     }
 
     #[test]
+    fn pre_damage_max_hp_rescale_adopts_the_new_pool() {
+        // Royal Cnidarian-style: the local player registers the fight while the
+        // boss is invulnerable at a smaller player-scaled pool, then more players
+        // load in and the boss rescales before any real damage lands. Both
+        // observers should end up with the same pool instead of freezing the
+        // first-seen max.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Cnidarian Reef", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 120_000),
+                    stat(StatType::HP, 120_000),
+                    stat(StatType::Condition, COND_INVULNERABLE),
+                ],
+            ),
+            0,
+        );
+        // An invulnerable-phase shot creates the fight but records no damage.
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 10_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        let fight = t.fights.get(&500).expect("fight created by the shot");
+        assert_eq!((fight.boss_max_hp, fight.boss_start_hp), (120_000, 120_000));
+        assert!(fight.attackers.values().all(|a| a.damage == 0));
+
+        // More players load in: the boss rescales to the full group pool. The
+        // MaxHP packet can arrive before the matching HP update.
+        t.on_object_status(
+            500,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::Condition, 0)],
+            ),
+            20,
+        );
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 300_000)]), 21);
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.boss_max_hp, 300_000, "adopts the rescaled max");
+        assert_eq!(fight.boss_start_hp, 300_000, "adopts the rescaled pool");
+        assert_eq!(
+            fight.min_hp_seen, 300_000,
+            "the rescale is not mistaken for damage already dealt"
+        );
+
+        // The real fight kills the rescaled pool.
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 300_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 11, 1000, 1000, 30);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 40);
+        let done = t.on_tick(40);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].total_damage(),
+            300_000,
+            "caps against the rescaled pool"
+        );
+    }
+
+    #[test]
+    fn late_arrival_pool_follows_the_rescaled_current_hp() {
+        // The local player arrives when the boss is already at half HP, then the
+        // pool rescales with their arrival. The card should start from the
+        // scaled current HP, not the pre-arrival numbers.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Some Dungeon", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 1_000_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Condition, COND_INVULNERABLE),
+                ],
+            ),
+            0,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 10_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        let fight = t.fights.get(&500).expect("fight created");
+        assert_eq!(
+            (fight.boss_max_hp, fight.boss_start_hp),
+            (1_000_000, 500_000)
+        );
+
+        // The arrival scales the boss to 2M max at 50% (1M current).
+        t.on_object_status(
+            500,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 2_000_000),
+                    stat(StatType::HP, 1_000_000),
+                ],
+            ),
+            20,
+        );
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.boss_max_hp, 2_000_000);
+        assert_eq!(fight.boss_start_hp, 1_000_000);
+        assert_eq!(fight.min_hp_seen, 1_000_000);
+
+        // A later downscale maps the current HP to the smaller pool too.
+        t.on_object_status(
+            500,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 1_000_000),
+                    stat(StatType::HP, 500_000),
+                ],
+            ),
+            30,
+        );
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(
+            (fight.boss_max_hp, fight.boss_start_hp),
+            (1_000_000, 500_000)
+        );
+        assert_eq!(fight.min_hp_seen, 500_000);
+    }
+
+    #[test]
     fn mv_boss_damage_is_not_capped_to_nominal_hp() {
         // Moonlight Village mechanics bosses floor invulnerable -- their nominal
         // max HP is not the damage they absorbed -- so the party's raw damage must
@@ -10480,73 +10659,6 @@ mod tests {
             done[0].total_damage(),
             450_000,
             "raw damage kept, not capped to the nominal 180000 HP"
-        );
-    }
-
-    #[test]
-    fn mv_boss_hp_dip_does_not_reintroduce_hp_capping() {
-        // MV bosses are scored by completion, not HP depletion. Even if the
-        // observed HP dips below its start, the nominal pool must not cap the
-        // party -- including the "slightly over max HP" range that would pass
-        // the plausibility bound for an ordinary HP boss.
-        let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
-        t.on_player_loaded(1000, 42);
-        t.on_object_spawn(
-            500,
-            20450,
-            &status(
-                500,
-                vec![
-                    stat(StatType::MaxHP, 180_000),
-                    stat(StatType::HP, 180_000),
-                    stat(StatType::Condition, COND_INVULNERABLE),
-                ],
-            ),
-            100,
-        );
-        // An invulnerable shot creates the fight at the nominal 180k pool
-        // without recording damage.
-        t.pending_shots.insert(
-            10,
-            PendingShot {
-                base_damage: 1_000,
-                armor_piercing: true,
-                ..Default::default()
-            },
-        );
-        t.on_local_hit(500, 10, 1000, 1000, 110);
-        assert_eq!(
-            t.fights.get(&500).expect("fight live").boss_start_hp,
-            180_000
-        );
-        // An observed HP dip would make `effective_damage_pool` non-zero.
-        t.on_object_status(
-            500,
-            &status(
-                500,
-                vec![stat(StatType::HP, 120_000), stat(StatType::Condition, 0)],
-            ),
-            120,
-        );
-        // 200k is only 1.11x the nominal 180k pool -- within the 2x
-        // plausibility bound, so an ordinary boss would be capped to 180k.
-        t.pending_shots.insert(
-            11,
-            PendingShot {
-                base_damage: 200_000,
-                armor_piercing: true,
-                ..Default::default()
-            },
-        );
-        t.on_local_hit(500, 11, 1000, 1000, 130);
-        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
-        assert_eq!(done.len(), 1);
-        assert!(done[0].killed);
-        assert_eq!(
-            done[0].total_damage(),
-            200_000,
-            "MV damage stays raw even after an HP dip"
         );
     }
 

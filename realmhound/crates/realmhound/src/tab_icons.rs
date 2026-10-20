@@ -25,6 +25,11 @@ pub enum TabIconSprite {
     SheetIndex(&'static str, i32),
     /// Use embedded PNG icon
     Embedded(EmbeddedIcon),
+    /// Like [`TabIconSprite::Embedded`] but the PNG is scaled (fractionally,
+    /// preserving aspect ratio) to fill the icon box. Use for embedded art
+    /// whose native size would otherwise floor to a smaller integer scale than
+    /// the atlas icons next to it.
+    EmbeddedFilled(EmbeddedIcon),
     /// Draw a player's own character as the icon (the equipped skin when there
     /// is one, else the class sprite), dyed like the character's roster row.
     Character {
@@ -70,7 +75,7 @@ pub fn get_character_avatar_icon(
 /// Each tab has an associated sprite from the game assets:
 /// - Live Feed: Nexus Crystal (embedded PNG, not in the atlas)
 /// - Loot History: White Bag (object 1292)
-/// - Party: Valentine's Candy Heart (lofiObj:818)
+/// - Party: embedded Party.png, upscaled to fill the icon box
 /// - Vault: Vault Portal (object 1824)
 /// - Quests: Daily Quest Portal (object 5974)
 /// - Characters: Char Slot Unlocker (lofiObj3:0x5a0)
@@ -81,7 +86,7 @@ pub fn get_tab_icon(tab: ActiveTab) -> TabIconSprite {
         ActiveTab::LiveFeed => TabIconSprite::Embedded(EmbeddedIcon::NexusCrystal), // Nexus Crystal
         ActiveTab::LootHistory => TabIconSprite::ObjectId(1292),                    // White Bag
         ActiveTab::TrophyHall => TabIconSprite::ObjectId(25991), // Abyssal Trophy
-        ActiveTab::Party => TabIconSprite::Embedded(EmbeddedIcon::Party), // Party.png
+        ActiveTab::Party => TabIconSprite::EmbeddedFilled(EmbeddedIcon::Party), // Party.png
         ActiveTab::Vault => TabIconSprite::ObjectId(1824),       // Vault Portal
         ActiveTab::Quests => TabIconSprite::ObjectId(5974),      // Daily Quest Portal
         ActiveTab::Characters => TabIconSprite::ObjectId(810),   // Char Slot Unlocker

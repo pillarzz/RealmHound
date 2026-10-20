@@ -748,6 +748,9 @@ pub struct RealmHoundApp {
     /// keyed by section prefix ("veteran"/"adept"/"seasonal").
     event_pickers:
         std::collections::HashMap<&'static str, crate::realm_event_sound::EventPickerState>,
+    /// Expanded custom-chat trigger alert in Settings -> Sound. UI-only; at most
+    /// one alert is expanded so the list stays compact.
+    expanded_chat_alert: Option<u32>,
     /// User settings (shared, thread-safe)
     settings: Arc<RwLock<Settings>>,
     /// Modal/dialog visibility state
@@ -1233,6 +1236,7 @@ impl RealmHoundApp {
             event_session: GameSession::new(),
             sprite_renderer: SpriteRenderer::new(),
             event_pickers: std::collections::HashMap::new(),
+            expanded_chat_alert: None,
             settings: settings.clone(),
             modals: ModalState::new(),
             update_checker: UpdateChecker::new(),
@@ -5292,29 +5296,44 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
-                        .switch(ui, &mut current_settings.custom_chat, "Custom chat")
-                        .hover_tip(
-                            "Plays when any chat message contains one of the trigger \
-                             variants configured below. Whole words only: a trigger of \
-                             \"abyss\" does not play for \"abyssal\".",
-                        )
-                        .changed();
-                    ui.label("");
-                    ui.label("");
-                    ui.label("");
-                    ui.label("");
-                    ui.end_row();
-
-                    settings_changed |= shadcn
                         .switch(ui, &mut current_settings.trade, "Trade request")
                         .hover_tip("Plays when another player sends you a trade request.")
                         .changed();
                     settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::Trade, current_settings);
                     ui.end_row();
                 });
+        });
 
-            ui.add_space(8.0);
-            ui.label(RichText::new("Custom chat trigger alerts").strong());
+        ui.add_space(12.0);
+
+        // Custom chat trigger alerts. The master toggle gates a list of
+        // independently named trigger groups, each with its own sound.
+        shadcn.card(ui, "snd_custom_chat_alerts", "Custom chat alerts", |ui| {
+            ui.horizontal(|ui| {
+                settings_changed |= shadcn
+                    .switch(ui, &mut current_settings.custom_chat, "Custom chat")
+                    .hover_tip(
+                        "Plays when any chat message contains one of the trigger \
+                             variants configured below. Whole words only: a trigger of \
+                             \"abyss\" does not play for \"abyssal\".",
+                    )
+                    .changed();
+                ui.label(
+                    RichText::new(format!(
+                        "{}/{} enabled",
+                        current_settings.custom_chat_alerts.len(),
+                        realmhound_core::chat_ping::CUSTOM_CHAT_ALERTS_MAX
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+
+            if !current_settings.custom_chat {
+                return;
+            }
+
+            ui.add_space(6.0);
             ui.label(
                 RichText::new(
                     "Comma-separated whole words. 50 characters per variant, \
@@ -5325,63 +5344,64 @@ impl RealmHoundApp {
             );
 
             let mut remove_alert: Option<usize> = None;
-            egui::Grid::new("custom_chat_alerts_grid")
-                .num_columns(3)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    for idx in 0..current_settings.custom_chat_alerts.len() {
-                        let (id, key) = {
-                            let alert = &current_settings.custom_chat_alerts[idx];
-                            (alert.id, alert.sound_key())
-                        };
+            for idx in 0..current_settings.custom_chat_alerts.len() {
+                let (id, key, display_name) = {
+                    let alert = &current_settings.custom_chat_alerts[idx];
+                    let display_name = if alert.name.trim().is_empty() {
+                        format!("Alert {}", idx + 1)
+                    } else {
+                        alert.name.trim().to_string()
+                    };
+                    (alert.id, alert.sound_key(), display_name)
+                };
+                let expanded = self.expanded_chat_alert == Some(id);
 
-                        let mut words_changed = false;
-                        let mut words_lost_focus = false;
-                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                        egui::ScrollArea::vertical()
-                            .id_salt(("custom_chat_words", id))
-                            .max_height(row_height * 3.0 + 8.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.set_width(150.0);
-                                let resp = ui.add(
-                                    egui::TextEdit::multiline(
-                                        &mut current_settings.custom_chat_alerts[idx].words,
-                                    )
-                                    .id_source(("custom_chat_words_edit", id))
-                                    .desired_width(150.0)
-                                    .desired_rows(1)
-                                    .hint_text("abyss, abby, aby"),
-                                );
-                                words_changed = resp.changed();
-                                words_lost_focus = resp.lost_focus();
-                            });
-                        if words_changed {
-                            if current_settings.custom_chat_alerts[idx]
-                                .words
-                                .chars()
-                                .count()
-                                > realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_TOTAL_MAX
-                            {
-                                current_settings.custom_chat_alerts[idx].words =
-                                    current_settings.custom_chat_alerts[idx]
-                                        .words
-                                        .chars()
-                                        .take(
-                                            realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_TOTAL_MAX,
-                                        )
-                                        .collect();
-                            }
-                            settings_changed = true;
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let mut toggle = false;
+                    let mut name_changed = false;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_sized(
+                                egui::vec2(18.0, 20.0),
+                                egui::Button::new(
+                                    RichText::new(if expanded { "▼" } else { "▶" }).strong(),
+                                )
+                                .frame(false),
+                            )
+                            .hover_tip(if expanded {
+                                "Collapse alert"
+                            } else {
+                                "Expand alert"
+                            })
+                            .clicked()
+                        {
+                            toggle = true;
                         }
-                        if words_lost_focus {
-                            let normalized = realmhound_core::chat_ping::normalize_trigger_words(
-                                &current_settings.custom_chat_alerts[idx].words,
-                            );
-                            if normalized != current_settings.custom_chat_alerts[idx].words {
-                                current_settings.custom_chat_alerts[idx].words = normalized;
-                                settings_changed = true;
-                            }
+                        if expanded {
+                            name_changed = ui
+                                .add_sized(
+                                    egui::vec2(120.0, 20.0),
+                                    egui::TextEdit::singleline(
+                                        &mut current_settings.custom_chat_alerts[idx].name,
+                                    )
+                                    .id_source(("custom_chat_name", id))
+                                    .char_limit(20)
+                                    .desired_width(120.0)
+                                    .hint_text("Alert name"),
+                                )
+                                .changed();
+                        } else if ui
+                            .add_sized(
+                                egui::vec2(120.0, 20.0),
+                                egui::Label::new(RichText::new(display_name).strong())
+                                    .truncate()
+                                    .halign(egui::Align::LEFT)
+                                    .sense(egui::Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            toggle = true;
                         }
 
                         settings_changed |= self.render_custom_chat_alert_controls(
@@ -5397,14 +5417,86 @@ impl RealmHoundApp {
                         {
                             remove_alert = Some(idx);
                         }
-                        ui.end_row();
+                    });
+                    settings_changed |= name_changed;
+
+                    if toggle {
+                        self.expanded_chat_alert = if expanded { None } else { Some(id) };
+                    }
+
+                    if expanded {
+                        ui.add_space(4.0);
+                        let width = ui.available_width();
+                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                        let mut words_changed = false;
+                        let mut words_lost_focus = false;
+                        egui::ScrollArea::vertical()
+                            .id_salt(("custom_chat_words", id))
+                            .max_height(row_height * 3.0 + 10.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.set_width(width);
+                                let resp = ui.add(
+                                    egui::TextEdit::multiline(
+                                        &mut current_settings.custom_chat_alerts[idx].words,
+                                    )
+                                    .id_source(("custom_chat_words_edit", id))
+                                    .desired_width(width)
+                                    .desired_rows(3)
+                                    .hint_text("abyss, abby, aby"),
+                                );
+                                words_changed = resp.changed();
+                                words_lost_focus = resp.lost_focus();
+                            });
+                        if words_changed {
+                            if current_settings.custom_chat_alerts[idx]
+                                .words
+                                .chars()
+                                .count()
+                                > realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_TOTAL_MAX
+                            {
+                                current_settings.custom_chat_alerts[idx].words = current_settings
+                                    .custom_chat_alerts[idx]
+                                    .words
+                                    .chars()
+                                    .take(realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_TOTAL_MAX)
+                                    .collect();
+                            }
+                            settings_changed = true;
+                        }
+                        if words_lost_focus {
+                            let normalized = realmhound_core::chat_ping::normalize_trigger_words(
+                                &current_settings.custom_chat_alerts[idx].words,
+                            );
+                            if normalized != current_settings.custom_chat_alerts[idx].words {
+                                current_settings.custom_chat_alerts[idx].words = normalized;
+                                settings_changed = true;
+                            }
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "{} / {} characters",
+                                current_settings.custom_chat_alerts[idx]
+                                    .words
+                                    .chars()
+                                    .count(),
+                                realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_TOTAL_MAX
+                            ))
+                            .small()
+                            .weak(),
+                        );
                     }
                 });
+                ui.add_space(4.0);
+            }
 
             if let Some(idx) = remove_alert {
                 if idx < current_settings.custom_chat_alerts.len() {
                     let alert = current_settings.custom_chat_alerts.remove(idx);
                     let key = alert.sound_key();
+                    if self.expanded_chat_alert == Some(alert.id) {
+                        self.expanded_chat_alert = None;
+                    }
                     if let Some(file) = current_settings.custom_sounds.remove(&key) {
                         if let Some(dir) = custom_sounds_dir() {
                             let _ = fs::remove_file(dir.join(file));
@@ -5421,7 +5513,7 @@ impl RealmHoundApp {
                     < realmhound_core::chat_ping::CUSTOM_CHAT_ALERTS_MAX
                 {
                     if shadcn
-                        .button_sm(ui, "＋ Add trigger alert")
+                        .button_sm(ui, "+ Add trigger alert")
                         .hover_tip("Add another trigger word and sound")
                         .clicked()
                     {
@@ -5440,8 +5532,10 @@ impl RealmHoundApp {
                             realmhound_core::settings::ChatTriggerAlert {
                                 id: next_id,
                                 words: String::new(),
+                                name: String::new(),
                             },
                         );
+                        self.expanded_chat_alert = Some(next_id);
                         settings_changed = true;
                     }
                 } else {
@@ -5451,15 +5545,6 @@ impl RealmHoundApp {
                             .weak(),
                     );
                 }
-                ui.label(
-                    RichText::new(format!(
-                        "{}/{}",
-                        current_settings.custom_chat_alerts.len(),
-                        realmhound_core::chat_ping::CUSTOM_CHAT_ALERTS_MAX
-                    ))
-                    .small()
-                    .weak(),
-                );
             });
         });
 

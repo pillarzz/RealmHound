@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Current settings file version for migration support.
-const SETTINGS_VERSION: u32 = 8;
+const SETTINGS_VERSION: u32 = 9;
 
 /// Rename an unparseable data file to a timestamped `.corrupt-<ts>.bak` sibling
 /// so a single bad field can't silently wipe the user's data on the next save.
@@ -2137,6 +2137,9 @@ pub struct ChatTriggerAlert {
     /// Comma-separated trigger variants.
     #[serde(default)]
     pub words: String,
+    /// Optional user-visible group name shown in the collapsed header.
+    #[serde(default)]
+    pub name: String,
 }
 
 impl ChatTriggerAlert {
@@ -2575,14 +2578,24 @@ impl SoundSettings {
             .insert(key.to_string(), volume.clamp(0.0, 1.0));
     }
 
-    /// Move the legacy single trigger word into `custom_chat_alerts`.
+    /// Move the legacy single trigger word into `custom_chat_alerts` and align
+    /// the master switch with the result: on when at least one alert exists,
+    /// off when none do. Runs once when upgrading to settings v9.
     pub fn migrate_custom_chat_alerts(&mut self) {
-        if self.custom_chat_alerts.is_empty() {
-            let words = crate::chat_ping::normalize_trigger_words(&self.custom_chat_text);
-            if !words.is_empty() {
-                self.custom_chat_alerts
-                    .push(ChatTriggerAlert { id: 0, words });
-            }
+        self.migrate_legacy_custom_chat_text();
+        self.custom_chat = !self.custom_chat_alerts.is_empty();
+    }
+
+    /// Move the legacy single trigger word into `custom_chat_alerts` while
+    /// leaving the master switch untouched.
+    fn migrate_legacy_custom_chat_text(&mut self) {
+        let legacy = crate::chat_ping::normalize_trigger_words(&self.custom_chat_text);
+        if !legacy.is_empty() && self.custom_chat_alerts.is_empty() {
+            self.custom_chat_alerts.push(ChatTriggerAlert {
+                id: 0,
+                words: legacy,
+                name: String::new(),
+            });
         }
         self.custom_chat_text.clear();
         self.custom_chat_alerts
@@ -2744,7 +2757,15 @@ impl Settings {
                 self.live_feed.nexus_marker = NexusMarker::InNexus;
             }
         }
-        self.sound.migrate_custom_chat_alerts();
+        if self.version < 9 {
+            // 0.22.0's single custom-chat word becomes Alert 1, and the switch
+            // follows whether any alerts ended up configured.
+            self.sound.migrate_custom_chat_alerts();
+        } else if !self.sound.custom_chat_text.is_empty() {
+            // Legacy text is never serialized, so only an unsaved/manual edit
+            // can reach here; migrate it without touching the switch state.
+            self.sound.migrate_legacy_custom_chat_text();
+        }
         self.version = SETTINGS_VERSION;
     }
 
@@ -3002,12 +3023,14 @@ mod tests {
         s.custom_chat_alerts.push(ChatTriggerAlert {
             id: 0,
             words: "abyss, abby".into(),
+            name: "Abyss".into(),
         });
         let back: SoundSettings =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(back.ign_mention && back.custom_chat);
         assert_eq!(back.custom_chat_alerts.len(), 1);
         assert_eq!(back.custom_chat_alerts[0].words, "abyss, abby");
+        assert_eq!(back.custom_chat_alerts[0].name, "Abyss");
     }
 
     #[test]
@@ -3019,6 +3042,7 @@ mod tests {
         assert_eq!(s.custom_chat_alerts.len(), 1);
         assert_eq!(s.custom_chat_alerts[0].id, 0);
         assert_eq!(s.custom_chat_alerts[0].words, "abyss, abby");
+        assert!(s.custom_chat);
         assert!(s.custom_chat_text.is_empty());
 
         let json = serde_json::to_string(&s).unwrap();
@@ -3031,7 +3055,8 @@ mod tests {
         assert_eq!(
             ChatTriggerAlert {
                 id: 0,
-                words: String::new()
+                words: String::new(),
+                name: String::new(),
             }
             .sound_key(),
             "custom_chat"
@@ -3039,7 +3064,8 @@ mod tests {
         assert_eq!(
             ChatTriggerAlert {
                 id: 3,
-                words: String::new()
+                words: String::new(),
+                name: String::new(),
             }
             .sound_key(),
             "custom_chat_3"
@@ -3053,6 +3079,42 @@ mod tests {
         assert_eq!(settings.sound.custom_chat_alerts.len(), 1);
         assert_eq!(settings.sound.custom_chat_alerts[0].words, "abyss, abby");
         assert!(settings.sound.custom_chat_text.is_empty());
+    }
+
+    #[test]
+    fn v9_migration_enables_custom_chat_for_migrated_words() {
+        let json =
+            r#"{"version":8,"sound":{"custom_chat":false,"custom_chat_text":"abyss, abby"}}"#;
+        let settings = Settings::from_json(json).unwrap();
+        assert_eq!(settings.sound.custom_chat_alerts.len(), 1);
+        assert_eq!(settings.sound.custom_chat_alerts[0].words, "abyss, abby");
+        assert!(settings.sound.custom_chat);
+        assert!(settings.sound.custom_chat_text.is_empty());
+        assert_eq!(settings.version, SETTINGS_VERSION);
+    }
+
+    #[test]
+    fn v9_migration_leaves_custom_chat_off_without_alerts() {
+        let json = r#"{"version":8,"sound":{"custom_chat":true}}"#;
+        let settings = Settings::from_json(json).unwrap();
+        assert!(settings.sound.custom_chat_alerts.is_empty());
+        assert!(!settings.sound.custom_chat);
+    }
+
+    #[test]
+    fn v9_migration_enables_custom_chat_when_alerts_already_exist() {
+        let json = r#"{"version":8,"sound":{"custom_chat":false,"custom_chat_alerts":[{"id":3,"words":"abyss","name":"Abyss"}]}}"#;
+        let settings = Settings::from_json(json).unwrap();
+        assert_eq!(settings.sound.custom_chat_alerts.len(), 1);
+        assert!(settings.sound.custom_chat);
+    }
+
+    #[test]
+    fn current_settings_keep_an_explicit_custom_chat_off_choice() {
+        let json = r#"{"version":9,"sound":{"custom_chat":false,"custom_chat_alerts":[{"id":3,"words":"abyss","name":"Abyss"}]}}"#;
+        let settings = Settings::from_json(json).unwrap();
+        assert_eq!(settings.sound.custom_chat_alerts.len(), 1);
+        assert!(!settings.sound.custom_chat);
     }
 
     #[test]

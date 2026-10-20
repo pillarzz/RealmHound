@@ -163,6 +163,80 @@ fn passes_author_filters(filters: &[AuthorFilter], line: &dyn ChatRow) -> bool {
     filters.is_empty() || filters.iter().any(|a| line.matches_participant(&a.name))
 }
 
+/// Compact author pill matching the shared filter-pill dimensions (20px high,
+/// 11px label) used by Loot and Combat History. Returns true when clicked.
+fn render_author_pill(ui: &mut Ui, author: &AuthorFilter) -> bool {
+    const H: f32 = 20.0;
+    const LEFT_PAD: f32 = 4.0;
+    const ICON: f32 = 16.0;
+    const GAP1: f32 = 4.0;
+    const GAP2: f32 = 6.0;
+    const X_W: f32 = 10.0;
+    const RIGHT_PAD: f32 = 6.0;
+
+    let font = egui::FontId::proportional(11.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(author.name.clone(), font.clone(), Color32::WHITE);
+    let text_w = galley.size().x;
+    let width = LEFT_PAD + ICON + GAP1 + text_w + GAP2 + X_W + RIGHT_PAD;
+
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, H), Sense::click());
+    let hovered = resp.hovered();
+    let clicked = resp.clicked();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(4),
+        Color32::from_rgb(40, 60, 50),
+    );
+
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + LEFT_PAD, rect.center().y - ICON / 2.0),
+        egui::vec2(ICON, ICON),
+    );
+    let (icon, icon_color) = if author.stars > 0 {
+        ("★", ChatPanel::star_color(author.stars))
+    } else if author.is_supporter {
+        ("♦", Color32::WHITE)
+    } else {
+        ("?", Color32::WHITE)
+    };
+    ui.painter().text(
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        egui::FontId::proportional(10.0),
+        icon_color,
+    );
+
+    let text_pos = egui::pos2(
+        icon_rect.right() + GAP1,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(text_pos, galley, Color32::WHITE);
+
+    let x_center = egui::pos2(rect.right() - RIGHT_PAD - X_W / 2.0, rect.center().y);
+    let x_color = if hovered {
+        Color32::from_rgb(255, 120, 120)
+    } else {
+        Color32::from_gray(200)
+    };
+    ui.painter().text(
+        x_center,
+        egui::Align2::CENTER_CENTER,
+        "\u{2715}",
+        font,
+        x_color,
+    );
+
+    let _ = resp.on_hover_text(format!("Remove {} filter", author.name));
+    clicked
+}
+
 /// A single chat message.
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -734,8 +808,6 @@ pub struct ChatPanel {
     history_author_filters: Vec<AuthorFilter>,
     /// Distinct authors seen in the loaded history, for the filter suggestions.
     history_author_catalog: Vec<AuthorFilter>,
-    /// Text typed into the author filter box.
-    history_author_search: String,
     /// Whether the author suggestion popup is open.
     history_author_popup_open: bool,
     /// Parsed history entries loaded from disk for the current selection.
@@ -809,7 +881,6 @@ impl Default for ChatPanel {
             history_search_scope: SearchScope::default(),
             history_author_filters: Vec::new(),
             history_author_catalog: Vec::new(),
-            history_author_search: String::new(),
             history_author_popup_open: false,
             history_entries: Vec::new(),
             history_loaded: None,
@@ -880,13 +951,13 @@ impl ChatPanel {
     /// user's other persisted type-filter preferences.
     pub fn view_chat_with(&mut self, sender: String) {
         self.history_range = HistoryRange::AllTime;
+        self.history_search_scope = SearchScope::Name;
         self.history_author_filters.clear();
         self.history_author_filters.push(AuthorFilter {
             name: sender,
             stars: 0,
             is_supporter: false,
         });
-        self.history_author_search.clear();
         self.history_author_popup_open = false;
         self.history_search = String::new();
         self.filters.show_whisper = true;
@@ -895,6 +966,7 @@ impl ChatPanel {
 
     /// Add or refresh an author filter pill.
     fn add_author_filter(&mut self, author: AuthorFilter) {
+        self.history_search_scope = SearchScope::Name;
         if let Some(existing) = self
             .history_author_filters
             .iter_mut()
@@ -905,7 +977,7 @@ impl ChatPanel {
         } else {
             self.history_author_filters.push(author);
         }
-        self.history_author_search.clear();
+        self.history_search.clear();
         self.history_author_popup_open = false;
         self.history_loaded = None;
         self.clear_history_jump();
@@ -1460,7 +1532,9 @@ impl ChatPanel {
         // Compute the message-count label from last frame's loaded entries/filters,
         // so it can be shown at the very left of the toolbar (matching the Live tab).
         let count_query = self.history_search.trim().to_ascii_lowercase();
-        let count_has_search = !count_query.is_empty();
+        let count_has_search = !count_query.is_empty()
+            && !(self.history_search_scope == SearchScope::Name
+                && !self.history_author_filters.is_empty());
         let count_filtering_inputs = count_has_search || !self.history_author_filters.is_empty();
         let count_passes = |e: &HistoryEntry| -> bool {
             if !self.filters.should_show(e.line.chat_type) {
@@ -1498,12 +1572,12 @@ impl ChatPanel {
         // custom pickers, refresh, and search, all combined into a single toolbar
         // row (Message count | type filters | everything else, matching Live).
         shadcn.header_band_stacked_divided(ui, shadcn.secondary_header_fill(), |ui| {
-            shadcn.band_row(ui, |ui| {
+            shadcn.band_row_wrapped(ui, |ui| {
                 ui.label(count_label);
-                ui.separator();
+                shadcn.band_divider(ui);
 
                 Self::type_filter_buttons(ui, shadcn, &mut self.filters);
-                ui.separator();
+                shadcn.band_divider(ui);
 
                 ui.label("From:");
                 let mut range_key = Some(
@@ -1552,7 +1626,7 @@ impl ChatPanel {
                     );
                 }
 
-                ui.separator();
+                shadcn.band_divider(ui);
                 if shadcn
                     .btn(ui, "⟳")
                     .hover_tip("Refresh (reload from disk)")
@@ -1561,18 +1635,23 @@ impl ChatPanel {
                     self.history_loaded = None;
                 }
 
-                ui.separator();
+                shadcn.band_divider(ui);
                 ui.label("🔍");
-                ui.add(
+                let search_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.history_search)
                         .id_source("chat_history_search_box")
                         .desired_width(160.0)
-                        .hint_text("Filter history…"),
+                        .hint_text(if self.history_search_scope == SearchScope::Name {
+                            "Filter authors…"
+                        } else {
+                            "Filter history…"
+                        }),
                 );
                 if !self.history_search.is_empty()
                     && shadcn.btn(ui, "✕").hover_tip("Clear search").clicked()
                 {
                     self.history_search.clear();
+                    self.history_author_popup_open = false;
                 }
                 Self::search_scope_combo(
                     ui,
@@ -1581,105 +1660,98 @@ impl ChatPanel {
                     &mut self.history_search_scope,
                 );
 
-                // Author filters live on their own wrapped row so multiple
-                // pills can fold onto extra lines without squeezing the search.
-            });
-            shadcn.band_row_wrapped(ui, |ui| {
-                ui.label("Authors:");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.history_author_search)
-                        .id_source("chat_author_filter_box")
-                        .desired_width(150.0)
-                        .hint_text("Filter authors…"),
-                );
-                if resp.has_focus() && !self.history_author_search.trim().is_empty() {
-                    self.history_author_popup_open = true;
-                }
-                if !self.history_author_search.is_empty()
-                    && shadcn
-                        .btn(ui, "✕")
-                        .hover_tip("Clear author input")
-                        .clicked()
-                {
-                    self.history_author_search.clear();
-                    self.history_author_popup_open = false;
-                }
-
-                let author_query = self.history_author_search.trim().to_ascii_lowercase();
-                let suggestions: Vec<AuthorFilter> = if author_query.is_empty() {
-                    Vec::new()
-                } else {
-                    self.history_author_catalog
-                        .iter()
-                        .filter(|a| a.name.to_ascii_lowercase().contains(&author_query))
-                        .take(8)
-                        .cloned()
-                        .collect()
-                };
-
-                let enter_pressed =
-                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter_pressed && self.history_author_popup_open {
-                    if let Some(author) = suggestions.first().cloned() {
-                        self.add_author_filter(author);
+                // In Name mode the search box is an author tag input: typing
+                // suggests known senders, and each selection becomes a compact
+                // pill. Pills are ORed; free-text still applies when no tag is
+                // selected.
+                if self.history_search_scope == SearchScope::Name {
+                    let author_query = self.history_search.trim().to_ascii_lowercase();
+                    let suggestions: Vec<AuthorFilter> = if author_query.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.history_author_catalog
+                            .iter()
+                            .filter(|a| a.name.to_ascii_lowercase().contains(&author_query))
+                            .take(8)
+                            .cloned()
+                            .collect()
+                    };
+                    if search_resp.has_focus() && !author_query.is_empty() {
+                        self.history_author_popup_open = true;
                     }
-                }
-                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.history_author_popup_open = false;
-                }
+                    let enter_pressed =
+                        search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter_pressed && !author_query.is_empty() {
+                        if let Some(author) = suggestions.first().cloned() {
+                            self.add_author_filter(author);
+                        } else {
+                            self.add_author_filter(AuthorFilter {
+                                name: self.history_search.trim().to_string(),
+                                stars: 0,
+                                is_supporter: false,
+                            });
+                        }
+                    }
+                    if search_resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.history_author_popup_open = false;
+                    }
 
-                if self.history_author_popup_open && !author_query.is_empty() {
-                    let popup_id = ui.make_persistent_id("chat_author_popup");
-                    let popup_pos = resp.rect.left_bottom() + egui::vec2(0.0, 2.0);
-                    let mut chosen: Option<AuthorFilter> = None;
-                    egui::Area::new(popup_id)
-                        .fixed_pos(popup_pos)
-                        .order(egui::Order::Foreground)
-                        .show(ui.ctx(), |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.set_min_width(200.0);
-                                ui.set_max_height(240.0);
-                                egui::ScrollArea::vertical()
-                                    .max_height(220.0)
-                                    .show(ui, |ui| {
-                                        if suggestions.is_empty() {
-                                            ui.label(
-                                                RichText::new("No matching authors")
-                                                    .italics()
-                                                    .color(Color32::GRAY),
-                                            );
-                                        } else {
-                                            for author in &suggestions {
-                                                if ui
-                                                    .selectable_label(false, author.label())
-                                                    .clicked()
-                                                {
-                                                    chosen = Some(author.clone());
+                    if self.history_author_popup_open && !author_query.is_empty() {
+                        let popup_id = ui.make_persistent_id("chat_author_popup");
+                        let popup_pos = search_resp.rect.left_bottom() + egui::vec2(0.0, 2.0);
+                        let mut chosen: Option<AuthorFilter> = None;
+                        egui::Area::new(popup_id)
+                            .fixed_pos(popup_pos)
+                            .order(egui::Order::Foreground)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.set_min_width(200.0);
+                                    ui.set_max_height(240.0);
+                                    egui::ScrollArea::vertical()
+                                        .max_height(220.0)
+                                        .show(ui, |ui| {
+                                            if suggestions.is_empty() {
+                                                ui.label(
+                                                    RichText::new("No matching authors")
+                                                        .italics()
+                                                        .color(Color32::GRAY),
+                                                );
+                                            } else {
+                                                for author in &suggestions {
+                                                    if ui
+                                                        .selectable_label(false, author.label())
+                                                        .clicked()
+                                                    {
+                                                        chosen = Some(author.clone());
+                                                    }
                                                 }
                                             }
-                                        }
-                                    });
+                                        });
+                                });
                             });
-                        });
-                    if let Some(author) = chosen {
-                        self.add_author_filter(author);
+                        if let Some(author) = chosen {
+                            self.add_author_filter(author);
+                        }
                     }
-                }
 
-                for (idx, author) in self.history_author_filters.clone().iter().enumerate() {
-                    if shadcn
-                        .button_sm(ui, format!("{} ✕", author.label()))
-                        .hover_tip("Remove author filter")
-                        .clicked()
-                    {
-                        self.history_author_filters.remove(idx);
-                        self.history_loaded = None;
-                        self.clear_history_jump();
-                        break;
+                    for (idx, author) in self.history_author_filters.clone().iter().enumerate() {
+                        if render_author_pill(ui, author) {
+                            self.history_author_filters.remove(idx);
+                            self.history_loaded = None;
+                            self.clear_history_jump();
+                            break;
+                        }
                     }
                 }
             });
         });
+
+        // Leaving Name mode drops the author tags; they belong to that scope.
+        if self.history_search_scope != prev_scope && self.history_search_scope != SearchScope::Name
+        {
+            self.history_author_filters.clear();
+            self.history_author_popup_open = false;
+        }
 
         // Drop any active jump when the user changes a filter/search input, so the
         // context window does not constrain new results. Name-click author changes
@@ -1711,9 +1783,10 @@ impl ChatPanel {
 
         // Status line.
         let query = self.history_search.trim().to_ascii_lowercase();
-        let has_search = !query.is_empty();
         let scope = self.history_search_scope;
         let author_filters = self.history_author_filters.clone();
+        let has_search =
+            !query.is_empty() && !(scope == SearchScope::Name && !author_filters.is_empty());
         let filters = self.filters.clone();
         let filtering = has_search || !author_filters.is_empty();
 
@@ -1954,7 +2027,6 @@ impl ChatPanel {
         }
         if let Some(idx) = pending_jump {
             self.history_search.clear();
-            self.history_author_search.clear();
             self.history_author_popup_open = false;
             let had_authors = !self.history_author_filters.is_empty();
             self.history_author_filters.clear();

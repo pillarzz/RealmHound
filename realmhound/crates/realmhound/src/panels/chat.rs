@@ -134,6 +134,35 @@ trait ChatRow {
     }
 }
 
+/// A selected author filter: a player name plus the star/supporter metadata
+/// shown on its pill and suggestion row.
+#[derive(Debug, Clone, PartialEq)]
+struct AuthorFilter {
+    name: String,
+    stars: i16,
+    is_supporter: bool,
+}
+
+impl AuthorFilter {
+    fn label(&self) -> String {
+        let mut label = String::new();
+        if self.stars > 0 {
+            label.push_str(&format!("★{} ", self.stars));
+        }
+        if self.is_supporter {
+            label.push_str("♦ ");
+        }
+        label.push_str(&self.name);
+        label
+    }
+}
+
+/// True when `line` involves any of the selected authors. An empty filter list
+/// means every row passes.
+fn passes_author_filters(filters: &[AuthorFilter], line: &dyn ChatRow) -> bool {
+    filters.is_empty() || filters.iter().any(|a| line.matches_participant(&a.name))
+}
+
 /// A single chat message.
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -701,8 +730,14 @@ pub struct ChatPanel {
     history_search: String,
     /// Which fields the history search matches against.
     history_search_scope: SearchScope,
-    /// Active sender filter for history, set by clicking a name.
-    history_sender_filter: Option<String>,
+    /// Active author filters for history; rows matching any of them are shown.
+    history_author_filters: Vec<AuthorFilter>,
+    /// Distinct authors seen in the loaded history, for the filter suggestions.
+    history_author_catalog: Vec<AuthorFilter>,
+    /// Text typed into the author filter box.
+    history_author_search: String,
+    /// Whether the author suggestion popup is open.
+    history_author_popup_open: bool,
     /// Parsed history entries loaded from disk for the current selection.
     history_entries: Vec<HistoryEntry>,
     /// The selection currently loaded; used to avoid re-reading files every frame.
@@ -772,7 +807,10 @@ impl Default for ChatPanel {
             history_end: Local::now().date_naive(),
             history_search: String::new(),
             history_search_scope: SearchScope::default(),
-            history_sender_filter: None,
+            history_author_filters: Vec::new(),
+            history_author_catalog: Vec::new(),
+            history_author_search: String::new(),
+            history_author_popup_open: false,
             history_entries: Vec::new(),
             history_loaded: None,
             history_truncated: false,
@@ -842,10 +880,35 @@ impl ChatPanel {
     /// user's other persisted type-filter preferences.
     pub fn view_chat_with(&mut self, sender: String) {
         self.history_range = HistoryRange::AllTime;
-        self.history_sender_filter = Some(sender);
+        self.history_author_filters.clear();
+        self.history_author_filters.push(AuthorFilter {
+            name: sender,
+            stars: 0,
+            is_supporter: false,
+        });
+        self.history_author_search.clear();
+        self.history_author_popup_open = false;
         self.history_search = String::new();
         self.filters.show_whisper = true;
         self.history_loaded = None;
+    }
+
+    /// Add or refresh an author filter pill.
+    fn add_author_filter(&mut self, author: AuthorFilter) {
+        if let Some(existing) = self
+            .history_author_filters
+            .iter_mut()
+            .find(|a| a.name.eq_ignore_ascii_case(&author.name))
+        {
+            existing.stars = existing.stars.max(author.stars);
+            existing.is_supporter |= author.is_supporter;
+        } else {
+            self.history_author_filters.push(author);
+        }
+        self.history_author_search.clear();
+        self.history_author_popup_open = false;
+        self.history_loaded = None;
+        self.clear_history_jump();
     }
 
     /// Get color for star count based on RotMG star tiers.
@@ -1282,6 +1345,7 @@ impl ChatPanel {
     /// only counts rows the user actually wants to see.
     fn load_history(&mut self, sel: LoadedSel) {
         self.history_entries.clear();
+        self.history_author_catalog.clear();
         self.history_truncated = false;
         self.history_error = None;
 
@@ -1291,7 +1355,9 @@ impl ChatPanel {
         };
 
         let filters = &self.filters;
-        let sender_filter = &self.history_sender_filter;
+        let author_filters = &self.history_author_filters;
+        let mut author_catalog: std::collections::HashMap<String, (i16, bool)> =
+            std::collections::HashMap::new();
 
         // Build the ordered list of (date, path) files to read.
         let mut files: Vec<(NaiveDate, PathBuf)> = Vec::new();
@@ -1345,16 +1411,30 @@ impl ChatPanel {
                     if !filters.should_show(parsed.chat_type) {
                         continue;
                     }
-                    if let Some(sf) = sender_filter {
-                        if !parsed.matches_participant(sf) {
-                            continue;
-                        }
+                    let author = author_catalog
+                        .entry(parsed.sender.clone())
+                        .or_insert((0, false));
+                    author.0 = author.0.max(parsed.stars);
+                    author.1 |= parsed.is_supporter;
+                    if !passes_author_filters(author_filters, &parsed) {
+                        continue;
                     }
                     self.history_entries
                         .push(HistoryEntry { date, line: parsed });
                 }
             }
         }
+
+        self.history_author_catalog = author_catalog
+            .into_iter()
+            .map(|(name, (stars, is_supporter))| AuthorFilter {
+                name,
+                stars,
+                is_supporter,
+            })
+            .collect();
+        self.history_author_catalog
+            .sort_by_key(|a| a.name.to_ascii_lowercase());
     }
 
     /// Render the chat history browser (date range, search, results list).
@@ -1375,21 +1455,19 @@ impl ChatPanel {
         let prev_search = self.history_search.clone();
         let prev_scope = self.history_search_scope;
         let prev_filters = self.filters.clone();
-        let prev_sender = self.history_sender_filter.clone();
+        let prev_authors = self.history_author_filters.clone();
 
         // Compute the message-count label from last frame's loaded entries/filters,
         // so it can be shown at the very left of the toolbar (matching the Live tab).
         let count_query = self.history_search.trim().to_ascii_lowercase();
         let count_has_search = !count_query.is_empty();
-        let count_filtering_inputs = count_has_search || self.history_sender_filter.is_some();
+        let count_filtering_inputs = count_has_search || !self.history_author_filters.is_empty();
         let count_passes = |e: &HistoryEntry| -> bool {
             if !self.filters.should_show(e.line.chat_type) {
                 return false;
             }
-            if let Some(sf) = &self.history_sender_filter {
-                if !e.line.matches_participant(sf) {
-                    return false;
-                }
+            if !passes_author_filters(&self.history_author_filters, &e.line) {
+                return false;
             }
             if count_has_search
                 && !e
@@ -1503,33 +1581,120 @@ impl ChatPanel {
                     &mut self.history_search_scope,
                 );
 
-                if let Some(sf) = self.history_sender_filter.clone() {
-                    ui.separator();
+                // Author filters live on their own wrapped row so multiple
+                // pills can fold onto extra lines without squeezing the search.
+            });
+            shadcn.band_row_wrapped(ui, |ui| {
+                ui.label("Authors:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.history_author_search)
+                        .id_source("chat_author_filter_box")
+                        .desired_width(150.0)
+                        .hint_text("Filter authors…"),
+                );
+                if resp.has_focus() && !self.history_author_search.trim().is_empty() {
+                    self.history_author_popup_open = true;
+                }
+                if !self.history_author_search.is_empty()
+                    && shadcn
+                        .btn(ui, "✕")
+                        .hover_tip("Clear author input")
+                        .clicked()
+                {
+                    self.history_author_search.clear();
+                    self.history_author_popup_open = false;
+                }
+
+                let author_query = self.history_author_search.trim().to_ascii_lowercase();
+                let suggestions: Vec<AuthorFilter> = if author_query.is_empty() {
+                    Vec::new()
+                } else {
+                    self.history_author_catalog
+                        .iter()
+                        .filter(|a| a.name.to_ascii_lowercase().contains(&author_query))
+                        .take(8)
+                        .cloned()
+                        .collect()
+                };
+
+                let enter_pressed =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if enter_pressed && self.history_author_popup_open {
+                    if let Some(author) = suggestions.first().cloned() {
+                        self.add_author_filter(author);
+                    }
+                }
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.history_author_popup_open = false;
+                }
+
+                if self.history_author_popup_open && !author_query.is_empty() {
+                    let popup_id = ui.make_persistent_id("chat_author_popup");
+                    let popup_pos = resp.rect.left_bottom() + egui::vec2(0.0, 2.0);
+                    let mut chosen: Option<AuthorFilter> = None;
+                    egui::Area::new(popup_id)
+                        .fixed_pos(popup_pos)
+                        .order(egui::Order::Foreground)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(200.0);
+                                ui.set_max_height(240.0);
+                                egui::ScrollArea::vertical()
+                                    .max_height(220.0)
+                                    .show(ui, |ui| {
+                                        if suggestions.is_empty() {
+                                            ui.label(
+                                                RichText::new("No matching authors")
+                                                    .italics()
+                                                    .color(Color32::GRAY),
+                                            );
+                                        } else {
+                                            for author in &suggestions {
+                                                if ui
+                                                    .selectable_label(false, author.label())
+                                                    .clicked()
+                                                {
+                                                    chosen = Some(author.clone());
+                                                }
+                                            }
+                                        }
+                                    });
+                            });
+                        });
+                    if let Some(author) = chosen {
+                        self.add_author_filter(author);
+                    }
+                }
+
+                for (idx, author) in self.history_author_filters.clone().iter().enumerate() {
                     if shadcn
-                        .button_sm(ui, format!("sender: {sf} ✕"))
-                        .hover_tip("Clear sender filter")
+                        .button_sm(ui, format!("{} ✕", author.label()))
+                        .hover_tip("Remove author filter")
                         .clicked()
                     {
-                        self.history_sender_filter = None;
+                        self.history_author_filters.remove(idx);
+                        self.history_loaded = None;
+                        self.clear_history_jump();
+                        break;
                     }
                 }
             });
         });
 
         // Drop any active jump when the user changes a filter/search input, so the
-        // context window does not constrain new results. Name-click sender changes
+        // context window does not constrain new results. Name-click author changes
         // are applied after the loop and clear the jump there.
         if self.history_search != prev_search
             || self.history_search_scope != prev_scope
             || self.filters != prev_filters
-            || self.history_sender_filter != prev_sender
+            || self.history_author_filters != prev_authors
         {
             self.clear_history_jump();
         }
 
-        // Chat-type and sender filters are applied during loading so the entry
+        // Chat-type and author filters are applied during loading so the entry
         // cap counts only matching rows. Invalidate the cache when they change.
-        if self.filters != prev_filters || self.history_sender_filter != prev_sender {
+        if self.filters != prev_filters || self.history_author_filters != prev_authors {
             self.history_loaded = None;
         }
 
@@ -1548,19 +1713,17 @@ impl ChatPanel {
         let query = self.history_search.trim().to_ascii_lowercase();
         let has_search = !query.is_empty();
         let scope = self.history_search_scope;
-        let sender_filter = self.history_sender_filter.clone();
+        let author_filters = self.history_author_filters.clone();
         let filters = self.filters.clone();
-        let filtering = has_search || sender_filter.is_some();
+        let filtering = has_search || !author_filters.is_empty();
 
         // A history entry passes the current filters.
         let passes = |e: &HistoryEntry| -> bool {
             if !filters.should_show(e.line.chat_type) {
                 return false;
             }
-            if let Some(sf) = &sender_filter {
-                if !e.line.matches_participant(sf) {
-                    return false;
-                }
+            if !passes_author_filters(&author_filters, &e.line) {
+                return false;
             }
             if has_search && !e.line.matches_search(&query, scope) {
                 return false;
@@ -1629,7 +1792,7 @@ impl ChatPanel {
         let do_scroll = self.history_jump_scroll;
         let now = Instant::now();
 
-        let mut pending_sender: Option<String> = None;
+        let mut pending_author: Option<AuthorFilter> = None;
         let mut pending_jump: Option<usize> = None;
         let mut pending_status: Option<String> = None;
         let mut jump_scrolled = false;
@@ -1734,7 +1897,11 @@ impl ChatPanel {
                         .or_else(|| ui.input(|i| i.pointer.interact_pos()));
                     if let Some(pos) = pos {
                         if name_rect.contains(pos) {
-                            pending_sender = Some(entry.line.displayed_name().to_string());
+                            pending_author = Some(AuthorFilter {
+                                name: entry.line.displayed_name().to_string(),
+                                stars: entry.line.stars(),
+                                is_supporter: entry.line.is_supporter(),
+                            });
                         }
                     }
                 }
@@ -1747,7 +1914,11 @@ impl ChatPanel {
                         ui.close();
                     }
                     if shadcn.btn(ui, format!("Filter by {name}")).clicked() {
-                        pending_sender = Some(name.clone());
+                        pending_author = Some(AuthorFilter {
+                            name: name.clone(),
+                            stars: entry.line.stars(),
+                            is_supporter: entry.line.is_supporter(),
+                        });
                         ui.close();
                     }
                     if shadcn.btn(ui, "📋 Copy IGN").clicked() {
@@ -1774,10 +1945,8 @@ impl ChatPanel {
         // Remember the scroll offset for the next PgUp/PgDn keyboard step.
         nav.store(ui, &scroll_output);
 
-        if let Some(name) = pending_sender {
-            self.history_sender_filter = Some(name);
-            self.history_loaded = None;
-            self.clear_history_jump();
+        if let Some(author) = pending_author {
+            self.add_author_filter(author);
         }
         if let Some(status) = pending_status {
             self.status_message = Some((status, Instant::now()));
@@ -1785,9 +1954,11 @@ impl ChatPanel {
         }
         if let Some(idx) = pending_jump {
             self.history_search.clear();
-            let had_sender = self.history_sender_filter.is_some();
-            self.history_sender_filter = None;
-            if had_sender {
+            self.history_author_search.clear();
+            self.history_author_popup_open = false;
+            let had_authors = !self.history_author_filters.is_empty();
+            self.history_author_filters.clear();
+            if had_authors {
                 // Reload is needed; find the target entry's identity so we can
                 // locate it after reload with the new (unfiltered) dataset.
                 let target_entry = self.history_entries.get(idx).cloned();
@@ -2029,6 +2200,53 @@ mod tests {
         assert!(msg.matches_search("pillar", SearchScope::Name));
         // ...but message text is not, in name scope.
         assert!(!msg.matches_search("shatts", SearchScope::Name));
+    }
+
+    #[test]
+    fn multiple_author_filters_match_either_author() {
+        let packet = make_packet("EangoNPE", "", "Good luck out there");
+        let msg = ChatMessage::from_text_packet(&packet).unwrap();
+        let filters = vec![
+            AuthorFilter {
+                name: "someone".to_string(),
+                stars: 0,
+                is_supporter: false,
+            },
+            AuthorFilter {
+                name: "eangonpe".to_string(),
+                stars: 0,
+                is_supporter: false,
+            },
+        ];
+        assert!(passes_author_filters(&filters, &msg));
+        assert!(!passes_author_filters(
+            &[AuthorFilter {
+                name: "missing".to_string(),
+                stars: 0,
+                is_supporter: false,
+            }],
+            &msg
+        ));
+        assert!(passes_author_filters(&[], &msg));
+    }
+
+    #[test]
+    fn author_filter_label_shows_stars_and_supporter() {
+        let author = AuthorFilter {
+            name: "Pillar".to_string(),
+            stars: 12,
+            is_supporter: true,
+        };
+        assert_eq!(author.label(), "★12 ♦ Pillar");
+        assert_eq!(
+            AuthorFilter {
+                name: "Lovens".to_string(),
+                stars: 0,
+                is_supporter: false,
+            }
+            .label(),
+            "Lovens"
+        );
     }
 
     #[test]

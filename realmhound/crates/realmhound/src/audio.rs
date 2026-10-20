@@ -53,6 +53,7 @@ impl TimedCommand {
             AudioCommand::PlayForBag(_) => "play_for_bag",
             AudioCommand::PlayForBagShiny(_) => "play_for_bag_shiny",
             AudioCommand::PlayEvent { .. } => "play_event",
+            AudioCommand::PlayCustomChat { .. } => "play_custom_chat",
             AudioCommand::SetVolume(_) => "set_volume",
         }
     }
@@ -398,6 +399,24 @@ fn run(
                 last_event.insert(key, now);
                 engine.play_at(
                     sound,
+                    custom_path,
+                    volume * master,
+                    #[cfg(feature = "latency-diagnostics")]
+                    timed.dispatched_at,
+                );
+            }
+            AudioCommand::PlayCustomChat { custom_key, volume } => {
+                let (master, custom_path) = settings
+                    .read()
+                    .map(|s| {
+                        (
+                            s.sound.volume,
+                            resolve_custom_sound_key(&s.sound, &custom_key),
+                        )
+                    })
+                    .unwrap_or((1.0, None));
+                engine.play(
+                    SoundType::CustomChat,
                     custom_path,
                     volume * master,
                     #[cfg(feature = "latency-diagnostics")]

@@ -105,8 +105,8 @@ pub enum SoundType {
     /// Plays when a chat message from another player mentions the local
     /// character name. Placeholder audio is the private-message ping.
     IgnMention,
-    /// Plays when a chat message contains the user's custom chat trigger text.
-    /// Placeholder audio is the guild-message ping.
+    /// Plays when a chat message contains any configured custom-chat trigger
+    /// variant. Placeholder audio is the guild-message ping.
     CustomChat,
     /// Plays when entering a Dimitus dungeon.
     DimitusAlert,

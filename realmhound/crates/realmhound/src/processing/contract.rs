@@ -183,6 +183,9 @@ pub enum AudioCommand {
         instance_id: Option<i32>,
         volume: f32,
     },
+    /// Play one custom-chat alert sound. `custom_key` is the alert's
+    /// `custom_chat` / `custom_chat_{id}` key in `SoundSettings::custom_sounds`.
+    PlayCustomChat { custom_key: String, volume: f32 },
     /// Set the output volume (Session 2 audio thread).
     SetVolume(f32),
 }

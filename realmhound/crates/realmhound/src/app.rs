@@ -5294,33 +5294,15 @@ impl RealmHoundApp {
                     settings_changed |= shadcn
                         .switch(ui, &mut current_settings.custom_chat, "Custom chat")
                         .hover_tip(
-                            "Plays when any chat message contains your trigger word. \
-                             Whole words only: a trigger of \"abyss\" does not play for \
-                             \"abyssal\". Set the word on the line below.",
+                            "Plays when any chat message contains one of the trigger \
+                             variants configured below. Whole words only: a trigger of \
+                             \"abyss\" does not play for \"abyssal\".",
                         )
                         .changed();
-                    settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::CustomChat, current_settings);
-                    ui.end_row();
-
-                    // The trigger word gets its own line under its toggle so the
-                    // ping controls stay aligned with every other row.
-                    ui.label("Trigger word:");
-                    if shadcn
-                        .text_edit_counted(
-                            ui,
-                            &mut current_settings.custom_chat_text,
-                            realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_MAX,
-                            150.0,
-                            Some("abyss"),
-                        )
-                        .on_hover_text(
-                            "Word or phrase that triggers the Custom chat ping. Max 50 \
-                             characters, matched case-insensitively as whole words.",
-                        )
-                        .changed()
-                    {
-                        settings_changed = true;
-                    }
+                    ui.label("");
+                    ui.label("");
+                    ui.label("");
+                    ui.label("");
                     ui.end_row();
 
                     settings_changed |= shadcn
@@ -5330,6 +5312,155 @@ impl RealmHoundApp {
                     settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::Trade, current_settings);
                     ui.end_row();
                 });
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("Custom chat trigger alerts").strong());
+            ui.label(
+                RichText::new(
+                    "Comma-separated whole words. 50 characters per variant, \
+                     2000 characters per field.",
+                )
+                .small()
+                .weak(),
+            );
+
+            let mut remove_alert: Option<usize> = None;
+            egui::Grid::new("custom_chat_alerts_grid")
+                .num_columns(3)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    for idx in 0..current_settings.custom_chat_alerts.len() {
+                        let (id, key) = {
+                            let alert = &current_settings.custom_chat_alerts[idx];
+                            (alert.id, alert.sound_key())
+                        };
+
+                        let mut words_changed = false;
+                        let mut words_lost_focus = false;
+                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                        egui::ScrollArea::vertical()
+                            .id_salt(("custom_chat_words", id))
+                            .max_height(row_height * 3.0 + 8.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.set_width(150.0);
+                                let resp = ui.add(
+                                    egui::TextEdit::multiline(
+                                        &mut current_settings.custom_chat_alerts[idx].words,
+                                    )
+                                    .id_source(("custom_chat_words_edit", id))
+                                    .desired_width(150.0)
+                                    .desired_rows(1)
+                                    .hint_text("abyss, abby, aby"),
+                                );
+                                words_changed = resp.changed();
+                                words_lost_focus = resp.lost_focus();
+                            });
+                        if words_changed {
+                            if current_settings.custom_chat_alerts[idx]
+                                .words
+                                .chars()
+                                .count()
+                                > realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_TOTAL_MAX
+                            {
+                                current_settings.custom_chat_alerts[idx].words =
+                                    current_settings.custom_chat_alerts[idx]
+                                        .words
+                                        .chars()
+                                        .take(
+                                            realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_TOTAL_MAX,
+                                        )
+                                        .collect();
+                            }
+                            settings_changed = true;
+                        }
+                        if words_lost_focus {
+                            let normalized = realmhound_core::chat_ping::normalize_trigger_words(
+                                &current_settings.custom_chat_alerts[idx].words,
+                            );
+                            if normalized != current_settings.custom_chat_alerts[idx].words {
+                                current_settings.custom_chat_alerts[idx].words = normalized;
+                                settings_changed = true;
+                            }
+                        }
+
+                        settings_changed |= self.render_custom_chat_alert_controls(
+                            ui,
+                            shadcn,
+                            &key,
+                            current_settings,
+                        );
+                        if ui
+                            .small_button("✕")
+                            .hover_tip("Remove trigger alert")
+                            .clicked()
+                        {
+                            remove_alert = Some(idx);
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            if let Some(idx) = remove_alert {
+                if idx < current_settings.custom_chat_alerts.len() {
+                    let alert = current_settings.custom_chat_alerts.remove(idx);
+                    let key = alert.sound_key();
+                    if let Some(file) = current_settings.custom_sounds.remove(&key) {
+                        if let Some(dir) = custom_sounds_dir() {
+                            let _ = fs::remove_file(dir.join(file));
+                        }
+                    }
+                    current_settings.custom_sound_names.remove(&key);
+                    current_settings.sound_volumes.remove(&key);
+                    settings_changed = true;
+                }
+            }
+
+            ui.horizontal(|ui| {
+                if current_settings.custom_chat_alerts.len()
+                    < realmhound_core::chat_ping::CUSTOM_CHAT_ALERTS_MAX
+                {
+                    if shadcn
+                        .button_sm(ui, "＋ Add trigger alert")
+                        .hover_tip("Add another trigger word and sound")
+                        .clicked()
+                    {
+                        let next_id = if current_settings.custom_chat_alerts.is_empty() {
+                            0
+                        } else {
+                            current_settings
+                                .custom_chat_alerts
+                                .iter()
+                                .map(|a| a.id)
+                                .max()
+                                .unwrap_or(0)
+                                + 1
+                        };
+                        current_settings.custom_chat_alerts.push(
+                            realmhound_core::settings::ChatTriggerAlert {
+                                id: next_id,
+                                words: String::new(),
+                            },
+                        );
+                        settings_changed = true;
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Maximum of 20 trigger alerts reached.")
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{}/{}",
+                        current_settings.custom_chat_alerts.len(),
+                        realmhound_core::chat_ping::CUSTOM_CHAT_ALERTS_MAX
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
         });
 
         ui.add_space(12.0);
@@ -6764,6 +6895,41 @@ impl RealmHoundApp {
         changed |= self.render_custom_sound_button(ui, sound, settings);
         if ui.small_button("🔊 Test").hover_tip("Test").clicked() {
             self.audio_tx.send(AudioCommand::Play(sound));
+        }
+        changed
+    }
+
+    /// Volume, custom-file picker and test button for one custom-chat trigger
+    /// alert, keyed by `custom_chat` / `custom_chat_{id}`.
+    fn render_custom_chat_alert_controls(
+        &self,
+        ui: &mut egui::Ui,
+        shadcn: &crate::shadcn_ui::Shadcn,
+        key: &str,
+        settings: &mut realmhound_core::settings::SoundSettings,
+    ) -> bool {
+        let mut changed = false;
+        let mut vol = settings.sound_volume(key);
+        if shadcn
+            .slider_value(ui, &format!("vol_{}", key), &mut vol, 0.0, 1.0)
+            .on_hover_cursor(egui::CursorIcon::Default)
+            .changed()
+        {
+            settings.set_sound_volume(key, vol);
+            changed = true;
+        }
+        ui.label(format!("{:.0}%", vol * 100.0));
+        changed |= self.render_custom_sound_button_key(
+            ui,
+            key,
+            &mut settings.custom_sounds,
+            &mut settings.custom_sound_names,
+        );
+        if ui.small_button("🔊 Test").hover_tip("Test").clicked() {
+            self.audio_tx.send(AudioCommand::PlayCustomChat {
+                custom_key: key.to_string(),
+                volume: vol,
+            });
         }
         changed
     }

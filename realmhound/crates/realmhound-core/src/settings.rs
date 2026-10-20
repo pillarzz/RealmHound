@@ -2126,6 +2126,30 @@ impl KeyPopTierFilter {
     }
 }
 
+/// One custom-chat trigger alert: comma-separated whole-word variants and a
+/// stable id that keys its own volume and custom sound file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatTriggerAlert {
+    /// Stable id used for `custom_chat_{id}` sound/volume keys. Id 0 is the
+    /// migrated legacy single trigger and keeps the old `custom_chat` key.
+    #[serde(default)]
+    pub id: u32,
+    /// Comma-separated trigger variants.
+    #[serde(default)]
+    pub words: String,
+}
+
+impl ChatTriggerAlert {
+    /// `custom_sounds` / `sound_volumes` key for this alert.
+    pub fn sound_key(&self) -> String {
+        if self.id == 0 {
+            "custom_chat".to_string()
+        } else {
+            format!("custom_chat_{}", self.id)
+        }
+    }
+}
+
 /// Sound notification settings.
 ///
 /// Controls which sounds play and their volume.
@@ -2206,18 +2230,20 @@ pub struct SoundSettings {
     #[serde(default)]
     pub ign_mention: bool,
 
-    /// Play a ping when a chat message contains the trigger text configured in
-    /// [`Self::custom_chat_text`] as a whole word. Off by default.
+    /// Play a ping when a chat message contains any configured custom-chat
+    /// trigger variant. Off by default; this is the master switch for
+    /// [`Self::custom_chat_alerts`].
     #[serde(default)]
     pub custom_chat: bool,
 
-    /// Trigger text for the custom chat ping. Empty by default, so no custom
-    /// ping fires until the user sets a word (the settings field shows `abyss` as
-    /// its example). Matched case-insensitively against whole words, so it never
-    /// fires on a substring such as `abyssal`. Capped at
-    /// [`crate::chat_ping::CUSTOM_CHAT_TEXT_MAX`] characters by the settings UI.
-    #[serde(default)]
+    /// Legacy single trigger word, read only for migration into
+    /// [`Self::custom_chat_alerts`]. Never serialized after migration.
+    #[serde(default, skip_serializing)]
     pub custom_chat_text: String,
+
+    /// Configured custom-chat alerts, each with its own variants and sound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_chat_alerts: Vec<ChatTriggerAlert>,
 
     /// Play the Dimitus alert sound when entering a dungeon with the Dimitus
     /// modifier (golden outline). Off by default.
@@ -2514,6 +2540,7 @@ impl Default for SoundSettings {
             ign_mention: false,
             custom_chat: false,
             custom_chat_text: String::new(),
+            custom_chat_alerts: Vec::new(),
             // Dimitus dungeon alert disabled by default
             dimitus_dungeon: false,
             // Bad-mod warning disabled by default
@@ -2546,6 +2573,20 @@ impl SoundSettings {
     pub fn set_sound_volume(&mut self, key: &str, volume: f32) {
         self.sound_volumes
             .insert(key.to_string(), volume.clamp(0.0, 1.0));
+    }
+
+    /// Move the legacy single trigger word into `custom_chat_alerts`.
+    pub fn migrate_custom_chat_alerts(&mut self) {
+        if self.custom_chat_alerts.is_empty() {
+            let words = crate::chat_ping::normalize_trigger_words(&self.custom_chat_text);
+            if !words.is_empty() {
+                self.custom_chat_alerts
+                    .push(ChatTriggerAlert { id: 0, words });
+            }
+        }
+        self.custom_chat_text.clear();
+        self.custom_chat_alerts
+            .truncate(crate::chat_ping::CUSTOM_CHAT_ALERTS_MAX);
     }
 }
 
@@ -2703,6 +2744,7 @@ impl Settings {
                 self.live_feed.nexus_marker = NexusMarker::InNexus;
             }
         }
+        self.sound.migrate_custom_chat_alerts();
         self.version = SETTINGS_VERSION;
     }
 
@@ -2937,11 +2979,12 @@ mod tests {
 
     #[test]
     fn chat_ping_sounds_default_off_and_survive_missing_json() {
-        // Both extra chat pings are opt-in and the trigger word starts empty.
+        // Both extra chat pings are opt-in and start with no alerts.
         let d = SoundSettings::default();
         assert!(!d.ign_mention);
         assert!(!d.custom_chat);
         assert!(d.custom_chat_text.is_empty());
+        assert!(d.custom_chat_alerts.is_empty());
 
         // Back-compat: configs saved before these options existed still load.
         let legacy = r#"{ "volume": 0.5, "whitebag": true, "pm": true, "guild": true }"#;
@@ -2950,16 +2993,66 @@ mod tests {
         assert!(!parsed.ign_mention);
         assert!(!parsed.custom_chat);
         assert!(parsed.custom_chat_text.is_empty());
+        assert!(parsed.custom_chat_alerts.is_empty());
 
-        // Round-trip preserves both toggles and the configured trigger.
+        // Round-trip preserves both toggles and the configured alerts.
         let mut s = SoundSettings::default();
         s.ign_mention = true;
         s.custom_chat = true;
-        s.custom_chat_text = "abyss".into();
+        s.custom_chat_alerts.push(ChatTriggerAlert {
+            id: 0,
+            words: "abyss, abby".into(),
+        });
         let back: SoundSettings =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(back.ign_mention && back.custom_chat);
-        assert_eq!(back.custom_chat_text, "abyss");
+        assert_eq!(back.custom_chat_alerts.len(), 1);
+        assert_eq!(back.custom_chat_alerts[0].words, "abyss, abby");
+    }
+
+    #[test]
+    fn legacy_single_trigger_migrates_to_an_alert() {
+        let mut s = SoundSettings::default();
+        s.custom_chat_text = " abyss, ABYSS, abby ".into();
+        s.migrate_custom_chat_alerts();
+
+        assert_eq!(s.custom_chat_alerts.len(), 1);
+        assert_eq!(s.custom_chat_alerts[0].id, 0);
+        assert_eq!(s.custom_chat_alerts[0].words, "abyss, abby");
+        assert!(s.custom_chat_text.is_empty());
+
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("custom_chat_text"));
+        assert!(json.contains("custom_chat_alerts"));
+    }
+
+    #[test]
+    fn chat_trigger_alert_sound_keys_are_stable() {
+        assert_eq!(
+            ChatTriggerAlert {
+                id: 0,
+                words: String::new()
+            }
+            .sound_key(),
+            "custom_chat"
+        );
+        assert_eq!(
+            ChatTriggerAlert {
+                id: 3,
+                words: String::new()
+            }
+            .sound_key(),
+            "custom_chat_3"
+        );
+    }
+
+    #[test]
+    fn loading_settings_migrates_the_legacy_trigger() {
+        let json = r#"{"sound":{"custom_chat":true,"custom_chat_text":"abyss, abby"}}"#;
+        let settings = Settings::from_json(json).unwrap();
+        assert_eq!(settings.sound.custom_chat_alerts.len(), 1);
+        assert_eq!(settings.sound.custom_chat_alerts[0].words, "abyss, abby");
+        assert!(settings.sound.custom_chat_text.is_empty());
     }
 
     #[test]

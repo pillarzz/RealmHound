@@ -6,9 +6,15 @@
 //! user configured appears. Both match whole words only, so a trigger of `abyss`
 //! never fires on `abyssal`.
 
-/// Longest trigger text accepted for the custom chat ping. The settings field
-/// enforces the same cap, so a stored value can never exceed it.
+/// Longest trigger text accepted for one custom-chat variant. The settings
+/// field enforces the same cap, so a stored variant can never exceed it.
 pub const CUSTOM_CHAT_TEXT_MAX: usize = 50;
+
+/// Longest comma-separated trigger field accepted for one custom-chat alert.
+pub const CUSTOM_CHAT_TEXT_TOTAL_MAX: usize = 2000;
+
+/// Maximum number of custom-chat alerts a user can configure.
+pub const CUSTOM_CHAT_ALERTS_MAX: usize = 20;
 
 /// Whether `c` can be part of a word for trigger matching. Everything else
 /// (spaces, punctuation, quotes) counts as a boundary, so `Bob's` mentions
@@ -50,6 +56,52 @@ pub fn contains_word(text: &str, needle: &str) -> bool {
         searched = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
     }
     false
+}
+
+/// Split a comma-separated trigger field into its non-empty variants.
+pub fn split_trigger_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c == ',' || c == '\n' || c == '\r')
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+}
+
+/// True if `body` contains any variant in a comma-separated trigger field as a
+/// whole word.
+pub fn matches_any_trigger(body: &str, words: &str) -> bool {
+    split_trigger_words(words).any(|word| contains_word(body, word))
+}
+
+/// Normalise a comma-separated trigger field: trim variants, cap each at
+/// [`CUSTOM_CHAT_TEXT_MAX`] characters, remove case-insensitive duplicates, and
+/// keep the joined field within [`CUSTOM_CHAT_TEXT_TOTAL_MAX`] characters.
+pub fn normalize_trigger_words(text: &str) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut used = 0usize;
+
+    for raw in text.split(|c: char| c == ',' || c == '\n' || c == '\r') {
+        let word: String = raw
+            .trim()
+            .chars()
+            .take(CUSTOM_CHAT_TEXT_MAX)
+            .collect::<String>();
+        if word.is_empty() {
+            continue;
+        }
+        let key = word.to_lowercase();
+        if seen.iter().any(|existing| existing == &key) {
+            continue;
+        }
+        let added = word.chars().count() + if words.is_empty() { 0 } else { 2 };
+        if used + added > CUSTOM_CHAT_TEXT_TOTAL_MAX {
+            break;
+        }
+        used += added;
+        seen.push(key);
+        words.push(word);
+    }
+
+    words.join(", ")
 }
 
 /// Which extra chat pings a message body matches. Pure text matching: callers
@@ -215,5 +267,40 @@ mod tests {
         assert!(!is_presence_notice(""));
         let pings = pings_for("did Bob come online?", Some("Bob"), "");
         assert!(pings.ign_mention);
+    }
+
+    #[test]
+    fn matches_any_comma_separated_trigger_variant() {
+        assert!(matches_any_trigger("wanna do abyss?", "abyss, abby, aby"));
+        assert!(matches_any_trigger("abby run?", "abyss, abby, aby"));
+        assert!(matches_any_trigger("aby now", "abyss, abby, aby"));
+        assert!(!matches_any_trigger("nothing here", "abyss, abby, aby"));
+        assert!(!matches_any_trigger("abyssal", "abyss, abby, aby"));
+    }
+
+    #[test]
+    fn normalize_trigger_words_trims_caps_and_deduplicates() {
+        assert_eq!(
+            normalize_trigger_words(" abyss,  ABYSS ,abby,,aby "),
+            "abyss, abby, aby"
+        );
+        assert_eq!(
+            normalize_trigger_words("abyss\nabby\r\naby"),
+            "abyss, abby, aby"
+        );
+        let long = "x".repeat(CUSTOM_CHAT_TEXT_MAX + 20);
+        assert_eq!(
+            normalize_trigger_words(&long).chars().count(),
+            CUSTOM_CHAT_TEXT_MAX
+        );
+    }
+
+    #[test]
+    fn normalize_trigger_words_respects_the_total_field_cap() {
+        let words = (0..100)
+            .map(|i| format!("word{i:03}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(normalize_trigger_words(&words).chars().count() <= CUSTOM_CHAT_TEXT_TOTAL_MAX);
     }
 }

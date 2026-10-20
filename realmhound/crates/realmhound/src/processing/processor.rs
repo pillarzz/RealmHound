@@ -2729,32 +2729,51 @@ impl PacketProcessor {
                                     | ChatType::Guild
                                     | ChatType::Whisper
                             ) {
-                                let (mention_ping, custom_ping) = self
+                                let (mention_ping, custom_pings) = self
                                     .settings
                                     .read()
                                     .map(|s| {
                                         let pings = realmhound_core::chat_ping::pings_for(
                                             &chat_msg.text,
                                             me.as_deref(),
-                                            s.sound.custom_chat_text.as_str(),
+                                            "",
                                         );
+                                        let custom = if SoundType::CustomChat.is_enabled(&s.sound) {
+                                            s.sound
+                                                .custom_chat_alerts
+                                                .iter()
+                                                .filter(|alert| {
+                                                    realmhound_core::chat_ping::matches_any_trigger(
+                                                        &chat_msg.text,
+                                                        &alert.words,
+                                                    )
+                                                })
+                                                .map(|alert| {
+                                                    let key = alert.sound_key();
+                                                    let volume = s.sound.sound_volume(&key);
+                                                    (key, volume)
+                                                })
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            Vec::new()
+                                        };
                                         (
                                             pings.ign_mention
                                                 && SoundType::IgnMention.is_enabled(&s.sound),
-                                            pings.custom_chat
-                                                && SoundType::CustomChat.is_enabled(&s.sound),
+                                            custom,
                                         )
                                     })
-                                    .unwrap_or((false, false));
+                                    .unwrap_or((false, Vec::new()));
                                 if mention_ping {
                                     self.emit(UiPayload::Audio(AudioCommand::Play(
                                         SoundType::IgnMention,
                                     )));
                                 }
-                                if custom_ping {
-                                    self.emit(UiPayload::Audio(AudioCommand::Play(
-                                        SoundType::CustomChat,
-                                    )));
+                                for (custom_key, volume) in custom_pings {
+                                    self.emit(UiPayload::Audio(AudioCommand::PlayCustomChat {
+                                        custom_key,
+                                        volume,
+                                    }));
                                 }
                             }
                         }

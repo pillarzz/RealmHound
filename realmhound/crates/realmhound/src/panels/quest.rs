@@ -8,6 +8,7 @@ use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
     assets::get_asset_manager,
     protocol::{data::QuestData, QuestFetchResponsePacket},
+    settings::{QuestChestHeaderMode, QuestMarkProgressMode},
     vault::AccountData,
 };
 use serde::{Deserialize, Serialize};
@@ -297,6 +298,37 @@ fn chest_completable(quest: &QuestData, item_counts: &HashMap<i32, (u32, u32)>) 
     seasonal_ok || regular_ok
 }
 
+/// Whether a chest quest's marks satisfy the configured header mode: one full
+/// storage side for `Seasonal`/`Regular`, either side for `Any`, or the two
+/// sides counted together for `Combined`.
+fn chest_completable_for_mode(
+    quest: &QuestData,
+    item_counts: &HashMap<i32, (u32, u32)>,
+    mode: QuestChestHeaderMode,
+) -> bool {
+    let mut need: HashMap<i32, u32> = HashMap::new();
+    for &id in &quest.requirements {
+        *need.entry(id).or_insert(0) += 1;
+    }
+    if need.is_empty() {
+        return false;
+    }
+    let seasonal_ok = need
+        .iter()
+        .all(|(id, c)| item_counts.get(id).is_some_and(|&(s, _)| s >= *c));
+    let regular_ok = need
+        .iter()
+        .all(|(id, c)| item_counts.get(id).is_some_and(|&(_, r)| r >= *c));
+    match mode {
+        QuestChestHeaderMode::Any => seasonal_ok || regular_ok,
+        QuestChestHeaderMode::Seasonal => seasonal_ok,
+        QuestChestHeaderMode::Regular => regular_ok,
+        QuestChestHeaderMode::Combined => need
+            .iter()
+            .all(|(id, c)| item_counts.get(id).is_some_and(|&(s, r)| s + r >= *c)),
+    }
+}
+
 /// True when a resolved item name denotes a Quest Chest reward. Shared by the
 /// Daily Quest Chests classifier and the chest-tier icon resolver.
 fn name_is_quest_chest(name: &str) -> bool {
@@ -350,6 +382,7 @@ fn claimable_chest_icon(
     quests: &[QuestData],
     hidden: &HashSet<String>,
     item_counts: &HashMap<i32, (u32, u32)>,
+    mode: QuestChestHeaderMode,
 ) -> Option<i32> {
     let mut best: Option<(u8, i32)> = None;
     for q in quests {
@@ -359,7 +392,7 @@ fn claimable_chest_icon(
         if QuestSection::for_quest(q) != QuestSection::DailyChests {
             continue;
         }
-        if !chest_completable(q, item_counts) {
+        if !chest_completable_for_mode(q, item_counts, mode) {
             continue;
         }
         if let Some((tier, icon)) = chest_tier_icon(q) {
@@ -409,6 +442,10 @@ pub struct QuestPanel {
     has_data: bool,
     /// Hide the quest-name column to save horizontal space.
     hide_names: bool,
+    /// Which mark-progress row(s) cards and task tooltips show.
+    mark_progress: QuestMarkProgressMode,
+    /// Which storage side(s) can show the claimable chest in the tab header.
+    header_chest: QuestChestHeaderMode,
     /// Whether the data was loaded from cache
     from_cache: bool,
     /// Experimental: shrink icons/fonts by half to fit more on small screens
@@ -451,6 +488,8 @@ impl QuestPanel {
             quests,
             has_data,
             hide_names: false,
+            mark_progress: QuestMarkProgressMode::default(),
+            header_chest: QuestChestHeaderMode::default(),
             from_cache,
             compact_view: false,
             cached_at,
@@ -472,6 +511,19 @@ impl QuestPanel {
         self.disabled = s.disabled.iter().copied().collect();
         self.hidden = s.hidden.iter().cloned().collect();
         self.hide_names = s.hide_names;
+        // The Taskbar projection caches on `quests_revision`, so a mark-progress
+        // change must invalidate it (the tab header reads its mode per frame).
+        if self.mark_progress != s.mark_progress {
+            self.quests_revision = self.quests_revision.wrapping_add(1);
+        }
+        self.mark_progress = s.mark_progress;
+        self.header_chest = s.header_chest;
+    }
+
+    /// Which storage side(s) can show the claimable chest in the Quests tab
+    /// header.
+    pub fn header_chest_mode(&self) -> QuestChestHeaderMode {
+        self.header_chest
     }
 
     /// Apply the Live Feed Taskbar settings. Call on startup and whenever the
@@ -509,6 +561,7 @@ impl QuestPanel {
                     q,
                     |id| counts.get(&id).copied().unwrap_or((0, 0)),
                     self.taskbar.prioritize_seasonal_mark_progress,
+                    self.mark_progress,
                 )
             })
             .filter(|t| t.remaining > 0)
@@ -522,6 +575,8 @@ impl QuestPanel {
             disabled: self.disabled.iter().copied().collect(),
             hidden: self.hidden.iter().cloned().collect(),
             hide_names: self.hide_names,
+            mark_progress: self.mark_progress,
+            header_chest: self.header_chest,
         }
     }
 
@@ -748,7 +803,7 @@ impl QuestPanel {
             Self::build_item_counts_cache(&self.quests, account_data)
         });
         let counts = self.item_counts_memo.get()?;
-        claimable_chest_icon(&self.quests, &self.hidden, counts)
+        claimable_chest_icon(&self.quests, &self.hidden, counts, self.header_chest)
     }
 
     /// Whether the currently-held daily quests are stale after a post-reset
@@ -1097,6 +1152,7 @@ impl QuestPanel {
                             item_counts,
                             sprite_renderer,
                             cols,
+                            self.mark_progress,
                             card_fill,
                             is_hidden_sec,
                             &mut to_hide,
@@ -1559,8 +1615,16 @@ pub(crate) fn render_quest_tooltip(
     quest: &QuestData,
     item_counts: &HashMap<i32, (u32, u32)>,
     seasonal: bool,
+    mark_mode: QuestMarkProgressMode,
     exclude_dungeons: &HashSet<String>,
 ) {
+    // The progress side drives the "Drops from" list below; the row visibility
+    // is governed separately by the mark-progress setting.
+    let seasonal_side = match mark_mode {
+        QuestMarkProgressMode::Both => seasonal,
+        QuestMarkProgressMode::Seasonal => true,
+        QuestMarkProgressMode::Regular => false,
+    };
     ui.spacing_mut().item_spacing.y = 6.0;
     let cols = Cols::build(false, false, quest.requirements.len(), quest.rewards.len());
 
@@ -1610,30 +1674,36 @@ pub(crate) fn render_quest_tooltip(
         .layout_no_wrap("Seasonal".to_string(), lbl_font.clone(), Color32::WHITE)
         .size()
         .x;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        let (r, _) = ui.allocate_exact_size(egui::vec2(label_w, cols.tile), egui::Sense::hover());
-        ui.painter().text(
-            egui::pos2(r.left(), r.center().y),
-            egui::Align2::LEFT_CENTER,
-            "Seasonal",
-            lbl_font.clone(),
-            SEASONAL_COLOR,
-        );
-        render_collected(ui, sr, quest, item_counts, cols, true);
-    });
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        let (r, _) = ui.allocate_exact_size(egui::vec2(label_w, cols.tile), egui::Sense::hover());
-        ui.painter().text(
-            egui::pos2(r.left(), r.center().y),
-            egui::Align2::LEFT_CENTER,
-            "Regular",
-            lbl_font.clone(),
-            REGULAR_COLOR,
-        );
-        render_collected(ui, sr, quest, item_counts, cols, false);
-    });
+    if mark_mode.show_seasonal() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (r, _) =
+                ui.allocate_exact_size(egui::vec2(label_w, cols.tile), egui::Sense::hover());
+            ui.painter().text(
+                egui::pos2(r.left(), r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "Seasonal",
+                lbl_font.clone(),
+                SEASONAL_COLOR,
+            );
+            render_collected(ui, sr, quest, item_counts, cols, true);
+        });
+    }
+    if mark_mode.show_regular() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (r, _) =
+                ui.allocate_exact_size(egui::vec2(label_w, cols.tile), egui::Sense::hover());
+            ui.painter().text(
+                egui::pos2(r.left(), r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "Regular",
+                lbl_font.clone(),
+                REGULAR_COLOR,
+            );
+            render_collected(ui, sr, quest, item_counts, cols, false);
+        });
+    }
 
     // Where the required marks come from. A mark that's already fully collected
     // on the active storage side drops out (its dungeon disappears). Low-grave
@@ -1652,7 +1722,7 @@ pub(crate) fn render_quest_tooltip(
     let mut dungeons: Vec<String> = Vec::new();
     for id in order {
         let (s, r) = item_counts.get(&id).copied().unwrap_or((0, 0));
-        let collected = if seasonal { s } else { r } as i32;
+        let collected = if seasonal_side { s } else { r } as i32;
         if collected >= need[&id] {
             continue;
         }
@@ -1727,6 +1797,7 @@ fn quest_card(
     item_counts: &HashMap<i32, (u32, u32)>,
     sr: &mut SpriteRenderer,
     cols: Cols,
+    mark_mode: QuestMarkProgressMode,
     card_fill: Color32,
     in_hidden: bool,
     to_hide: &mut Vec<String>,
@@ -1756,8 +1827,10 @@ fn quest_card(
     } else {
         0.0
     };
-    let req_rows = if unique { 4.0 } else { 3.0 };
-    let req_stack_h = unique_h + cols.tile + 2.0 * cols.small_tile + (req_rows - 1.0) * vgap;
+    let collected_rows = u32::from(mark_mode.show_seasonal()) + u32::from(mark_mode.show_regular());
+    let req_rows = 1.0 + collected_rows as f32 + if unique { 1.0 } else { 0.0 };
+    let req_stack_h =
+        unique_h + cols.tile + collected_rows as f32 * cols.small_tile + (req_rows - 1.0) * vgap;
     // Status column may show up to two short lines.
     let status_lines = (timer.is_some() as u32
         + (quest.repeatable && !matches!(timer, Some(QuestStatusTimer::Resets { .. }))) as u32)
@@ -1830,8 +1903,12 @@ fn quest_card(
             ui.horizontal(|ui| {
                 render_tiles(ui, sr, &quest.requirements, cols);
             });
-            render_small_collected(ui, sr, quest, item_counts, cols, true);
-            render_small_collected(ui, sr, quest, item_counts, cols, false);
+            if mark_mode.show_seasonal() {
+                render_small_collected(ui, sr, quest, item_counts, cols, true);
+            }
+            if mark_mode.show_regular() {
+                render_small_collected(ui, sr, quest, item_counts, cols, false);
+            }
         });
     });
     cell(&mut cui, cols.arrow, content_h, |ui| {
@@ -2165,6 +2242,62 @@ mod tests {
         // Empty requirements are never completable.
         let empty = mk("Empty", 0);
         assert!(!chest_completable(&empty, &seasonal_ok));
+    }
+
+    #[test]
+    fn chest_header_modes_select_the_right_storage_sides() {
+        let mut q = mk("Daily Hold", 0);
+        q.requirements = vec![10, 20];
+        // One mark on each side: no single side is complete.
+        let split: HashMap<i32, (u32, u32)> = [(10, (1u32, 0u32)), (20, (0u32, 1u32))]
+            .into_iter()
+            .collect();
+        assert!(!chest_completable_for_mode(
+            &q,
+            &split,
+            QuestChestHeaderMode::Any
+        ));
+        assert!(!chest_completable_for_mode(
+            &q,
+            &split,
+            QuestChestHeaderMode::Seasonal
+        ));
+        assert!(!chest_completable_for_mode(
+            &q,
+            &split,
+            QuestChestHeaderMode::Regular
+        ));
+        assert!(chest_completable_for_mode(
+            &q,
+            &split,
+            QuestChestHeaderMode::Combined
+        ));
+
+        // A full Seasonal set only satisfies the Seasonal (and Any/Combined)
+        // modes; Regular stays hidden.
+        let seasonal: HashMap<i32, (u32, u32)> = [(10, (1u32, 0u32)), (20, (1u32, 0u32))]
+            .into_iter()
+            .collect();
+        assert!(chest_completable_for_mode(
+            &q,
+            &seasonal,
+            QuestChestHeaderMode::Any
+        ));
+        assert!(chest_completable_for_mode(
+            &q,
+            &seasonal,
+            QuestChestHeaderMode::Seasonal
+        ));
+        assert!(!chest_completable_for_mode(
+            &q,
+            &seasonal,
+            QuestChestHeaderMode::Regular
+        ));
+        assert!(chest_completable_for_mode(
+            &q,
+            &seasonal,
+            QuestChestHeaderMode::Combined
+        ));
     }
 
     #[test]

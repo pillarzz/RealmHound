@@ -2057,6 +2057,47 @@ impl Default for MissionsSettings {
     }
 }
 
+/// Which storage side's mark progress a quest shows. `Both` keeps the two
+/// Seasonal and Regular rows; the single-side modes hide the other row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QuestMarkProgressMode {
+    /// Show both the Seasonal and Regular collected rows (default).
+    #[default]
+    Both,
+    /// Show seasonal mark progress only.
+    Seasonal,
+    /// Show regular mark progress only.
+    Regular,
+}
+
+impl QuestMarkProgressMode {
+    /// Whether the Seasonal collected row is shown.
+    pub fn show_seasonal(self) -> bool {
+        !matches!(self, QuestMarkProgressMode::Regular)
+    }
+
+    /// Whether the Regular collected row is shown.
+    pub fn show_regular(self) -> bool {
+        !matches!(self, QuestMarkProgressMode::Seasonal)
+    }
+}
+
+/// Which storage side(s) can satisfy a Daily Quest Chest for the Quests tab
+/// header chest cue. `Any` matches a full set of marks on either side;
+/// `Combined` counts Seasonal and Regular marks together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QuestChestHeaderMode {
+    /// Either storage side on its own (default, previous behaviour).
+    #[default]
+    Any,
+    /// Seasonal marks only.
+    Seasonal,
+    /// Regular marks only.
+    Regular,
+    /// Seasonal plus Regular marks counted together.
+    Combined,
+}
+
 /// Quests tab settings. Persists the sections the user has collapsed and the
 /// sections toggled off, keyed by the stable per-section id, so choices survive
 /// app restarts.
@@ -2077,6 +2118,14 @@ pub struct QuestsSettings {
     /// Hide the quest-name column to save horizontal space.
     #[serde(default)]
     pub hide_names: bool,
+
+    /// Which mark-progress row(s) quest cards and task pill tooltips show.
+    #[serde(default)]
+    pub mark_progress: QuestMarkProgressMode,
+
+    /// Which storage side(s) can show the claimable chest in the tab header.
+    #[serde(default)]
+    pub header_chest: QuestChestHeaderMode,
 }
 
 /// Which dungeon difficulty tiers trigger a public key-pop notification.
@@ -2996,6 +3045,27 @@ mod tests {
         assert_eq!(back.realm_events.veteran.overrides.len(), 1);
         assert_eq!(back.realm_events.veteran.overrides[0].boss_id, 22146);
         assert_eq!(back.realm_events.veteran.overrides[0].volume, 0.8);
+    }
+
+    #[test]
+    fn quest_mark_and_header_modes_default_and_round_trip() {
+        let d = QuestsSettings::default();
+        assert_eq!(d.mark_progress, QuestMarkProgressMode::Both);
+        assert_eq!(d.header_chest, QuestChestHeaderMode::Any);
+
+        // Configs saved before these options existed still load with defaults.
+        let legacy = r#"{ "collapsed": [1], "hide_names": true }"#;
+        let parsed: QuestsSettings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.mark_progress, QuestMarkProgressMode::Both);
+        assert_eq!(parsed.header_chest, QuestChestHeaderMode::Any);
+
+        let mut s = QuestsSettings::default();
+        s.mark_progress = QuestMarkProgressMode::Regular;
+        s.header_chest = QuestChestHeaderMode::Combined;
+        let back: QuestsSettings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.mark_progress, QuestMarkProgressMode::Regular);
+        assert_eq!(back.header_chest, QuestChestHeaderMode::Combined);
     }
 
     #[test]

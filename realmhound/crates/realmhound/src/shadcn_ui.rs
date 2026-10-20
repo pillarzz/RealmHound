@@ -1198,7 +1198,7 @@ impl Shadcn {
         width: f32,
         options: &[(&str, &str)],
     ) -> Response {
-        self.select_with_side(ui, id, selected, width, options, SelectSide::Bottom)
+        self.select_with_side(ui, id, selected, width, options, SelectSide::Bottom, None)
     }
 
     /// Same as [`Self::select`] but opens the popup upward instead of downward.
@@ -1213,7 +1213,31 @@ impl Shadcn {
         width: f32,
         options: &[(&str, &str)],
     ) -> Response {
-        self.select_with_side(ui, id, selected, width, options, SelectSide::Top)
+        self.select_with_side(ui, id, selected, width, options, SelectSide::Top, None)
+    }
+
+    /// Same as [`Self::select`] but keeps the popup inside `boundary` instead of
+    /// the whole app viewport (for example the settings dialog's visible content
+    /// rect). The crate still slides the popup up/down to fit, so it opens the
+    /// way that leaves the most room at the current window size.
+    pub fn select_within(
+        &self,
+        ui: &mut Ui,
+        id: &str,
+        selected: &mut Option<String>,
+        width: f32,
+        options: &[(&str, &str)],
+        boundary: egui::Rect,
+    ) -> Response {
+        self.select_with_side(
+            ui,
+            id,
+            selected,
+            width,
+            options,
+            SelectSide::Bottom,
+            Some(boundary),
+        )
     }
 
     /// Keep an open dropdown the only clickable layer.
@@ -1287,6 +1311,7 @@ impl Shadcn {
         width: f32,
         options: &[(&str, &str)],
         side: SelectSide,
+        boundary: Option<egui::Rect>,
     ) -> Response {
         let items: Vec<SelectItem> = options
             .iter()
@@ -1310,7 +1335,7 @@ impl Shadcn {
         let mut reported: Option<bool> = None;
         let response = {
             let mut on_change = |is_open: bool| reported = Some(is_open);
-            let props = SelectProps::new(egui::Id::new(id), selected)
+            let mut props = SelectProps::new(egui::Id::new(id), selected)
                 .size(SelectSize::Size2)
                 .width(width)
                 .side(side)
@@ -1318,6 +1343,9 @@ impl Shadcn {
                 // to the same order so it isn't hidden behind the dialog frame.
                 .container(SelectPortalContainer::Tooltip)
                 .on_open_change(&mut on_change);
+            if let Some(boundary) = boundary {
+                props = props.collision_boundary(boundary);
+            }
             egui_shadcn::select::select_with_items(ui, &self.theme, props, &items)
         };
         self.maintain_select_blocker(ui, open_key, reported, response.rect);

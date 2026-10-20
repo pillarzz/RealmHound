@@ -5866,6 +5866,7 @@ fn render_single_pill(
                 &q.quest,
                 &q.item_counts,
                 q.seasonal,
+                q.mark_mode,
                 &std::collections::HashSet::new(),
             );
         }
@@ -5984,6 +5985,7 @@ fn render_combined_pill(
                             q,
                             &c.item_counts,
                             c.seasonal,
+                            c.mark_mode,
                             &mission_dungeons,
                         );
                     }
@@ -6065,6 +6067,7 @@ fn render_chain(
                         &q.quest,
                         &q.item_counts,
                         q.seasonal,
+                        q.mark_mode,
                         &std::collections::HashSet::new(),
                     );
                 });

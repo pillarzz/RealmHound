@@ -12,6 +12,7 @@
 
 use realmhound_core::api::MissionState;
 use realmhound_core::protocol::data::QuestData;
+use realmhound_core::settings::QuestMarkProgressMode;
 
 use realmhound_core::assets::{
     dungeon_difficulty, dungeon_for_mark_name, get_asset_manager, get_dungeon_portal_map,
@@ -98,6 +99,8 @@ pub struct QuestTask {
     /// Owned `(seasonal, regular)` counts per required id, for the tooltip's
     /// collected columns.
     pub item_counts: std::collections::HashMap<i32, (u32, u32)>,
+    /// Which collected row(s) the hover tooltip shows.
+    pub mark_mode: QuestMarkProgressMode,
 }
 
 /// One Taskbar entry: either a mission or a quest.
@@ -214,16 +217,23 @@ pub fn build_mission_task(
 
 /// Project one Daily Quest Chest onto a [`QuestTask`]. `owned` returns the
 /// `(seasonal, regular)` owned count for a given required item id. When
-/// `prioritize_seasonal` is set the pill always reflects seasonal marks (even
-/// if the regular marks are already collected); otherwise it reflects regular.
+/// `prioritize_seasonal` is set the pill reflects seasonal marks (even if the
+/// regular marks are already collected); otherwise it reflects regular. A
+/// single-side `mark_mode` overrides that choice so the pill matches the rows
+/// the quest card and tooltip show.
 pub fn build_quest_task(
     quest: &QuestData,
     owned: impl Fn(i32) -> (u32, u32),
     prioritize_seasonal: bool,
+    mark_mode: QuestMarkProgressMode,
 ) -> Option<QuestTask> {
     use std::collections::HashMap;
     let mark_id = *quest.requirements.first()?;
-    let seasonal = prioritize_seasonal;
+    let seasonal = match mark_mode {
+        QuestMarkProgressMode::Both => prioritize_seasonal,
+        QuestMarkProgressMode::Seasonal => true,
+        QuestMarkProgressMode::Regular => false,
+    };
     let side = |id: i32| {
         let (s, r) = owned(id);
         (if seasonal { s } else { r }) as i32
@@ -269,6 +279,7 @@ pub fn build_quest_task(
         marks,
         quest: quest.clone(),
         item_counts,
+        mark_mode,
     })
 }
 
@@ -323,6 +334,8 @@ pub struct CombinedTask {
     /// Which storage side (seasonal vs regular) the merge counted marks on, so
     /// the tooltip can hide dungeons whose mark is already fully collected.
     pub seasonal: bool,
+    /// Which collected row(s) the quest tooltip shows.
+    pub mark_mode: QuestMarkProgressMode,
     pub item_counts: std::collections::HashMap<i32, (u32, u32)>,
 }
 
@@ -812,6 +825,7 @@ pub fn build_taskbar_items(
     let quest_mark_dungeons: Vec<Vec<QuestMarkDungeon>> =
         quest_tasks.iter().map(resolve_quest_marks).collect();
     let quest_seasonal = quest_tasks.first().map(|q| q.seasonal).unwrap_or(false);
+    let quest_mark_mode = quest_tasks.first().map(|q| q.mark_mode).unwrap_or_default();
 
     // --- Feature 1: exact dungeon<->mark overlaps -------------------------
     for mi in 0..mission_tasks.len() {
@@ -933,6 +947,7 @@ pub fn build_taskbar_items(
             current_char: mission_tasks[mi].current_char,
             quests,
             seasonal: quest_seasonal,
+            mark_mode: quest_mark_mode,
             item_counts,
         }));
     }
@@ -1018,6 +1033,7 @@ pub fn build_taskbar_items(
             current_char: mission_tasks[mi].current_char,
             quests,
             seasonal: quest_seasonal,
+            mark_mode: quest_mark_mode,
             item_counts,
         }));
     }
@@ -1390,20 +1406,29 @@ mod tests {
     fn quest_marks_use_chosen_side() {
         // Two required marks (same id). Seasonal owns 1, regular owns 2.
         let q = quest("q1", vec![100, 100]);
-        let seasonal = build_quest_task(&q, |_| (1, 2), true).unwrap();
+        let seasonal = build_quest_task(&q, |_| (1, 2), true, QuestMarkProgressMode::Both).unwrap();
         assert_eq!(
             (seasonal.have, seasonal.need, seasonal.seasonal),
             (1, 2, true)
         );
         assert_eq!(seasonal.remaining, 1);
 
-        let regular = build_quest_task(&q, |_| (1, 2), false).unwrap();
+        let regular = build_quest_task(&q, |_| (1, 2), false, QuestMarkProgressMode::Both).unwrap();
         assert_eq!(
             (regular.have, regular.need, regular.seasonal),
             (2, 2, false)
         );
         assert_eq!(regular.remaining, 0);
         assert!(regular.marks.is_empty());
+
+        // A single-side mark mode overrides the seasonal-priority preference so
+        // the pill matches the row(s) the card and tooltip show.
+        let regular_mode =
+            build_quest_task(&q, |_| (1, 2), true, QuestMarkProgressMode::Regular).unwrap();
+        assert_eq!((regular_mode.have, regular_mode.seasonal), (2, false));
+        let seasonal_mode =
+            build_quest_task(&q, |_| (1, 2), false, QuestMarkProgressMode::Seasonal).unwrap();
+        assert_eq!((seasonal_mode.have, seasonal_mode.seasonal), (1, true));
     }
 
     #[test]
@@ -1411,7 +1436,13 @@ mod tests {
         // Four of mark 10, two of mark 20 (Sprite World + 3D marks). Regular
         // owns 1 of mark 10 and none of mark 20.
         let q = quest("q2", vec![10, 10, 10, 10, 20, 20]);
-        let t = build_quest_task(&q, |id| if id == 10 { (0, 1) } else { (0, 0) }, false).unwrap();
+        let t = build_quest_task(
+            &q,
+            |id| if id == 10 { (0, 1) } else { (0, 0) },
+            false,
+            QuestMarkProgressMode::Both,
+        )
+        .unwrap();
         assert_eq!(t.marks.len(), 2);
         assert_eq!((t.marks[0].mark_id, t.marks[0].remaining), (10, 3));
         assert_eq!((t.marks[1].mark_id, t.marks[1].remaining), (20, 2));
@@ -1474,6 +1505,7 @@ mod tests {
                 &quest("q-advanced-nest", vec![17571, 17571, 17571, 17571]),
                 |_| (0, 0),
                 false,
+                QuestMarkProgressMode::Both,
             )
             .unwrap()
         };
@@ -1517,6 +1549,7 @@ mod tests {
             &quest("q-multi", vec![7741, 7741, 7739, 7739]),
             |_| (0, 0),
             false,
+            QuestMarkProgressMode::Both,
         )
         .unwrap();
         assert_eq!(quest_task.marks.len(), 2, "two distinct marks still needed");
@@ -1583,6 +1616,7 @@ mod tests {
             &quest("q-and", vec![7741, 7741, 7739, 7739]),
             |_| (0, 0),
             false,
+            QuestMarkProgressMode::Both,
         )
         .unwrap();
         let items = build_taskbar_items(
@@ -1644,10 +1678,16 @@ mod tests {
             &quest("q-unsettling", vec![7741, 7741, 7739, 7739]),
             |_| (0, 0),
             false,
+            QuestMarkProgressMode::Both,
         )
         .unwrap();
-        let lost_and_found =
-            build_quest_task(&quest("q-lost", vec![7741, 7741]), |_| (0, 0), false).unwrap();
+        let lost_and_found = build_quest_task(
+            &quest("q-lost", vec![7741, 7741]),
+            |_| (0, 0),
+            false,
+            QuestMarkProgressMode::Both,
+        )
+        .unwrap();
         let mut entry = mission(
             20,
             vec![
@@ -1706,11 +1746,17 @@ mod tests {
             &quest("q-unsettling", vec![7741, 7741, 7739, 7739]),
             |id| if id == 7739 { (0, 1) } else { (0, 0) },
             false,
+            QuestMarkProgressMode::Both,
         )
         .unwrap();
         assert_eq!(unsettling.have, 1, "this quest carries the headstart");
-        let lost_and_found =
-            build_quest_task(&quest("q-lost", vec![7741, 7741]), |_| (0, 0), false).unwrap();
+        let lost_and_found = build_quest_task(
+            &quest("q-lost", vec![7741, 7741]),
+            |_| (0, 0),
+            false,
+            QuestMarkProgressMode::Both,
+        )
+        .unwrap();
         let mut entry = mission(
             21,
             vec![
@@ -1757,10 +1803,16 @@ mod tests {
             &quest("q-unsettling", vec![7741, 7741, 7739, 7739]),
             |_| (0, 0),
             false,
+            QuestMarkProgressMode::Both,
         )
         .unwrap();
-        let lost_and_found =
-            build_quest_task(&quest("q-lost", vec![7741, 7741]), |_| (0, 0), false).unwrap();
+        let lost_and_found = build_quest_task(
+            &quest("q-lost", vec![7741, 7741]),
+            |_| (0, 0),
+            false,
+            QuestMarkProgressMode::Both,
+        )
+        .unwrap();
 
         let items = build_taskbar_items(
             &view_of(vec![mission(
@@ -1819,6 +1871,7 @@ mod tests {
             &quest("q-multi", vec![7741, 7741, 7739, 7739]),
             |_| (0, 0),
             false,
+            QuestMarkProgressMode::Both,
         )
         .unwrap();
         let items = build_taskbar_items(

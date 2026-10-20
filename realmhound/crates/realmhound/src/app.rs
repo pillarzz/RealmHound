@@ -2317,7 +2317,7 @@ impl RealmHoundApp {
                         let tab_items = [
                             ("live_feed", "📡 Live Feed"),
                             ("widget_bar", "📊 Widget Bar"),
-                            ("taskbar", "🧭 Taskbar"),
+                            ("taskbar", "🧭 Taskbar & Quests"),
                             ("loot", "🎒 Loot History"),
                             ("combat_history", "⚔ Combat History"),
                             ("trophy_hall", "🏆 Trophy Hall"),
@@ -4567,16 +4567,19 @@ impl RealmHoundApp {
         }
     }
 
-    /// Render the Taskbar settings panel: the row of mission/quest progress
-    /// pills shown below the Widget Bar on every tab.
+    /// Render the Taskbar & Quests settings panel: the row of mission/quest
+    /// progress pills shown below the Widget Bar on every tab, plus the Quests
+    /// tab's mark-progress and header-chest options.
     fn render_taskbar_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
+        use realmhound_core::settings::{QuestChestHeaderMode, QuestMarkProgressMode};
+
         ui.add_space(10.0);
-        ui.heading("Taskbar");
+        ui.heading("Taskbar & Quests");
         ui.add_space(5.0);
         ui.label(
             RichText::new(
                 "A full-width row of mission and daily-quest progress pills, shown below the \
-                 Widget Bar on every tab.",
+                 Widget Bar on every tab, and how the Quests tab displays mark progress.",
             )
             .weak(),
         );
@@ -4586,7 +4589,12 @@ impl RealmHoundApp {
             let s = self.settings.read().unwrap();
             s.taskbar.clone()
         };
+        let mut quests = {
+            let s = self.settings.read().unwrap();
+            s.quests.clone()
+        };
         let mut settings_changed = false;
+        let mut quests_changed = false;
 
         shadcn.card(ui, "taskbar_opts", "Taskbar", |ui| {
             ui.label(
@@ -4632,18 +4640,36 @@ impl RealmHoundApp {
                         settings_changed = true;
                     }
                     ui.add_space(4.0);
-                    settings_changed |= shadcn
-                        .switch(
-                            ui,
-                            &mut current.prioritize_seasonal_mark_progress,
-                            "Prioritize seasonal mark progress",
-                        )
-                        .hover_tip(
-                            "Quest pills show remaining seasonal marks even when the regular \
-                             marks are already collected. Turn off to show regular mark \
-                             progress instead.",
-                        )
-                        .changed();
+                    let seasonal_priority_tip =
+                        "Quest pills show remaining seasonal marks even when the regular marks \
+                         are already collected. Turn off to show regular mark progress instead. \
+                         Only applies when \"Track mark progress\" is set to Both or Seasonal; \
+                         it is automatically turned off when Regular is selected.";
+                    if quests.mark_progress == QuestMarkProgressMode::Regular {
+                        // Regular-only progress makes seasonal priority meaningless.
+                        if current.prioritize_seasonal_mark_progress {
+                            current.prioritize_seasonal_mark_progress = false;
+                            settings_changed = true;
+                        }
+                        let mut off = false;
+                        ui.add_enabled_ui(false, |ui| {
+                            shadcn.switch(ui, &mut off, "Prioritize seasonal mark progress");
+                        })
+                        .response
+                        .on_hover_text(format!(
+                            "{seasonal_priority_tip}\n\nTurned off because \"Track mark \
+                             progress\" is set to Regular."
+                        ));
+                    } else {
+                        settings_changed |= shadcn
+                            .switch(
+                                ui,
+                                &mut current.prioritize_seasonal_mark_progress,
+                                "Prioritize seasonal mark progress",
+                            )
+                            .hover_tip(seasonal_priority_tip)
+                            .changed();
+                    }
                     ui.add_space(4.0);
                     settings_changed |= shadcn
                         .switch(
@@ -4661,13 +4687,141 @@ impl RealmHoundApp {
             }
         });
 
-        if settings_changed {
+        ui.add_space(12.0);
+        shadcn.card(ui, "quests_opts", "Quests", |ui| {
+            // Keep the dropdown popups inside the settings dialog's visible
+            // content area, so they never spill past the window edge at small
+            // app/window sizes. The select still slides up when the trigger is
+            // near the bottom.
+            let boundary = ui.clip_rect().intersect(ui.ctx().content_rect());
+            shadcn.field_row(ui, |ui| {
+                ui.label("Track mark progress:").on_hover_text(
+                    "Which collected marks the quest cards and Taskbar tooltips show. Both \
+                     keeps the separate Seasonal and Regular rows; a single mode hides the \
+                     other row.",
+                );
+                let mut selected = Some(
+                    match quests.mark_progress {
+                        QuestMarkProgressMode::Both => "both",
+                        QuestMarkProgressMode::Seasonal => "seasonal",
+                        QuestMarkProgressMode::Regular => "regular",
+                    }
+                    .to_string(),
+                );
+                if shadcn
+                    .select_within(
+                        ui,
+                        "quest_mark_progress",
+                        &mut selected,
+                        160.0,
+                        &[
+                            ("both", "Both"),
+                            ("seasonal", "Seasonal"),
+                            ("regular", "Regular"),
+                        ],
+                        boundary,
+                    )
+                    .hover_tip(
+                        "Both shows the Seasonal and Regular collected rows. Seasonal or \
+                         Regular hides the other row and makes the Taskbar pill track that \
+                         side.",
+                    )
+                    .changed()
+                {
+                    let mode = match selected.as_deref() {
+                        Some("seasonal") => QuestMarkProgressMode::Seasonal,
+                        Some("regular") => QuestMarkProgressMode::Regular,
+                        _ => QuestMarkProgressMode::Both,
+                    };
+                    if quests.mark_progress != mode {
+                        quests.mark_progress = mode;
+                        quests_changed = true;
+                        // Seasonal priority only makes sense while seasonal marks can
+                        // be shown: force it off for Regular and back on otherwise.
+                        let priority = mode != QuestMarkProgressMode::Regular;
+                        if current.prioritize_seasonal_mark_progress != priority {
+                            current.prioritize_seasonal_mark_progress = priority;
+                            settings_changed = true;
+                        }
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            shadcn.field_row(ui, |ui| {
+                ui.label("Display chest in the tab header:").on_hover_text(
+                    "Controls when the Quests tab shows a claimable Daily Quest Chest. Any \
+                     shows it when either storage side has every required mark; Seasonal or \
+                     Regular restrict it to that side; Combined counts both sides together.",
+                );
+                let mut selected = Some(
+                    match quests.header_chest {
+                        QuestChestHeaderMode::Any => "any",
+                        QuestChestHeaderMode::Seasonal => "seasonal",
+                        QuestChestHeaderMode::Regular => "regular",
+                        QuestChestHeaderMode::Combined => "combined",
+                    }
+                    .to_string(),
+                );
+                if shadcn
+                    .select_within(
+                        ui,
+                        "quest_header_chest",
+                        &mut selected,
+                        160.0,
+                        &[
+                            ("any", "Any"),
+                            ("seasonal", "Seasonal"),
+                            ("regular", "Regular"),
+                            ("combined", "Combined"),
+                        ],
+                        boundary,
+                    )
+                    .hover_tip(
+                        "Any shows the chest when either storage side has a full set of \
+                         marks. Seasonal or Regular restrict it to that side. Combined counts \
+                         both sides together.",
+                    )
+                    .changed()
+                {
+                    let mode = match selected.as_deref() {
+                        Some("seasonal") => QuestChestHeaderMode::Seasonal,
+                        Some("regular") => QuestChestHeaderMode::Regular,
+                        Some("combined") => QuestChestHeaderMode::Combined,
+                        _ => QuestChestHeaderMode::Any,
+                    };
+                    if quests.header_chest != mode {
+                        quests.header_chest = mode;
+                        quests_changed = true;
+                    }
+                }
+            });
+            if quests.header_chest == QuestChestHeaderMode::Combined {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Transfer Seasonal marks to Regular to exchange them together")
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+
+        if settings_changed || quests_changed {
             if let Ok(mut s) = self.settings.write() {
-                s.taskbar = current.clone();
+                if settings_changed {
+                    s.taskbar = current.clone();
+                }
+                if quests_changed {
+                    s.quests = quests.clone();
+                }
                 s.save();
             }
+        }
+        if settings_changed {
             self.missions_panel.apply_taskbar_settings(&current);
             self.quest_panel.apply_taskbar_settings(&current);
+        }
+        if quests_changed {
+            self.quest_panel.apply_settings(&quests);
         }
     }
 
@@ -7662,7 +7816,15 @@ impl RealmHoundApp {
         let tip: String = if claimable {
             "Seasonal missions progress and rewards.\nYou have unclaimed mission rewards - open and claim them in the game.".to_string()
         } else if show_quest_chest.is_some() {
-            "Daily and event quests from the Tinkerer.\nA Daily Quest Chest is ready to claim - you have enough marks collected.".to_string()
+            let mut t = "Daily and event quests from the Tinkerer.\nA Daily Quest Chest is \
+                         ready to claim - you have enough marks collected."
+                .to_string();
+            if self.quest_panel.header_chest_mode()
+                == realmhound_core::settings::QuestChestHeaderMode::Combined
+            {
+                t.push_str("\nTransfer Seasonal marks to Regular to exchange them together");
+            }
+            t
         } else {
             tooltip.to_string()
         };

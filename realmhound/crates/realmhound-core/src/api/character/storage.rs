@@ -1,6 +1,7 @@
 //! Account storage data structures (vault, gifts, potions, materials).
 
 use std::collections::HashMap;
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
 /// An item in storage (can have an instance ID for unique items).
 #[derive(Debug, Clone, Default)]
@@ -395,128 +396,198 @@ impl AccountData {
     }
 }
 
-/// Decode a URL-safe base64 string (RotMG's "6-bit string" encoding).
-/// This uses `-` and `_` instead of `+` and `/`.
+/// Decode RotMG's URL-safe Base64 encoding, accepting unpadded input.
 fn decode_rotmg_base64(s: &str) -> Option<Vec<u8>> {
-    let padding_idx = s.find('=').unwrap_or(s.len());
-    let padding = s.len() - padding_idx;
-    let output_len = (s.len() / 4) * 3 - padding;
-
-    if s.len() % 4 != 0 {
-        return None;
-    }
-
-    let mut output = vec![0u8; output_len];
-    let mut o = 0;
-
-    let chars: Vec<char> = s.chars().collect();
-    for i in (0..s.len()).step_by(4) {
-        let v1 = char_value(chars[i]);
-        let v2 = char_value(chars[i + 1]);
-        let c3 = chars[i + 2];
-        let c4 = chars[i + 3];
-        let v3 = char_value(c3);
-        let v4 = char_value(c4);
-
-        output[o] = ((v1 << 2) | (v2 >> 4)) as u8;
-        if c3 != '=' && o + 1 < output.len() {
-            output[o + 1] = (((v2 & 0x0F) << 4) | (v3 >> 2)) as u8;
-            if c4 != '=' && o + 2 < output.len() {
-                output[o + 2] = (((v3 & 0x03) << 6) | v4) as u8;
-            }
-        }
-        o += 3;
-    }
-
-    Some(output)
+    let mut padded = s.to_owned();
+    padded.push_str(&"=".repeat((4 - padded.len() % 4) % 4));
+    URL_SAFE.decode(padded).ok()
 }
 
-/// Convert a character to its 6-bit value (RotMG's custom base64 alphabet).
-fn char_value(c: char) -> u8 {
-    match c {
-        '0'..='9' => (c as u8) - b'0' + 52, // 0-9 -> 52-61
-        'A'..='Z' => (c as u8) - b'A',      // A-Z -> 0-25
-        'a'..='z' => (c as u8) - b'a' + 26, // a-z -> 26-51
-        '-' => 62,                          // URL-safe replacement for +
-        '_' => 63,                          // URL-safe replacement for /
-        '=' => 0,                           // padding
-        _ => 0,
-    }
-}
-
-/// Per-slot breakdown of an item's enchant slots, decoded from an encoded
-/// enchant string.
-///
-/// Slot markers in the encoded data: a value `>= 0` is a filled enchant, `-1`
-/// is an empty (unlocked) slot, `-2` is a locked slot, and `-3` marks the end
-/// of the item's real slots (any trailing shorts are metadata).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// All information decoded from an item's encoded enchant string.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnchantSlots {
-    /// Enchant type IDs occupying filled slots, in slot order.
+    /// Type-1 key grade, or empty when absent/invalid.
+    pub key_grade: String,
+    /// Type-1 key modifier IDs.
+    pub key_mods: Vec<u16>,
+
+    /// Type-2 enchant IDs, including sentinel values:
+    /// `-3` = nonexistent slot, `-2` = locked, `-1` = empty.
+    pub enchants: Vec<i16>,
+    /// Non-negative type-2 enchant IDs only.
     pub filled: Vec<u16>,
-    /// Number of empty (unlocked, unenchanted) slots.
+    /// Number of `-1` type-2 enchant entries.
     pub empty: u8,
-    /// Number of locked slots.
+    /// Number of `-2` type-2 enchant entries.
     pub locked: u8,
+
+    /// Type-3 unlocked enchant IDs.
+    pub unlocked_enchants: Vec<i16>,
+    /// Type-4 legacy reroll count; `-1` means absent.
+    pub times_rerolled_legacy: i16,
+    /// Type-5 meter values, indexed using the encoded meter ID.
+    pub meters: Vec<i16>,
+}
+
+impl Default for EnchantSlots {
+    fn default() -> Self {
+        Self {
+            key_grade: String::new(),
+            key_mods: Vec::new(),
+            enchants: Vec::new(),
+            filled: Vec::new(),
+            empty: 0,
+            locked: 0,
+            unlocked_enchants: Vec::new(),
+            times_rerolled_legacy: -1,
+            meters: Vec::new(),
+        }
+    }
 }
 
 impl EnchantSlots {
-    /// Total number of real enchant slots (filled + empty + locked).
+    /// Total filled, empty, and locked enchant slots.
     pub fn total(&self) -> usize {
         self.filled.len() + self.empty as usize + self.locked as usize
     }
+
+    /// Meter
+    pub fn meter_value(&self) -> i16 {
+        self.meters.first().copied().unwrap_or(-1)
+    }
+
+    pub fn meter(&self, meter_id: usize) -> Option<i16> {
+        self.meters.get(meter_id).copied()
+    }
 }
 
-/// Parse the per-slot enchant breakdown from an encoded enchant string.
-///
-/// Reads up to 4 slots, stopping at the first `-3` (slot does not exist).
+/// Parse every record from an encoded enchant string.
 pub fn parse_enchant_slots(code: &str) -> EnchantSlots {
     if code.is_empty() {
         return EnchantSlots::default();
     }
 
-    match decode_rotmg_base64(code) {
-        Some(bytes) => parse_enchant_slots_bytes(&bytes),
-        None => EnchantSlots::default(),
-    }
+    let Some(bytes) = decode_rotmg_base64(code) else {
+        return EnchantSlots::default();
+    };
+
+    parse_enchant_slots_bytes(&bytes)
 }
 
-/// Parse the per-slot enchant breakdown from decoded enchant bytes.
 fn parse_enchant_slots_bytes(bytes: &[u8]) -> EnchantSlots {
     let mut slots = EnchantSlots::default();
+    let mut pos = 0;
 
-    // Skip header byte; need at least header + 2-byte type.
-    if bytes.len() < 3 {
-        return slots;
-    }
+    // Skip version. If absent, there are no records to parse.
+    if read_u8(bytes, &mut pos).is_some() {
+        'parse: while let Some(parse_type) = read_u8(bytes, &mut pos) {
+            match parse_type {
+                1 => {
+                    let (Some(grade), Some(mod_count)) =
+                        (read_u8(bytes, &mut pos), read_u8(bytes, &mut pos))
+                    else {
+                        break 'parse;
+                    };
 
-    // Read type as little-endian short (bytes 1-2). Type 1026 (0x0402) is enchant data.
-    let type_val = (bytes[1] as u16) | ((bytes[2] as u16) << 8);
-    if type_val != 1026 {
-        return slots;
-    }
+                    slots.key_grade = if grade.is_ascii_alphabetic() {
+                        char::from(grade).to_string()
+                    } else {
+                        "#".to_owned()
+                    };
 
-    let mut pos = 3;
-    let mut read = 0;
-    while pos + 1 < bytes.len() && read < 4 {
-        let slot = (bytes[pos] as i16) | ((bytes[pos + 1] as i16) << 8);
-        pos += 2;
-        read += 1;
+                    for _ in 0..mod_count {
+                        let Some(mod_id) = read_u16_le(bytes, &mut pos) else {
+                            break 'parse;
+                        };
+                        slots.key_mods.push(mod_id);
+                    }
+                }
 
-        match slot {
-            -3 => break, // slot does not exist: no further real slots
-            -2 => slots.locked = slots.locked.saturating_add(1),
-            -1 => slots.empty = slots.empty.saturating_add(1),
-            id if id >= 0 => slots.filled.push(id as u16),
-            _ => {}
+                2 => {
+                    let Some(enchant_count) = read_u8(bytes, &mut pos) else {
+                        break 'parse;
+                    };
+
+                    for _ in 0..enchant_count {
+                        let Some(enchant_id) = read_i16_le(bytes, &mut pos) else {
+                            break 'parse;
+                        };
+
+                        slots.enchants.push(enchant_id);
+
+                        match enchant_id {
+                            -2 => slots.locked = slots.locked.saturating_add(1),
+                            -1 => slots.empty = slots.empty.saturating_add(1),
+                            id if id >= 0 => slots.filled.push(id as u16),
+                            -3 => {} // Does not stop slot or record parsing.
+                            _ => {}
+                        }
+                    }
+                }
+
+                3 => {
+                    let Some(enchant_count) = read_i16_le(bytes, &mut pos) else {
+                        break 'parse;
+                    };
+
+                    for _ in 0..enchant_count.max(0) as usize {
+                        let Some(enchant_id) = read_i16_le(bytes, &mut pos) else {
+                            break 'parse;
+                        };
+                        slots.unlocked_enchants.push(enchant_id);
+                    }
+                }
+
+                4 => {
+                    let Some(count) = read_u8(bytes, &mut pos) else {
+                        break 'parse;
+                    };
+                    slots.times_rerolled_legacy = i16::from(count);
+                }
+
+                5 => {
+                    let Some(meter_count) = read_u8(bytes, &mut pos) else {
+                        break 'parse;
+                    };
+
+                    for _ in 0..meter_count {
+                        let (Some(meter_id), Some(meter_value)) =
+                            (read_u8(bytes, &mut pos), read_i16_le(bytes, &mut pos))
+                        else {
+                            break 'parse;
+                        };
+
+                        let index = usize::from(meter_id).min(slots.meters.len());
+                        slots.meters.insert(index, meter_value);
+                    }
+                }
+
+                // Unknown type: consume only its tag, then continue.
+                _ => {}
+            }
         }
     }
 
     slots
 }
 
-/// Parse the filled enchant type IDs from an encoded enchant string.
-/// Returns a vector of up to 4 enchant type IDs (as u16).
+fn read_u8(bytes: &[u8], pos: &mut usize) -> Option<u8> {
+    let value = *bytes.get(*pos)?;
+    *pos += 1;
+    Some(value)
+}
+
+fn read_u16_le(bytes: &[u8], pos: &mut usize) -> Option<u16> {
+    let value = u16::from_le_bytes([*bytes.get(*pos)?, *bytes.get(*pos + 1)?]);
+    *pos += 2;
+    Some(value)
+}
+
+fn read_i16_le(bytes: &[u8], pos: &mut usize) -> Option<i16> {
+    read_u16_le(bytes, pos).map(|value| value as i16)
+}
+
+/// Return only non-negative type-2 enchant IDs.
 pub fn parse_enchant_ids(code: &str) -> Vec<u16> {
     parse_enchant_slots(code).filled
 }

@@ -3604,10 +3604,31 @@ impl CombatHistoryPanel {
                 }
                 ui.end_row();
                 for w in &local.weapons {
+                    // The rows below this one are disjoint shares of the weapon's
+                    // hits (enchant patterns and other items' weapon-shot procs),
+                    // so the weapon's own row is the remainder -- that is what
+                    // makes "native shots" and "shots added by the enchant"
+                    // add up to the total with no overlap. When an enchant
+                    // *replaces* the weapon's patterns (a SetSubAttack), the
+                    // remainder is zero and only the enchant row is shown.
+                    let sub_hits: u64 = w.patterns.iter().map(|p| p.hits).sum::<u64>()
+                        + w.item_procs.iter().map(|p| p.hits).sum::<u64>();
+                    let sub_damage: i64 = w.patterns.iter().map(|p| p.damage.max(0)).sum::<i64>()
+                        + w.item_procs.iter().map(|p| p.damage.max(0)).sum::<i64>();
+                    let native_hits = w.hits.saturating_sub(sub_hits);
+                    // With no native hits there is no native damage either; any
+                    // leftover is rounding from scaling the sub-rows.
+                    let native_damage = if native_hits == 0 {
+                        0
+                    } else {
+                        (w.damage.max(0) - sub_damage).max(0)
+                    };
                     // The item's own cell, enchant gems and tooltip included, the
                     // way the character page's weapon line draws it: the gems show
                     // which enchantments were on it, and hovering anywhere on the
-                    // cell opens the same tooltip the big gear icons use.
+                    // cell opens the same tooltip the big gear icons use. Shown even
+                    // when every shot came from an enchant, so the weapon always
+                    // heads its group.
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let ench: Vec<i32> = w.enchants.iter().map(|&e| e as i32).collect();
@@ -3619,15 +3640,175 @@ impl CombatHistoryPanel {
                         );
                         ui.label(item_name(w.weapon_id));
                     });
-                    ui.label(w.hits.to_string());
-                    let avg = if w.hits > 0 {
-                        format!("{:.1}", w.damage.max(0) as f64 / w.hits as f64)
+                    ui.label(native_hits.to_string());
+                    let avg = if native_hits > 0 {
+                        format!("{:.1}", native_damage as f64 / native_hits as f64)
                     } else {
                         "-".to_string()
                     };
                     ui.label(avg);
-                    ui.label(RichText::new(w.damage.max(0).to_string()).strong());
+                    ui.label(RichText::new(native_damage.to_string()).strong());
                     ui.end_row();
+
+                    // Extra firing patterns this weapon used (an enchantment's
+                    // sub-attack, or any other added pattern), shown beneath it
+                    // with their own hits and value. A subset of the row above,
+                    // never extra damage. The default pattern stays in the weapon
+                    // row and is not repeated.
+                    let default_pid = if w.patterns.iter().any(|p| p.projectile_id == -1) {
+                        -1
+                    } else {
+                        w.patterns
+                            .iter()
+                            .max_by_key(|p| p.hits)
+                            .map(|p| p.projectile_id)
+                            .unwrap_or(0)
+                    };
+                    for p in &w.patterns {
+                        if p.enchant_id.is_none() && p.projectile_id == default_pid {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            let label = match p.enchant_id {
+                                Some(enchant_id) => {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ctx.sprite_renderer
+                                        .draw_enchant_sprite_in_rect(ui, enchant_id, rect);
+                                    let name = get_asset_manager()
+                                        .enchant_name(enchant_id)
+                                        .unwrap_or_else(|| format!("Enchant 0x{enchant_id:X}"));
+                                    // An enchant that supplies several patterns gets
+                                    // one row each (the wider 2-projectile swing and
+                                    // the narrower extra shot); number them so the
+                                    // rows are distinguishable.
+                                    let same_enchant = w
+                                        .patterns
+                                        .iter()
+                                        .filter(|q| q.enchant_id == Some(enchant_id))
+                                        .count();
+                                    if same_enchant > 1 {
+                                        let pid = p.projectile_id;
+                                        let which = if pid < 0 {
+                                            "default".to_string()
+                                        } else {
+                                            pid.to_string()
+                                        };
+                                        format!("{name} (pattern {which})")
+                                    } else {
+                                        name
+                                    }
+                                }
+                                None => {
+                                    let pid = p.projectile_id;
+                                    if pid < 0 {
+                                        "Sub-attack".to_string()
+                                    } else {
+                                        format!("Sub-attack {pid}")
+                                    }
+                                }
+                            };
+                            ui.label(RichText::new(label).italics()).on_hover_text(
+                                "Shots fired with this additional firing pattern, listed \
+                                 separately from the weapon's own shots so the two rows never \
+                                 overlap. An enchantment that replaces the weapon's pattern \
+                                 takes the whole row (the weapon line is then hidden).",
+                            );
+                        });
+                        ui.label(p.hits.to_string());
+                        let avg = if p.hits > 0 {
+                            format!("{:.1}", p.damage.max(0) as f64 / p.hits as f64)
+                        } else {
+                            "-".to_string()
+                        };
+                        ui.label(avg);
+                        ui.label(RichText::new(p.damage.max(0).to_string()).strong());
+                        ui.end_row();
+                    }
+
+                    // Lethal Strike's share of this weapon's damage (the cloak's
+                    // per-hit bonus plus its two simulated side procs), shown on
+                    // its own line so the cloak's contribution is visible while
+                    // staying inside the weapon's total.
+                    if !w.ls.is_empty() {
+                        for ls in &w.ls {
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                if ls.item_id > 0 {
+                                    ctx.sprite_renderer.render_item_sprite_with_enchants_native(
+                                        ui,
+                                        ls.item_id,
+                                        &[],
+                                        16.0,
+                                    );
+                                }
+                                let cloak_name = if ls.item_id > 0 {
+                                    ctx.sprite_renderer
+                                        .item_name(ls.item_id)
+                                        .unwrap_or_else(|| item_name(ls.item_id))
+                                } else {
+                                    String::new()
+                                };
+                                let label = if cloak_name.is_empty() {
+                                    "Lethal Strike".to_string()
+                                } else {
+                                    format!("Lethal Strike - {cloak_name}")
+                                };
+                                ui.label(RichText::new(label).italics()).on_hover_text(
+                                    "Damage this cloak's Lethal Strike added on top of these \
+                                     hits: the per-hit bonus, plus the two side procs the game \
+                                     fires without packets (those are simulated from the \
+                                     cloak's params and your WIS). A subset of the weapon row \
+                                     above.",
+                                );
+                            });
+                            ui.label(ls.hits.to_string());
+                            let avg = if ls.hits > 0 {
+                                format!("{:.1}", ls.damage.max(0) as f64 / ls.hits as f64)
+                            } else {
+                                "-".to_string()
+                            };
+                            ui.label(avg);
+                            ui.label(RichText::new(ls.damage.max(0).to_string()).strong());
+                            ui.end_row();
+                        }
+                    }
+
+                    // Weapon-shot procs from other equipped items (Holy Barrage),
+                    // which fire alongside the weapon but belong to their own
+                    // item. Shown with that item's icon, inside the weapon total.
+                    for proc in &w.item_procs {
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ctx.sprite_renderer.render_item_sprite_with_enchants_native(
+                                ui,
+                                proc.item_id,
+                                &[],
+                                16.0,
+                            );
+                            let name = ctx
+                                .sprite_renderer
+                                .item_name(proc.item_id)
+                                .unwrap_or_else(|| item_name(proc.item_id));
+                            ui.label(RichText::new(name).italics()).on_hover_text(
+                                "Shots this item's weapon-shot proc fired alongside the weapon \
+                                 (for example Holy Barrage), listed separately from the \
+                                 weapon's own shots so the two rows never overlap.",
+                            );
+                        });
+                        ui.label(proc.hits.to_string());
+                        let avg = if proc.hits > 0 {
+                            format!("{:.1}", proc.damage.max(0) as f64 / proc.hits as f64)
+                        } else {
+                            "-".to_string()
+                        };
+                        ui.label(avg);
+                        ui.label(RichText::new(proc.damage.max(0).to_string()).strong());
+                        ui.end_row();
+                    }
                 }
             });
     }

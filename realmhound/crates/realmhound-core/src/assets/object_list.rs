@@ -1263,6 +1263,14 @@ pub struct ObjectList {
     /// projectile 0) need this mapping to resolve their damage. Only weapons
     /// whose subattack list is present and non-trivial appear.
     subattack_projectiles: HashMap<i32, Vec<i32>>,
+    /// Items that declare an `OnPlayerShootActivate` proc, i.e. effects that fire
+    /// alongside every weapon shot rather than on activation (Tome of Holy
+    /// Furor's Holy Barrage, a cloak's Lethal Strike side procs). Their shots
+    /// belong to the weapon they fired alongside, not to an ability activation.
+    on_shoot_proc_items: std::collections::HashSet<i32>,
+    /// Object types whose HP the game keeps off zero (`<AlwaysPositiveHealth />`).
+    /// Their HP bar refills mid-fight with no heal behind it.
+    always_positive_health_types: std::collections::HashSet<i32>,
     /// Map from a summoned creature's object type to the items that spawn it, from
     /// every item's <Activate> / On*Activate summon effect. One creature can
     /// have several sources (base + (SB) or shiny variants of one item, or a
@@ -1287,6 +1295,8 @@ impl ObjectList {
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
             subattack_projectiles: HashMap::new(),
+            on_shoot_proc_items: std::collections::HashSet::new(),
+            always_positive_health_types: std::collections::HashSet::new(),
             summon_sources: HashMap::new(),
             summon_names: HashMap::new(),
         }
@@ -1436,6 +1446,8 @@ impl ObjectList {
             ability_effects: HashMap::new(),
             stat_relatives: HashMap::new(),
             subattack_projectiles: HashMap::new(),
+            on_shoot_proc_items: std::collections::HashSet::new(),
+            always_positive_health_types: std::collections::HashSet::new(),
             summon_sources: HashMap::new(),
             summon_names: HashMap::new(),
         })
@@ -1839,6 +1851,93 @@ impl ObjectList {
             .unwrap_or(&[])
     }
 
+    /// Whether an object declares an `OnPlayerShootActivate` proc: an effect
+    /// that fires alongside weapon shots rather than on activation (a tome's
+    /// barrage, a cloak's Lethal Strike procs).
+    pub fn has_on_shoot_proc(&self, id: i32) -> bool {
+        self.on_shoot_proc_items.contains(&id)
+    }
+
+    /// Whether the game keeps this object's HP number off zero
+    /// (`<AlwaysPositiveHealth />`).
+    pub fn always_positive_health(&self, id: i32) -> bool {
+        self.always_positive_health_types.contains(&id)
+    }
+
+    /// Index every object the game marks `<AlwaysPositiveHealth />`.
+    ///
+    /// The tag lives in the per-dungeon enemy catalogs (`heroes2.xml`,
+    /// `theShattersObjects.xml`, ...), which are never merged into the object
+    /// list, so it cannot ride along with the equipment merge. Those catalogs are
+    /// ~10 MB together, so each file is read once and skipped outright unless it
+    /// contains the tag at all, and the parse only records object types.
+    ///
+    /// It matters for damage accounting: an `<AlwaysPositiveHealth />` boss keeps
+    /// its HP number positive and refills it mid-fight without being healed (the
+    /// realm's Artificial Sprite God snaps from 12,775 back to 18,500), and a rise
+    /// counted as healing inflates the fight's damage pool above what was dealt.
+    pub fn index_always_positive_health(&mut self, xml_dir: &std::path::Path) -> usize {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let entries = match std::fs::read_dir(xml_dir) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+        let mut found = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("xml") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            if !content.contains("<AlwaysPositiveHealth") {
+                continue;
+            }
+            let mut reader = Reader::from_str(&content);
+            reader.config_mut().trim_text(true);
+            let mut buf = Vec::new();
+            let mut current: Option<i32> = None;
+            loop {
+                match reader.read_event_into(&mut buf) {
+                    Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                        match e.name().as_ref() {
+                            b"Object" => {
+                                current = e
+                                    .attributes()
+                                    .flatten()
+                                    .find(|a| a.key.as_ref() == b"type")
+                                    .and_then(|a| {
+                                        parse_hex_type(&String::from_utf8_lossy(&a.value))
+                                    });
+                            }
+                            b"AlwaysPositiveHealth" => {
+                                if let Some(id) = current {
+                                    if self.always_positive_health_types.insert(id) {
+                                        found += 1;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Event::End(ref e)) => {
+                        if e.name().as_ref() == b"Object" {
+                            current = None;
+                        }
+                    }
+                    Ok(Event::Eof) | Err(_) => break,
+                    _ => {}
+                }
+                buf.clear();
+            }
+        }
+        found
+    }
+
     /// Resolve a weapon's `PlayerShoot.projectileId` to a `<Projectile>` index.
     ///
     /// The client reports the *subattack* index, which for most weapons equals
@@ -2117,6 +2216,9 @@ impl ObjectList {
         // Count of OnPlayerShootActivate BulletCreate entries with
         // requiredConditions="LethalStrike" on the current object.
         let mut ls_extra_shots: i32 = 0;
+        // Items that declare an OnPlayerShootActivate proc, collected here and
+        // merged into the list at the end of the parse.
+        let mut on_shoot_proc: std::collections::HashSet<i32> = std::collections::HashSet::new();
         // Deferred ShurikenAbility attrs, resolved at Object end once
         // pending_proj is known. At most one per item.
         let mut pending_shuriken: Option<HashMap<String, String>> = None;
@@ -2297,6 +2399,9 @@ impl ObjectList {
                                 a.key.as_ref() == b"requiredConditions"
                                     && a.value.as_ref() == b"LethalStrike"
                             });
+                            if let Some(tid) = current_type_id {
+                                on_shoot_proc.insert(tid);
+                            }
                             in_on_player_shoot = true;
                         }
                         _ => {}
@@ -2897,6 +3002,7 @@ impl ObjectList {
         // Extend rather than replace: later supplemental catalogs must not wipe
         // the ability data parsed from equip.xml.
         self.ability_effects.extend(ability_map);
+        self.on_shoot_proc_items.extend(on_shoot_proc);
         Ok(merged_count)
     }
 

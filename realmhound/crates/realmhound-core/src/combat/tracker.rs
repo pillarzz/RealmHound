@@ -29,7 +29,8 @@ use crate::stats::derived::pet_ability_deals_damage;
 use super::damage::{self, AttackerStats, Rng, DEFAULT_EXALT_BONUS};
 use super::types::{
     AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
-    FightParticipant, ParticipantEndStatus, PetInfo, SummonContribution, WeaponContribution,
+    FightParticipant, ItemProcContribution, LethalStrikeContribution, ParticipantEndStatus,
+    PatternContribution, PetInfo, SummonContribution, WeaponContribution,
 };
 
 /// MaxHP fallback for boss classification, used only when an enemy is not tag-
@@ -634,6 +635,26 @@ struct PendingShot {
     /// trajectories. `None` for shots fired before this was recorded (and in
     /// tests), in which case both procs are credited unconditionally.
     shot_geo: Option<(f32, f32, f32)>,
+    /// Enchantment whose sub-attack supplied this shot's projectile, if any. Set
+    /// only when the resolver actually used the enchant's mapping, so the
+    /// per-weapon breakdown can show what the enchant contributed.
+    enchant_source: Option<u16>,
+    /// Cloak that supplied this shot's Lethal Strike parameters (0 when the
+    /// shot is not empowered). Kept so a mid-fight cloak swap shows one row per
+    /// cloak instead of merging their different bonuses.
+    ls_cloak: i32,
+    /// `PlayerShoot.projectileId` exactly as the client reported it (`-1` is the
+    /// weapon's default pattern). Kept raw so the breakdown can separate patterns
+    /// even when the weapon's own data cannot name them.
+    raw_projectile_id: i32,
+    /// The ability item that fired this shot, when the packet's `weaponId` named
+    /// the local player's ability slot rather than a weapon. Such a shot is the
+    /// ability's own damage -- it fires with no weapon involved (a quiver's bolt)
+    /// -- so it is credited to the ability activation and kept out of the weapon
+    /// breakdown. Weapon-synergy procs (a cloak's Lethal Strike, Holy Barrage)
+    /// never take this path: the server fires those and names them in a
+    /// `ServerPlayerShoot` instead.
+    ability_item: Option<i32>,
 }
 
 /// Accumulated contribution from one attacker during an active fight.
@@ -678,6 +699,18 @@ struct ParticipantAccum {
     /// the most damage with -- and its matching enchants -- rather than whatever
     /// they happened to have equipped when the boss died.
     damage_by_equipment: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
+    /// Damage + hits fired from a specific firing pattern, keyed by
+    /// `(weapon id, reported projectile id, enchant that supplied it)`. Always a
+    /// subset of `damage_by_equipment`, so the weapon row keeps the total and the
+    /// UI can break out the extra shots.
+    damage_by_pattern: HashMap<(i32, i32, Option<u16>), (i64, u64)>,
+    /// Lethal Strike bonus + empowered hit count, keyed by `(weapon, cloak)`.
+    /// A subset of the weapon's damage, broken out per cloak so a swap mid-fight
+    /// keeps each cloak's own bonus visible.
+    ls_by_weapon: HashMap<(i32, i32), (i64, u64)>,
+    /// Weapon-shot procs fired by other equipped items, keyed by
+    /// `(weapon id, proc item id)`. A subset of the weapon's damage.
+    damage_by_item: HashMap<(i32, i32), (i64, u64)>,
     /// Summon/pet-sourced subset of `damage`/`hits`. The owner's row keeps the
     /// total (the game attributes pet damage to the player), but the split lets
     /// the summary show the pet's own line and keeps pet hits out of the owner's
@@ -3657,46 +3690,111 @@ impl CombatTracker {
             self.self_damage_available = false;
             return;
         }
-        // Mastery and the seasonal Crucible/Blood Ritual multipliers are
-        // character data rather than object stats, so they are folded in from the
-        // tracker (see `set_shot_damage_bonus`) -- the game scales the weapon's
-        // whole damage range by them, and the server-side spell values the
-        // ability rows use already include them.
-        let atk = AttackerStats {
-            mastery_mult: self.shot_damage_bonus.mastery,
-            challenge_mult: self.shot_damage_bonus.challenge,
-            ..local.attacker_stats()
+        // The packet's `weaponId` names the item that fired the projectile, and
+        // the game reports the ability slot for an ability's own shot (a quiver's
+        // bolt, fired with no weapon involved). That is a different thing from a
+        // weapon-synergy proc -- a cloak's Lethal Strike, Holy Barrage -- which
+        // the server fires and names in a `ServerPlayerShoot`; those never come
+        // through here. Detecting it up front keeps the ability's damage out of
+        // the weapon breakdown, which would otherwise read as a weapon row named
+        // after the ability.
+        let ability_item = if weapon_id >= 0 && weapon_id == local_equipment[ABILITY_SLOT] {
+            Some(weapon_id)
+        } else {
+            None
         };
-        let lethal_strike = self.lethal_strike_snapshot();
+        // A weapon shot can benefit from the weapon's Lethal Strike cloak; an
+        // ability's own shot cannot, and its bonus would otherwise be invented.
+        let lethal_strike = if ability_item.is_some() {
+            None
+        } else {
+            self.lethal_strike_snapshot()
+        };
+        let ls_cloak = if lethal_strike.is_some() {
+            local_equipment[ABILITY_SLOT]
+        } else {
+            0
+        };
 
         let proj_index = if projectile_id < 0 {
             0
         } else {
             projectile_id as usize
         };
-        let resolved = get_asset_manager().weapon_projectile(weapon_id, proj_index);
+        // An enchantment can replace or add the firing pattern a slot uses
+        // (`SetSubAttack` / `AddSubAttack`), so resolve through the enchants of
+        // the slot that fired: the weapon's, or the ability's own. A stat update
+        // lag or a mid-fight swap would pair one item's shot with another's
+        // enchants, so only trust them while that slot still holds the item that
+        // fired.
+        let firing_slot = if ability_item.is_some() {
+            ABILITY_SLOT
+        } else {
+            WEAPON_SLOT
+        };
+        let weapon_enchants: &[u16] = if weapon_id == local_equipment[firing_slot] {
+            &local_enchants[firing_slot]
+        } else {
+            &[]
+        };
+        let mut resolved = get_asset_manager().weapon_projectile_with_enchants(
+            weapon_id,
+            proj_index,
+            weapon_enchants,
+        );
+        // An ability's own shot is not priced off its raw projectile range: the
+        // item's `<Activate>` adds a flat stat-mod bonus per point of its scaling
+        // stat above a floor, and the game's tooltip prints exactly that in
+        // brackets (Quiver of Thunder "(+840)" on ATT, Quiver of Shadows "(+310)"
+        // on DEF). Rolling the bare `<Projectile>` range values every ability shot
+        // at roughly half its real damage, which is what made a quiver-only solo
+        // read 49% of a boss's HP. Resolved through the same accessors the
+        // Character Stats readout uses, so the two cannot drift apart again.
+        if let Some(item) = ability_item {
+            if let Some((bmin, bmax, bap)) = self.ability_shot_range(item) {
+                resolved = Some((
+                    bmin,
+                    bmax,
+                    bap,
+                    resolved.as_ref().map(|r| r.3).unwrap_or(0),
+                    None,
+                ));
+            }
+        }
 
-        let Some((min, max, ap, slot)) = resolved else {
-            // Unknown projectile data: cannot determine whether this shot advances
-            // the RNG, so all later rolls would be unreliable.
-            tracing::warn!(
-                "[COMBAT] self-compute disabled for this map: no projectile data for \
-                 weapon={weapon_id} projectile_id={projectile_id} (index {proj_index}, \
-                 weapon defines {} projectile type(s))",
-                get_asset_manager().projectile_type_count(weapon_id)
-            );
-            self.self_damage_available = false;
+        let Some((min, max, ap, slot, enchant_source)) = resolved else {
+            // One unresolvable projectile must not zero every later fight on this
+            // map: the shot stays unresolved (its hits are estimated from the
+            // resolved ones) and self-compute stays alive. Without projectile data
+            // the RNG step is a best-effort hedge -- consume one when the weapon's
+            // own projectile is variable-damage, which is the common case for
+            // sub-attacks, rather than leaving every later roll shifted.
+            if !self.unresolved_projectile_logged {
+                self.unresolved_projectile_logged = true;
+                tracing::warn!(
+                    "[COMBAT] unresolvable projectile: weapon={weapon_id} \
+                     projectile_id={projectile_id} (index {proj_index}, weapon \
+                     defines {} projectile type(s)); keeping self-compute for this \
+                     map and estimating these hits",
+                    get_asset_manager().projectile_type_count(weapon_id)
+                );
+            }
+            if get_asset_manager()
+                .weapon_projectile(weapon_id, 0)
+                .is_some_and(|(mn, mx, _, _)| mn != mx)
+            {
+                self.rng.next();
+            }
             return;
         };
 
-        // Weapon-damage enchant multipliers apply only when the shot's weapon is
-        // the one currently equipped in the weapon slot; a stat update lag or a
-        // mid-fight swap would otherwise pair one weapon's shot with another's
-        // enchants. Unenchanted (or mismatched) weapons roll at (1.0, 1.0), i.e.
+        // Weapon-damage enchant multipliers apply only when the shot's item is
+        // the one currently equipped in the slot that fired; a stat update lag or
+        // a mid-fight swap would otherwise pair one item's shot with another's
+        // enchants. Unenchanted (or mismatched) items roll at (1.0, 1.0), i.e.
         // exactly as before.
-        let (min_mult, max_mult) = if weapon_id == local.equipment[WEAPON_SLOT] {
-            get_asset_manager()
-                .weapon_damage_enchant_mult(&local.equipment_enchants[WEAPON_SLOT], proj_index)
+        let (min_mult, max_mult) = if weapon_id == local_equipment[firing_slot] {
+            get_asset_manager().weapon_damage_enchant_mult(&local_enchants[firing_slot], proj_index)
         } else {
             (1.0, 1.0)
         };
@@ -3969,10 +4067,35 @@ impl CombatTracker {
         // Set when this hit came from a volley the server fired for a local
         // ability activation; its damage is that ability's, not the weapon's.
         let mut volley_item: Option<i32> = None;
+        // Set when the shot's projectile came from an enchantment's sub-attack.
+        let mut enchant_source: Option<u16> = None;
+        // Set when this hit came from a shot the client fired from an ability
+        // activation (its `PlayerShoot` named the ability slot), so the damage is
+        // that ability's own and not the weapon's.
+        let mut ability_shot_item: Option<i32> = None;
+        // The pattern the client reported for this shot (`-1` = default).
+        let mut raw_projectile_id: i32 = -1;
+        // Lethal Strike bonus contained in this hit's damage, and whether the hit
+        // itself was empowered (the simulated side procs add damage, not hits).
+        let mut ls_extra: i64 = 0;
+        let mut ls_empowered = false;
+        // Cloak that supplied this hit's Lethal Strike (0 = not empowered).
+        let mut ls_cloak: i32 = 0;
+        // Equipped item whose weapon-shot proc fired this hit (Holy Barrage).
+        let mut proc_item: Option<i32> = None;
+        let local_weapon = self
+            .objects
+            .get(&self.local_object_id)
+            .map(|o| o.equipment[WEAPON_SLOT])
+            .unwrap_or(-1);
         let resolved = if shooter_id == self.local_object_id {
             // Weapon shot: damage was rolled from the map RNG at shoot time.
             let weapon_resolved = if self.self_damage_available {
                 self.pending_shots.get(&bullet_id).cloned().map(|shot| {
+                    enchant_source = shot.enchant_source;
+                    raw_projectile_id = shot.raw_projectile_id;
+                    ls_cloak = shot.ls_cloak;
+                    ability_shot_item = shot.ability_item;
                     let base = damage::damage_with_defense(
                         shot.base_damage,
                         shot.armor_piercing,
@@ -3993,6 +4116,8 @@ impl CombatTracker {
                                 // Main-shot bonus: once per resolved hit (so a
                                 // piercing bullet's several hits each get it).
                                 dmg += bonus as i32;
+                                ls_extra += bonus as i64;
+                                ls_empowered = true;
                                 // Side procs: fire once per trigger, so credit
                                 // them on the first hit only to avoid piercing
                                 // duplication, and only on the primary projectile
@@ -4024,6 +4149,7 @@ impl CombatTracker {
                                         None => 2,
                                     };
                                     dmg += (proc_hits as i64 * bonus) as i32;
+                                    ls_extra += proc_hits as i64 * bonus as i64;
                                     if let Some(s) = self.pending_shots.get_mut(&bullet_id) {
                                         s.procs_credited = true;
                                     }
@@ -4051,7 +4177,16 @@ impl CombatTracker {
                     // it is credited to the ability row instead of the loadout
                     // bucket (which stays self-computed weapon damage only).
                     if let Some((_, _, item_id)) = volley {
-                        if self.local_ability_uses.iter().any(|u| {
+                        // A weapon-shot proc (Holy Barrage) belongs to the item
+                        // that owns the proc, not to an activation: it fires
+                        // whenever the condition holds, often with no activation
+                        // of that item at all. It is shown under the weapon it
+                        // fired alongside.
+                        let is_weapon_proc = item_id != local_weapon
+                            && get_asset_manager().item_has_on_shoot_proc(item_id);
+                        if is_weapon_proc {
+                            proc_item = Some(item_id);
+                        } else if self.local_ability_uses.iter().any(|u| {
                             u.item_id == item_id
                                 && u.time_ms <= time_ms
                                 && time_ms - u.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
@@ -4184,6 +4319,45 @@ impl CombatTracker {
                 accum.damage += dmg as i64;
                 if target_guarded {
                     accum.guarded_damage += dmg as i64;
+                }
+                // Attribute the shot to its reported firing pattern. The weapon row
+                // still carries the full total; this is the subset the UI shows
+                // beneath it, split per pattern the client reported. An ability's
+                // own shot has no weapon row to sit under, so it is left out here
+                // and credited to the ability activation below.
+                if ability_shot_item.is_none() {
+                    if let Some((gear, _)) = shot_gear.as_ref() {
+                        let entry = accum
+                            .damage_by_pattern
+                            .entry((gear[WEAPON_SLOT], raw_projectile_id, enchant_source))
+                            .or_default();
+                        entry.0 += dmg as i64;
+                        entry.1 += 1;
+                        // Lethal Strike is a bonus inside those same hits, broken
+                        // out so the cloak's share is visible on its own row.
+                        if ls_extra > 0 {
+                            let ls = accum
+                                .ls_by_weapon
+                                .entry((gear[WEAPON_SLOT], ls_cloak))
+                                .or_default();
+                            ls.0 += ls_extra;
+                            if ls_empowered {
+                                ls.1 += 1;
+                            }
+                        }
+                    }
+                }
+                // A weapon-shot proc from another equipped item fires alongside the
+                // weapon, so it belongs to that weapon's line with the item's icon.
+                if let Some(item_id) = proc_item {
+                    if local_weapon >= 0 {
+                        let e = accum
+                            .damage_by_item
+                            .entry((local_weapon, item_id))
+                            .or_default();
+                        e.0 += dmg as i64;
+                        e.1 += 1;
+                    }
                 }
                 dmg as i64
             }
@@ -5221,7 +5395,12 @@ impl CombatTracker {
             // damage is reconstructed from their own shot packets. Remote rows are
             // whole damage packets with no weapon attribution.
             weapons: if is_local {
-                aggregate_weapons(&accum.damage_by_equipment)
+                aggregate_weapons(
+                    &accum.damage_by_equipment,
+                    &accum.damage_by_pattern,
+                    &accum.ls_by_weapon,
+                    &accum.damage_by_item,
+                )
             } else {
                 Vec::new()
             },
@@ -5985,23 +6164,59 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
             bucket.0 += dmg;
             bucket.1 += hits;
         }
+        for (key, (dmg, hits)) in accum.damage_by_pattern {
+            let bucket = e.damage_by_pattern.entry(key).or_default();
+            bucket.0 += dmg;
+            bucket.1 += hits;
+        }
+        for (key, (dmg, hits)) in accum.ls_by_weapon {
+            let bucket = e.ls_by_weapon.entry(key).or_default();
+            bucket.0 += dmg;
+            bucket.1 += hits;
+        }
+        for (key, (dmg, hits)) in accum.damage_by_item {
+            let bucket = e.damage_by_item.entry(key).or_default();
+            bucket.0 += dmg;
+            bucket.1 += hits;
+        }
     }
 }
 
 /// Collapse a participant's per-loadout damage buckets into one row per weapon
 /// (item id plus the enchants it was fired with), summing across loadouts so a
 /// mid-fight armor or ring swap does not split the same weapon's contribution.
+/// The per-pattern buckets are attached as a subset of their weapon's row.
 /// Highest damage first.
 fn aggregate_weapons(
     buckets: &HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
+    pattern_buckets: &HashMap<(i32, i32, Option<u16>), (i64, u64)>,
+    ls_buckets: &HashMap<(i32, i32), (i64, u64)>,
+    item_buckets: &HashMap<(i32, i32), (i64, u64)>,
 ) -> Vec<WeaponContribution> {
     let mut out: Vec<WeaponContribution> = Vec::new();
+    // A loadout bucket recorded before the weapon's enchants arrived has an empty
+    // enchant list. Fold those into the same weapon's enchanted row rather than
+    // showing a one-hit ghost line beside it.
+    let mut enchants_by_weapon: HashMap<i32, Vec<u16>> = HashMap::new();
+    for ((gear, enchants), _) in buckets {
+        let weapon_id = gear[WEAPON_SLOT];
+        if !enchants[WEAPON_SLOT].is_empty() {
+            enchants_by_weapon.insert(weapon_id, enchants[WEAPON_SLOT].clone());
+        }
+    }
     for ((gear, enchants), &(damage, hits)) in buckets {
         let weapon_id = gear[WEAPON_SLOT];
         if weapon_id < 0 {
             continue;
         }
-        let weapon_enchants = enchants[WEAPON_SLOT].clone();
+        let weapon_enchants = if enchants[WEAPON_SLOT].is_empty() {
+            enchants_by_weapon
+                .get(&weapon_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            enchants[WEAPON_SLOT].clone()
+        };
         match out
             .iter_mut()
             .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
@@ -6015,8 +6230,89 @@ fn aggregate_weapons(
                 enchants: weapon_enchants,
                 damage,
                 hits,
+                patterns: Vec::new(),
+                ls: Vec::new(),
+                item_procs: Vec::new(),
             }),
         }
+    }
+    for (&(weapon_id, cloak_id), &(ls_damage, ls_hits)) in ls_buckets {
+        if let Some(w) = out.iter_mut().find(|w| w.weapon_id == weapon_id) {
+            w.ls.push(LethalStrikeContribution {
+                item_id: cloak_id,
+                damage: ls_damage,
+                hits: ls_hits,
+            });
+        }
+    }
+    for (&(weapon_id, item_id), &(damage, hits)) in item_buckets {
+        if let Some(w) = out.iter_mut().find(|w| w.weapon_id == weapon_id) {
+            w.item_procs.push(ItemProcContribution {
+                item_id,
+                damage,
+                hits,
+            });
+        }
+    }
+    for (&(weapon_id, projectile_id, enchant_id), &(damage, hits)) in pattern_buckets {
+        if let Some(w) = out.iter_mut().find(|w| w.weapon_id == weapon_id) {
+            w.patterns.push(PatternContribution {
+                projectile_id,
+                enchant_id,
+                damage,
+                hits,
+            });
+        }
+    }
+    for w in out.iter_mut() {
+        // The pattern with the most hits is the weapon's default.
+        let default_pid = if w.patterns.iter().any(|p| p.projectile_id == -1) {
+            -1
+        } else {
+            w.patterns
+                .iter()
+                .max_by_key(|p| p.hits)
+                .map(|p| p.projectile_id)
+                .unwrap_or(0)
+        };
+        let sole_sub_attack_enchant = {
+            let mut candidates = w
+                .enchants
+                .iter()
+                .copied()
+                .filter(|&e| get_asset_manager().enchant_sub_attack_count(e) > 0);
+            match (candidates.next(), candidates.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        };
+        // A weapon that defines more than one projectile reports their indices as
+        // `projectileId`: those are its own main shots, not extra patterns, and
+        // must stay in the weapon row. Only when the weapon can fire just one
+        // projectile is a second reported index necessarily something the enchant
+        // added.
+        let single_projectile = get_asset_manager().projectile_type_count(w.weapon_id) <= 1;
+        if single_projectile && sole_sub_attack_enchant.is_some() {
+            for p in w.patterns.iter_mut() {
+                if p.enchant_id.is_none() && p.projectile_id != default_pid {
+                    p.enchant_id = sole_sub_attack_enchant;
+                }
+            }
+        }
+        // Keep only patterns that are provably extra: enchant-sourced ones. Any
+        // other reported index is the weapon's own projectile.
+        w.patterns.retain(|p| p.enchant_id.is_some());
+        w.patterns.sort_by(|a, b| {
+            b.damage
+                .cmp(&a.damage)
+                .then(b.hits.cmp(&a.hits))
+                .then(a.projectile_id.cmp(&b.projectile_id))
+        });
+    }
+    for w in out.iter_mut() {
+        w.item_procs
+            .sort_by(|a, b| b.damage.cmp(&a.damage).then(a.item_id.cmp(&b.item_id)));
+        w.ls.sort_by(|a, b| b.damage.cmp(&a.damage).then(a.item_id.cmp(&b.item_id)));
     }
     out.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
     out
@@ -6103,6 +6399,27 @@ fn cap_overkill(participants: &mut [FightParticipant], cap: i64) {
         if let Some(gd) = p.guarded_damage.as_mut() {
             let graw = (*gd).max(0) as i128 * cap as i128;
             *gd = (graw / total as i128) as i64;
+        }
+        // The pattern breakdown is likewise a subset of the weapon rows, so it
+        // scales with them or a sub-row could exceed its weapon after a trim.
+        for w in p.weapons.iter_mut() {
+            // Scale the weapon row itself too: its sub-rows are scaled below, so
+            // leaving it at its pre-trim figure would manufacture "native" damage
+            // that has no hits behind it (and rows that no longer sum).
+            let wraw = w.damage.max(0) as i128 * cap as i128;
+            w.damage = (wraw / total as i128) as i64;
+            for pc in w.patterns.iter_mut() {
+                let praw = pc.damage.max(0) as i128 * cap as i128;
+                pc.damage = (praw / total as i128) as i64;
+            }
+            for ls in w.ls.iter_mut() {
+                let lraw = ls.damage.max(0) as i128 * cap as i128;
+                ls.damage = (lraw / total as i128) as i64;
+            }
+            for ip in w.item_procs.iter_mut() {
+                let iraw = ip.damage.max(0) as i128 * cap as i128;
+                ip.damage = (iraw / total as i128) as i64;
+            }
         }
         assigned += floor;
         remainders.push((i, rem));
@@ -9001,14 +9318,113 @@ mod tests {
             (300, 3),
         );
         buckets.insert(([200, 1, 2, 3], [vec![], vec![], vec![], vec![]]), (100, 2));
-        let weapons = aggregate_weapons(&buckets);
+        let mut ls = HashMap::new();
+        ls.insert((100, 2855), (250i64, 4u64));
+        ls.insert((100, 2600), (90i64, 2u64));
+        let mut item_buckets = HashMap::new();
+        item_buckets.insert((100, 608), (900i64, 9u64));
+        let weapons = aggregate_weapons(&buckets, &HashMap::new(), &ls, &item_buckets);
         assert_eq!(weapons.len(), 2, "one row per weapon, not per loadout");
         assert_eq!(weapons[0].weapon_id, 100);
         assert_eq!(weapons[0].damage, 800);
         assert_eq!(weapons[0].hits, 8);
         assert_eq!(weapons[0].enchants, vec![7]);
+        assert!(
+            weapons[0].patterns.is_empty(),
+            "no per-pattern shots recorded"
+        );
+        assert_eq!(weapons[0].ls.len(), 2, "one Lethal Strike row per cloak");
+        assert_eq!(weapons[0].ls[0].item_id, 2855, "highest bonus first");
+        assert_eq!((weapons[0].ls[0].damage, weapons[0].ls[0].hits), (250, 4));
+        assert_eq!(weapons[0].ls[1].item_id, 2600);
+        assert_eq!(weapons[0].item_procs.len(), 1, "item proc subset attached");
+        assert_eq!(weapons[0].item_procs[0].item_id, 608);
+        assert_eq!(
+            (
+                weapons[0].item_procs[0].damage,
+                weapons[0].item_procs[0].hits
+            ),
+            (900, 9)
+        );
         assert_eq!(weapons[1].weapon_id, 200);
         assert_eq!(weapons[1].damage, 100);
+        assert!(weapons[1].ls.is_empty(), "no LS on the other weapon");
+        assert!(weapons[1].item_procs.is_empty());
+    }
+
+    #[test]
+    fn enchant_sub_attack_hits_get_their_own_row_under_the_weapon() {
+        // A shot whose projectile came from an enchantment's sub-attack is still
+        // part of the weapon's total, but also gets its own line so the enchant's
+        // hits and value are visible.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 10);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+            ),
+            10,
+        );
+        t.pending_shots.insert(
+            7,
+            PendingShot {
+                base_damage: 100,
+                shot_gear: ([3073, -1, -1, -1], Default::default()),
+                enchant_source: Some(0x4008),
+                raw_projectile_id: 1,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 12);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local participant retained");
+        assert_eq!(local.weapons.len(), 1);
+        let weapon = &local.weapons[0];
+        assert_eq!(weapon.weapon_id, 3073);
+        assert_eq!(weapon.hits, 1, "the weapon row keeps the full total");
+        assert_eq!(
+            weapon.patterns.len(),
+            1,
+            "the extra pattern gets its own row"
+        );
+        assert_eq!(weapon.patterns[0].projectile_id, 1);
+        assert_eq!(weapon.patterns[0].enchant_id, Some(0x4008));
+        assert_eq!(weapon.patterns[0].hits, 1);
+        assert_eq!(
+            weapon.patterns[0].damage, weapon.damage,
+            "the sub-row is a subset of the weapon row"
+        );
+    }
+
+    #[test]
+    fn a_weapon_bucket_without_enchants_merges_into_its_enchanted_row() {
+        // A hit recorded before the weapon's enchant list arrived must not show as
+        // a second, one-hit line for the same weapon.
+        let mut buckets: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)> = HashMap::new();
+        buckets.insert(
+            ([100, 1, 2, 3], [vec![7], vec![], vec![], vec![]]),
+            (500, 5),
+        );
+        buckets.insert(([100, 1, 9, 3], [vec![], vec![], vec![], vec![]]), (50, 1));
+        let weapons =
+            aggregate_weapons(&buckets, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            weapons.len(),
+            1,
+            "the snapshot without enchants folds into the enchanted row"
+        );
+        assert_eq!(weapons[0].enchants, vec![7]);
+        assert_eq!((weapons[0].damage, weapons[0].hits), (550, 6));
     }
 
     #[test]
@@ -9314,6 +9730,276 @@ mod tests {
         assert!(
             p.damage_by_equipment.is_empty(),
             "a spell volley is not the weapon's self-computed damage"
+        );
+    }
+
+    #[test]
+    fn ability_shot_is_credited_to_its_activation_not_the_weapon() {
+        // An ability that fires its own projectile (a quiver's bolt) sends a
+        // PlayerShoot naming the ability slot, not a weapon. That hit is the
+        // ability's damage: it belongs on the ability row and must not become a
+        // weapon row named after the ability, even when the fight held no weapon
+        // shot at all.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 300_000),
+                    stat(StatType::HP, 300_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            10,
+        );
+        t.on_object_status(1000, &status(1000, vec![name_stat("You")]), 10);
+        t.local_ability_uses.push_back(ability_use(100, 0xC07, None));
+        t.pending_shots.insert(
+            9,
+            PendingShot {
+                base_damage: 1000,
+                shot_gear: ([-1, 0xC07, -1, -1], Default::default()),
+                ability_item: Some(0xC07),
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 9, 1000, 1000, 150);
+
+        let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
+        assert_eq!(acts.len(), 1);
+        assert_eq!((acts[0].damage, acts[0].hits), (1000, 1));
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!(p.damage, 1000, "the hit still counts in the fight total");
+        assert!(
+            p.damage_by_equipment.is_empty(),
+            "an ability's own shot is not a weapon's damage"
+        );
+        assert!(
+            p.damage_by_pattern.is_empty(),
+            "nor does it open a firing-pattern row under a weapon"
+        );
+        assert!(p.ls_by_weapon.is_empty(), "ability shots get no Lethal Strike");
+    }
+
+    #[test]
+    fn an_ability_shot_stays_with_its_activation_past_the_volley_window() {
+        // The window that bounds server-fired volleys exists because a late packet
+        // could otherwise be blamed on an activation that could not have produced
+        // it. A client-fired ability shot already proves its owner, so a slow
+        // projectile landing after the window still credits the activation that
+        // fired it instead of falling out of the breakdown.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 300_000),
+                    stat(StatType::HP, 300_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            10,
+        );
+        t.on_object_status(1000, &status(1000, vec![name_stat("You")]), 10);
+        t.local_ability_uses.push_back(ability_use(100, 0xC07, None));
+        t.pending_shots.insert(
+            9,
+            PendingShot {
+                base_damage: 1000,
+                shot_gear: ([-1, 0xC07, -1, -1], Default::default()),
+                ability_item: Some(0xC07),
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 9, 1000, 1000, 6_000);
+
+        let acts = t.ability_activations_for(0, 10_000, FightDestination::Boss(500));
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (1000, 1),
+            "a hit five seconds after the activation still belongs to it"
+        );
+    }
+
+    #[test]
+    fn the_firing_slot_decides_how_a_client_shot_is_bucketed() {
+        // End to end through `on_local_shot`: the packet's weapon id resolves the
+        // projectile (the ability's own, so its damage range is used), while the
+        // weapon slot keeps the gear actually worn instead of being overwritten
+        // with the ability's item id.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() || am.weapon_projectile(0xC07, 0).is_none() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    name_stat("You"),
+                    stat(StatType::Attack, 65),
+                    stat(StatType::Inventory0, 3072),
+                    stat(StatType::Inventory1, 0xC07),
+                ],
+            ),
+            10,
+        );
+        t.on_local_shot(0xC07, -1, 7, 100, 0.0, 0.0, 0.0, 150);
+
+        let shot = t.pending_shots.get(&7).expect("the ability's shot recorded");
+        assert_eq!(shot.ability_item, Some(0xC07));
+        assert_eq!(
+            shot.shot_gear.0[WEAPON_SLOT], 3072,
+            "the weapon slot keeps the equipped weapon, not the firing ability"
+        );
+        assert!(
+            shot.base_damage >= 925,
+            "the shot rolled the ability's projectile range (925-1125), \
+             got {}",
+            shot.base_damage
+        );
+        assert!(shot.lethal_strike.is_none(), "no Lethal Strike on ability shots");
+    }
+
+    #[test]
+    fn a_weapon_shot_is_unaffected_by_the_ability_slot() {
+        // The same path with the packet naming the weapon: nothing about the
+        // ability-slot branch may leak into a normal weapon shot.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() || am.weapon_projectile(0xC07, 0).is_none() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    name_stat("You"),
+                    stat(StatType::Attack, 65),
+                    stat(StatType::Inventory0, 0xC07),
+                    stat(StatType::Inventory1, 3072),
+                ],
+            ),
+            10,
+        );
+        t.on_local_shot(0xC07, -1, 7, 100, 0.0, 0.0, 0.0, 150);
+
+        let shot = t.pending_shots.get(&7).expect("shot recorded");
+        assert_eq!(
+            shot.ability_item, None,
+            "an item in the weapon slot is a weapon, whatever else is equipped"
+        );
+        assert_eq!(shot.shot_gear.0[WEAPON_SLOT], 0xC07);
+    }
+
+    #[test]
+    fn an_ability_shot_is_rolled_from_its_stat_modded_range() {
+        // Quiver of Thunder declares 925-1125 and `statModDamage="40"` above ATT
+        // 55, so the game's own tooltip prints 1765-1965 at ATT 76 -- "(+840)".
+        // Rolling the bare projectile range values every shot at about half its
+        // damage, which is what made a quiver-only solo read 49% of a boss's HP.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let Some(burst) = am.ability_effects(0xC07).and_then(|fx| {
+            fx.effects.into_iter().find_map(|e| match e {
+                crate::assets::AbilityEffect::ProjectileBurst { burst, min_hex, .. }
+                    if min_hex == 0 =>
+                {
+                    Some(burst)
+                }
+                _ => None,
+            })
+        }) else {
+            eprintln!("skipping: Quiver of Thunder declares no shoot effect");
+            return;
+        };
+        assert_eq!(
+            (burst.min_for(76), burst.max_for(76)),
+            (1765, 1965),
+            "the in-game tooltip's range at ATT 76"
+        );
+        assert_eq!(
+            (burst.min_for(81), burst.max_for(81)),
+            (1965, 2165),
+            "the Character Stats readout's average (+1040) at ATT 81"
+        );
+
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    name_stat("You"),
+                    stat(StatType::Attack, 76),
+                    stat(StatType::Inventory1, 0xC07),
+                ],
+            ),
+            10,
+        );
+        t.on_local_shot(0xC07, -1, 7, 100, 0.0, 0.0, 0.0, 150);
+
+        let shot = t.pending_shots.get(&7).expect("shot recorded");
+        assert_eq!(shot.ability_item, Some(0xC07));
+        assert!(
+            (1765..1965).contains(&shot.base_damage),
+            "the roll lands inside the tooltip range, got {}",
+            shot.base_damage
+        );
+    }
+
+    #[test]
+    fn an_ability_hit_before_its_first_activation_is_still_credited() {
+        // A quiver's first bolt can land before the fight's own first activation
+        // is inside the window. Losing it would leave the damage in the fight
+        // total while no row showed it (observed: 8 hits landed, 7 credited).
+        let mut t = CombatTracker::new();
+        t.local_ability_uses.push_back(ability_use(500, 0xC07, None));
+        t.local_volley_hits.push_back(LocalVolleyHit {
+            time_ms: 100,
+            item_id: 0xC07,
+            damage: 900,
+            destination: FightDestination::Boss(500),
+            owns_ability: true,
+        });
+        let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (900, 1),
+            "the item's earliest activation takes the hit rather than dropping it"
         );
     }
 

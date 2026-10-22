@@ -315,6 +315,51 @@ pub struct WeaponContribution {
     pub enchants: Vec<u16>,
     pub damage: i64,
     pub hits: u64,
+    /// The part of `damage` / `hits` fired from a firing pattern other than the
+    /// weapon's default, one entry per pattern the client reported. A subset of
+    /// `damage` / `hits`, never additional damage, so the UI can break out the
+    /// extra shots an enchantment (or any other pattern-adding effect) produced.
+    pub patterns: Vec<PatternContribution>,
+    /// Lethal Strike bonus contained in `damage` (a subset, never extra damage),
+    /// one entry per cloak that empowered hits: the per-hit bonus plus the two
+    /// simulated side procs.
+    pub ls: Vec<LethalStrikeContribution>,
+    /// Weapon-shot procs from other equipped items that fired alongside this
+    /// weapon (e.g. Tome of Holy Furor's Holy Barrage), one entry per item. A
+    /// subset of `damage` / `hits`.
+    pub item_procs: Vec<ItemProcContribution>,
+}
+
+/// Lethal Strike damage contributed by one cloak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LethalStrikeContribution {
+    /// The cloak that supplied the Lethal Strike parameters.
+    pub item_id: i32,
+    pub damage: i64,
+    /// Hits empowered by that cloak. The two side procs are simulated, so they
+    /// are counted in `damage` but not as hits.
+    pub hits: u64,
+}
+
+/// Hits a weapon landed from one equipped item's weapon-shot proc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemProcContribution {
+    /// The proc's source item (the ability/armor/ring it belongs to).
+    pub item_id: i32,
+    pub damage: i64,
+    pub hits: u64,
+}
+
+/// Hits a weapon landed from one reported firing pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternContribution {
+    /// `PlayerShoot.projectileId` exactly as the client reported it; `-1` is the
+    /// weapon's default pattern.
+    pub projectile_id: i32,
+    /// Enchantment that supplied this pattern, when it can be identified.
+    pub enchant_id: Option<u16>,
+    pub damage: i64,
+    pub hits: u64,
 }
 
 /// A window during which one of the local player's stats or conditions differed

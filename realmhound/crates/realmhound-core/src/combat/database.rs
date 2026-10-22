@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use super::types::{
     AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
-    FightParticipant, FightSelection, ParticipantEndStatus, PetInfo, SummonContribution,
-    WeaponContribution,
+    FightParticipant, FightSelection, ItemProcContribution, LethalStrikeContribution,
+    ParticipantEndStatus, PatternContribution, PetInfo, SummonContribution, WeaponContribution,
 };
 
 /// Database schema version for migrations.
@@ -5353,7 +5353,43 @@ fn serialize_weapons(weapons: &[WeaponContribution]) -> Option<String> {
                     .map(|e| e.to_string())
                     .collect::<Vec<_>>()
                     .join(":");
-                format!("{},{},{},{}", w.weapon_id, w.damage, w.hits, enchants)
+                // A fifth field carries the per-pattern breakdown as
+                // `projectileId:enchant:damage:hits` groups joined by `|`, where
+                // enchant id 0 means "no enchant identified". Rows written before
+                // it existed simply end at the enchant list.
+                let patterns = w
+                    .patterns
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}:{}:{}:{}",
+                            p.projectile_id,
+                            p.enchant_id.unwrap_or(0),
+                            p.damage,
+                            p.hits
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                // A sixth field carries the Lethal Strike subset as
+                // `item:damage:hits` groups, one per cloak.
+                let ls =
+                    w.ls.iter()
+                        .map(|l| format!("{}:{}:{}", l.item_id, l.damage, l.hits))
+                        .collect::<Vec<_>>()
+                        .join("|");
+                // A seventh field carries weapon-shot procs from other equipped
+                // items as `item:damage:hits` groups. Same optionality.
+                let procs = w
+                    .item_procs
+                    .iter()
+                    .map(|p| format!("{}:{}:{}", p.item_id, p.damage, p.hits))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                format!(
+                    "{},{},{},{},{},{},{}",
+                    w.weapon_id, w.damage, w.hits, enchants, patterns, ls, procs
+                )
             })
             .collect::<Vec<_>>()
             .join(";"),
@@ -5379,11 +5415,82 @@ fn parse_weapons(data: Option<&str>) -> Vec<WeaponContribution> {
                 .split(':')
                 .filter_map(|e| e.trim().parse::<u16>().ok())
                 .collect();
+            // Fifth field: `projectileId:enchant:damage:hits` groups. Absent in rows
+            // written before the pattern breakdown existed, which parse to an
+            // empty list. A legacy three-field group (`enchant:damage:hits`) is
+            // accepted too, with the pattern unknown.
+            let patterns = parts
+                .next()
+                .unwrap_or("")
+                .split('|')
+                .filter_map(|entry| {
+                    let fields: Vec<&str> = entry.split(':').collect();
+                    let (projectile_id, enchant_id, damage, hits) = match fields.len() {
+                        4 => (
+                            fields[0].trim().parse::<i32>().ok()?,
+                            fields[1].trim().parse::<u16>().ok()?,
+                            fields[2].trim().parse::<i64>().unwrap_or(0),
+                            fields[3].trim().parse::<u64>().unwrap_or(0),
+                        ),
+                        3 => (
+                            -1,
+                            fields[0].trim().parse::<u16>().ok()?,
+                            fields[1].trim().parse::<i64>().unwrap_or(0),
+                            fields[2].trim().parse::<u64>().unwrap_or(0),
+                        ),
+                        _ => return None,
+                    };
+                    Some(PatternContribution {
+                        projectile_id,
+                        enchant_id: (enchant_id != 0).then_some(enchant_id),
+                        damage,
+                        hits,
+                    })
+                })
+                .collect();
+            let ls = parts
+                .next()
+                .unwrap_or("")
+                .split('|')
+                .filter_map(|entry| {
+                    let fields: Vec<&str> = entry.split(':').collect();
+                    match fields.len() {
+                        3 => Some(LethalStrikeContribution {
+                            item_id: fields[0].trim().parse::<i32>().ok()?,
+                            damage: fields[1].trim().parse::<i64>().unwrap_or(0),
+                            hits: fields[2].trim().parse::<u64>().unwrap_or(0),
+                        }),
+                        // A pair is the pre-cloak-split form: damage:hits.
+                        2 => Some(LethalStrikeContribution {
+                            item_id: 0,
+                            damage: fields[0].trim().parse::<i64>().unwrap_or(0),
+                            hits: fields[1].trim().parse::<u64>().unwrap_or(0),
+                        }),
+                        _ => None,
+                    }
+                })
+                .collect();
+            let item_procs = parts
+                .next()
+                .unwrap_or("")
+                .split('|')
+                .filter_map(|entry| {
+                    let mut f = entry.split(':');
+                    Some(ItemProcContribution {
+                        item_id: f.next()?.trim().parse::<i32>().ok()?,
+                        damage: f.next()?.trim().parse::<i64>().unwrap_or(0),
+                        hits: f.next()?.trim().parse::<u64>().unwrap_or(0),
+                    })
+                })
+                .collect();
             Some(WeaponContribution {
                 weapon_id,
                 enchants,
                 damage,
                 hits,
+                patterns,
+                ls,
+                item_procs,
             })
         })
         .collect()
@@ -6370,6 +6477,34 @@ mod tests {
     use crate::combat::types::{
         CompletedFight, DamageProvenance, FightParticipant, ParticipantEndStatus,
     };
+
+    #[test]
+    fn weapon_pattern_breakdown_roundtrips_and_legacy_rows_still_parse() {
+        let weapons = vec![WeaponContribution {
+            weapon_id: 3073,
+            enchants: vec![0x4008],
+            damage: 1200,
+            hits: 6,
+            patterns: vec![PatternContribution {
+                projectile_id: 1,
+                enchant_id: Some(0x4008),
+                damage: 600,
+                hits: 3,
+            }],
+            ls: Vec::new(),
+            item_procs: Vec::new(),
+        }];
+        let stored = serialize_weapons(&weapons).expect("weapons serialize");
+        assert_eq!(parse_weapons(Some(&stored)), weapons);
+
+        // Rows written before the pattern breakdown existed end at the enchant
+        // list and must still read (with no pattern rows).
+        let legacy = parse_weapons(Some("3073,1200,6,16392"));
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].weapon_id, 3073);
+        assert_eq!(legacy[0].enchants, vec![16392]);
+        assert!(legacy[0].patterns.is_empty());
+    }
 
     #[test]
     fn combine_end_status_is_died_over_present_over_nexused() {

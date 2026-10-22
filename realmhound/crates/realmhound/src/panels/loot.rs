@@ -264,6 +264,7 @@ pub struct LootPanel {
     filters: LootFilters,
     /// Item-property display filters (UT / ST / Shiny)
     prop_filters: PropertyFilters,
+    sql_prop_filters: Option<PropertyFilters>,
     /// Source filters for history (mob, dungeon, character)
     source_filters: SourceFilters,
     /// History: date range filter
@@ -325,6 +326,7 @@ impl Default for LootPanel {
         Self {
             filters,
             prop_filters: PropertyFilters::default(),
+            sql_prop_filters: None,
             source_filters,
             history_date_filter: DateFilter::AllTime,
             history_drops: Vec::new(),
@@ -374,6 +376,7 @@ impl LootPanel {
         Self {
             filters,
             prop_filters: PropertyFilters::default(),
+            sql_prop_filters: None,
             source_filters,
             history_date_filter: DateFilter::AllTime,
             history_drops: Vec::new(),
@@ -436,6 +439,7 @@ impl LootPanel {
     {
         // Snapshot filters before UI
         let filters_before = self.filters.clone();
+        let prop_before = self.prop_filters;
 
         // Filter toggles in header
         shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
@@ -450,19 +454,20 @@ impl LootPanel {
             });
         });
 
+        let filters_changed = self.filters != filters_before;
+        if filters_changed {
+            self.source_filters
+                .set_bag_types(self.filters.visible_bag_type_ids());
+        }
+        if filters_changed || self.prop_filters != prop_before {
+            self.reset_history();
+        }
+
         // Render history directly
         self.render_history(ui, sprite_renderer, &get_label, &get_appearance, shadcn);
 
         // Batch-delete confirmation + execution.
         self.render_delete_confirm(ui, shadcn);
-
-        // Check if bag filters changed - if so, sync to source_filters and refresh
-        let filters_changed = self.filters != filters_before;
-        if filters_changed {
-            self.source_filters
-                .set_bag_types(self.filters.visible_bag_type_ids());
-            self.reset_history();
-        }
 
         filters_changed
     }
@@ -850,62 +855,24 @@ impl LootPanel {
         // Date filter bar + search + source filters on same line
         let mut search_filter_applied = false;
 
-        // Drop-count stats and selectable ids, computed before the bar so the
-        // counts can render inline at the start of the filter row and the
-        // "Select" toggle can act on every currently-visible row.
-        let prop = self.prop_filters;
-        let prop_active = prop.any();
-        let visible_ids: Vec<i64> = self
-            .history_drops
-            .iter()
-            .filter(|d| prop.matches_items(&d.items))
-            .map(|d| d.id)
-            .collect();
-        let (stat_white, stat_orange, stat_red) = if prop_active {
-            let mut w = 0usize;
-            let mut o = 0usize;
-            let mut r = 0usize;
-            for d in self
-                .history_drops
-                .iter()
-                .filter(|d| prop.matches_items(&d.items))
-            {
-                if let Some(b) = LootBagType::from_id(d.bag_type) {
-                    if b.is_white() {
-                        w += 1;
-                    }
-                    if b.is_orange() {
-                        o += 1;
-                    }
-                    if b.is_red() {
-                        r += 1;
-                    }
-                }
-            }
-            (w, o, r)
-        } else {
-            (
-                self.history_white_count,
-                self.history_orange_count,
-                self.history_red_count,
-            )
-        };
-        let stat_shown = if prop_active {
-            visible_ids.len()
-        } else {
-            self.history_drops.len()
-        };
-        let raw_scanned = self.history_drops.len();
+        let prop_active = self.prop_filters.any();
+        let (stat_white, stat_orange, stat_red) = (
+            self.history_white_count,
+            self.history_orange_count,
+            self.history_red_count,
+        );
+        let stat_shown = self.history_drops.len();
         let total_count = self.history_total_count;
 
         shadcn.header_band_stacked_divided(ui, shadcn.secondary_header_fill(), |ui| {
             shadcn.band_row(ui, |ui| {
                 // Batch-select controls on the far left, so the "Select" checkbox
                 // sits directly above the per-row checkboxes.
-                let all_selected = !visible_ids.is_empty()
-                    && visible_ids
+                let all_selected = !self.history_drops.is_empty()
+                    && self
+                        .history_drops
                         .iter()
-                        .all(|id| self.selected_for_delete.contains(id));
+                        .all(|drop| self.selected_for_delete.contains(&drop.id));
                 let mut select_all = all_selected;
                 if ui
                     .checkbox(&mut select_all, "Select")
@@ -913,12 +880,12 @@ impl LootPanel {
                     .changed()
                 {
                     if all_selected {
-                        for id in &visible_ids {
-                            self.selected_for_delete.remove(id);
+                        for drop in &self.history_drops {
+                            self.selected_for_delete.remove(&drop.id);
                         }
                     } else {
-                        for &id in &visible_ids {
-                            self.selected_for_delete.insert(id);
+                        for drop in &self.history_drops {
+                            self.selected_for_delete.insert(drop.id);
                         }
                     }
                 }
@@ -931,12 +898,7 @@ impl LootPanel {
                     egui::vec2(400.0, 22.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        if prop_active {
-                            ui.label(format!(
-                                "History drops: {} matching ({} scanned)",
-                                stat_shown, raw_scanned
-                            ));
-                        } else if let Some(total) = total_count {
+                        if let Some(total) = total_count {
                             if total as usize > stat_shown {
                                 ui.label(format!(
                                     "History drops: {} ({} loaded)",
@@ -1163,21 +1125,8 @@ impl LootPanel {
             self.reset_history();
         }
 
-        // Item-property display filter (UT / ST / Shiny): keep only bags that
-        // contain at least one matching item. Whole bags (all items) are shown.
-        // Applied here over loaded rows; raw `history_drops` is left intact so
-        // DB pagination (offset = history_drops.len()) is unaffected. Reuses the
-        // `prop`/`prop_active` computed above for the inline stats.
-        let display_indices: Vec<usize> = self
-            .history_drops
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| prop.matches_items(&d.items))
-            .map(|(i, _)| i)
-            .collect();
-
         // If nothing is visible and there is nothing more to load, show empty state.
-        if display_indices.is_empty() && !self.history_needs_refresh && !self.history_has_more {
+        if self.history_drops.is_empty() && !self.history_needs_refresh && !self.history_has_more {
             ui.vertical_centered(|ui| {
                 ui.add_space(50.0);
                 if self.source_filters.is_empty() && !prop_active {
@@ -1213,7 +1162,7 @@ impl LootPanel {
 
         // Row height: 42.0 content + 2.0 spacing = 44.0 per row
         const ROW_HEIGHT: f32 = 44.0;
-        let total_rows = display_indices.len() + if self.history_has_more { 1 } else { 0 };
+        let total_rows = self.history_drops.len() + if self.history_has_more { 1 } else { 0 };
 
         // PageUp/PageDown scroll a viewport-sized step relative to the last known
         // offset. Only acted on when the pointer is over this panel so it does
@@ -1255,8 +1204,8 @@ impl LootPanel {
         }
         let scroll_output = history_area.show_rows(ui, ROW_HEIGHT, total_rows, |ui, row_range| {
             for row_idx in row_range {
-                if row_idx < display_indices.len() {
-                    let drop = &self.history_drops[display_indices[row_idx]];
+                if row_idx < self.history_drops.len() {
+                    let drop = &self.history_drops[row_idx];
                     let id = drop.id;
                     let mut checked = self.selected_for_delete.contains(&id);
                     let was_checked = checked;
@@ -1305,17 +1254,9 @@ impl LootPanel {
             if distance_from_bottom < 100.0 {
                 should_load_more = true;
             }
-
-            // When a property filter is active, a loaded page may yield few/no
-            // matches and never fill the viewport, so the scroll trigger never
-            // fires. Keep pulling raw pages until the viewport fills or the data
-            // is exhausted. Gated by `!history_needs_refresh` => one load at a time.
-            if prop_active && content_height <= visible_height + 1.0 {
-                should_load_more = true;
-            }
         }
 
-        // Trigger load more if needed (offset = number of raw items already loaded)
+        // Trigger load more if needed.
         if should_load_more {
             self.history_offset = self.history_drops.len() as i64;
             self.history_needs_refresh = true;
@@ -1649,6 +1590,10 @@ impl LootPanel {
             return;
         }
 
+        if self.sql_prop_filters != Some(self.prop_filters) {
+            self.prop_filters.apply_to_source(&mut self.source_filters);
+            self.sql_prop_filters = Some(self.prop_filters);
+        }
         let (start, end) = self.history_date_filter.range_millis();
         let limit = 100i64;
 
@@ -1670,41 +1615,24 @@ impl LootPanel {
             Ok(drops) => {
                 self.history_has_more = drops.len() == limit as usize;
                 if self.history_offset == 0 {
+                    self.history_white_count = 0;
+                    self.history_orange_count = 0;
+                    self.history_red_count = 0;
+                }
+                for drop in &drops {
+                    if let Some(bag) = LootBagType::from_id(drop.bag_type) {
+                        self.history_white_count += usize::from(bag.is_white());
+                        self.history_orange_count += usize::from(bag.is_orange());
+                        self.history_red_count += usize::from(bag.is_red());
+                    }
+                }
+                if self.history_offset == 0 {
                     self.fight_links.reset();
                     self.history_drops = drops;
                 } else {
                     self.history_drops.extend(drops);
                 }
                 self.history_needs_refresh = false;
-
-                // Update cached bag type counts
-                self.history_white_count = self
-                    .history_drops
-                    .iter()
-                    .filter(|d| {
-                        LootBagType::from_id(d.bag_type)
-                            .map(|b| b.is_white())
-                            .unwrap_or(false)
-                    })
-                    .count();
-                self.history_orange_count = self
-                    .history_drops
-                    .iter()
-                    .filter(|d| {
-                        LootBagType::from_id(d.bag_type)
-                            .map(|b| b.is_orange())
-                            .unwrap_or(false)
-                    })
-                    .count();
-                self.history_red_count = self
-                    .history_drops
-                    .iter()
-                    .filter(|d| {
-                        LootBagType::from_id(d.bag_type)
-                            .map(|b| b.is_red())
-                            .unwrap_or(false)
-                    })
-                    .count();
             }
             Err(e) => {
                 eprintln!("Failed to load history: {}", e);
@@ -1718,6 +1646,7 @@ impl LootPanel {
         self.history_drops.clear();
         self.fight_links.reset();
         self.history_total_count = None;
+        self.history_has_more = false;
         self.history_needs_refresh = true;
         self.history_white_count = 0;
         self.history_orange_count = 0;
@@ -2191,6 +2120,98 @@ impl Panel for LootPanel {
             actions.push(AppAction::OpenFight { selection });
         }
         actions
+    }
+}
+
+#[cfg(test)]
+mod property_history_tests {
+    use super::*;
+    use realmhound_core::loot::{NewLootDrop, NewLootItem, PlayerStateTracker};
+
+    #[test]
+    fn property_pages_counts_and_resets_use_matching_bags_only() {
+        let mut db = LootDatabase::open_in_memory().unwrap();
+        let mut player = PlayerStateTracker::new();
+        player.on_create_success(1, 1);
+        player.on_new_map("Realm", 1);
+        let mut expected = Vec::new();
+        for n in 0..2_101 {
+            let matching = n % 10 == 0;
+            let id = db
+                .insert_loot_drop(&NewLootDrop {
+                    timestamp: 1_000,
+                    player: player.capture_snapshot().unwrap(),
+                    bag_type: if matching {
+                        LootBagType::White
+                    } else {
+                        LootBagType::Orange
+                    },
+                    mob_type: 100,
+                    mob_name: String::new(),
+                    items: vec![NewLootItem {
+                        slot: 0,
+                        item_id: 999_999,
+                        item_name: "Synthetic item".to_string(),
+                        enchant_ids: if matching {
+                            vec![1, 2, 3, 4, 5]
+                        } else {
+                            Vec::new()
+                        },
+                    }],
+                })
+                .unwrap();
+            if matching {
+                expected.push(id);
+            }
+        }
+        expected.reverse();
+        let mut panel = LootPanel {
+            prop_filters: PropertyFilters {
+                r_none: false,
+                r_uncommon: false,
+                r_rare: false,
+                r_legendary: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        panel.load_history(&db);
+        assert_eq!(panel.history_total_count, Some(211));
+        assert_eq!(panel.history_drops.len(), 100);
+        assert_eq!(panel.history_white_count, 100);
+        assert_eq!(panel.history_orange_count, 0);
+        assert!(panel.history_has_more);
+        let property_ids = panel.source_filters.property_item_ids.clone();
+        panel.history_offset = 100;
+        panel.history_needs_refresh = true;
+        panel.load_history(&db);
+        assert_eq!(panel.history_drops.len(), 200);
+        assert_eq!(panel.history_white_count, 200);
+        assert_eq!(panel.source_filters.property_item_ids, property_ids);
+        panel.history_offset = 200;
+        panel.history_needs_refresh = true;
+        panel.load_history(&db);
+        assert!(!panel.history_has_more);
+        assert_eq!(panel.history_white_count, 211);
+        assert_eq!(
+            panel.history_drops.iter().map(|d| d.id).collect::<Vec<_>>(),
+            expected
+        );
+
+        panel.source_filters.clear();
+        panel.reset_history();
+        assert!(!panel.history_has_more);
+        panel.load_history(&db);
+        assert_eq!(panel.history_total_count, Some(211));
+        assert_eq!(panel.history_white_count, 100);
+
+        panel.prop_filters = PropertyFilters::default();
+        panel.reset_history();
+        panel.load_history(&db);
+        assert_eq!(panel.history_total_count, Some(2_101));
+        assert_eq!(panel.history_white_count, 10);
+        assert_eq!(panel.history_orange_count, 90);
+        assert!(panel.source_filters.property_rarities.is_none());
     }
 }
 

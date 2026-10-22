@@ -128,6 +128,10 @@ pub struct SourceFilters {
     /// Free-text query matched against mob name, dungeon, or item name
     /// (case-insensitive LIKE). None/empty = no text filter.
     pub search_text: Option<String>,
+    /// Asset-derived UT/ST/Shiny union. None = unrestricted; Some(empty) = no matches.
+    pub property_item_ids: Option<Vec<i32>>,
+    /// Selected enchant-count tiers (0..=4, with 4 meaning 4+). None = unrestricted.
+    pub property_rarities: Option<Vec<i32>>,
 }
 
 impl SourceFilters {
@@ -144,11 +148,15 @@ impl SourceFilters {
                 .unwrap_or(true)
     }
 
-    /// Clear all source filters (preserves bag_types).
+    /// Clear source filters, preserving the bag and property toggles.
     pub fn clear(&mut self) {
         let bag_types = self.bag_types.take();
+        let property_item_ids = self.property_item_ids.take();
+        let property_rarities = self.property_rarities.take();
         *self = Self::default();
         self.bag_types = bag_types;
+        self.property_item_ids = property_item_ids;
+        self.property_rarities = property_rarities;
     }
 
     /// Set bag type filter.
@@ -2256,164 +2264,16 @@ impl LootDatabase {
         offset: i64,
         limit: i64,
     ) -> SqlResult<Vec<LootDropRecord>> {
-        // Build dynamic SQL with optional filter clauses
-        // When filtering by item, we need to JOIN with loot_items
-        let has_item_filter = filters.item_id.is_some();
-
-        let mut sql = if has_item_filter {
-            String::from(
-                "SELECT DISTINCT d.* FROM loot_drops d \
-                 INNER JOIN loot_items i ON i.drop_id = d.id \
-                 WHERE d.timestamp >= ?1 AND d.timestamp <= ?2",
-            )
-        } else {
-            String::from("SELECT * FROM loot_drops WHERE timestamp >= ?1 AND timestamp <= ?2")
-        };
-
-        // Table alias prefix for column references when using JOIN
-        let col_prefix = if has_item_filter { "d." } else { "" };
-
-        // Track parameter index (starts at 3 since ?1 and ?2 are start/end)
-        let mut param_idx = 3;
-
-        // Filter the whole encounter, not just the selected variant, so a reskin
-        // source's drops recorded under the base id surface too (and vice versa).
-        let mob_variants = filters.mob_type.map(crate::assets::encounter_variant_types);
-        if let Some(variants) = &mob_variants {
-            let placeholders: Vec<String> = (0..variants.len())
-                .map(|i| format!("?{}", param_idx + i))
-                .collect();
-            sql.push_str(&format!(
-                " AND {}mob_type IN ({})",
-                col_prefix,
-                placeholders.join(", ")
-            ));
-            param_idx += variants.len();
-        }
-        if filters.dungeon.is_some() {
-            sql.push_str(&format!(" AND {}dungeon = ?{}", col_prefix, param_idx));
-            param_idx += 1;
-        }
-        if filters.char_id.is_some() {
-            sql.push_str(&format!(" AND {}char_id = ?{}", col_prefix, param_idx));
-            param_idx += 1;
-        }
-        if filters.item_id.is_some() {
-            sql.push_str(&format!(" AND i.item_id = ?{}", param_idx));
-            param_idx += 1;
-        }
-
-        // Free-text search across mob name, dungeon, and item name. A reskinned
-        // encounter matches by either of its names.
-        let search_like = filters
-            .search_text
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("%{}%", s));
-        let alias_likes: Vec<String> = filters
-            .search_text
-            .as_deref()
-            .map(crate::assets::encounter_alias_names_matching)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|n| format!("%{}%", n))
-            .collect();
-        if search_like.is_some() {
-            // Qualify the outer drops id so it isn't shadowed by loot_items.id
-            // inside the correlated EXISTS subquery.
-            let drop_id_ref = if has_item_filter {
-                "d.id"
-            } else {
-                "loot_drops.id"
-            };
-            let p = col_prefix;
-            let mut idx = param_idx;
-            let mut name_parts = vec![format!("{p}mob_name LIKE ?{idx}")];
-            idx += 1;
-            for _ in &alias_likes {
-                name_parts.push(format!("{p}mob_name LIKE ?{idx}"));
-                idx += 1;
-            }
-            name_parts.push(format!("{p}dungeon LIKE ?{idx}"));
-            idx += 1;
-            name_parts.push(format!(
-                "EXISTS (SELECT 1 FROM loot_items li WHERE li.drop_id = {drop_id_ref} AND li.item_name LIKE ?{idx})"
-            ));
-            idx += 1;
-            param_idx = idx;
-            sql.push_str(&format!(" AND ({})", name_parts.join(" OR ")));
-        }
-
-        // Add bag type filter with IN clause.
-        // Some(non-empty) => restrict to those bag types.
-        // Some(empty) => user disabled all bag types, so match nothing.
-        // None => no bag-type restriction.
-        if let Some(ref bag_types) = filters.bag_types {
-            if !bag_types.is_empty() {
-                let placeholders: Vec<String> = (0..bag_types.len())
-                    .map(|i| format!("?{}", param_idx + i))
-                    .collect();
-                sql.push_str(&format!(
-                    " AND {}bag_type IN ({})",
-                    col_prefix,
-                    placeholders.join(", ")
-                ));
-                param_idx += bag_types.len();
-            } else {
-                sql.push_str(" AND 1=0");
-            }
-        }
-
-        sql.push_str(&format!(
-            " ORDER BY {}timestamp DESC LIMIT ?{} OFFSET ?{}",
-            col_prefix,
-            param_idx,
-            param_idx + 1
-        ));
-
+        let (predicate, mut params) = Self::drop_filter_sql(start, end, filters);
+        let sql = format!(
+            "SELECT d.* FROM loot_drops d WHERE {predicate} \
+             ORDER BY d.timestamp DESC, d.id DESC LIMIT ? OFFSET ?"
+        );
+        params.push(limit.into());
+        params.push(offset.into());
         let mut stmt = self.conn.prepare(&sql)?;
-
-        // Build parameter list dynamically using boxed trait objects
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        params.push(Box::new(start));
-        params.push(Box::new(end));
-
-        if let Some(variants) = &mob_variants {
-            for &v in variants {
-                params.push(Box::new(v));
-            }
-        }
-        if let Some(ref dung) = filters.dungeon {
-            params.push(Box::new(dung.clone()));
-        }
-        if let Some(char) = filters.char_id {
-            params.push(Box::new(char));
-        }
-        if let Some(item) = filters.item_id {
-            params.push(Box::new(item));
-        }
-        if let Some(ref like) = search_like {
-            params.push(Box::new(like.clone()));
-            for alias in &alias_likes {
-                params.push(Box::new(alias.clone()));
-            }
-            params.push(Box::new(like.clone()));
-            params.push(Box::new(like.clone()));
-        }
-        if let Some(ref bag_types) = filters.bag_types {
-            for &bt in bag_types {
-                params.push(Box::new(bt));
-            }
-        }
-        params.push(Box::new(limit));
-        params.push(Box::new(offset));
-
-        // Convert to slice of references for rusqlite
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
         let drops = stmt
-            .query_map(param_refs.as_slice(), Self::row_to_drop)?
+            .query_map(rusqlite::params_from_iter(params), Self::row_to_drop)?
             .collect::<SqlResult<Vec<_>>>()?;
 
         let drops = self.apply_display_variants(drops)?;
@@ -2427,152 +2287,87 @@ impl LootDatabase {
         end: i64,
         filters: &SourceFilters,
     ) -> SqlResult<i64> {
-        // Build dynamic SQL with optional filter clauses
-        // When filtering by item, we need to JOIN with loot_items
-        let has_item_filter = filters.item_id.is_some();
+        let (predicate, params) = Self::drop_filter_sql(start, end, filters);
+        self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM loot_drops d WHERE {predicate}"),
+            rusqlite::params_from_iter(params),
+            |row| row.get(0),
+        )
+    }
 
-        let mut sql = if has_item_filter {
-            String::from(
-                "SELECT COUNT(DISTINCT d.id) FROM loot_drops d \
-                 INNER JOIN loot_items i ON i.drop_id = d.id \
-                 WHERE d.timestamp >= ?1 AND d.timestamp <= ?2",
-            )
-        } else {
-            String::from(
-                "SELECT COUNT(*) FROM loot_drops WHERE timestamp >= ?1 AND timestamp <= ?2",
-            )
-        };
-
-        // Table alias prefix for column references when using JOIN
-        let col_prefix = if has_item_filter { "d." } else { "" };
-
-        // Track parameter index (starts at 3 since ?1 and ?2 are start/end)
-        let mut param_idx = 3;
-
-        // Match the whole encounter (all reskin variants), as in get_drops_filtered.
-        let mob_variants = filters.mob_type.map(crate::assets::encounter_variant_types);
-        if let Some(variants) = &mob_variants {
-            let placeholders: Vec<String> = (0..variants.len())
-                .map(|i| format!("?{}", param_idx + i))
-                .collect();
-            sql.push_str(&format!(
-                " AND {}mob_type IN ({})",
-                col_prefix,
-                placeholders.join(", ")
-            ));
-            param_idx += variants.len();
+    fn drop_filter_sql(
+        start: i64,
+        end: i64,
+        filters: &SourceFilters,
+    ) -> (String, Vec<rusqlite::types::Value>) {
+        let mut sql = String::from("d.timestamp >= ? AND d.timestamp <= ?");
+        let mut params = vec![start.into(), end.into()];
+        if let Some(mob_type) = filters.mob_type {
+            sql.push_str(" AND d.mob_type IN (SELECT value FROM json_each(?))");
+            params.push(
+                serde_json::json!(crate::assets::encounter_variant_types(mob_type))
+                    .to_string()
+                    .into(),
+            );
         }
-        if filters.dungeon.is_some() {
-            sql.push_str(&format!(" AND {}dungeon = ?{}", col_prefix, param_idx));
-            param_idx += 1;
+        if let Some(dungeon) = &filters.dungeon {
+            sql.push_str(" AND d.dungeon = ?");
+            params.push(dungeon.clone().into());
         }
-        if filters.char_id.is_some() {
-            sql.push_str(&format!(" AND {}char_id = ?{}", col_prefix, param_idx));
-            param_idx += 1;
+        if let Some(char_id) = filters.char_id {
+            sql.push_str(" AND d.char_id = ?");
+            params.push(char_id.into());
         }
-        if filters.item_id.is_some() {
-            sql.push_str(&format!(" AND i.item_id = ?{}", param_idx));
-            param_idx += 1;
+        if let Some(item_id) = filters.item_id {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM loot_items i WHERE i.drop_id = d.id AND i.item_id = ?)",
+            );
+            params.push(item_id.into());
         }
-
-        // Free-text search across mob name, dungeon, and item name, matching a
-        // reskinned encounter by either of its names.
+        // This EXISTS is separate from source-item matching: the selected source
+        // item and the item satisfying both property groups may be different.
+        if filters.property_item_ids.is_some() || filters.property_rarities.is_some() {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM loot_items i WHERE i.drop_id = d.id");
+            if let Some(ids) = &filters.property_item_ids {
+                sql.push_str(" AND i.item_id IN (SELECT value FROM json_each(?))");
+                // One JSON parameter avoids SQLite's bind limit for large asset sets.
+                params.push(serde_json::json!(ids).to_string().into());
+            }
+            if let Some(rarities) = &filters.property_rarities {
+                sql.push_str(" AND min(i.enchant_count, 4) IN (SELECT value FROM json_each(?))");
+                params.push(serde_json::json!(rarities).to_string().into());
+            }
+            sql.push(')');
+        }
         let search_like = filters
             .search_text
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| format!("%{}%", s));
-        let alias_likes: Vec<String> = filters
-            .search_text
-            .as_deref()
-            .map(crate::assets::encounter_alias_names_matching)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|n| format!("%{}%", n))
-            .collect();
-        if search_like.is_some() {
-            let drop_id_ref = if has_item_filter {
-                "d.id"
-            } else {
-                "loot_drops.id"
-            };
-            let p = col_prefix;
-            let mut idx = param_idx;
-            let mut name_parts = vec![format!("{p}mob_name LIKE ?{idx}")];
-            idx += 1;
-            for _ in &alias_likes {
-                name_parts.push(format!("{p}mob_name LIKE ?{idx}"));
-                idx += 1;
+        if let Some(like) = search_like {
+            let mut name_parts = vec!["d.mob_name LIKE ?".to_string()];
+            params.push(like.clone().into());
+            for alias in crate::assets::encounter_alias_names_matching(
+                filters.search_text.as_deref().unwrap_or_default(),
+            ) {
+                name_parts.push("d.mob_name LIKE ?".to_string());
+                params.push(format!("%{alias}%").into());
             }
-            name_parts.push(format!("{p}dungeon LIKE ?{idx}"));
-            idx += 1;
-            name_parts.push(format!(
-                "EXISTS (SELECT 1 FROM loot_items li WHERE li.drop_id = {drop_id_ref} AND li.item_name LIKE ?{idx})"
-            ));
-            idx += 1;
-            param_idx = idx;
+            name_parts.push("d.dungeon LIKE ?".to_string());
+            params.push(like.clone().into());
+            name_parts.push(
+                "EXISTS (SELECT 1 FROM loot_items i WHERE i.drop_id = d.id AND i.item_name LIKE ?)"
+                    .to_string(),
+            );
+            params.push(like.into());
             sql.push_str(&format!(" AND ({})", name_parts.join(" OR ")));
         }
-
-        // Add bag type filter with IN clause.
-        // Some(non-empty) => restrict to those bag types.
-        // Some(empty) => user disabled all bag types, so match nothing.
-        // None => no bag-type restriction.
-        if let Some(ref bag_types) = filters.bag_types {
-            if !bag_types.is_empty() {
-                let placeholders: Vec<String> = (0..bag_types.len())
-                    .map(|i| format!("?{}", param_idx + i))
-                    .collect();
-                sql.push_str(&format!(
-                    " AND {}bag_type IN ({})",
-                    col_prefix,
-                    placeholders.join(", ")
-                ));
-            } else {
-                sql.push_str(" AND 1=0");
-            }
+        if let Some(bag_types) = &filters.bag_types {
+            sql.push_str(" AND d.bag_type IN (SELECT value FROM json_each(?))");
+            params.push(serde_json::json!(bag_types).to_string().into());
         }
-
-        let mut stmt = self.conn.prepare(&sql)?;
-
-        // Build parameter list dynamically using boxed trait objects
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        params.push(Box::new(start));
-        params.push(Box::new(end));
-
-        if let Some(variants) = &mob_variants {
-            for &v in variants {
-                params.push(Box::new(v));
-            }
-        }
-        if let Some(ref dung) = filters.dungeon {
-            params.push(Box::new(dung.clone()));
-        }
-        if let Some(char) = filters.char_id {
-            params.push(Box::new(char));
-        }
-        if let Some(item) = filters.item_id {
-            params.push(Box::new(item));
-        }
-        if let Some(ref like) = search_like {
-            params.push(Box::new(like.clone()));
-            for alias in &alias_likes {
-                params.push(Box::new(alias.clone()));
-            }
-            params.push(Box::new(like.clone()));
-            params.push(Box::new(like.clone()));
-        }
-        if let Some(ref bag_types) = filters.bag_types {
-            for &bt in bag_types {
-                params.push(Box::new(bt));
-            }
-        }
-
-        // Convert to slice of references for rusqlite
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        stmt.query_row(param_refs.as_slice(), |row| row.get(0))
+        (sql, params)
     }
 
     /// Convert a database row to LootDropRecord (without items).
@@ -5303,6 +5098,191 @@ mod tests {
 
         filters.clear();
         assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn property_filters_require_one_item_to_match_both_groups() {
+        let mut db = LootDatabase::open_in_memory().unwrap();
+        let mut insert = |items: &[(i32, usize)]| {
+            db.insert_loot_drop(&NewLootDrop {
+                timestamp: 1_000,
+                player: create_test_player(),
+                bag_type: LootBagType::White,
+                mob_type: 100,
+                mob_name: "Boss".to_string(),
+                items: items
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &(id, count))| NewLootItem {
+                        slot: slot as i32,
+                        item_id: id,
+                        item_name: format!("Item {id}"),
+                        enchant_ids: (0..count as i32).collect(),
+                    })
+                    .collect(),
+            })
+            .unwrap()
+        };
+        let split = insert(&[(10, 0), (20, 4)]);
+        let matching = insert(&[(10, 5), (20, 0), (10, 4)]);
+        let other_type = insert(&[(30, 4)]);
+        insert(&[]);
+        let mut filters = SourceFilters {
+            property_item_ids: Some(vec![10, 30]),
+            property_rarities: Some(vec![4]),
+            ..Default::default()
+        };
+        let drops = db.get_drops_filtered(0, 2_000, &filters, 0, 100).unwrap();
+        assert_eq!(
+            drops.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![other_type, matching]
+        );
+        assert!(!drops.iter().any(|d| d.id == split));
+        assert_eq!(db.count_drops_filtered(0, 2_000, &filters).unwrap(), 2);
+        let whole_bag = drops.iter().find(|d| d.id == matching).unwrap();
+        assert_eq!(whole_bag.items.len(), 3);
+        assert_eq!(whole_bag.items[1].item_id, 20);
+        for item in &whole_bag.items {
+            assert_eq!(item.enchant_count as usize, item.parsed_enchant_ids.len());
+        }
+
+        // A source-item match may be a different item in the same bag.
+        filters.item_id = Some(20);
+        filters.mob_type = Some(100);
+        filters.dungeon = Some(create_test_player().dungeon);
+        filters.char_id = Some(create_test_player().char_id);
+        filters.bag_types = Some(vec![LootBagType::White.id()]);
+        filters.search_text = Some("  item 20  ".to_string());
+        let drops = db.get_drops_filtered(1_000, 1_000, &filters, 0, 1).unwrap();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].id, matching);
+        assert_eq!(db.count_drops_filtered(1_000, 1_000, &filters).unwrap(), 1);
+        assert_eq!(db.count_drops_filtered(1_001, 2_000, &filters).unwrap(), 0);
+    }
+
+    #[test]
+    fn property_filter_empty_and_large_sets_keep_row_count_parity() {
+        let mut db = LootDatabase::open_in_memory().unwrap();
+        db.insert_loot_drop(&NewLootDrop {
+            timestamp: 1_000,
+            player: create_test_player(),
+            bag_type: LootBagType::White,
+            mob_type: 100,
+            mob_name: "Boss".to_string(),
+            items: vec![NewLootItem {
+                slot: 0,
+                item_id: 40_000,
+                item_name: "Item".to_string(),
+                enchant_ids: vec![1, 2],
+            }],
+        })
+        .unwrap();
+        for (ids, rarities, expected) in [
+            (Some(vec![]), None, 0),
+            (None, Some(vec![]), 0),
+            (Some((0..40_001).collect()), Some(vec![0, 2, 4]), 1),
+            (Some(vec![40_000]), Some(vec![0, 1, 3, 4]), 0),
+            (None, None, 1),
+        ] {
+            let filters = SourceFilters {
+                property_item_ids: ids,
+                property_rarities: rarities,
+                ..Default::default()
+            };
+            assert_eq!(
+                db.get_drops_filtered(0, 2_000, &filters, 0, 100)
+                    .unwrap()
+                    .len(),
+                expected
+            );
+            assert_eq!(
+                db.count_drops_filtered(0, 2_000, &filters).unwrap(),
+                expected as i64
+            );
+        }
+    }
+
+    #[test]
+    fn source_clear_preserves_property_toggles() {
+        let mut filters = SourceFilters {
+            mob_type: Some(100),
+            item_id: Some(20),
+            search_text: Some("Boss".to_string()),
+            bag_types: Some(vec![7]),
+            property_item_ids: Some(vec![10]),
+            property_rarities: Some(vec![4]),
+            ..Default::default()
+        };
+        filters.clear();
+        assert!(filters.is_empty());
+        assert_eq!(filters.bag_types, Some(vec![7]));
+        assert_eq!(filters.property_item_ids, Some(vec![10]));
+        assert_eq!(filters.property_rarities, Some(vec![4]));
+    }
+
+    #[test]
+    fn sparse_property_history_pages_matching_bags_at_large_database_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("loot.db");
+        let db = LootDatabase::open_writer(&path, None).unwrap();
+        db.conn
+            .execute_batch(
+                "BEGIN;
+             WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<90000)
+             INSERT INTO loot_drops
+                 (timestamp, dungeon, map_seed, char_id, char_name, class_id,
+                  fame, bag_type, mob_type, mob_name)
+             SELECT 1000, 'Synthetic Dungeon', n, 1, 'Synthetic Player', 768,
+                    0, 7, 100, 'Synthetic Boss' FROM seq;
+             INSERT INTO loot_items (drop_id, slot, item_id, item_name, enchant_count, enchant_ids)
+             SELECT d.id, s.slot, 10+s.slot, 'Synthetic equipment item',
+                    CASE WHEN d.id%401=0 AND s.slot=0 THEN 4 ELSE 0 END,
+                    CASE WHEN d.id%401=0 AND s.slot=0 THEN '1,2,3,4' ELSE '' END
+             FROM loot_drops d CROSS JOIN
+                  (SELECT 0 AS slot UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) s;
+             COMMIT;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let filters = SourceFilters {
+            property_item_ids: Some(vec![10]),
+            property_rarities: Some(vec![4]),
+            ..Default::default()
+        };
+        let reader = LootDatabase::open_reader_at(&path).unwrap();
+        let started = std::time::Instant::now();
+        let total = reader.count_drops_filtered(0, 2_000, &filters).unwrap();
+        assert_eq!(total, 224);
+        let mut ids = Vec::new();
+        for (offset, expected) in [(0, 100), (100, 100), (200, 24)] {
+            let page = reader
+                .get_drops_filtered(0, 2_000, &filters, offset, 100)
+                .unwrap();
+            assert_eq!(page.len(), expected);
+            assert!(page.iter().all(|drop| drop.items.len() == 4));
+            ids.extend(page.iter().map(|drop| drop.id));
+        }
+        assert_eq!(ids, (1..=224).rev().map(|n| n * 401).collect::<Vec<_>>());
+        assert!(reader
+            .get_drops_filtered(0, 2_000, &filters, 224, 100)
+            .unwrap()
+            .is_empty());
+        println!(
+            "Synthetic loot DB: {:.2} MiB, 90,000 bags / 360,000 items; count + 4 filtered pages: {:?}",
+            std::fs::metadata(&path).unwrap().len() as f64 / 1_048_576.0,
+            started.elapsed()
+        );
+        let (predicate, params) = LootDatabase::drop_filter_sql(0, 2_000, &filters);
+        let plan: Vec<String> = reader.conn
+            .prepare(&format!("EXPLAIN QUERY PLAN SELECT d.* FROM loot_drops d WHERE {predicate} ORDER BY d.timestamp DESC, d.id DESC LIMIT 100"))
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(params), |row| row.get(3))
+            .unwrap()
+            .collect::<SqlResult<_>>().unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("idx_items_drop_id")),
+            "{plan:?}"
+        );
     }
 
     #[test]

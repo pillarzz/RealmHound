@@ -3075,6 +3075,24 @@ impl AssetManager {
             .unwrap_or(false)
     }
 
+    /// Union of the enabled loot item types, using the same tags as live filtering.
+    pub fn loot_property_item_ids(&self, ut: bool, st: bool, shiny: bool) -> Vec<i32> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        let Some(list) = guard.as_ref() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<i32> = list
+            .iter()
+            .filter(|asset| {
+                (ut && asset.is_ut()) || (st && asset.is_st()) || (shiny && asset.is_shiny())
+            })
+            .map(|asset| asset.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Get the forge/tooltip category icon index for an item, normalizing
     /// stackable variants to their canonical base first. Returns `None` for
     /// items that are neither UT nor a Blueprint, or that have no
@@ -6613,6 +6631,52 @@ mod tests {
             CURATED_NON_BOSS_TYPES.windows(2).all(|w| w[0] < w[1]),
             "CURATED_NON_BOSS_TYPES must be sorted and unique for binary_search",
         );
+    }
+
+    #[test]
+    fn loot_property_ids_match_live_type_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ObjectID.list");
+        std::fs::write(
+            &path,
+            "10;UT item;Equipment;Weapon;;;UT;UT item\n\
+             20;ST item;Equipment;Armor;;;ST;ST item\n\
+             30;Shiny UT;Equipment;Weapon;;;SHINY,UT;Shiny UT\n\
+             40;Consumable;Consumable;;;;UT,CONSUMABLE;Consumable\n\
+             50;Shiny ST;Equipment;Armor;;;SHINY,ST;Shiny ST\n\
+             60;Other;Equipment;Weapon;;;UTILITY;Other\n",
+        )
+        .unwrap();
+        let manager = AssetManager::new();
+        manager.set_assets_dir(temp.path());
+        *manager.objects.write().unwrap() = Some(ObjectList::load_from_file(&path).unwrap());
+        *manager.initialized.write().unwrap() = true;
+        assert_eq!(
+            manager.loot_property_item_ids(true, false, false),
+            vec![10, 30]
+        );
+        assert_eq!(
+            manager.loot_property_item_ids(false, true, false),
+            vec![20, 50]
+        );
+        assert_eq!(
+            manager.loot_property_item_ids(false, false, true),
+            vec![30, 50]
+        );
+        for mask in 0..8 {
+            let (ut, st, shiny) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+            let ids = manager.loot_property_item_ids(ut, st, shiny);
+            for id in [10, 20, 30, 40, 50, 60, 999] {
+                let expected = (ut && manager.is_ut(id))
+                    || (st
+                        && manager
+                            .get_object(id)
+                            .map(|item| item.is_st())
+                            .unwrap_or(false))
+                    || (shiny && manager.is_shiny(id));
+                assert_eq!(ids.contains(&id), expected, "mask={mask}, id={id}");
+            }
+        }
     }
 
     #[test]

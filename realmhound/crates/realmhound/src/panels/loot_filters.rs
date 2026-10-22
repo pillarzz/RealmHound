@@ -8,7 +8,7 @@ use crate::ui_ext::HoverTooltipExt;
 use eframe::egui::{self, Color32, RichText};
 use realmhound_core::{
     assets::get_asset_manager,
-    loot::{LootBagType, LootItemRecord, ProcessedLootItem},
+    loot::{LootBagType, LootItemRecord, ProcessedLootItem, SourceFilters},
     settings::LiveFeedFilterSettings,
 };
 
@@ -186,7 +186,7 @@ impl FilterItem for ProcessedLootItem {
 
 /// Item-property display filters (UT / ST / Shiny + rarity).
 ///
-/// Applied at display time over a bag's items. A bag is shown when it contains
+/// A bag is shown when it contains
 /// at least one item that satisfies BOTH active subgroups (AND between groups),
 /// where each subgroup is OR within itself:
 ///   * type subgroup: UT / ST / Shiny
@@ -257,6 +257,25 @@ impl PropertyFilters {
     /// Whether any property filter actually narrows results.
     pub(crate) fn any(&self) -> bool {
         self.type_active() || self.rarity_constraining()
+    }
+
+    pub(crate) fn apply_to_source(&self, filters: &mut SourceFilters) {
+        filters.property_item_ids = self
+            .type_active()
+            .then(|| get_asset_manager().loot_property_item_ids(self.ut, self.st, self.shiny));
+        filters.property_rarities = self.rarity_constraining().then(|| {
+            [
+                self.r_none,
+                self.r_uncommon,
+                self.r_rare,
+                self.r_legendary,
+                self.r_divine,
+            ]
+            .into_iter()
+            .zip(0..=4)
+            .filter_map(|(enabled, tier)| enabled.then_some(tier))
+            .collect()
+        });
     }
 
     /// Build property filters from persisted Live Feed settings.
@@ -702,6 +721,79 @@ mod tests {
             r_rare: rare,
             r_legendary: leg,
             r_divine: div,
+        }
+    }
+
+    #[test]
+    fn sql_property_filters_match_all_live_rarity_combinations() {
+        use realmhound_core::loot::{LootDatabase, NewLootDrop, NewLootItem, PlayerStateTracker};
+
+        let mut db = LootDatabase::open_in_memory().unwrap();
+        let mut player = PlayerStateTracker::new();
+        player.on_create_success(1, 1);
+        player.on_new_map("Realm", 1);
+        for count in 0..=8 {
+            db.insert_loot_drop(&NewLootDrop {
+                timestamp: 1_000,
+                player: player.capture_snapshot().unwrap(),
+                bag_type: LootBagType::White,
+                mob_type: 100,
+                mob_name: String::new(),
+                items: if count == 8 {
+                    Vec::new()
+                } else {
+                    vec![NewLootItem {
+                        slot: 0,
+                        item_id: 999_999,
+                        item_name: "Synthetic item".to_string(),
+                        enchant_ids: (0..count).collect(),
+                    }]
+                },
+            })
+            .unwrap();
+        }
+        let all = db
+            .get_drops_filtered(0, 2_000, &SourceFilters::default(), 0, 100)
+            .unwrap();
+        for mask in 0..32 {
+            let prop = rarity_only(
+                mask & 1 != 0,
+                mask & 2 != 0,
+                mask & 4 != 0,
+                mask & 8 != 0,
+                mask & 16 != 0,
+            );
+            let mut filters = SourceFilters::default();
+            prop.apply_to_source(&mut filters);
+            let expected: Vec<i64> = all
+                .iter()
+                .filter(|drop| prop.matches_items(&drop.items))
+                .map(|drop| drop.id)
+                .collect();
+            let actual: Vec<i64> = db
+                .get_drops_filtered(0, 2_000, &filters, 0, 100)
+                .unwrap()
+                .iter()
+                .map(|drop| drop.id)
+                .collect();
+            assert_eq!(actual, expected, "rarity mask={mask}");
+            assert_eq!(
+                db.count_drops_filtered(0, 2_000, &filters).unwrap(),
+                expected.len() as i64
+            );
+            for drop in &all {
+                let live: Vec<ProcessedLootItem> = drop
+                    .items
+                    .iter()
+                    .map(|item| ProcessedLootItem {
+                        slot: item.slot,
+                        item_id: item.item_id,
+                        item_name: item.item_name.clone(),
+                        enchant_ids: item.parsed_enchant_ids.clone(),
+                    })
+                    .collect();
+                assert_eq!(prop.matches_items(&live), actual.contains(&drop.id));
+            }
         }
     }
 

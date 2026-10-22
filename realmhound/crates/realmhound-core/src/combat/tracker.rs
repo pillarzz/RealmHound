@@ -523,6 +523,9 @@ impl TrackedObject {
             ScalingStat::Vitality => self.vitality_seen.then_some(self.vitality),
             ScalingStat::Speed => self.speed_seen.then_some(self.speed),
             ScalingStat::MaxMp => Some(self.max_mp),
+            // Max HP is only usable once the server has reported it; a zero
+            // would price an HP-scaled ability as if the stat were empty.
+            ScalingStat::MaxHp => (self.max_hp > 0).then_some(self.max_hp),
         }
     }
 

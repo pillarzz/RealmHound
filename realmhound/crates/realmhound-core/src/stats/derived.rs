@@ -1355,6 +1355,7 @@ fn scaling_value(stat: ScalingStat, e: &EffectiveStats) -> i32 {
         ScalingStat::Vitality => e.vitality,
         ScalingStat::Speed => e.speed,
         ScalingStat::MaxMp => e.max_mp,
+        ScalingStat::MaxHp => e.max_hp,
     }
 }
 
@@ -1367,6 +1368,7 @@ fn scaling_label(stat: ScalingStat) -> &'static str {
         ScalingStat::Vitality => "VIT",
         ScalingStat::Speed => "SPD",
         ScalingStat::MaxMp => "MP",
+        ScalingStat::MaxHp => "HP",
     }
 }
 
@@ -1797,8 +1799,10 @@ fn ability_readout_from(
                 let sv = sh.scaling_stat.map(|s| scaling_value(s, eff)).unwrap_or(0);
                 let bonus =
                     (sh.stat_mod_damage * (sv as f32 - sh.stat_mod_scaling_min).max(0.0)).floor();
-                let min_total = (sh.min_damage + bonus).round() as i32;
-                let max_total = (sh.max_damage + bonus).round() as i32;
+                // Scaled through the same accessor the Combat History roll uses,
+                // so the readout and the fight numbers cannot drift apart.
+                let min_total = sh.min_for(sv);
+                let max_total = sh.max_for(sv);
 
                 let mut segs = vec![Seg::plain(format!("{}-{}", min_total, max_total))];
                 if bonus > 0.0 {
@@ -1968,9 +1972,7 @@ fn ability_potential_damage(
             }
             AbilityEffect::Shuriken(sh) => {
                 let sv = sh.scaling_stat.map(|s| scaling_value(s, eff)).unwrap_or(0);
-                let bonus =
-                    (sh.stat_mod_damage * (sv as f32 - sh.stat_mod_scaling_min).max(0.0)).floor();
-                let avg = ((sh.min_damage + sh.max_damage) / 2.0 + bonus).round() as i32;
+                let avg = ((sh.min_for(sv) + sh.max_for(sv)) / 2).max(0);
                 total += avg * sh.num_projectiles;
             }
             AbilityEffect::DashTrail { damage } => {
@@ -2017,6 +2019,7 @@ fn with_stat_zeroed(eff: &EffectiveStats, stat: ScalingStat) -> EffectiveStats {
         ScalingStat::Vitality => e.vitality = 0,
         ScalingStat::Speed => e.speed = 0,
         ScalingStat::MaxMp => e.max_mp = 0,
+        ScalingStat::MaxHp => e.max_hp = 0,
     }
     e
 }

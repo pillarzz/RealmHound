@@ -138,6 +138,7 @@ pub enum ScalingStat {
     Vitality,
     Speed,
     MaxMp,
+    MaxHp,
 }
 
 impl ScalingStat {
@@ -149,7 +150,11 @@ impl ScalingStat {
             "DEX" | "DEXTERITY" => Some(Self::Dexterity),
             "VIT" | "VITALITY" => Some(Self::Vitality),
             "SPD" | "SPEED" => Some(Self::Speed),
-            "MAXMP" | "MAXMANA" => Some(Self::MaxMp),
+            "MAXMP" | "MAXMANA" | "MP" => Some(Self::MaxMp),
+            // "MAHMP" is not a typo here: it is what five items in the live
+            // game data actually declare, and dropping it silently zeroed their
+            // scaling.
+            "MAXHP" | "MAX_HP" | "HP" | "MAHMP" => Some(Self::MaxHp),
             _ => None,
         }
     }
@@ -164,6 +169,7 @@ impl ScalingStat {
             Self::Vitality => "VIT",
             Self::Speed => "SPD",
             Self::MaxMp => "MP",
+            Self::MaxHp => "HP",
         }
     }
 }

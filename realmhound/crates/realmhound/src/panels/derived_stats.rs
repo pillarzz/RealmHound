@@ -396,6 +396,7 @@ fn stat_color(stat: ScalingStat) -> Color32 {
         ScalingStat::Vitality => Color32::from_rgb(230, 80, 80), // red
         ScalingStat::Speed => Color32::from_rgb(120, 220, 120), // green
         ScalingStat::MaxMp => Color32::from_rgb(255, 215, 0),   // gold
+        ScalingStat::MaxHp => Color32::from_rgb(120, 220, 220), // cyan
     }
 }
 

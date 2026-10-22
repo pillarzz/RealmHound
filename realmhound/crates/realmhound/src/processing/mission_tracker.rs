@@ -261,7 +261,7 @@ impl MissionTracker {
         let mut changed = false;
         for season in &defs.seasons {
             for def in &season.missions {
-                if !def.name.contains("Repeatable") {
+                if !def.is_repeatable() {
                     continue;
                 }
                 let Some(rt) = self.runtime.get_mut(&(season.id, def.id)) else {
@@ -431,7 +431,7 @@ impl MissionTracker {
             RewardView::Item { object_id, .. } if *object_id > 0 => Some(*object_id),
             _ => None,
         });
-        let repeatable = def.name.contains("Repeatable");
+        let repeatable = def.is_repeatable();
         let name = def
             .name
             .replace("(Repeatable)", "")
@@ -792,7 +792,9 @@ pub struct MissionEntryView {
     /// character must have an item of one of these slot types equipped to make
     /// progress. Empty when unrestricted.
     pub worn_restriction: Vec<WornReqView>,
-    /// True when the mission title is flagged `(Repeatable)`.
+    /// True when the mission is repeatable: either its name carries the
+    /// `(Repeatable)` marker or it declares a positive repeat `interval`. This
+    /// drives the cooldown label, `reset_at`, and the cooldown bucket.
     pub repeatable: bool,
     /// Reward-sprite fallback for the mission icon (first item reward).
     pub icon_object_id: Option<i32>,
@@ -990,6 +992,47 @@ mod tests {
         assert!(m7.repeatable);
         // 1_000_000 + 5 * 86_400.
         assert_eq!(m7.reset_at, Some(1_432_000));
+    }
+
+    #[test]
+    fn interval_only_repeatable_gets_a_cooldown_and_expires() {
+        // Newer repeatables (e.g. The Dragon's Omen) carry no "(Repeatable)"
+        // marker; only a positive interval. They must still show the cooldown
+        // and reset when the interval elapses.
+        const RDEFS: &str = r#"
+        {
+          "seasons": [{
+            "name": "S", "current": 1, "id": 52,
+            "missions": [
+              { "id": 9, "name": "The Dragon's Omen",
+                "desc": "d", "interval": 3.0,
+                "conds": [{ "type": 2, "target": "", "amount": 3 }],
+                "rewards": [{ "type": 1, "target": "", "amount": 3000 }] }
+            ]
+          }]
+        }"#;
+        let mut t = MissionTracker::new();
+        t.apply_definitions(parse_client_seasons(RDEFS).unwrap());
+        // Claimed with progress 3/3 and a claim timestamp three days back.
+        t.apply_player_missions(realmhound_core::api::parse_player_missions(
+            "<Missions><Season id=\"52\">9,3,3,1787053943,1,1000000</Season></Missions>",
+        ));
+        let view = t.build_view();
+        let m = entry(&view, 9);
+        assert!(
+            m.repeatable,
+            "a positive interval marks the mission repeatable"
+        );
+        assert_eq!(m.state, MissionState::Claimed);
+        assert_eq!(m.reset_at, Some(1_000_000 + 3 * 86_400));
+
+        // The interval elapsed: the tracker resets it without a Refresh.
+        assert!(t.expire_cooldowns(1_259_200));
+        let view = t.build_view();
+        let m = entry(&view, 9);
+        assert_eq!(m.state, MissionState::InProgress);
+        assert_eq!(m.objectives[0].have, 0);
+        assert_eq!(m.reset_at, None);
     }
 
     #[test]

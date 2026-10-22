@@ -435,6 +435,13 @@ impl MissionDef {
         (self.interval > 0.0).then(|| (self.interval * 86_400.0).round() as i64)
     }
 
+    /// Whether this mission repeats after a claim. The game flags older
+    /// missions with "(Repeatable)" in the name, but newer ones (e.g. The
+    /// Dragon's Omen) carry only a positive `interval`; either signal counts.
+    pub fn is_repeatable(&self) -> bool {
+        self.interval > 0.0 || self.name.contains("Repeatable")
+    }
+
     /// Group cond indices by their `cond_spread` digit. Conds in the same group
     /// are alternatives (satisfy any one); groups are ANDed together. With no
     /// spread, all conds form a single all-required group. Order of appearance
@@ -1027,6 +1034,22 @@ mod tests {
         let one: MissionDef = serde_json::from_str(r#"{"id":1}"#).unwrap();
         assert_eq!(one.icon_ref(), None);
         assert_eq!(one.cooldown_secs(), None);
+    }
+
+    #[test]
+    fn repeatable_is_interval_or_name_flagged() {
+        let mut m = MissionDef::default();
+        assert!(!m.is_repeatable(), "neither signal => one-time");
+
+        // Newer missions carry only the interval (e.g. The Dragon's Omen).
+        m.interval = 3.0;
+        assert!(m.is_repeatable());
+        assert_eq!(m.cooldown_secs(), Some(259_200));
+
+        // Older missions also flag the name.
+        m.interval = 0.0;
+        m.name = "The Veil Tears (Repeatable)".to_string();
+        assert!(m.is_repeatable());
     }
 
     #[test]

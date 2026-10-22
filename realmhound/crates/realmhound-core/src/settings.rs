@@ -1891,6 +1891,11 @@ pub struct TrophyHallSettings {
     /// Legacy Heroic ones) are listed. On by default.
     #[serde(default = "default_true")]
     pub show_legacy_dungeons: bool,
+    /// Whether the dungeon page's collection shows a rarity gem on discovered
+    /// items (highest discovered slot count). On by default; the compact
+    /// collections on the index page never show gems.
+    #[serde(default = "default_true")]
+    pub show_item_rarities: bool,
 }
 
 impl Default for TrophyHallSettings {
@@ -1900,6 +1905,7 @@ impl Default for TrophyHallSettings {
             show_no_collection_dungeons: false,
             compact_view: false,
             show_legacy_dungeons: true,
+            show_item_rarities: true,
         }
     }
 }

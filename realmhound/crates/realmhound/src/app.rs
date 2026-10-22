@@ -1304,6 +1304,7 @@ impl RealmHoundApp {
                 s.trophy_hall.show_no_collection_dungeons;
             *app.trophy_hall_panel.compact_view_mut() = s.trophy_hall.compact_view;
             *app.trophy_hall_panel.show_legacy_dungeons_mut() = s.trophy_hall.show_legacy_dungeons;
+            *app.trophy_hall_panel.show_item_rarities_mut() = s.trophy_hall.show_item_rarities;
         }
 
         // Forward cached vault data to treasury panel (vault panel loads its own cache)
@@ -1388,6 +1389,7 @@ impl RealmHoundApp {
             settings.trophy_hall.compact_view = self.trophy_hall_panel.compact_view();
             settings.trophy_hall.show_legacy_dungeons =
                 self.trophy_hall_panel.show_legacy_dungeons();
+            settings.trophy_hall.show_item_rarities = self.trophy_hall_panel.show_item_rarities();
             settings.save();
         }
     }
@@ -9059,7 +9061,7 @@ impl RealmHoundApp {
                             );
                         }
                         // Blood Ritual (orange) closes the row: Seasonal,
-                        // Crucible, then the ritual. [#64]
+                        // Crucible, then the ritual.
                         if blood_ritual {
                             let (r, _) =
                                 ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());

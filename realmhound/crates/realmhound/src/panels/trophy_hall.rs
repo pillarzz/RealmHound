@@ -140,6 +140,9 @@ pub struct TrophyHallPanel {
     /// List Legacy dungeons (the Time Chamber's retro dungeons, and the Legacy
     /// Heroic ones). On by default, matching the game's own Time Chamber hub.
     show_legacy_dungeons: bool,
+    /// Show the highest discovered rarity gem on discovered items in the
+    /// dungeon page's collection. On by default.
+    show_item_rarities: bool,
     /// Dungeon name selected in the icon view, for keyboard navigation. The first
     /// visible tile is selected as soon as the view is shown.
     selected_icon: Option<String>,
@@ -185,6 +188,7 @@ impl TrophyHallPanel {
             column_count: 2,
             show_no_collection_dungeons: false,
             show_legacy_dungeons: true,
+            show_item_rarities: true,
             selected_icon: None,
             show_st: true,
             show_ut: true,
@@ -252,6 +256,14 @@ impl TrophyHallPanel {
 
     pub fn show_legacy_dungeons(&self) -> bool {
         self.show_legacy_dungeons
+    }
+
+    pub fn show_item_rarities_mut(&mut self) -> &mut bool {
+        &mut self.show_item_rarities
+    }
+
+    pub fn show_item_rarities(&self) -> bool {
+        self.show_item_rarities
     }
 
     /// Open a file picker for a RealmShark `dungeon.stats` file and import it to
@@ -884,7 +896,8 @@ impl TrophyHallPanel {
         sprites.shiny_toggle(ui, shadcn, &mut self.show_shiny, "Show Shiny items");
 
         // Checkboxes, not pills: the pills filter item categories inside a
-        // collection, while these two change which dungeons are listed.
+        // collection, while these change which dungeons are listed or how the
+        // dungeon page's collection is drawn.
         if ui
             .checkbox(&mut self.show_legacy_dungeons, "Legacy Dungeons")
             .hover_tip("List the Time Chamber's Legacy dungeons and their retro collections")
@@ -907,6 +920,18 @@ impl TrophyHallPanel {
             .changed()
         {
             self.show_no_collection_dungeons = !hide_without_collection;
+            changed = true;
+        }
+        if ui
+            .checkbox(
+                &mut self.show_item_rarities,
+                "Show discovered item rarities",
+            )
+            .hover_tip(
+                "Show the highest discovered rarity gem on items in a dungeon page's collection",
+            )
+            .changed()
+        {
             changed = true;
         }
         changed
@@ -2276,6 +2301,22 @@ impl TrophyHallPanel {
                 ctx.sprite_renderer
                     .draw_shiny_overlay_in_rect(ui, item_rect, sparkle_tint);
             }
+            // Discovered items show their highest discovered rarity as a gem.
+            // Undiscovered items and Common (no slot) rarities stay unslotted.
+            if self.show_item_rarities && obtained && !has_no_enchant_slots(item_id) {
+                if let Some(slots) = self.highest_discovered_rarity(item_id) {
+                    let gem_size = item_size * 0.45;
+                    let gem_rect = egui::Rect::from_min_size(
+                        egui::pos2(item_rect.right() - gem_size, item_rect.bottom() - gem_size),
+                        egui::vec2(gem_size, gem_size),
+                    );
+                    ctx.sprite_renderer.draw_enchant_tier_in_rect_scaled(
+                        ui,
+                        (slots - 1) as usize,
+                        gem_rect,
+                    );
+                }
+            }
         } else {
             // Index list: tight, sparkle-free icons filling the cell.
             if obtained {
@@ -2308,6 +2349,18 @@ impl TrophyHallPanel {
             .collect();
         ctx.sprite_renderer
             .show_item_tooltip_with_rarities(ui, &resp, item_id, item_name, &rarities);
+    }
+
+    /// Highest non-Common enchant-slot count ever discovered for `item_id`.
+    ///
+    /// `None` when nothing above Common has been recorded, so undiscovered
+    /// items and Common-only items stay unslotted. `rarity_seen` merges
+    /// tracked drop history with currently-owned instances.
+    fn highest_discovered_rarity(&self, item_id: i32) -> Option<u8> {
+        self.rarity_seen
+            .get(&item_id)
+            .and_then(|seen| seen.iter().copied().filter(|&slots| slots > 0).max())
+            .map(|slots| slots.min(4))
     }
 
     /// Tracked-loot breakdown (per-item drop counts + mob-item table), sourced
@@ -2806,6 +2859,33 @@ mod gating_tests {
             realmhound_core::settings::TrophyHallSettings::default().show_legacy_dungeons,
             "a fresh settings file must list Legacy dungeons"
         );
+    }
+
+    #[test]
+    fn show_item_rarities_defaults_on() {
+        assert!(TrophyHallPanel::new().show_item_rarities());
+        assert!(
+            realmhound_core::settings::TrophyHallSettings::default().show_item_rarities,
+            "a fresh settings file must show discovered item rarities"
+        );
+    }
+
+    #[test]
+    fn highest_discovered_rarity_uses_the_best_recorded_slot_count() {
+        let mut panel = TrophyHallPanel::new();
+        panel
+            .rarity_seen
+            .insert(1, [0u8, 2, 3].into_iter().collect());
+        assert_eq!(panel.highest_discovered_rarity(1), Some(3));
+
+        // Common-only and unknown items stay unslotted.
+        panel.rarity_seen.insert(2, [0u8].into_iter().collect());
+        assert_eq!(panel.highest_discovered_rarity(2), None);
+        assert_eq!(panel.highest_discovered_rarity(3), None);
+
+        // Defensive clamp for malformed history.
+        panel.rarity_seen.insert(4, [9u8].into_iter().collect());
+        assert_eq!(panel.highest_discovered_rarity(4), Some(4));
     }
 
     #[test]

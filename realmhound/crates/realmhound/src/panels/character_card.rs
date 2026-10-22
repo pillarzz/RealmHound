@@ -138,7 +138,7 @@ fn draw_blood_ritual_pill(ui: &mut egui::Ui) {
 /// through the same allocation is the only exact way to do it: a spacer is laid
 /// out slightly differently (the vertical spacing between rows is applied to a
 /// spacer and a pill differently), which left cards without challenges a couple
-/// of pixels short in the grid. [#64]
+/// of pixels short in the grid.
 fn draw_season_pills(ui: &mut egui::Ui, crucible: bool, blood_ritual: bool, reserve: bool) {
     if !crucible && !blood_ritual {
         if reserve {

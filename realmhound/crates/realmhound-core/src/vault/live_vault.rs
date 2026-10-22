@@ -815,7 +815,7 @@ mod tests {
 
     /// An item with an unlocked but unenchanted slot must keep that slot when
     /// captured from a vault packet. Without it the item renders as Common /
-    /// unslotted even though it is Uncommon (issue #87).
+    /// unslotted even though it is Uncommon.
     #[test]
     fn vault_packet_keeps_empty_enchant_slots() {
         // Base64 for the type-1026 blob [-1, -3, -3, -3]: one empty slot,

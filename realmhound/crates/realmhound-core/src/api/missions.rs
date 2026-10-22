@@ -744,7 +744,7 @@ pub struct PlayerMission {
     /// (verified against a live capture: a reset repeatable came back as
     /// `11,21,0,<T_updated>,3,<T_claimed>` -- state 0 and partial progress, but
     /// count 3 and a claim timestamp). Without it the missions behind a reset
-    /// gate re-lock, which is issue #59.
+    /// gate re-lock, which is the reset-gate bug.
     pub claim_count: i32,
 }
 

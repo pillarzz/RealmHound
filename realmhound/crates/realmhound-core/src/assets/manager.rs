@@ -656,7 +656,7 @@ pub const MV_UMI_SPIRIT_TYPE: i32 = 0x513C;
 /// The Moonlight Village loot tier a spirit total earns (4 is the best), or
 /// `None` when no spirits were collected at all.
 ///
-/// RealmEye / issue #30: the dance is scored out of 88 spirits (Tier 4 from 78,
+/// RealmEye data: the dance is scored out of 88 spirits (Tier 4 from 78,
 /// Tier 3 from 58, Tier 2 from 40, Tier 1 from 2), while Kitsune Umi's shorter
 /// fight -- and a Leisurely Mode dance, which shares her thresholds -- is scored
 /// out of 56 (Tier 4 from 48, Tier 3 from 36, Tier 2 from 24, Tier 1 from 2).
@@ -6516,7 +6516,7 @@ mod tests {
         // "Withered Sphinx" and "Calcium God" are names from past seasons: they
         // only exist in the stable table, so they must still match after the
         // assets rename those encounters back (this is the outside-Halloween
-        // search behaviour requested in #56).
+        // search behaviour for the off-season name).
         let withered = encounter_alias_names_matching("Withered Sphinx");
         assert!(withered.iter().any(|n| n == "Withered Sphinx"));
         assert!(withered.iter().any(|n| n == "Grand Sphinx"));

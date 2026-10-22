@@ -7,7 +7,7 @@
 /// so a tag RH has never heard of is indistinguishable in the cached data from
 /// one the server did not send. Collecting the names as a payload is parsed
 /// makes such a tag observable without having to guess at its name -- which is
-/// how the `BloodRitualActive` tag behind issue #64 was found.
+/// how the `BloodRitualActive` tag was found.
 fn note_unmodelled_char_tag(name: &str) {
     unmodelled_char_tags()
         .lock()

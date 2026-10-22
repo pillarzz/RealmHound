@@ -373,7 +373,7 @@ pub struct CachedCharacter {
     /// Whether a Blood Ritual is in effect for this character. Derived from
     /// `blood_ritual_by_char` rather than parsed straight from the character list,
     /// so the id can be held to account against the tiers the feed delivered: an
-    /// id from a previous event is not a ritual and leaves this false. [#64]
+    /// id from a previous event is not a ritual and leaves this false.
     #[serde(default)]
     pub blood_ritual_active: bool,
     /// Last loot-drop boost the server reported for this character, in seconds.
@@ -869,7 +869,7 @@ impl CharacterCache {
     /// season*, and the character list's own `<CrucibleActive>` field cannot be
     /// trusted to clear it afterwards -- the flag on a once-crucible character
     /// keeps coming back. So the only safe way to retire a flag is to drop it and
-    /// let the acceptance be observed again (issue #66).
+    /// let the acceptance be observed again.
     fn clear_crucible_flags(&mut self) -> usize {
         let mut cleared = 0usize;
         for c in self
@@ -1430,8 +1430,8 @@ impl CharacterCache {
             // definition id. A different id therefore means the definition we held
             // is last season's: every flag recorded against it describes an
             // acceptance that no longer applies, so drop them all rather than let
-            // them linger on characters that never accepted the new crucible
-            // (issue #66). A first-time feed has nothing to compare against and
+            // them linger on characters that never accepted the new crucible.
+            // A first-time feed has nothing to compare against and
             // clears nothing.
             let season_changed = match (&self.active_crucible, next.as_ref()) {
                 (Some(old), Some(new)) => old.id != new.id,
@@ -1537,7 +1537,7 @@ impl CharacterCache {
         // resolved -- and never let such an id displace one that does resolve,
         // which is what keeps a lazy character-list refresh from erasing what
         // the live status just reported. Until the feed has arrived nothing can
-        // be judged, so the id is kept and resolved later. [#64]
+        // be judged, so the id is kept and resolved later.
         if !self.blood_ritual_defs.is_empty() && !self.blood_ritual_defs.iter().any(|d| d.id == id)
         {
             tracing::debug!("[RITUAL] Ignoring stale Blood Ritual id {id} on character {char_id}");
@@ -3307,7 +3307,7 @@ mod tests {
 
         // Next season brings a different definition id, so every acceptance made
         // against the old one is void and no character keeps a flag until it
-        // accepts again. This is the stale-flag case from issue #66.
+        // accepts again. This is the stale-flag case.
         cache.set_crucible_defs(vec![crucible_def("5000000000000000")]);
         assert!(
             !cache.find_character(1).unwrap().crucible_active,
@@ -3352,7 +3352,7 @@ mod tests {
 
         // The next season's feed defines a new id and no longer knows this one, so
         // the ritual it named is over: the flag must not survive on the character,
-        // which is how the stale crucible flag should have behaved in issue #66.
+        // which is how a stale crucible flag should behave.
         cache.set_blood_ritual_defs(vec![ritual_tier("7000000000000000", 1, 0.9, 1.1)]);
         assert!(
             !cache.find_character(1).unwrap().blood_ritual_active,

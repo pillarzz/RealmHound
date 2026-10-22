@@ -952,7 +952,7 @@ impl PacketProcessor {
                 }
                 // The character list reports each character's Blood Ritual, which is
                 // what makes the ritual known for characters that are not the live
-                // one (issue #64). The list can lag behind the live status, so a
+                // one. The list can lag behind the live status, so a
                 // live observation (set or cleared) takes precedence over it.
                 let live_char_id = self.live_char_id;
                 let mut challenge_changed = false;
@@ -961,7 +961,7 @@ impl PacketProcessor {
                     // The Crucible marker is never taken from this list, in either
                     // direction: it is only ever *set* by the character's own live
                     // CRUCIBLE stat, and cleared by that same stat or a new season's
-                    // definitions (issue #63/#66). The list's `CrucibleActive` flag
+                    // definitions. The list's `CrucibleActive` flag
                     // is stale, so preserving the live-detected value in
                     // `update_from_api` is what matters here.
                     //
@@ -1397,7 +1397,7 @@ impl PacketProcessor {
     /// (Crucible x Blood Ritual tier). None of these ride the wire during a fight,
     /// so the engine can only learn them from here; resolving them through the
     /// same helper the theoretical DPS page uses is what keeps the two readouts
-    /// on the same numbers (issue #64).
+    /// on the same numbers.
     fn sync_shot_damage_bonus(&mut self) {
         let bonus = self
             .live_char_id
@@ -5161,8 +5161,8 @@ mod isolation_gate_tests {
 
     /// A deactivation is only ever reported by the character list, and the live
     /// character was skipped entirely by it, so a ritual switched off in-game stuck
-    /// on that character until logout -- the reset of "[RITUAL] live" that issue #64
-    /// introduced. The list may clear the live character (it may not set it: the live
+    /// on that character until logout -- the stuck "[RITUAL] live" state the
+    /// reset introduced. The list may clear the live character (it may not set it: the live
     /// `BloodRitual` stat is fresher for that).
     #[test]
     fn api_account_data_clears_a_deactivated_live_blood_ritual() {
@@ -5255,7 +5255,7 @@ mod isolation_gate_tests {
 
     /// The character list is what makes the Blood Ritual known for characters
     /// that are not the live one -- the live status only ever describes the
-    /// character being played (issue #64). The list can lag behind that status, so
+    /// character being played. The list can lag behind that status, so
     /// the live character must be left to its own `BloodRitual` stat.
     #[test]
     fn api_account_data_seeds_blood_ritual_for_non_live_characters() {
@@ -5333,7 +5333,7 @@ mod isolation_gate_tests {
 
     /// The Crucible marker comes from the live CRUCIBLE stat and from nowhere else:
     /// the character list's own flag is stale (it claims crucible on non-seasonal
-    /// characters -- issue #66), and a Refresh must never revoke a marker the live
+    /// characters), and a Refresh must never revoke a marker the live
     /// stat set. Crucible runs on non-seasonal characters too, so clearing on
     /// `!seasonal` wiped a real marker every time the account data refreshed, which
     /// is what made the Character card pill vanish on Refresh.
@@ -5405,7 +5405,7 @@ mod isolation_gate_tests {
     /// change even while a ritual is active, and the game follows it with the real
     /// id within milliseconds when one is: only silence past the settle window means
     /// "none". Reading the empty spawn as a deactivation made the pill, the
-    /// attribute brackets and the Bonuses line flash on every portal (#64); ignoring
+    /// attribute brackets and the Bonuses line flash on every portal; ignoring
     /// the empty delta left a ritual switched off in-game stuck until Refresh.
     #[test]
     fn blood_ritual_stat_deactivation_clears_and_zone_changes_do_not() {

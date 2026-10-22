@@ -179,7 +179,8 @@ const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;
 /// not depend on the asset catalog being loaded, and names are matched as well so a
 /// reskin or a new barrel-like object works without a code change. Anything else
 /// leaving the world at the same tick as a hit -- a trap, a wall piece, a mob -- is
-/// not a source, however plausible the coincidence. Background: issue #74.
+/// not a source, however plausible the coincidence. Background: some dungeon
+/// mechanics damage the boss when they despawn.
 fn is_boss_damaging_mechanic(object_type: i32) -> bool {
     matches!(object_type, 0x0786 | 0x0796)
         || get_asset_manager()
@@ -3250,7 +3251,8 @@ impl CombatTracker {
     /// an `Explosive Barrel` removal, in the same tick, with no shot, activation or
     /// creature of theirs behind the packet. Only objects that are such a mechanic are
     /// recorded at all (see [`is_boss_damaging_mechanic`]), so a trap or a wall piece
-    /// despawning at the same tick cannot claim the hit. Background: issue #74.
+    /// despawning at the same tick cannot claim the hit. Background: a
+    /// barrel-like mechanic deals its hit when the object leaves the world.
     fn object_removal_near(&self, target_id: i32, time_ms: i64) -> Option<i32> {
         let target = self.objects.get(&target_id)?;
         let (tx, ty) = (target.last_x, target.last_y);
@@ -7811,7 +7813,7 @@ mod tests {
         // One projectile the asset layer cannot resolve (in tests no assets are
         // loaded, which is the same shape as an unmodelled enchant sub-attack)
         // must leave that shot unvalued instead of zeroing every later fight on
-        // the map (issue #73).
+        // the map.
         let mut t = CombatTracker::new();
         t.on_map_change("Mad Lab", 42, 0);
         t.on_player_loaded(1000, 42);

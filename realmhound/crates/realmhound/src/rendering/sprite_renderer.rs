@@ -5694,7 +5694,7 @@ mod tests {
 
         // A live inventory update removes the item but only advances the
         // character-view generation; the account generation is unchanged. The
-        // map must still rebuild or the count stays stuck (issue #87).
+        // map must still rebuild or the count stays stuck.
         account_data.characters.characters[0].equipment.clear();
         renderer.update_owned_rarities(&account_data, (account_gen, 2, 1));
         assert_eq!(renderer.owned_rarities.get(&1228).map_or(0, |c| c[1]), 0);

@@ -363,7 +363,7 @@ pub struct RealmCharacter {
     /// character list, and it is the same id the live `BloodRitual` stat carries.
     /// It can lag behind the live status, and the id of a previous season's ritual
     /// survives on characters that have not taken this season's, so it is resolved
-    /// against the current feed before use rather than trusted outright. [#64]
+    /// against the current feed before use rather than trusted outright.
     pub blood_ritual_id: Option<String>,
     /// Whether character has a backpack
     pub has_backpack: bool,

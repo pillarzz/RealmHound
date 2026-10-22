@@ -1157,7 +1157,7 @@ mod tests {
         assert_eq!(entry(&v, 2).state, MissionState::InProgress);
     }
 
-    /// The live tree shape that produced #59: mission 2 is a daily repeatable
+    /// The live tree shape that produced the reset-gate bug: mission 2 is a daily repeatable
     /// that gates a whole multi-branch subtree (missions 3-5).
     const REPEATABLE_GATE_DEFS: &str = r#"
     {
@@ -1229,8 +1229,8 @@ mod tests {
 
     #[test]
     fn only_the_tree_frontier_is_active_for_a_fresh_account() {
-        // The server lists *every* mission of the tree in its <Season> block
-        // (issue #20); a fresh account reports them all at zero progress. Only
+        // The server lists *every* mission of the tree in its <Season> block;
+        // a fresh account reports them all at zero progress. Only
         // the root is active -- everything behind an unfinished parent is locked
         // rather than "In progress".
         let mut t = MissionTracker::new();
@@ -1315,7 +1315,7 @@ mod tests {
         }
     }
 
-    /// Regression for the *non-repeatable* half of #59, from a captured tree.
+    /// Regression for the *non-repeatable* half of the reset-gate bug, from a captured tree.
     ///
     /// `season52_the_mad_gods_tempest.json` is a real `getClientSeasons` body
     /// (The Mad God's Tempest, 36 missions; 15 of them repeatable gates). Its

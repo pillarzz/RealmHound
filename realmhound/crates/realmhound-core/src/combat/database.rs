@@ -15,7 +15,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 66;
+pub const SCHEMA_VERSION: i32 = 67;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -1635,6 +1635,15 @@ impl CombatDatabase {
                  PRAGMA user_version = 66;",
             )?;
         }
+        if from_version < 67 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_fights_loot_link
+                    ON fights(map_seed, boss_object_type, killed, ended_at, started_at);
+                 PRAGMA user_version = 67;",
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -2817,6 +2826,8 @@ impl CombatDatabase {
 
             CREATE INDEX IF NOT EXISTS idx_fights_started ON fights(started_at);
             CREATE INDEX IF NOT EXISTS idx_fights_ended ON fights(ended_at, started_at);
+            CREATE INDEX IF NOT EXISTS idx_fights_loot_link
+                ON fights(map_seed, boss_object_type, killed, ended_at, started_at);
             CREATE INDEX IF NOT EXISTS idx_fights_run ON fights(encounter_run_id);
             CREATE INDEX IF NOT EXISTS idx_fights_group ON fights(boss_group);
             CREATE INDEX IF NOT EXISTS idx_participants_fight ON fight_participants(fight_id);
@@ -6754,6 +6765,131 @@ mod tests {
     }
 
     #[test]
+    fn loot_link_index_exists_for_fresh_and_migrated_databases() {
+        for migrate in [false, true] {
+            let mut db = CombatDatabase::open_in_memory().unwrap();
+            let id = db.insert_fight(&sample_fight()).unwrap();
+            if migrate {
+                db.conn
+                    .execute_batch(
+                        "DROP INDEX idx_fights_loot_link;
+                         PRAGMA user_version = 66;",
+                    )
+                    .unwrap();
+                db.migrate(66).unwrap();
+            }
+
+            let columns: Vec<String> = db
+                .conn
+                .prepare("PRAGMA index_info(idx_fights_loot_link)")
+                .unwrap()
+                .query_map([], |row| row.get(2))
+                .unwrap()
+                .collect::<SqlResult<_>>()
+                .unwrap();
+            assert_eq!(
+                columns,
+                [
+                    "map_seed",
+                    "boss_object_type",
+                    "killed",
+                    "ended_at",
+                    "started_at"
+                ]
+            );
+            let version: i32 = db
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            assert!(db.fight_detail(id).unwrap().is_some());
+            let retained_index: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_fights_ended'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained_index, 1);
+        }
+    }
+
+    #[test]
+    fn loot_link_index_migration_failure_preserves_version_and_can_retry() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_fights_loot_link;
+                 CREATE TABLE idx_fights_loot_link (id INTEGER);
+                 PRAGMA user_version = 66;",
+            )
+            .unwrap();
+
+        assert!(db.migrate(66).is_err());
+        assert!(db.conn.is_autocommit());
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 66);
+
+        db.conn
+            .execute_batch("DROP TABLE idx_fights_loot_link;")
+            .unwrap();
+        db.migrate(66).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn loot_link_index_narrows_link_and_repair_queries() {
+        let db = CombatDatabase::open_in_memory().unwrap();
+        let queries = [
+            "EXPLAIN QUERY PLAN
+             SELECT id, encounter_run_id, ended_at FROM fights
+             WHERE killed = 1 AND map_seed = ?1 AND boss_object_type = ?2
+               AND ended_at >= ?3 AND started_at <= ?4
+             ORDER BY ABS(ended_at - ?5) ASC, id ASC LIMIT 1",
+            "EXPLAIN QUERY PLAN
+             UPDATE fights SET killed = 1 WHERE id = (
+                 SELECT id FROM fights
+                 WHERE killed = 0 AND map_seed = ?1 AND boss_object_type = ?2
+                   AND started_at <= ?3 AND ended_at >= ?4
+                 ORDER BY ABS(ended_at - ?5) LIMIT 1
+             )",
+        ];
+        for query in queries {
+            let plan: Vec<String> = db
+                .conn
+                .prepare(query)
+                .unwrap()
+                .query_map(params![7, 8200, 0, 1_000_000, 61_000], |row| row.get(3))
+                .unwrap()
+                .collect::<SqlResult<_>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("idx_fights_loot_link")
+                        && detail.contains("map_seed=?")
+                        && detail.contains("boss_object_type=?")
+                        && detail.contains("killed=?")
+                        && detail.contains("ended_at>?")
+                }),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.starts_with("SCAN fights")),
+                "{plan:?}"
+            );
+        }
+    }
+
+    #[test]
     fn database_size_is_explicit_and_path_based() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat_history.db");
@@ -7725,6 +7861,63 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn find_killed_fight_index_preserves_boundaries_and_nearest_ties() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = flawless_fight("Realm", 8200, vec![]);
+        fight.started_at = 1_000;
+        fight.ended_at = 60_000;
+        let first = db.insert_fight(&fight).unwrap();
+        fight.ended_at = 62_000;
+        db.insert_fight(&fight).unwrap();
+        fight.ended_at = 61_000;
+        fight.killed = false;
+        db.insert_fight(&fight).unwrap();
+        fight.killed = true;
+        fight.map_seed = 99;
+        db.insert_fight(&fight).unwrap();
+        fight.map_seed = 1;
+        fight.boss_object_type = 99999;
+        db.insert_fight(&fight).unwrap();
+        fight.boss_object_type = 8200;
+        fight.started_at = 10_000_000;
+        fight.ended_at = 10_060_000;
+        db.insert_fight(&fight).unwrap();
+
+        for indexed in [true, false] {
+            if !indexed {
+                db.conn
+                    .execute_batch("DROP INDEX idx_fights_loot_link")
+                    .unwrap();
+            }
+            assert_eq!(
+                db.find_killed_fight(1, 8200, 61_000).unwrap(),
+                Some(FightSelection::Single(first)),
+                "equal-distance links use the older id, indexed={indexed}"
+            );
+            assert_eq!(
+                db.find_killed_fight(1, 8200, 1_000 - LOOT_LINK_PRE_MS)
+                    .unwrap(),
+                Some(FightSelection::Single(first))
+            );
+            assert_eq!(
+                db.find_killed_fight(1, 8200, 1_000 - LOOT_LINK_PRE_MS - 1)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                db.find_killed_fight(1, 8200, 62_000 + LOOT_LINK_POST_MS)
+                    .unwrap(),
+                Some(FightSelection::Single(first + 1))
+            );
+            assert_eq!(
+                db.find_killed_fight(1, 8200, 62_000 + LOOT_LINK_POST_MS + 1)
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[test]

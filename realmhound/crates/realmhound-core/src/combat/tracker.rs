@@ -661,6 +661,38 @@ struct PendingShot {
     ability_item: Option<i32>,
 }
 
+/// Identity of one equipped weapon copy: item id plus up to four enchant ids,
+/// packed into a fixed-size key so the per-hit pattern/LS/proc buckets do not
+/// allocate. Parent weapon rows are keyed the same way, so subsets attach to
+/// the exact copy that fired them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WeaponIdentity {
+    item_id: i32,
+    enchants: [u16; 4],
+    len: u8,
+}
+
+impl WeaponIdentity {
+    fn new(item_id: i32, enchants: &[u16]) -> Self {
+        let mut packed = [0u16; 4];
+        let len = enchants.len().min(packed.len());
+        packed[..len].copy_from_slice(&enchants[..len]);
+        Self {
+            item_id,
+            enchants: packed,
+            len: len as u8,
+        }
+    }
+
+    fn as_slice(&self) -> &[u16] {
+        &self.enchants[..self.len as usize]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Accumulated contribution from one attacker during an active fight.
 #[derive(Debug, Clone, Default)]
 struct ParticipantAccum {
@@ -704,17 +736,17 @@ struct ParticipantAccum {
     /// they happened to have equipped when the boss died.
     damage_by_equipment: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
     /// Damage + hits fired from a specific firing pattern, keyed by
-    /// `(weapon id, reported projectile id, enchant that supplied it)`. Always a
-    /// subset of `damage_by_equipment`, so the weapon row keeps the total and the
-    /// UI can break out the extra shots.
-    damage_by_pattern: HashMap<(i32, i32, Option<u16>), (i64, u64)>,
-    /// Lethal Strike bonus + empowered hit count, keyed by `(weapon, cloak)`.
-    /// A subset of the weapon's damage, broken out per cloak so a swap mid-fight
-    /// keeps each cloak's own bonus visible.
-    ls_by_weapon: HashMap<(i32, i32), (i64, u64)>,
+    /// `(weapon identity, reported projectile id, enchant that supplied it)`.
+    /// Always a subset of `damage_by_equipment`, so the weapon row keeps the
+    /// total and the UI can break out the extra shots.
+    damage_by_pattern: HashMap<(WeaponIdentity, i32, Option<u16>), (i64, u64)>,
+    /// Lethal Strike bonus + empowered hit count, keyed by
+    /// `(weapon identity, cloak)`. A subset of the weapon's damage, broken out
+    /// per cloak so a swap mid-fight keeps each cloak's own bonus visible.
+    ls_by_weapon: HashMap<(WeaponIdentity, i32), (i64, u64)>,
     /// Weapon-shot procs fired by other equipped items, keyed by
-    /// `(weapon id, proc item id)`. A subset of the weapon's damage.
-    damage_by_item: HashMap<(i32, i32), (i64, u64)>,
+    /// `(weapon identity, proc item id)`. A subset of the weapon's damage.
+    damage_by_item: HashMap<(WeaponIdentity, i32), (i64, u64)>,
     /// Summon/pet-sourced subset of `damage`/`hits`. The owner's row keeps the
     /// total (the game attributes pet damage to the player), but the split lets
     /// the summary show the pet's own line and keeps pet hits out of the owner's
@@ -3464,11 +3496,34 @@ impl CombatTracker {
         ended_at: i64,
         destination: FightDestination,
     ) -> Vec<AbilityActivation> {
-        let uses: Vec<&LocalAbilityUse> = self
+        let mut uses: Vec<&LocalAbilityUse> = self
             .local_ability_uses
             .iter()
             .filter(|u| u.time_ms >= started_at && u.time_ms <= ended_at)
             .collect();
+        // An opening ability projectile can land after the fight has started even
+        // though the activation that fired it predates the lazy fight start
+        // (the fight begins on the first hit). Keep that activation as the owner
+        // -- and as a row -- for client-fired ability shots landing in this fight.
+        for hit in self
+            .local_volley_hits
+            .iter()
+            .filter(|h| h.owns_ability)
+            .filter(|h| h.time_ms >= started_at && h.time_ms <= ended_at)
+            .filter(|h| h.destination == destination)
+        {
+            let owner = self
+                .local_ability_uses
+                .iter()
+                .rev()
+                .find(|u| u.item_id == hit.item_id && u.time_ms <= hit.time_ms);
+            if let Some(owner) = owner {
+                if !uses.iter().any(|u| std::ptr::eq(*u, owner)) {
+                    uses.push(owner);
+                }
+            }
+        }
+        uses.sort_by_key(|u| u.time_ms);
         // Credit every packet to the activation that can own it, so no packet is
         // counted twice and none lands on an ability that could not have produced
         // it. Packets are scoped to their destination first: overlapping fights
@@ -3480,11 +3535,11 @@ impl CombatTracker {
             .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
             .filter(|e| e.destination == destination)
         {
-            let owner = uses
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, use_)| activation_claims_packet(use_, event.time_ms));
+            let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
+                // A pre-fight activation kept for an opening projectile may only
+                // own that projectile, never a bulletless packet in this fight.
+                use_.time_ms >= started_at && activation_claims_packet(use_, event.time_ms)
+            });
             if let Some((i, _)) = owner {
                 credited[i].0 += event.damage;
                 credited[i].1 += 1;
@@ -3506,7 +3561,8 @@ impl CombatTracker {
                     // otherwise be blamed on an activation that could not have
                     // produced it.
                     && (hit.owns_ability
-                        || hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS)
+                        || (use_.time_ms >= started_at
+                            && hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS))
             });
             // A hit that no activation can own yet would otherwise stay in the
             // fight total while appearing in no row at all (a quiver's first bolt
@@ -3515,7 +3571,10 @@ impl CombatTracker {
             // against the ability that fired it.
             let owner = owner.or_else(|| {
                 uses.iter()
-                    .position(|use_| use_.item_id == hit.item_id)
+                    .position(|use_| {
+                        use_.item_id == hit.item_id
+                            && (hit.owns_ability || use_.time_ms >= started_at)
+                    })
                     .map(|i| (i, &uses[i]))
             });
             if let Some((i, _)) = owner {
@@ -4376,20 +4435,19 @@ impl CombatTracker {
                 // own shot has no weapon row to sit under, so it is left out here
                 // and credited to the ability activation below.
                 if ability_shot_item.is_none() {
-                    if let Some((gear, _)) = shot_gear.as_ref() {
+                    if let Some((gear, gear_enchants)) = shot_gear.as_ref() {
+                        let weapon =
+                            WeaponIdentity::new(gear[WEAPON_SLOT], &gear_enchants[WEAPON_SLOT]);
                         let entry = accum
                             .damage_by_pattern
-                            .entry((gear[WEAPON_SLOT], raw_projectile_id, enchant_source))
+                            .entry((weapon, raw_projectile_id, enchant_source))
                             .or_default();
                         entry.0 += dmg as i64;
                         entry.1 += 1;
                         // Lethal Strike is a bonus inside those same hits, broken
                         // out so the cloak's share is visible on its own row.
                         if ls_extra > 0 {
-                            let ls = accum
-                                .ls_by_weapon
-                                .entry((gear[WEAPON_SLOT], ls_cloak))
-                                .or_default();
+                            let ls = accum.ls_by_weapon.entry((weapon, ls_cloak)).or_default();
                             ls.0 += ls_extra;
                             if ls_empowered {
                                 ls.1 += 1;
@@ -4401,10 +4459,15 @@ impl CombatTracker {
                 // weapon, so it belongs to that weapon's line with the item's icon.
                 if let Some(item_id) = proc_item {
                     if local_weapon >= 0 {
-                        let e = accum
-                            .damage_by_item
-                            .entry((local_weapon, item_id))
-                            .or_default();
+                        let weapon = shot_gear
+                            .as_ref()
+                            .map(|(gear, gear_enchants)| {
+                                WeaponIdentity::new(gear[WEAPON_SLOT], &gear_enchants[WEAPON_SLOT])
+                            })
+                            .unwrap_or_else(|| {
+                                WeaponIdentity::new(local_weapon, &enchants[WEAPON_SLOT])
+                            });
+                        let e = accum.damage_by_item.entry((weapon, item_id)).or_default();
                         e.0 += dmg as i64;
                         e.1 += 1;
                     }
@@ -6232,6 +6295,23 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
     }
 }
 
+/// Resolve a raw weapon identity's enchant list the way the parent rows do: a
+/// bucket recorded before the weapon's enchants arrived folds into the same
+/// weapon's enchanted row.
+fn effective_weapon_enchants(
+    identity: &WeaponIdentity,
+    enchants_by_weapon: &HashMap<i32, Vec<u16>>,
+) -> Vec<u16> {
+    if identity.is_empty() {
+        enchants_by_weapon
+            .get(&identity.item_id)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        identity.as_slice().to_vec()
+    }
+}
+
 /// Collapse a participant's per-loadout damage buckets into one row per weapon
 /// (item id plus the enchants it was fired with), summing across loadouts so a
 /// mid-fight armor or ring swap does not split the same weapon's contribution.
@@ -6239,9 +6319,9 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
 /// Highest damage first.
 fn aggregate_weapons(
     buckets: &HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
-    pattern_buckets: &HashMap<(i32, i32, Option<u16>), (i64, u64)>,
-    ls_buckets: &HashMap<(i32, i32), (i64, u64)>,
-    item_buckets: &HashMap<(i32, i32), (i64, u64)>,
+    pattern_buckets: &HashMap<(WeaponIdentity, i32, Option<u16>), (i64, u64)>,
+    ls_buckets: &HashMap<(WeaponIdentity, i32), (i64, u64)>,
+    item_buckets: &HashMap<(WeaponIdentity, i32), (i64, u64)>,
 ) -> Vec<WeaponContribution> {
     let mut out: Vec<WeaponContribution> = Vec::new();
     // A loadout bucket recorded before the weapon's enchants arrived has an empty
@@ -6286,29 +6366,44 @@ fn aggregate_weapons(
             }),
         }
     }
-    for (&(weapon_id, cloak_id), &(ls_damage, ls_hits)) in ls_buckets {
-        if let Some(w) = out.iter_mut().find(|w| w.weapon_id == weapon_id) {
+    for ((identity, cloak_id), &(ls_damage, ls_hits)) in ls_buckets {
+        let weapon_id = identity.item_id;
+        let weapon_enchants = effective_weapon_enchants(identity, &enchants_by_weapon);
+        if let Some(w) = out
+            .iter_mut()
+            .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
+        {
             w.ls.push(LethalStrikeContribution {
-                item_id: cloak_id,
+                item_id: *cloak_id,
                 damage: ls_damage,
                 hits: ls_hits,
             });
         }
     }
-    for (&(weapon_id, item_id), &(damage, hits)) in item_buckets {
-        if let Some(w) = out.iter_mut().find(|w| w.weapon_id == weapon_id) {
+    for ((identity, item_id), &(damage, hits)) in item_buckets {
+        let weapon_id = identity.item_id;
+        let weapon_enchants = effective_weapon_enchants(identity, &enchants_by_weapon);
+        if let Some(w) = out
+            .iter_mut()
+            .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
+        {
             w.item_procs.push(ItemProcContribution {
-                item_id,
+                item_id: *item_id,
                 damage,
                 hits,
             });
         }
     }
-    for (&(weapon_id, projectile_id, enchant_id), &(damage, hits)) in pattern_buckets {
-        if let Some(w) = out.iter_mut().find(|w| w.weapon_id == weapon_id) {
+    for ((identity, projectile_id, enchant_id), &(damage, hits)) in pattern_buckets {
+        let weapon_id = identity.item_id;
+        let weapon_enchants = effective_weapon_enchants(identity, &enchants_by_weapon);
+        if let Some(w) = out
+            .iter_mut()
+            .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
+        {
             w.patterns.push(PatternContribution {
-                projectile_id,
-                enchant_id,
+                projectile_id: *projectile_id,
+                enchant_id: *enchant_id,
                 damage,
                 hits,
             });
@@ -9369,10 +9464,10 @@ mod tests {
         );
         buckets.insert(([200, 1, 2, 3], [vec![], vec![], vec![], vec![]]), (100, 2));
         let mut ls = HashMap::new();
-        ls.insert((100, 2855), (250i64, 4u64));
-        ls.insert((100, 2600), (90i64, 2u64));
+        ls.insert((WeaponIdentity::new(100, &[7]), 2855), (250i64, 4u64));
+        ls.insert((WeaponIdentity::new(100, &[7]), 2600), (90i64, 2u64));
         let mut item_buckets = HashMap::new();
-        item_buckets.insert((100, 608), (900i64, 9u64));
+        item_buckets.insert((WeaponIdentity::new(100, &[7]), 608), (900i64, 9u64));
         let weapons = aggregate_weapons(&buckets, &HashMap::new(), &ls, &item_buckets);
         assert_eq!(weapons.len(), 2, "one row per weapon, not per loadout");
         assert_eq!(weapons[0].weapon_id, 100);
@@ -9400,6 +9495,60 @@ mod tests {
         assert_eq!(weapons[1].damage, 100);
         assert!(weapons[1].ls.is_empty(), "no LS on the other weapon");
         assert!(weapons[1].item_procs.is_empty());
+    }
+
+    #[test]
+    fn subset_buckets_keep_each_weapon_copys_enchant_identity() {
+        // Two copies of the same weapon id with different enchants were fired in
+        // one fight. Parent rows are distinct; the pattern/LS/proc subsets must
+        // attach to their own copy instead of whichever row is visited first.
+        let mut buckets: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)> = HashMap::new();
+        buckets.insert(
+            ([100, -1, -1, -1], [vec![1], vec![], vec![], vec![]]),
+            (1_000, 10),
+        );
+        buckets.insert(
+            ([100, -1, -1, -1], [vec![2], vec![], vec![], vec![]]),
+            (1_000, 10),
+        );
+        let mut patterns = HashMap::new();
+        patterns.insert(
+            (WeaponIdentity::new(100, &[1]), -1, Some(1)),
+            (1_000i64, 10u64),
+        );
+        patterns.insert(
+            (WeaponIdentity::new(100, &[2]), -1, Some(2)),
+            (1_000i64, 10u64),
+        );
+        let mut ls = HashMap::new();
+        ls.insert((WeaponIdentity::new(100, &[1]), 2855), (100i64, 2u64));
+        ls.insert((WeaponIdentity::new(100, &[2]), 2855), (200i64, 3u64));
+        let mut procs = HashMap::new();
+        procs.insert((WeaponIdentity::new(100, &[1]), 608), (50i64, 1u64));
+        procs.insert((WeaponIdentity::new(100, &[2]), 608), (70i64, 1u64));
+
+        let weapons = aggregate_weapons(&buckets, &patterns, &ls, &procs);
+        assert_eq!(weapons.len(), 2, "each enchanted copy keeps its own row");
+        for w in &weapons {
+            let (ls_damage, proc_damage) = match w.enchants.as_slice() {
+                [1] => (100, 50),
+                [2] => (200, 70),
+                other => panic!("unexpected enchants {other:?}"),
+            };
+            assert_eq!(
+                w.patterns.len(),
+                1,
+                "only this copy's pattern attaches (was combined on one copy)"
+            );
+            assert_eq!((w.patterns[0].damage, w.patterns[0].hits), (1_000, 10));
+            assert_eq!(w.ls.len(), 1);
+            assert_eq!((w.ls[0].item_id, w.ls[0].damage), (2855, ls_damage));
+            assert_eq!(w.item_procs.len(), 1);
+            assert_eq!(
+                (w.item_procs[0].item_id, w.item_procs[0].damage),
+                (608, proc_damage)
+            );
+        }
     }
 
     #[test]
@@ -10062,6 +10211,45 @@ mod tests {
             (acts[0].damage, acts[0].hits),
             (900, 1),
             "the item's earliest activation takes the hit rather than dropping it"
+        );
+    }
+
+    #[test]
+    fn an_opening_ability_projectile_keeps_its_pre_fight_activation() {
+        // Fights start lazily on the first hit, so the activation that fired an
+        // opening ability projectile predates `started_at`. That activation must
+        // still own the hit (and appear in the breakdown) instead of the damage
+        // vanishing from every row.
+        let mut t = CombatTracker::new();
+        t.local_ability_uses
+            .push_back(ability_use(100, 0xC07, None));
+        t.local_ability_uses
+            .push_back(ability_use(400, 0xC07, None));
+        t.local_volley_hits.push_back(LocalVolleyHit {
+            time_ms: 150,
+            item_id: 0xC07,
+            damage: 1_000,
+            destination: FightDestination::Boss(500),
+            owns_ability: true,
+        });
+
+        let acts = t.ability_activations_for(150, 1_000, FightDestination::Boss(500));
+        assert_eq!(
+            acts.len(),
+            2,
+            "the pre-fight activation is kept alongside the in-fight one"
+        );
+        assert_eq!(acts[0].item_id, 0xC07);
+        assert_eq!(acts[0].start_offset_ms, 0);
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (1_000, 1),
+            "the opening hit stays with the activation that fired it"
+        );
+        assert_eq!(
+            (acts[1].damage, acts[1].hits),
+            (0, 0),
+            "a later activation cannot steal the opening hit"
         );
     }
 

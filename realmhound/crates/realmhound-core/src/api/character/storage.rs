@@ -56,10 +56,22 @@ impl StorageItem {
     /// Get the enchant type IDs on this item.
     /// Returns a vector of up to 4 enchant IDs (as u16).
     pub fn enchant_ids(&self) -> Vec<u16> {
+        self.enchant_slots().filled
+    }
+
+    /// Decode this item's enchant-slot breakdown (filled, empty, locked).
+    /// Returns the default (no slots) when there is no enchant data.
+    pub fn enchant_slots(&self) -> EnchantSlots {
         self.enchant_data
             .as_ref()
-            .map(|data| parse_enchant_ids(data))
+            .map(|data| parse_enchant_slots(data))
             .unwrap_or_default()
+    }
+
+    /// Total number of enchant slots (filled + empty + locked). This is the
+    /// item's rarity tier, so empty-but-slotted items count here too.
+    pub fn total_enchant_slots(&self) -> usize {
+        self.enchant_slots().total()
     }
 }
 

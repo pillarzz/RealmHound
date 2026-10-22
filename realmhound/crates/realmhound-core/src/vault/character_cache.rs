@@ -171,8 +171,8 @@ impl From<&LiveVaultItem> for CharacterItem {
         Self {
             item_id: item.item_id,
             enchant_ids: item.enchant_ids.clone(),
-            empty_enchant_slots: 0,
-            locked_enchant_slots: 0,
+            empty_enchant_slots: item.empty_enchant_slots,
+            locked_enchant_slots: item.locked_enchant_slots,
             stack_count: 1,
         }
     }
@@ -183,8 +183,8 @@ impl From<LiveVaultItem> for CharacterItem {
         Self {
             item_id: item.item_id,
             enchant_ids: item.enchant_ids,
-            empty_enchant_slots: 0,
-            locked_enchant_slots: 0,
+            empty_enchant_slots: item.empty_enchant_slots,
+            locked_enchant_slots: item.locked_enchant_slots,
             stack_count: 1,
         }
     }

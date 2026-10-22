@@ -11,6 +11,7 @@ use std::thread;
 use std::time::SystemTime;
 
 use crate::panels::{AppAction, Panel, PanelContext};
+use crate::rendering::sprite_renderer::enchant_slot_buffer;
 use crate::rendering::SpriteRenderer;
 use crate::shadcn_ui::Shadcn;
 use crate::tab_icons::{
@@ -1524,12 +1525,13 @@ impl VaultPanel {
         if item.is_empty() {
             sprite_renderer.render_empty_slot(ui, 38.0);
         } else {
-            // Use fixed-size array to avoid heap allocation (max 4 enchants)
-            let mut enchant_buf: [i32; 4] = [0; 4];
-            let enchant_count = item.enchant_ids.len().min(4);
-            for (i, &e) in item.enchant_ids.iter().take(4).enumerate() {
-                enchant_buf[i] = e as i32;
-            }
+            // Include empty (-1) and locked (-2) markers so an item with slots
+            // but no enchants still renders as slotted with the right rarity.
+            let (enchant_buf, enchant_count) = enchant_slot_buffer(
+                &item.enchant_ids,
+                item.empty_enchant_slots,
+                item.locked_enchant_slots,
+            );
             sprite_renderer.render_item_tile(ui, item.item_id, None, &enchant_buf[..enchant_count]);
         }
     }
@@ -1543,13 +1545,9 @@ impl VaultPanel {
         if item.is_empty() {
             sprite_renderer.render_empty_slot(ui, 38.0);
         } else {
-            // Use fixed-size array to avoid heap allocation (max 4 enchants)
-            let enchants = item.enchant_ids();
-            let mut enchant_buf: [i32; 4] = [0; 4];
-            let enchant_count = enchants.len().min(4);
-            for (i, &e) in enchants.iter().take(4).enumerate() {
-                enchant_buf[i] = e as i32;
-            }
+            let slots = item.enchant_slots();
+            let (enchant_buf, enchant_count) =
+                enchant_slot_buffer(&slots.filled, slots.empty, slots.locked);
             sprite_renderer.render_item_tile(ui, item.item_id, None, &enchant_buf[..enchant_count]);
         }
     }

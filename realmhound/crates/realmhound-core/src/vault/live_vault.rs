@@ -1,9 +1,14 @@
 //! Live vault data structures captured from VaultContentPacket.
 
-use crate::api::character::parse_enchant_ids;
+use crate::api::character::{parse_enchant_slots, EnchantSlots};
 use crate::protocol::VaultContentPacket;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+
+/// Helper for serde `skip_serializing_if`.
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
 
 /// Serde module for Option<SystemTime> (serialized as Unix millis).
 mod option_system_time {
@@ -47,8 +52,14 @@ pub enum VaultType {
 pub struct LiveVaultItem {
     /// Item type ID (-1 = empty slot)
     pub item_id: i32,
-    /// Enchant IDs on this item (up to 4)
+    /// Filled enchant type IDs on this item (up to 4)
     pub enchant_ids: Vec<u16>,
+    /// Number of empty (unlocked, unenchanted) enchant slots on this item.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub empty_enchant_slots: u8,
+    /// Number of locked enchant slots on this item.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub locked_enchant_slots: u8,
 }
 
 impl Default for LiveVaultItem {
@@ -56,6 +67,8 @@ impl Default for LiveVaultItem {
         Self {
             item_id: -1,
             enchant_ids: Vec::new(),
+            empty_enchant_slots: 0,
+            locked_enchant_slots: 0,
         }
     }
 }
@@ -66,6 +79,8 @@ impl LiveVaultItem {
         Self {
             item_id,
             enchant_ids: Vec::new(),
+            empty_enchant_slots: 0,
+            locked_enchant_slots: 0,
         }
     }
 
@@ -74,7 +89,26 @@ impl LiveVaultItem {
         Self {
             item_id,
             enchant_ids,
+            empty_enchant_slots: 0,
+            locked_enchant_slots: 0,
         }
+    }
+
+    /// Create a new item from a decoded enchant-slot breakdown.
+    pub fn with_enchant_slots(item_id: i32, slots: EnchantSlots) -> Self {
+        Self {
+            item_id,
+            enchant_ids: slots.filled,
+            empty_enchant_slots: slots.empty,
+            locked_enchant_slots: slots.locked,
+        }
+    }
+
+    /// Apply a decoded enchant-slot breakdown to this item.
+    pub fn apply_enchant_slots(&mut self, slots: &EnchantSlots) {
+        self.enchant_ids = slots.filled.clone();
+        self.empty_enchant_slots = slots.empty;
+        self.locked_enchant_slots = slots.locked;
     }
 
     /// Check if this slot is empty.
@@ -82,9 +116,18 @@ impl LiveVaultItem {
         self.item_id == -1
     }
 
-    /// Get the number of enchants on this item.
+    /// Get the number of filled enchant slots on this item.
     pub fn enchant_count(&self) -> usize {
         self.enchant_ids.len()
+    }
+
+    /// Total number of enchant slots (filled + empty + locked). Drives the
+    /// item's rarity tier and the "slotted" gem indicator, so an item with
+    /// slots but no enchantments still counts as slotted.
+    pub fn total_enchant_slots(&self) -> usize {
+        self.enchant_ids.len()
+            + self.empty_enchant_slots as usize
+            + self.locked_enchant_slots as usize
     }
 }
 
@@ -123,8 +166,8 @@ impl LiveVaultStorage {
             .extend(packet.vault_contents.iter().enumerate().map(|(i, &id)| {
                 let mut item = LiveVaultItem::new(id);
                 // Apply enchant data for this slot
-                if let Some(enchant_ids) = enchants.vault_enchants.get(&i) {
-                    item.enchant_ids = enchant_ids.clone();
+                if let Some(slots) = enchants.vault_enchants.get(&i) {
+                    item.apply_enchant_slots(slots);
                 }
                 item
             }));
@@ -147,8 +190,8 @@ impl LiveVaultStorage {
                 .map(|(i, &id)| {
                     let mut item = LiveVaultItem::new(id);
                     // Enchant index is based on original packet order, not reversed order
-                    if let Some(enchant_ids) = enchants.gift_enchants.get(&i) {
-                        item.enchant_ids = enchant_ids.clone();
+                    if let Some(slots) = enchants.gift_enchants.get(&i) {
+                        item.apply_enchant_slots(slots);
                     }
                     item
                 }),
@@ -171,8 +214,8 @@ impl LiveVaultStorage {
                     .enumerate()
                     .map(|(i, &id)| {
                         let mut item = LiveVaultItem::new(id);
-                        if let Some(enchant_ids) = enchants.spoils_enchants.get(&i) {
-                            item.enchant_ids = enchant_ids.clone();
+                        if let Some(slots) = enchants.spoils_enchants.get(&i) {
+                            item.apply_enchant_slots(slots);
                         }
                         item
                     }),
@@ -306,8 +349,9 @@ impl LiveVaultStorage {
     /// Returns true if the slot was updated.
     pub fn update_vault_slot(&mut self, index: usize, item_id: i32) -> bool {
         if index < self.vault_items.len() {
-            self.vault_items[index].item_id = item_id;
-            self.vault_items[index].enchant_ids.clear(); // Enchants lost on move
+            // NewTick only carries item ids, so any enchant data on this slot
+            // is stale. Drop filled, empty, and locked slot markers alike.
+            self.vault_items[index] = LiveVaultItem::new(item_id);
             self.last_updated = Some(std::time::SystemTime::now());
             true
         } else {
@@ -331,8 +375,7 @@ impl LiveVaultStorage {
     /// Returns true if the slot was updated.
     pub fn update_gift_slot(&mut self, index: usize, item_id: i32) -> bool {
         if index < self.gift_items.len() {
-            self.gift_items[index].item_id = item_id;
-            self.gift_items[index].enchant_ids.clear();
+            self.gift_items[index] = LiveVaultItem::new(item_id);
             self.last_updated = Some(std::time::SystemTime::now());
             true
         } else {
@@ -356,8 +399,7 @@ impl LiveVaultStorage {
     /// Returns true if the slot was updated.
     pub fn update_spoils_slot(&mut self, index: usize, item_id: i32) -> bool {
         if index < self.spoils_items.len() {
-            self.spoils_items[index].item_id = item_id;
-            self.spoils_items[index].enchant_ids.clear();
+            self.spoils_items[index] = LiveVaultItem::new(item_id);
             self.last_updated = Some(std::time::SystemTime::now());
             true
         } else {
@@ -486,12 +528,12 @@ impl LiveVaultStorage {
 /// Parsed enchant data from the packet's enchant strings.
 #[derive(Debug, Default)]
 pub struct ParsedEnchants {
-    /// Vault item enchants by slot index
-    pub vault_enchants: std::collections::HashMap<usize, Vec<u16>>,
-    /// Gift item enchants by slot index
-    pub gift_enchants: std::collections::HashMap<usize, Vec<u16>>,
-    /// Spoils item enchants by slot index
-    pub spoils_enchants: std::collections::HashMap<usize, Vec<u16>>,
+    /// Vault item enchant slots by slot index
+    pub vault_enchants: std::collections::HashMap<usize, EnchantSlots>,
+    /// Gift item enchant slots by slot index
+    pub gift_enchants: std::collections::HashMap<usize, EnchantSlots>,
+    /// Spoils item enchant slots by slot index
+    pub spoils_enchants: std::collections::HashMap<usize, EnchantSlots>,
 }
 
 impl ParsedEnchants {
@@ -524,22 +566,21 @@ impl ParsedEnchants {
         result
     }
 
-    /// Parse a base64 enchant string into a map of slot -> enchant IDs.
-    /// Format: comma-separated base64 strings, one per slot with enchants.
+    /// Parse a base64 enchant string into a map of slot -> enchant-slot details.
+    /// Format: comma-separated base64 strings, one per slot (empty parts for
+    /// items without enchant data).
     fn parse_enchant_string(
         s: &str,
         _slot_count: usize,
-    ) -> std::collections::HashMap<usize, Vec<u16>> {
+    ) -> std::collections::HashMap<usize, EnchantSlots> {
         let mut map = std::collections::HashMap::new();
 
-        // The enchant string format: each item's enchants are separated
-        // For items with enchants, we get their base64 data
         for (idx, part) in s.split(',').enumerate() {
             let trimmed = part.trim();
             if !trimmed.is_empty() {
-                let ids = parse_enchant_ids(trimmed);
-                if !ids.is_empty() {
-                    map.insert(idx, ids);
+                let slots = parse_enchant_slots(trimmed);
+                if slots.total() > 0 {
+                    map.insert(idx, slots);
                 }
             }
         }
@@ -684,10 +725,9 @@ mod tests {
     fn test_serialization_roundtrip() {
         let mut data = LiveVaultData::new();
         data.regular.vault_items.push(LiveVaultItem::new(100));
-        data.regular.vault_items.push(LiveVaultItem {
-            item_id: 200,
-            enchant_ids: vec![1, 2, 3],
-        });
+        data.regular
+            .vault_items
+            .push(LiveVaultItem::with_enchants(200, vec![1, 2, 3]));
         data.regular.last_updated = Some(SystemTime::now());
         data.seasonal.gift_items.push(LiveVaultItem::new(300));
 
@@ -771,5 +811,76 @@ mod tests {
         let changes: Vec<(usize, i32)> = (0..4).map(|slot| (slot, 216 + slot as i32)).collect();
         assert_eq!(storage.find_matching_gift_display_page(&changes), Some(2));
         assert_eq!(storage.gift_display_index(2, 4), None);
+    }
+
+    /// An item with an unlocked but unenchanted slot must keep that slot when
+    /// captured from a vault packet. Without it the item renders as Common /
+    /// unslotted even though it is Uncommon (issue #87).
+    #[test]
+    fn vault_packet_keeps_empty_enchant_slots() {
+        // Base64 for the type-1026 blob [-1, -3, -3, -3]: one empty slot,
+        // no filled enchants.
+        let mut packet = gift_packet(vec![1228]);
+        packet.gift_chest_enchants = "AAIE___9__3__f8A".to_string();
+
+        let mut data = LiveVaultData::new();
+        data.update_from_packet(&packet, VaultType::Seasonal);
+
+        let item = &data.seasonal.gift_items[0];
+        assert_eq!(item.item_id, 1228);
+        assert!(item.enchant_ids.is_empty());
+        assert_eq!(item.empty_enchant_slots, 1);
+        assert_eq!(item.locked_enchant_slots, 0);
+        assert_eq!(item.enchant_count(), 0);
+        assert_eq!(item.total_enchant_slots(), 1);
+    }
+
+    /// Slot markers survive a save/load round-trip.
+    #[test]
+    fn vault_item_serialization_keeps_slot_markers() {
+        let mut data = LiveVaultData::new();
+        data.regular
+            .vault_items
+            .push(LiveVaultItem::with_enchant_slots(
+                1228,
+                EnchantSlots {
+                    filled: Vec::new(),
+                    empty: 1,
+                    locked: 0,
+                },
+            ));
+
+        let json = serde_json::to_string(&data).unwrap();
+        let loaded: LiveVaultData = serde_json::from_str(&json).unwrap();
+
+        let item = &loaded.regular.vault_items[0];
+        assert_eq!(item.empty_enchant_slots, 1);
+        assert_eq!(item.total_enchant_slots(), 1);
+    }
+
+    /// Vault JSON written before this change has no slot-marker fields; it must
+    /// still deserialize (with zero empty/locked slots).
+    #[test]
+    fn legacy_vault_json_defaults_slot_markers() {
+        let json = r#"{"regular":{"vault_items":[{"item_id":1228,"enchant_ids":[]}]}}"#;
+        let data: LiveVaultData = serde_json::from_str(json).unwrap();
+        let item = &data.regular.vault_items[0];
+        assert_eq!(item.item_id, 1228);
+        assert_eq!(item.total_enchant_slots(), 0);
+    }
+
+    /// Total slots count filled, empty, and locked markers alike.
+    #[test]
+    fn total_enchant_slots_counts_all_markers() {
+        let item = LiveVaultItem::with_enchant_slots(
+            1,
+            EnchantSlots {
+                filled: vec![1458],
+                empty: 2,
+                locked: 1,
+            },
+        );
+        assert_eq!(item.enchant_count(), 1);
+        assert_eq!(item.total_enchant_slots(), 4);
     }
 }

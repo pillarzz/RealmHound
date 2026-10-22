@@ -6,7 +6,7 @@
 //! - Persists to a single JSON file with migration from legacy files
 
 use super::{CharacterCache, LiveVaultItem, LiveVaultStorage, VaultType};
-use crate::api::character::{parse_enchant_ids, RealmCharacter};
+use crate::api::character::{parse_enchant_slots, RealmCharacter};
 use crate::api::AccountData as ApiAccountData;
 use crate::dust::DustAmounts;
 use crate::protocol::VaultContentPacket;
@@ -323,28 +323,28 @@ impl AccountData {
         storage.vault_items.clear();
         for chest in &api_data.vault.chests {
             for item in &chest.items {
-                let enchant_ids = item
+                let slots = item
                     .enchant_data
                     .as_ref()
-                    .map(|data| parse_enchant_ids(data))
+                    .map(|data| parse_enchant_slots(data))
                     .unwrap_or_default();
                 storage
                     .vault_items
-                    .push(LiveVaultItem::with_enchants(item.item_id, enchant_ids));
+                    .push(LiveVaultItem::with_enchant_slots(item.item_id, slots));
             }
         }
 
         // Convert gifts
         storage.gift_items.clear();
         for item in &api_data.gifts.items {
-            let enchant_ids = item
+            let slots = item
                 .enchant_data
                 .as_ref()
-                .map(|data| parse_enchant_ids(data))
+                .map(|data| parse_enchant_slots(data))
                 .unwrap_or_default();
             storage
                 .gift_items
-                .push(LiveVaultItem::with_enchants(item.item_id, enchant_ids));
+                .push(LiveVaultItem::with_enchant_slots(item.item_id, slots));
         }
 
         // Convert potions

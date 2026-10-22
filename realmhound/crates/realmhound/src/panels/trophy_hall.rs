@@ -461,7 +461,7 @@ impl TrophyHallPanel {
                 .chain(ch.backpack_ext.iter())
                 .chain(ch.belt.iter());
             for item in all_items {
-                add(item.item_id, item.enchant_count(), out);
+                add(item.item_id, item.total_enchant_slots(), out);
             }
         }
         for vault in [&account_data.regular_vault, &account_data.seasonal_vault] {
@@ -473,7 +473,7 @@ impl TrophyHallPanel {
                 .chain(vault.potion_items.iter())
                 .chain(vault.spoils_items.iter());
             for item in all_items {
-                add(item.item_id, item.enchant_count(), out);
+                add(item.item_id, item.total_enchant_slots(), out);
             }
         }
     }

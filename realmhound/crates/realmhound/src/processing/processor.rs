@@ -3375,16 +3375,28 @@ impl PacketProcessor {
                     }
                 };
 
-                // Read enchant ids from the canonical character cache (must reflect
-                // inventory applied earlier in this same batch).
-                let to_enchants = char_id
-                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, to.slot_id))
-                    .map(|item| item.enchant_ids)
-                    .unwrap_or_default();
-                let from_enchants = char_id
-                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, from.slot_id))
-                    .map(|item| item.enchant_ids)
-                    .unwrap_or_default();
+                // Read enchant data from the canonical character cache (must reflect
+                // inventory applied earlier in this same batch). The packet's item
+                // type stays authoritative for the vault item's id, but the whole
+                // slot breakdown (filled + empty + locked) comes from the cached
+                // character item so empty-but-slotted items keep their rarity.
+                let to_char = char_id
+                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, to.slot_id));
+                let from_char = char_id
+                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, from.slot_id));
+                let vault_item = |item_type: i32,
+                                  char_item: Option<&realmhound_core::vault::CharacterItem>|
+                 -> LiveVaultItem {
+                    match char_item {
+                        Some(c) => LiveVaultItem {
+                            item_id: item_type,
+                            enchant_ids: c.enchant_ids.clone(),
+                            empty_enchant_slots: c.empty_enchant_slots,
+                            locked_enchant_slots: c.locked_enchant_slots,
+                        },
+                        None => LiveVaultItem::new(item_type),
+                    }
+                };
 
                 let storage = self.account_data.get_vault_mut(vault_type);
 
@@ -3398,7 +3410,7 @@ impl PacketProcessor {
                 } else if [chest_id, material_id, gift_id, potion_id]
                     .contains(&Some(from.object_id))
                 {
-                    let new_item = LiveVaultItem::with_enchants(to.item_type, to_enchants);
+                    let new_item = vault_item(to.item_type, to_char.as_ref());
                     if set_item(storage, from.object_id, from.slot_id, new_item) {
                         vault_updated = true;
                     }
@@ -3410,7 +3422,7 @@ impl PacketProcessor {
                     }
                 } else if [chest_id, material_id, gift_id, potion_id].contains(&Some(to.object_id))
                 {
-                    let new_item = LiveVaultItem::with_enchants(from.item_type, from_enchants);
+                    let new_item = vault_item(from.item_type, from_char.as_ref());
                     if set_item(storage, to.object_id, to.slot_id, new_item) {
                         vault_updated = true;
                     }

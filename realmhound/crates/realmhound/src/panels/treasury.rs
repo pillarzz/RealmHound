@@ -21,6 +21,7 @@ use crate::panels::character_card::{
 };
 use crate::panels::pet_card::PetCardWidget;
 use crate::panels::{AppAction, Panel, PanelContext};
+use crate::rendering::sprite_renderer::enchant_slot_buffer;
 use crate::rendering::SpriteRenderer;
 use crate::shadcn_ui::Shadcn;
 use crate::tab_icons::{get_treasury_section_icon, TAB_ICON_SIZE};
@@ -2566,7 +2567,7 @@ impl TreasuryPanel {
                         .iter()
                         .filter(|i| {
                             am.items_match(i.item_id, filter_id)
-                                && self.props.passes_rarity(i.enchant_ids.len())
+                                && self.props.passes_rarity(i.total_enchant_slots())
                         })
                         .map(|i| {
                             let (_base, stack) = am.get_stack_info(i.item_id);
@@ -2632,7 +2633,8 @@ impl TreasuryPanel {
                             .iter()
                             .filter(|i| {
                                 !i.is_empty()
-                                    && self.item_instance_matches(i.item_id, i.enchant_ids.len())
+                                    && self
+                                        .item_instance_matches(i.item_id, i.total_enchant_slots())
                             })
                             .count()
                     })
@@ -2671,7 +2673,7 @@ impl TreasuryPanel {
             items
                 .iter()
                 .filter(|i| {
-                    !i.is_empty() && self.item_instance_matches(i.item_id, i.enchant_ids.len())
+                    !i.is_empty() && self.item_instance_matches(i.item_id, i.total_enchant_slots())
                 })
                 .count()
         };
@@ -2714,7 +2716,7 @@ impl TreasuryPanel {
                 .iter()
                 .filter(|i| {
                     am.items_match(i.item_id, item_id)
-                        && self.props.passes_rarity(i.enchant_ids.len())
+                        && self.props.passes_rarity(i.total_enchant_slots())
                 })
                 .count()
         };
@@ -2740,7 +2742,7 @@ impl TreasuryPanel {
                     || filter_items
                         .iter()
                         .any(|&fid| am.items_match(i.item_id, fid)))
-                && self.item_instance_matches(i.item_id, i.enchant_ids.len())
+                && self.item_instance_matches(i.item_id, i.total_enchant_slots())
         })
     }
 
@@ -3043,7 +3045,7 @@ impl TreasuryPanel {
                 {
                     continue;
                 }
-                if !self.item_instance_matches(item.item_id, item.enchant_ids.len()) {
+                if !self.item_instance_matches(item.item_id, item.total_enchant_slots()) {
                     continue;
                 }
                 // allocate_ui reserves a fixed size so horizontal_wrapped can
@@ -3098,7 +3100,7 @@ impl TreasuryPanel {
                 return true; // empty stays empty
             }
             // Type filter (UT/ST/Shiny) + per-instance rarity filter.
-            if !props.passes(am, item.item_id, item.enchant_ids.len()) {
+            if !props.passes(am, item.item_id, item.total_enchant_slots()) {
                 return false;
             }
             // Text filter
@@ -3232,11 +3234,13 @@ impl TreasuryPanel {
         if item.is_empty() {
             sprite_renderer.render_empty_slot(ui, 38.0);
         } else {
-            let mut enchant_buf: [i32; 4] = [0; 4];
-            let enchant_count = item.enchant_ids.len().min(4);
-            for (i, &e) in item.enchant_ids.iter().take(4).enumerate() {
-                enchant_buf[i] = e as i32;
-            }
+            // Include empty (-1) and locked (-2) markers so slotted-but-empty
+            // items render with their real rarity.
+            let (enchant_buf, enchant_count) = enchant_slot_buffer(
+                &item.enchant_ids,
+                item.empty_enchant_slots,
+                item.locked_enchant_slots,
+            );
             let response = sprite_renderer.render_item_tile_ex(
                 ui,
                 item.item_id,

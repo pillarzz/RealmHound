@@ -236,6 +236,34 @@ impl OwnedUnlocks {
     }
 }
 
+/// Build the enchant-slot buffer a tile/tooltip renderer expects: filled
+/// enchant IDs first, then `-1` for each empty (unlocked) slot and `-2` for
+/// each locked slot, capped at four. Empty-but-slotted items therefore keep
+/// their rarity gem and show `<empty>` in the tooltip.
+pub(crate) fn enchant_slot_buffer(filled: &[u16], empty: u8, locked: u8) -> ([i32; 4], usize) {
+    let mut buf = [0i32; 4];
+    let mut len = 0usize;
+    for &id in filled {
+        if len < 4 {
+            buf[len] = id as i32;
+            len += 1;
+        }
+    }
+    for _ in 0..empty {
+        if len < 4 {
+            buf[len] = -1;
+            len += 1;
+        }
+    }
+    for _ in 0..locked {
+        if len < 4 {
+            buf[len] = -2;
+            len += 1;
+        }
+    }
+    (buf, len)
+}
+
 /// Sprite renderer for drawing item sprites in egui.
 pub struct SpriteRenderer {
     /// Local texture cache
@@ -307,8 +335,11 @@ pub struct SpriteRenderer {
     /// counts only: the `OWNED` cosmetic/blueprint tag is unrelated and always
     /// shows.
     hide_owned_rarity: bool,
-    /// Account generation the `owned_rarities` map was built from (skip recompute).
-    owned_rarities_generation: u64,
+    /// Epoch the `owned_rarities` map was built from: `(account generation,
+    /// character-view generation, vault-view generation)`. Live character
+    /// inventory changes advance only the character-view generation (they do
+    /// not bump the account generation), so all three must key the cache.
+    owned_rarities_epoch: (u64, u64, u64),
     /// Account unlock state behind the tooltip's `OWNED` tag.
     owned_unlocks: OwnedUnlocks,
     /// Account generation the `owned_unlocks` snapshot was built from.
@@ -373,7 +404,7 @@ impl SpriteRenderer {
             outlined_fit_cache: HashMap::new(),
             owned_rarities: HashMap::new(),
             hide_owned_rarity: false,
-            owned_rarities_generation: u64::MAX,
+            owned_rarities_epoch: (u64::MAX, u64::MAX, u64::MAX),
             owned_unlocks: OwnedUnlocks::default(),
             owned_unlocks_generation: u64::MAX,
             content_offsets: HashMap::new(),
@@ -700,13 +731,21 @@ impl SpriteRenderer {
 
     /// Refresh the owned-item rarity breakdown from account data. Counts every
     /// owned copy of each item by its enchant-slot rarity (0 = Common .. 4 =
-    /// Divine) across all live and dead characters and both vaults. Skips the
-    /// (potentially large) recompute when the account generation is unchanged.
-    pub fn update_owned_rarities(&mut self, account_data: &realmhound_core::vault::AccountData) {
-        if self.owned_rarities_generation == account_data.generation {
+    /// Divine) across all live and dead characters and both vaults.
+    ///
+    /// `epoch` must change whenever any counted collection changes: the account
+    /// generation alone is not enough, because live character inventory updates
+    /// only advance the character-view generation. `vault_view_gen` is included
+    /// so a live vault view refresh also invalidates the map.
+    pub fn update_owned_rarities(
+        &mut self,
+        account_data: &realmhound_core::vault::AccountData,
+        epoch: (u64, u64, u64),
+    ) {
+        if self.owned_rarities_epoch == epoch {
             return;
         }
-        self.owned_rarities_generation = account_data.generation;
+        self.owned_rarities_epoch = epoch;
         self.owned_rarities.clear();
 
         let mut add = |item_id: i32, enchant_count: usize| {
@@ -730,7 +769,7 @@ impl SpriteRenderer {
                 .chain(ch.backpack_ext.iter())
                 .chain(ch.belt.iter())
             {
-                add(item.item_id, item.enchant_count());
+                add(item.item_id, item.total_enchant_slots());
             }
         }
         for vault in [&account_data.regular_vault, &account_data.seasonal_vault] {
@@ -742,7 +781,7 @@ impl SpriteRenderer {
                 .chain(vault.potion_items.iter())
                 .chain(vault.spoils_items.iter())
             {
-                add(item.item_id, item.enchant_count());
+                add(item.item_id, item.total_enchant_slots());
             }
         }
     }
@@ -5626,6 +5665,39 @@ mod tests {
         account_data.bump_generation();
         renderer.update_owned_unlocks(&account_data);
         assert!(renderer.owned_unlocks.wardrobe.contains(&64979));
+    }
+
+    #[test]
+    fn owned_rarities_rebuild_when_character_view_changes() {
+        use realmhound_core::api::character::EnchantSlots;
+        use realmhound_core::vault::{AccountData, CachedCharacter, CharacterItem};
+
+        let item = CharacterItem::with_enchant_slots(
+            1228,
+            EnchantSlots {
+                filled: Vec::new(),
+                empty: 1,
+                locked: 0,
+            },
+        );
+        let mut account_data = AccountData::default();
+        account_data.characters.characters.push(CachedCharacter {
+            char_id: 1,
+            equipment: vec![item],
+            ..Default::default()
+        });
+
+        let mut renderer = SpriteRenderer::new();
+        let account_gen = account_data.generation;
+        renderer.update_owned_rarities(&account_data, (account_gen, 1, 1));
+        assert_eq!(renderer.owned_rarities[&1228][1], 1);
+
+        // A live inventory update removes the item but only advances the
+        // character-view generation; the account generation is unchanged. The
+        // map must still rebuild or the count stays stuck (issue #87).
+        account_data.characters.characters[0].equipment.clear();
+        renderer.update_owned_rarities(&account_data, (account_gen, 2, 1));
+        assert_eq!(renderer.owned_rarities.get(&1228).map_or(0, |c| c[1]), 0);
     }
 
     #[test]

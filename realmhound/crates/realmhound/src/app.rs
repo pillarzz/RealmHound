@@ -763,8 +763,9 @@ pub struct RealmHoundApp {
     pending_relaunch: Option<RelaunchReason>,
     /// Update notification panel
     update_panel: UpdatePanel,
-    /// Last synced character cache generation (avoids cloning every frame)
-    treasury_cache_generation: u64,
+    /// Last synced character cache epoch `(account generation, character-view
+    /// generation)` (avoids cloning every frame).
+    treasury_cache_epoch: (u64, u64),
     /// Last applied characters-mirror generation (avoids cloning every frame)
     last_char_view_gen: u64,
     /// Last applied live-vault generation (avoids cloning every frame)
@@ -1243,9 +1244,9 @@ impl RealmHoundApp {
             self_updater: SelfUpdater::new(),
             pending_relaunch: None,
             update_panel: UpdatePanel::new(),
-            treasury_cache_generation: u64::MAX, // Force initial sync
-            last_char_view_gen: u64::MAX,        // Force initial sync
-            last_vault_view_gen: u64::MAX,       // Force initial sync
+            treasury_cache_epoch: (u64::MAX, u64::MAX), // Force initial sync
+            last_char_view_gen: u64::MAX,               // Force initial sync
+            last_vault_view_gen: u64::MAX,              // Force initial sync
             owned_account_epoch: (u64::MAX, u64::MAX),
             account_data_revision: 0,
             owned_vault_gen: u64::MAX,
@@ -9902,10 +9903,12 @@ impl RealmHoundApp {
         }
 
         // Sync character cache to treasury panel when tab is active and cache changed.
-        // Note: keyed on the account_data generation (matches prior timing).
+        // Live inventory changes only advance the character-view generation, so
+        // both counters key the cache.
         if self.active_tab == ActiveTab::Treasury {
-            if account_generation != self.treasury_cache_generation {
-                self.treasury_cache_generation = account_generation;
+            let treasury_epoch = (account_generation, char_view_gen);
+            if treasury_epoch != self.treasury_cache_epoch {
+                self.treasury_cache_epoch = treasury_epoch;
                 self.treasury_panel
                     .set_character_cache(self.account_data.characters.clone());
             }
@@ -9914,8 +9917,9 @@ impl RealmHoundApp {
         // Build shared context for panel rendering
         let labels = self.account_data.characters.custom_labels.clone();
 
+        let owned_rarities_epoch = (account_generation, char_view_gen, vault_view_gen);
         self.sprite_renderer
-            .update_owned_rarities(&self.account_data);
+            .update_owned_rarities(&self.account_data, owned_rarities_epoch);
         self.sprite_renderer
             .update_owned_unlocks(&self.account_data);
 

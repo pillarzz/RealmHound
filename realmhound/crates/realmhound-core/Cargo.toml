@@ -45,7 +45,7 @@ semver = { workspace = true }
 urlencoding = "2.1"
 
 # SQLite database
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 
 # XML parsing
 quick-xml = { workspace = true }

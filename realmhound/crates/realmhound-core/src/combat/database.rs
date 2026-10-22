@@ -3184,21 +3184,23 @@ impl CombatDatabase {
     /// a filter that matches one phase returns the whole encounter and the limit
     /// never slices an encounter in half.
     pub fn list_fights(&self, query: &FightQuery, limit: i64) -> SqlResult<Vec<FightSummary>> {
-        // With a secret-stat filter active the qualifying cards may sit past the
-        // page limit, so fetch the whole (already group/date-narrowed) candidate
-        // set, tag flags, filter, then trim. Without one, behave as before.
-        let stat_filter = query.filter_lone_fighter
-            || query.filter_last_hero
-            || query.filter_most_damage_taken
-            || query.filter_close_calls;
-        let fetch_limit = if stat_filter { i64::MAX } else { limit };
-        let mut out = self.standalone_summaries(query, fetch_limit, None)?;
-        out.extend(self.encounter_summaries(query, fetch_limit, None)?);
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let variants = self.display_variants()?;
+        if query.filter_lone_fighter || query.filter_last_hero || query.filter_most_damage_taken {
+            self.register_card_stat_functions(variants.clone())?;
+        }
+        let mut out = self.standalone_summaries(query, limit, None, &variants)?;
+        out.extend(self.encounter_summaries(query, limit, None, &variants)?);
         out.sort_by(|a, b| {
             b.ended_at
                 .cmp(&a.ended_at)
                 .then(b.started_at.cmp(&a.started_at))
+                .then(a.encounter_run_id.cmp(&b.encounter_run_id))
+                .then(b.id.cmp(&a.id))
         });
+        out.truncate(limit as usize);
         for s in &mut out {
             s.flawless = self.card_is_flawless(s)?;
             let (lone, last, most_dmg) = self.card_secret_stats(s)?;
@@ -3206,15 +3208,6 @@ impl CombatDatabase {
             s.last_hero_standing = last;
             s.most_damage_taken = most_dmg;
         }
-        if stat_filter {
-            out.retain(|s| {
-                (query.filter_lone_fighter && s.lone_fighter)
-                    || (query.filter_last_hero && s.last_hero_standing)
-                    || (query.filter_most_damage_taken && s.most_damage_taken)
-                    || (query.filter_close_calls && s.local_close_calls > 0)
-            });
-        }
-        out.truncate(limit.max(0) as usize);
         Ok(out)
     }
 
@@ -3239,18 +3232,7 @@ impl CombatDatabase {
     ///   phase, whereas remote players are observed across every auxiliary phase,
     ///   so a card-wide sum would unfairly favour teammates.
     fn card_secret_stats(&self, s: &FightSummary) -> SqlResult<(bool, bool, bool)> {
-        if !s.killed {
-            return Ok((false, false, false));
-        }
-        if crate::assets::boss_group(&s.dungeon, s.boss_object_type, &s.boss_name)
-            != Some(crate::assets::BossGroup::Exaltation)
-        {
-            return Ok((false, false, false));
-        }
-        // Tracked mini-bosses of a dungeon whose markers are reserved for its
-        // main boss (Lost Halls' Agonized Titan, Cultist Hideout's sub-bosses)
-        // are not the fight these markers describe.
-        if !crate::assets::boss_earns_secret_stats(&s.dungeon, s.boss_object_type) {
+        if secret_stat_boss(&s.dungeon, s.boss_object_type, &s.boss_name, s.killed).is_none() {
             return Ok((false, false, false));
         }
         // Every fight in the card, flagged as a main-boss (anchor) phase.
@@ -3481,12 +3463,13 @@ impl CombatDatabase {
         };
         let fight_ids: Vec<i64> = fight_ids.into_iter().collect();
         let run_ids: Vec<String> = run_ids.into_iter().collect();
+        let variants = self.display_variants()?;
         let mut cards = Vec::new();
         for chunk in fight_ids.chunks(SELECTION_CHUNK_SIZE) {
-            cards.extend(self.standalone_summaries(&query, i64::MAX, Some(chunk))?);
+            cards.extend(self.standalone_summaries(&query, i64::MAX, Some(chunk), &variants)?);
         }
         for chunk in run_ids.chunks(SELECTION_CHUNK_SIZE) {
-            cards.extend(self.encounter_summaries(&query, i64::MAX, Some(chunk))?);
+            cards.extend(self.encounter_summaries(&query, i64::MAX, Some(chunk), &variants)?);
         }
 
         let mut updates = Vec::new();
@@ -3707,6 +3690,7 @@ impl CombatDatabase {
         query: &FightQuery,
         limit: i64,
         fight_ids: Option<&[i64]>,
+        variants: &HashMap<i32, i32>,
     ) -> SqlResult<Vec<FightSummary>> {
         if fight_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
@@ -3729,9 +3713,15 @@ impl CombatDatabase {
                       f.shatters_hm
                FROM fights f"#,
         );
+        if query.filter_lone_fighter || query.filter_last_hero || query.filter_most_damage_taken {
+            // Walk newest-first and stop at the page limit rather than sorting
+            // every stat-matching standalone card via the run-id index.
+            sql.push_str(" INDEXED BY idx_fights_ended");
+        }
         let mut conds: Vec<String> = vec!["f.encounter_run_id IS NULL".to_string()];
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         Self::apply_filters(query, &mut conds, &mut binds);
+        self.apply_card_stat_filters(query, false, &mut conds)?;
         if let Some(fight_ids) = fight_ids.filter(|ids| !ids.is_empty()) {
             conds.push(format!(
                 "f.id IN ({})",
@@ -3745,18 +3735,17 @@ impl CombatDatabase {
         }
         sql.push_str(" WHERE ");
         sql.push_str(&conds.join(" AND "));
-        sql.push_str(" ORDER BY f.ended_at DESC LIMIT ?");
+        sql.push_str(" ORDER BY f.ended_at DESC, f.started_at DESC, f.id DESC LIMIT ?");
         binds.push(Box::new(limit));
 
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref()));
         // One display variant per encounter, so a history stored under both the
         // classic and the reskin id reads with one name and one portrait.
-        let variants = self.display_variants()?;
         let rows = stmt.query_map(params, |row| {
             let boss_object_type: i32 = row.get(4)?;
             let stored_name: String = row.get(5)?;
-            let display_object_type = display_variant_of(&variants, boss_object_type);
+            let display_object_type = display_variant_of(variants, boss_object_type);
             let boss_name = display_boss_name(display_object_type, &stored_name);
             Ok(FightSummary {
                 id: row.get(0)?,
@@ -3881,6 +3870,7 @@ impl CombatDatabase {
         query: &FightQuery,
         limit: i64,
         run_ids: Option<&[String]>,
+        variants: &HashMap<i32, i32>,
     ) -> SqlResult<Vec<FightSummary>> {
         if limit <= 0 || run_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
@@ -3888,8 +3878,6 @@ impl CombatDatabase {
         // One display variant per encounter (see `display_variants`), so a run
         // stored under the classic id and one under its seasonal reskin are both
         // titled and pictured by the same variant.
-        let variants = self.display_variants()?;
-
         let mut sql = String::from(
             "SELECT r.run_id, r.encounter_id, r.dungeon, r.started_at, r.ended_at, r.killed
              FROM encounter_runs r",
@@ -3897,6 +3885,7 @@ impl CombatDatabase {
         let mut conds = Vec::new();
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         Self::apply_encounter_filters(query, &mut conds, &mut binds);
+        self.apply_card_stat_filters(query, true, &mut conds)?;
         if let Some(run_ids) = run_ids.filter(|ids| !ids.is_empty()) {
             conds.push(format!(
                 "r.run_id IN ({})",
@@ -3912,7 +3901,7 @@ impl CombatDatabase {
             sql.push_str(" WHERE ");
             sql.push_str(&conds.join(" AND "));
         }
-        sql.push_str(" ORDER BY r.ended_at DESC, r.started_at DESC LIMIT ?");
+        sql.push_str(" ORDER BY r.ended_at DESC, r.started_at DESC, r.run_id ASC LIMIT ?");
         binds.push(Box::new(limit));
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -4070,37 +4059,11 @@ impl CombatDatabase {
             // Moonlight Village headlines on the dancer the dance ended on (see
             // `mv_dancer_main`); its row is picked the same way as every other
             // anchor so the HP bar and completion state come from that phase.
-            let (mut boss_object_type, boss_max_hp, boss_start_hp, killed) =
-                mv_dancer_main(phases.iter().map(|p| (p.0, p.7)))
-                    .and_then(|dancer| {
-                        phase_stats
-                            .iter()
-                            .filter(|p| p.0 == dancer)
-                            .max_by_key(|p| p.4)
-                            .copied()
-                    })
-                    .map(|p| {
-                        let enc_id = phase_stats
-                            .iter()
-                            .find_map(|q| crate::assets::encounter_for_boss_type(q.0))
-                            .map(|e| e.id);
-                        (p.0, p.1, p.2, run_killed(enc_id, &phase_stats, p.3))
-                    })
-                    .unwrap_or_else(|| pick_anchor(&phase_stats).unwrap_or((0, 0, 0, false)));
-            // A run-level `killed` completes the card only for loot-completable
-            // encounters (Towering Perfection): a bag from a core that was never
-            // seen dying, where the anchor phase stays escaped. Other cards ignore
-            // the run flag so an intermediate-form kill never hijacks completion.
-            let loot_completable = phases
-                .iter()
-                .find_map(|p| crate::assets::encounter_for_boss_type(p.0))
-                .is_some_and(|e| crate::assets::encounter_supports_loot_completion(e.id));
-            let killed = killed
-                || (loot_completable && stored_killed != 0)
-                // Moonlight Village is cleared by its three dancers; the anchor
-                // can land on an escaped Kitsune Umi fought afterwards.
-                || mv_dancers_cleared(phases.iter().map(|p| (p.0, p.3)));
-            let raw_phase_count = phases.len() as i64;
+            let (mut boss_object_type, boss_max_hp, boss_start_hp, killed) = encounter_card_anchor(
+                &phase_stats,
+                mv_dancer_main(phases.iter().map(|p| (p.0, p.7))),
+                stored_killed != 0,
+            );
             // The card's phase count must match the collapsed detail view:
             // duplicate same-(type,name) phases of a dedup-prone boss (a
             // re-detected Sage Genji on a summoner run, a re-spawned Prismimic)
@@ -4125,21 +4088,15 @@ impl CombatDatabase {
             // "Realm" map name); a multi-boss dungeon run is headlined by its
             // dungeon; a lone boss keeps its own name.
             let object_types: Vec<i32> = phases.iter().map(|p| p.0).collect();
-            let display_name = if let Some(headline) = realm_headline(&dungeon, &object_types) {
-                // Realm-grouped encounter: title by the anchor boss's *current*
-                // name so a seasonally-reskinned fight reads uniformly.
-                display_boss_name(display_variant_of(&variants, boss_object_type), headline)
-            } else if raw_phase_count > 1 {
-                dungeon.clone()
-            } else {
-                phases
+            let display_name = encounter_card_name(
+                &dungeon,
+                boss_object_type,
+                &phases
                     .iter()
-                    .max_by_key(|phase| phase.4)
-                    .map(|phase| {
-                        display_boss_name(display_variant_of(&variants, phase.0), &phase.5)
-                    })
-                    .unwrap_or_else(|| dungeon.clone())
-            };
+                    .map(|p| (p.0, p.4, p.5.as_str()))
+                    .collect::<Vec<_>>(),
+                &variants,
+            );
             let local_char_id = phases
                 .iter()
                 .find_map(|phase| (phase.6 != 0).then_some(phase.6))
@@ -4458,19 +4415,14 @@ impl CombatDatabase {
     /// `Encounter` selection, standalone fights as `Single`). Used by the
     /// "delete filtered" action to remove all matches, not just the visible page.
     pub fn selections_matching(&self, query: &FightQuery) -> SqlResult<Vec<FightSelection>> {
-        // Secret-stat flags are computed at read time, so reuse the list path
-        // (unbounded) to keep "Select filtered" identical to what the list shows.
-        if query.filter_lone_fighter
-            || query.filter_last_hero
-            || query.filter_most_damage_taken
-            || query.filter_close_calls
-        {
-            return self.all_selections(query, i64::MAX);
+        if query.filter_lone_fighter || query.filter_last_hero || query.filter_most_damage_taken {
+            self.register_card_stat_functions(self.display_variants()?)?;
         }
         let mut sql = String::from("SELECT f.id, f.started_at, f.ended_at FROM fights f");
         let mut conds = vec!["f.encounter_run_id IS NULL".to_string()];
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         Self::apply_filters(query, &mut conds, &mut binds);
+        self.apply_card_stat_filters(query, false, &mut conds)?;
         sql.push_str(" WHERE ");
         sql.push_str(&conds.join(" AND "));
 
@@ -4491,6 +4443,7 @@ impl CombatDatabase {
         let mut conds = Vec::new();
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         Self::apply_encounter_filters(query, &mut conds, &mut binds);
+        self.apply_card_stat_filters(query, true, &mut conds)?;
         if !conds.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&conds.join(" AND "));
@@ -4508,7 +4461,20 @@ impl CombatDatabase {
             })?
             .collect::<SqlResult<Vec<_>>>()?,
         );
-        selections.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
+        selections.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then(b.1.cmp(&a.1))
+                .then_with(|| match (&a.0, &b.0) {
+                    (FightSelection::Single(a), FightSelection::Single(b)) => b.cmp(a),
+                    (FightSelection::Encounter(a), FightSelection::Encounter(b)) => a.cmp(b),
+                    (FightSelection::Single(_), FightSelection::Encounter(_)) => {
+                        std::cmp::Ordering::Less
+                    }
+                    (FightSelection::Encounter(_), FightSelection::Single(_)) => {
+                        std::cmp::Ordering::Greater
+                    }
+                })
+        });
         Ok(selections
             .into_iter()
             .map(|(selection, _, _)| selection)
@@ -4733,6 +4699,161 @@ impl CombatDatabase {
             }
         }
         total
+    }
+
+    fn register_card_stat_functions(&self, variants: HashMap<i32, i32>) -> SqlResult<()> {
+        use rusqlite::functions::FunctionFlags;
+
+        let standalone_variants = variants.clone();
+        // These functions resolve only card headers. Participant comparisons stay
+        // in SQL, while the encounter-specific anchor rules remain shared with UI.
+        self.conn.create_scalar_function(
+            "rh_stat_boss",
+            4,
+            FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                let dungeon = ctx.get::<String>(0)?;
+                let boss = ctx.get::<i32>(1)?;
+                let name = display_boss_name(
+                    display_variant_of(&standalone_variants, boss),
+                    &ctx.get::<String>(2)?,
+                );
+                Ok(secret_stat_boss(
+                    &dungeon,
+                    boss,
+                    &name,
+                    ctx.get::<i32>(3)? != 0,
+                ))
+            },
+        )?;
+        self.conn.create_scalar_function(
+            "rh_stat_run_boss",
+            3,
+            FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                let dungeon = ctx.get::<String>(0)?;
+                let stored_killed = ctx.get::<i32>(1)? != 0;
+                let json = ctx.get::<String>(2)?;
+                // type, max HP, start HP, killed, end, start, stored name
+                let phases: Vec<(i32, i32, i32, i32, i64, i64, String)> =
+                    serde_json::from_str(&json)
+                        .map_err(|err| rusqlite::Error::UserFunctionError(Box::new(err)))?;
+                let stats: Vec<PhaseStat> = phases
+                    .iter()
+                    .map(|p| (p.0, p.1, p.2, p.3 != 0, p.4))
+                    .collect();
+                let (mut boss, _, _, killed) = encounter_card_anchor(
+                    &stats,
+                    mv_dancer_main(phases.iter().map(|p| (p.0, p.5))),
+                    stored_killed,
+                );
+                let name = encounter_card_name(
+                    &dungeon,
+                    boss,
+                    &phases
+                        .iter()
+                        .map(|p| (p.0, p.4, p.6.as_str()))
+                        .collect::<Vec<_>>(),
+                    &variants,
+                );
+                let mut ordered = phases.iter().collect::<Vec<_>>();
+                ordered.sort_by_key(|p| (p.5, p.4));
+                if let Some(enc) = ordered
+                    .iter()
+                    .find_map(|p| crate::assets::encounter_for_boss_type(p.0))
+                {
+                    if crate::assets::encounter_headline_only(enc.id) {
+                        boss = enc.anchor_type;
+                    }
+                }
+                Ok(secret_stat_boss(&dungeon, boss, &name, killed))
+            },
+        )
+    }
+
+    fn apply_card_stat_filters(
+        &self,
+        query: &FightQuery,
+        encounter: bool,
+        conds: &mut Vec<String>,
+    ) -> SqlResult<()> {
+        let mut alternatives = Vec::new();
+        if query.filter_close_calls {
+            alternatives.push(if encounter {
+                "(SELECT COALESCE(SUM(sf.local_close_calls), 0) FROM fights sf
+                  WHERE sf.encounter_run_id = r.run_id) > 0"
+                    .to_string()
+            } else {
+                "f.local_close_calls > 0".to_string()
+            });
+        }
+        if query.filter_lone_fighter || query.filter_last_hero || query.filter_most_damage_taken {
+            let (anchor, membership) = if encounter {
+                (
+                    "rh_stat_run_boss(r.dungeon, r.killed,
+                        (SELECT json_group_array(json_array(
+                            sf.boss_object_type, sf.boss_max_hp, sf.boss_start_hp,
+                            sf.killed, sf.ended_at, sf.started_at, sf.boss_name))
+                         FROM fights sf WHERE sf.encounter_run_id = r.run_id))",
+                    "sf.encounter_run_id = r.run_id",
+                )
+            } else {
+                (
+                    "rh_stat_boss(f.dungeon, f.boss_object_type, f.boss_name, f.killed)",
+                    "sf.id = f.id",
+                )
+            };
+            let mut markers = Vec::new();
+            if query.filter_lone_fighter {
+                markers.push(
+                    "(MAX(CASE WHEN is_local = 1 THEN anchor_status END) = 2
+                      AND MAX(CASE WHEN is_local = 1 THEN damage END) > 0
+                      AND COALESCE(MAX(CASE WHEN is_local = 0 THEN damage END), 0) <= 0)",
+                );
+            }
+            if query.filter_last_hero {
+                markers.push(
+                    "(MAX(CASE WHEN is_local = 1 THEN anchor_status END) = 2
+                      AND SUM(is_local = 0 AND anchor_status > 0) > 0
+                      AND SUM(is_local = 0 AND anchor_status = 2) = 0)",
+                );
+            }
+            if query.filter_most_damage_taken {
+                markers.push(
+                    "(MAX(CASE WHEN is_local = 1 THEN damage_taken END) > 0
+                      AND SUM(is_local = 0) > 0
+                      AND MAX(CASE WHEN is_local = 1 THEN damage_taken END)
+                            > MAX(CASE WHEN is_local = 0 THEN damage_taken END))",
+                );
+            }
+            alternatives.push(format!(
+                "EXISTS (
+                    WITH anchor AS MATERIALIZED (SELECT {anchor} AS boss),
+                    participants AS (
+                        SELECT (p.is_local != 0) AS is_local,
+                               SUM(p.damage) AS damage,
+                               SUM(CASE WHEN sf.boss_object_type = anchor.boss
+                                   THEN COALESCE(p.damage_taken, 0) ELSE 0 END) AS damage_taken,
+                               MAX(CASE WHEN sf.boss_object_type = anchor.boss
+                                   THEN CASE p.end_status WHEN 'died' THEN 3
+                                        WHEN 'nexused' THEN 1 ELSE 2 END
+                                   ELSE 0 END) AS anchor_status
+                        FROM anchor CROSS JOIN fights sf
+                        JOIN fight_participants p ON p.fight_id = sf.id
+                        WHERE anchor.boss IS NOT NULL AND {membership}
+                          AND (p.is_local != 0 OR p.provenance != 'unresolved')
+                        GROUP BY (p.is_local != 0),
+                                 CASE WHEN p.is_local != 0 THEN 0 ELSE p.object_id END
+                    )
+                    SELECT MAX(is_local) FROM participants
+                    HAVING MAX(is_local) = 1 AND ({}))",
+                markers.join(" OR ")
+            ));
+        }
+        if !alternatives.is_empty() {
+            conds.push(format!("({})", alternatives.join(" OR ")));
+        }
+        Ok(())
     }
 
     /// Build filter predicates for the list query (columns prefixed `f.`).
@@ -6305,6 +6426,67 @@ impl From<&FightParticipant> for ParticipantRecord {
 /// `(object_type, max_hp, start_hp, killed, ended_at)`.
 type PhaseStat = (i32, i32, i32, bool, i64);
 
+fn secret_stat_boss(dungeon: &str, boss: i32, name: &str, killed: bool) -> Option<i32> {
+    (killed
+        && crate::assets::boss_group(dungeon, boss, name)
+            == Some(crate::assets::BossGroup::Exaltation)
+        && crate::assets::boss_earns_secret_stats(dungeon, boss))
+    .then_some(boss)
+}
+
+fn encounter_card_anchor(
+    phases: &[PhaseStat],
+    last_dancer: Option<i32>,
+    stored_killed: bool,
+) -> (i32, i32, i32, bool) {
+    let (boss, max_hp, start_hp, killed) = last_dancer
+        .and_then(|dancer| {
+            phases
+                .iter()
+                .filter(|p| p.0 == dancer)
+                .max_by_key(|p| p.4)
+                .copied()
+        })
+        .map(|p| {
+            let enc_id = phases
+                .iter()
+                .find_map(|q| crate::assets::encounter_for_boss_type(q.0))
+                .map(|e| e.id);
+            (p.0, p.1, p.2, run_killed(enc_id, phases, p.3))
+        })
+        .unwrap_or_else(|| pick_anchor(phases).unwrap_or((0, 0, 0, false)));
+    // Only loot-completable encounters may override an escaped anchor with the
+    // stored run flag. MV completion belongs to the dancers, not optional Umi.
+    let loot_completable = phases
+        .iter()
+        .find_map(|p| crate::assets::encounter_for_boss_type(p.0))
+        .is_some_and(|e| crate::assets::encounter_supports_loot_completion(e.id));
+    let killed = killed
+        || (loot_completable && stored_killed)
+        || mv_dancers_cleared(phases.iter().map(|p| (p.0, p.3)));
+    (boss, max_hp, start_hp, killed)
+}
+
+fn encounter_card_name(
+    dungeon: &str,
+    boss: i32,
+    phases: &[(i32, i64, &str)],
+    variants: &HashMap<i32, i32>,
+) -> String {
+    let types: Vec<i32> = phases.iter().map(|p| p.0).collect();
+    if let Some(headline) = realm_headline(dungeon, &types) {
+        display_boss_name(display_variant_of(variants, boss), headline)
+    } else if phases.len() > 1 {
+        dungeon.to_string()
+    } else {
+        phases
+            .iter()
+            .max_by_key(|p| p.1)
+            .map(|p| display_boss_name(display_variant_of(variants, p.0), p.2))
+            .unwrap_or_else(|| dungeon.to_string())
+    }
+}
+
 /// Resolve whether a grouped run counts as killed. Encounters listed in
 /// `encounter_completion_all` are killed only when EVERY listed member was killed
 /// (e.g. the Tomb of the Ancients' three main bosses); those in
@@ -6568,7 +6750,12 @@ mod tests {
             .unwrap();
 
         let rows = db
-            .standalone_summaries(&FightQuery::default(), 10, None)
+            .standalone_summaries(
+                &FightQuery::default(),
+                10,
+                None,
+                &db.display_variants().unwrap(),
+            )
             .unwrap();
         assert_eq!(rows.len(), 2);
         // Stored ids are untouched (newest fight first) ...
@@ -7156,6 +7343,423 @@ mod tests {
             packet_damage: 0,
             packet_hits: 0,
             damage_taken_hits: None,
+        }
+    }
+
+    fn assert_stat_filter_parity(db: &CombatDatabase, base: &FightQuery) {
+        let cards = db.list_fights(base, i64::MAX).unwrap();
+        for mask in 1..16 {
+            let query = FightQuery {
+                filter_lone_fighter: mask & 1 != 0,
+                filter_last_hero: mask & 2 != 0,
+                filter_most_damage_taken: mask & 4 != 0,
+                filter_close_calls: mask & 8 != 0,
+                ..base.clone()
+            };
+            let expected: Vec<FightSelection> = cards
+                .iter()
+                .filter(|s| {
+                    (query.filter_lone_fighter && s.lone_fighter)
+                        || (query.filter_last_hero && s.last_hero_standing)
+                        || (query.filter_most_damage_taken && s.most_damage_taken)
+                        || (query.filter_close_calls && s.local_close_calls > 0)
+                })
+                .map(FightSummary::selection)
+                .collect();
+            assert_eq!(
+                db.selections_matching(&query).unwrap(),
+                expected,
+                "mask={mask}"
+            );
+            for limit in [0, 1, 3, 100] {
+                let actual: Vec<_> = db
+                    .list_fights(&query, limit)
+                    .unwrap()
+                    .iter()
+                    .map(FightSummary::selection)
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected
+                        .iter()
+                        .take(limit as usize)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    "mask={mask}, limit={limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stat_sql_filters_preserve_standalone_and_encounter_semantics() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        for n in 0..18 {
+            let status = match n % 3 {
+                0 => ParticipantEndStatus::Present,
+                1 => ParticipantEndStatus::Nexused,
+                _ => ParticipantEndStatus::Died { grave_type: 1830 },
+            };
+            let mut local = secret_local_part(if n % 5 == 0 { 0 } else { 50_000 }, status);
+            local.damage_taken = (n % 4 != 0).then_some(9_000);
+            let mut other = flawless_part(
+                600,
+                "Alice",
+                if n % 4 == 0 { 0 } else { 30_000 },
+                Some(if n % 6 == 0 { 9_000 } else { 4_000 }),
+                match n % 3 {
+                    0 => ParticipantEndStatus::Nexused,
+                    1 => ParticipantEndStatus::Present,
+                    _ => ParticipantEndStatus::Died { grave_type: 1830 },
+                },
+            );
+            if n % 5 == 0 {
+                other.provenance = DamageProvenance::Unresolved;
+            }
+            let (dungeon, boss) = match n % 6 {
+                0 => ("Fungal Cavern", 45712),
+                1 => ("Lost Halls", 0xb010),
+                2 => ("Lost Halls", 45073),
+                3 => ("Cultist Hideout", 45231),
+                4 => ("Snake Pit", 9),
+                _ => ("Kogbold Steamworks", 0xc4ad),
+            };
+            let mut f = flawless_fight(dungeon, boss, vec![local.clone(), other.clone()]);
+            f.local_close_calls = i32::from(n % 4 == 0);
+            f.killed = n % 7 != 0;
+            db.insert_fight(&f).unwrap();
+
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some(format!("stat-run-{n:02}"));
+            db.insert_fight(&f).unwrap();
+            // Auxiliary-only participants affect Lone/Most but not Last Hero.
+            // Large auxiliary damage-taken must not overwhelm anchor comparisons.
+            let mut aux = f.clone();
+            aux.boss_object_type = 999_999;
+            aux.started_at = 900;
+            aux.ended_at = 60_000;
+            aux.local_close_calls = 0;
+            local.object_id = 11;
+            local.damage_taken = Some(0);
+            other.damage_taken = Some(99_000);
+            if n % 2 == 0 {
+                other.object_id = 601;
+            }
+            other.end_status = ParticipantEndStatus::Present;
+            aux.participants = vec![local, other];
+            db.insert_fight(&aux).unwrap();
+        }
+        // Ensure all four filters have real positive cases.
+        let local = secret_local_part(80_000, ParticipantEndStatus::Present);
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![local]))
+            .unwrap();
+        let cards = db.list_fights(&FightQuery::default(), 100).unwrap();
+        assert!(cards.iter().any(|s| s.lone_fighter));
+        assert!(cards.iter().any(|s| s.last_hero_standing));
+        assert!(cards.iter().any(|s| s.most_damage_taken));
+        assert!(cards.iter().any(|s| s.local_close_calls > 0));
+        for base in [
+            FightQuery::default(),
+            FightQuery {
+                dungeon: Some("Lost Halls".to_string()),
+                ..Default::default()
+            },
+            FightQuery {
+                groups: Some(vec!["exaltation".to_string()]),
+                ..Default::default()
+            },
+            FightQuery {
+                player_name: Some("Alice".to_string()),
+                char_id: Some(1),
+                ..Default::default()
+            },
+            FightQuery {
+                boss_object_type: Some(45073),
+                after: Some(0),
+                before: Some(2_000),
+                ..Default::default()
+            },
+            FightQuery {
+                text: Some("fungal".to_string()),
+                participant_count: Some(2),
+                ..Default::default()
+            },
+        ] {
+            assert_stat_filter_parity(&db, &base);
+        }
+    }
+
+    #[test]
+    fn stat_sql_filters_share_curated_anchor_and_completion_rules() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        for (run, dungeon, phases) in [
+            (
+                "mv",
+                "Moonlight Village",
+                vec![
+                    (20450, 1_000, 20_000, true),
+                    (20451, 2_000, 10_000, true),
+                    (20452, 3_000, 15_000, true),
+                    (20493, 4_000, 30_000, false),
+                ],
+            ),
+            (
+                "cult",
+                "Cultist Hideout",
+                vec![(45225, 1_000, 30_000, true), (45231, 2_000, 20_000, true)],
+            ),
+            (
+                "lost-halls",
+                "Lost Halls",
+                vec![(45073, 1_000, 20_000, true), (0xb010, 2_000, 30_000, true)],
+            ),
+            (
+                "tower",
+                "Realm",
+                vec![(44894, 1_000, 20_000, true), (47909, 2_000, 30_000, false)],
+            ),
+            (
+                "shatters",
+                "The Shatters",
+                vec![(29003, 1_000, 10_000, true), (29039, 2_000, 20_000, true)],
+            ),
+            (
+                "nest",
+                "The Nest",
+                vec![(45556, 1_000, 10_000, true), (34604, 2_000, 20_000, false)],
+            ),
+        ] {
+            for (boss, start, end, killed) in phases {
+                let mut local = secret_local_part(50_000, ParticipantEndStatus::Present);
+                local.damage_taken = Some(5_000);
+                let mut f = flawless_fight(
+                    dungeon,
+                    boss,
+                    vec![
+                        local,
+                        flawless_part(600, "Alice", 0, Some(1_000), ParticipantEndStatus::Nexused),
+                    ],
+                );
+                f.started_at = start;
+                f.ended_at = end;
+                f.killed = killed;
+                f.local_close_calls = 1;
+                f.encounter_id = Some("dungeon_run".to_string());
+                f.encounter_run_id = Some(run.to_string());
+                db.insert_fight(&f).unwrap();
+            }
+        }
+        assert_stat_filter_parity(&db, &FightQuery::default());
+        // Late death evidence, completion corrections, and character reassignment
+        // affect reads immediately; no persisted stat-flag backfill is needed.
+        db.conn
+            .execute(
+                "UPDATE fight_participants SET end_status = 'died' WHERE is_local = 1",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE fights SET killed = 1, local_char_id = 42 WHERE encounter_run_id = 'tower'",
+                [],
+            )
+            .unwrap();
+        assert_stat_filter_parity(&db, &FightQuery::default());
+        let query = FightQuery {
+            filter_close_calls: true,
+            ..Default::default()
+        };
+        let before = db.selections_matching(&query).unwrap();
+        db.delete_selection(&before[0]).unwrap();
+        let after = db.selections_matching(&query).unwrap();
+        assert_eq!(after.len() + 1, before.len());
+        assert!(!after.contains(&before[0]));
+        assert_stat_filter_parity(&db, &FightQuery::default());
+    }
+
+    #[test]
+    fn close_call_selection_does_not_register_or_evaluate_secret_stats() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = flawless_fight("Snake Pit", 9, vec![]);
+        fight.killed = false;
+        fight.local_close_calls = 1;
+        let id = db.insert_fight(&fight).unwrap();
+        let query = FightQuery {
+            filter_close_calls: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            db.selections_matching(&query).unwrap(),
+            vec![FightSelection::Single(id)]
+        );
+        let registrations: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_function_list WHERE name LIKE 'rh_stat_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registrations, 0);
+        let mut conds = Vec::new();
+        db.apply_card_stat_filters(&query, true, &mut conds)
+            .unwrap();
+        assert!(!conds.join(" ").contains("fight_participants"));
+    }
+
+    #[test]
+    fn stat_sql_pages_and_selections_at_large_database_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let db = CombatDatabase::open_writer(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "BEGIN;
+             WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<12000)
+             INSERT INTO fights
+                 (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+                  boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+                  encounter_run_id, encounter_id, boss_group, local_close_calls)
+             SELECT n*1000, n*1000+500, 'Fungal Cavern', n, 45712,
+                    'Synthetic Crystal Worm Mother', 100000, 100000, 10, 1, 1,
+                    CASE WHEN n<=6000 THEN 'synthetic-'||((n-1)/3+1) END,
+                    CASE WHEN n<=6000 THEN 'dungeon_run' END, 'exaltation',
+                    CASE WHEN (CASE WHEN n<=6000 THEN (n-1)/3+1 ELSE n END)%251=0
+                         THEN 1 ELSE 0 END
+             FROM seq;
+             INSERT INTO encounter_runs(run_id, encounter_id, dungeon, started_at, ended_at, killed)
+             SELECT encounter_run_id, 'dungeon_run', 'Fungal Cavern',
+                    MIN(started_at), MAX(ended_at), 1
+             FROM fights WHERE encounter_run_id IS NOT NULL GROUP BY encounter_run_id;
+             WITH RECURSIVE slots(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM slots WHERE n<43)
+             INSERT INTO fight_participants
+                 (fight_id, object_id, object_type, name, equip0, equip1, equip2, equip3,
+                  damage, hits, is_local, provenance, end_status, damage_taken, enchants)
+             SELECT f.id, CASE WHEN s.n=0 THEN 10 ELSE 100+s.n END, 768,
+                    'Player'||s.n,
+                    2594, 2595, 2596, 2597,
+                    CASE WHEN s.n=0 THEN 80000 WHEN f.local_close_calls>0 THEN 0 ELSE 1000 END,
+                    10, s.n=0, 'observed',
+                    CASE WHEN s.n>0 AND f.local_close_calls>0 THEN 'nexused' ELSE 'present' END,
+                    CASE WHEN s.n=0 OR f.local_close_calls=0 THEN 5000 ELSE 1000 END,
+                    '10000,10001,10002;10000,10001,10002;10000,10001,10002;10000,10001,10002'
+             FROM fights f CROSS JOIN slots s WHERE s.n<43 OR f.id<=4000;
+             COMMIT;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let mut expected: Vec<(FightSelection, i64)> = (1..=2000)
+            .filter(|n| n % 251 == 0)
+            .map(|n| {
+                (
+                    FightSelection::Encounter(format!("synthetic-{n}")),
+                    n * 3 * 1000 + 500,
+                )
+            })
+            .chain(
+                (6001..=12000)
+                    .filter(|n| n % 251 == 0)
+                    .map(|n| (FightSelection::Single(n), n * 1000 + 500)),
+            )
+            .collect();
+        expected.sort_by(|a, b| b.1.cmp(&a.1));
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(selection, _)| selection)
+            .collect();
+        assert_eq!(expected.len(), 31);
+        println!(
+            "Synthetic combat DB: {:.2} MiB, 12,000 fights / 520,000 participants",
+            std::fs::metadata(&path).unwrap().len() as f64 / 1_048_576.0
+        );
+        let started = std::time::Instant::now();
+        // Reproduce the former list+selection work against the same fixture.
+        for _ in 0..2 {
+            let query = FightQuery::default();
+            let variants = reader.display_variants().unwrap();
+            let mut candidates = reader
+                .standalone_summaries(&query, i64::MAX, None, &variants)
+                .unwrap();
+            candidates.extend(
+                reader
+                    .encounter_summaries(&query, i64::MAX, None, &variants)
+                    .unwrap(),
+            );
+            candidates.sort_by(|a, b| {
+                b.ended_at
+                    .cmp(&a.ended_at)
+                    .then(b.started_at.cmp(&a.started_at))
+            });
+            let mut matches = Vec::new();
+            for card in &candidates {
+                reader.card_is_flawless(card).unwrap();
+                let (lone, last, most) = reader.card_secret_stats(card).unwrap();
+                if lone || last || most || card.local_close_calls > 0 {
+                    matches.push(card.selection());
+                }
+            }
+            assert_eq!(matches, expected);
+        }
+        println!(
+            "Former full-candidate list + selection: {:?}",
+            started.elapsed()
+        );
+        for mask in [1, 2, 4, 8, 15] {
+            let query = FightQuery {
+                filter_lone_fighter: mask & 1 != 0,
+                filter_last_hero: mask & 2 != 0,
+                filter_most_damage_taken: mask & 4 != 0,
+                filter_close_calls: mask & 8 != 0,
+                ..Default::default()
+            };
+            let started = std::time::Instant::now();
+            let page = reader.list_fights(&query, 5).unwrap();
+            let list_elapsed = started.elapsed();
+            assert_eq!(
+                page.iter().map(FightSummary::selection).collect::<Vec<_>>(),
+                expected[..5]
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(reader.selections_matching(&query).unwrap(), expected);
+            println!(
+                "mask={mask}: list5={list_elapsed:?}, selections31={:?}",
+                started.elapsed()
+            );
+            if mask == 1 {
+                for encounter in [false, true] {
+                    let mut conds = Vec::new();
+                    reader
+                        .apply_card_stat_filters(&query, encounter, &mut conds)
+                        .unwrap();
+                    let (from, index) = if encounter {
+                        ("encounter_runs r", "idx_fights_run")
+                    } else {
+                        (
+                            "fights f INDEXED BY idx_fights_ended",
+                            "INTEGER PRIMARY KEY",
+                        )
+                    };
+                    let mut stmt = reader
+                        .conn
+                        .prepare(&format!(
+                            "EXPLAIN QUERY PLAN SELECT 1 FROM {from} WHERE {} LIMIT 5",
+                            conds.join(" AND ")
+                        ))
+                        .unwrap();
+                    let plan: Vec<String> = stmt
+                        .query_map([], |row| row.get(3))
+                        .unwrap()
+                        .collect::<SqlResult<_>>()
+                        .unwrap();
+                    assert!(plan.iter().any(|s| s.contains(index)), "{plan:?}");
+                    assert!(
+                        plan.iter().any(|s| s.contains("idx_participants_fight")),
+                        "{plan:?}"
+                    );
+                    assert!(!plan.iter().any(|s| s.starts_with("SCAN p ")), "{plan:?}");
+                }
+            }
         }
     }
 
@@ -9330,7 +9934,12 @@ mod tests {
 
         // One grouped card, titled "Pentaract" and marked killed.
         let summaries = db
-            .encounter_summaries(&FightQuery::default(), 10, None)
+            .encounter_summaries(
+                &FightQuery::default(),
+                10,
+                None,
+                &db.display_variants().unwrap(),
+            )
             .unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].boss_name, "Pentaract");
@@ -9365,7 +9974,12 @@ mod tests {
         db.regroup_realm_encounters().unwrap();
 
         let summaries = db
-            .encounter_summaries(&FightQuery::default(), 10, None)
+            .encounter_summaries(
+                &FightQuery::default(),
+                10,
+                None,
+                &db.display_variants().unwrap(),
+            )
             .unwrap();
         assert_eq!(summaries.len(), 1, "segments fold into one card");
         let card = &summaries[0];
@@ -9445,7 +10059,12 @@ mod tests {
         assert_eq!(killed, 1, "loot-latched Completed flag is preserved");
 
         let summaries = db
-            .encounter_summaries(&FightQuery::default(), 10, None)
+            .encounter_summaries(
+                &FightQuery::default(),
+                10,
+                None,
+                &db.display_variants().unwrap(),
+            )
             .unwrap();
         assert_eq!(
             summaries.len(),
@@ -9565,7 +10184,12 @@ mod tests {
 
         // One grouped Hornet's Nest card holding all four phases.
         let summaries = db
-            .encounter_summaries(&FightQuery::default(), 10, None)
+            .encounter_summaries(
+                &FightQuery::default(),
+                10,
+                None,
+                &db.display_variants().unwrap(),
+            )
             .unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].boss_name, "Hornet's Nest");
@@ -9620,7 +10244,12 @@ mod tests {
 
         // One grouped Legion Missionary card holding all three phases.
         let summaries = db
-            .encounter_summaries(&FightQuery::default(), 10, None)
+            .encounter_summaries(
+                &FightQuery::default(),
+                10,
+                None,
+                &db.display_variants().unwrap(),
+            )
             .unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].boss_name, "Legion Missionary");

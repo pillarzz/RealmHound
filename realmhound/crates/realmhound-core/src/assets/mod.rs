@@ -67,8 +67,8 @@ pub use dungeon_portals::{
     LEGACY_EMBED_PORTAL_COUNT,
 };
 pub use enchantments::{
-    EnchantCatalogEntry, EnchantEffect, EnchantEffectKind, EnchantmentDef, EnchantmentList,
-    EnchantmentTier,
+    EnchantCatalogEntry, EnchantEffect, EnchantEffectKind, EnchantSubAttack, EnchantmentDef,
+    EnchantmentList, EnchantmentTier,
 };
 pub use item_category::{slot_type_from_name, ItemCategorizer, ItemCategory, ItemSubCategory};
 pub use manager::{

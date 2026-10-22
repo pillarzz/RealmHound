@@ -2618,8 +2618,19 @@ pub struct AssetManager {
 /// Equipment XML files that define items. `equip_lo.xml` and
 /// `equip_design.xml` are supplemental catalogs for newer items (for example
 /// `HDruidST0`, "Aeonic Talon", and the Heirlooms set) that the game does not
-/// duplicate in `equip.xml`.
-const EQUIPMENT_XML_FILES: &[&str] = &["equip.xml", "equip_lo.xml", "equip_design.xml"];
+/// duplicate in `equip.xml`. `equipSubs.xml` holds the sub-attack containers
+/// (`SUBATTACK_CONTAINER`) that enchantments inject into a weapon's firing
+/// pattern; without their `<Subattack>` tables an enchanted shot cannot resolve
+/// its projectile.
+///
+/// Merging only enriches objects already loaded from `ObjectID.list`, so a
+/// catalog can never introduce a phantom object.
+const EQUIPMENT_XML_FILES: &[&str] = &[
+    "equip.xml",
+    "equip_lo.xml",
+    "equip_design.xml",
+    "equipSubs.xml",
+];
 
 /// Merge every available equipment catalog into `list`. Returns the number of
 /// objects enriched. Missing files are skipped so older asset packs still load.
@@ -3670,6 +3681,121 @@ impl AssetManager {
             resolved.max_damage,
             resolved.armor_piercing,
             asset.slot_type,
+        ))
+    }
+
+    /// Resolve a weapon shot's projectile damage, honoring an enchantment that
+    /// replaces or adds a sub-attack slot.
+    ///
+    /// `PlayerShoot.projectileId` is the *sub-attack slot*. `AddSubAttack` /
+    /// `SetSubAttack` enchantments point a slot at a container object that owns
+    /// the real projectile, so an enchanted weapon's slot resolves against that
+    /// container instead of its own `<Projectile>` list. Without this, an
+    /// enchanted Demon Blade's slot 1 has no projectile at all.
+    ///
+    /// Returns `(min_damage, max_damage, armor_piercing, slot_type)` of the
+    /// *weapon*, or `None` when neither the enchantment nor the weapon resolves.
+    pub fn weapon_projectile_with_enchants(
+        &self,
+        id: i32,
+        projectile_id: usize,
+        enchant_ids: &[u16],
+    ) -> Option<(i32, i32, bool, i32, Option<u16>)> {
+        if !enchant_ids.is_empty() {
+            // Copy the target out first: the enchantments and objects locks are
+            // never held together anywhere in this manager.
+            if let Some((enchant_id, container, index)) =
+                self.enchant_sub_attack_target(enchant_ids, projectile_id)
+            {
+                if let Some((min, max, ap)) = self.container_projectile(&container, index) {
+                    let slot_type = self
+                        .objects
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|list| list.get(id))
+                        .map(|weapon| weapon.slot_type)
+                        .unwrap_or(0);
+                    return Some((min, max, ap, slot_type, Some(enchant_id)));
+                }
+            }
+        }
+        self.weapon_projectile(id, projectile_id)
+            .map(|(min, max, ap, slot_type)| (min, max, ap, slot_type, None))
+    }
+
+    /// Whether an item declares an `OnPlayerShootActivate` proc, i.e. an effect
+    /// that fires alongside every weapon shot rather than on activation.
+    pub fn item_has_on_shoot_proc(&self, id: i32) -> bool {
+        self.try_load();
+        self.objects
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|list| list.has_on_shoot_proc(id))
+            .unwrap_or(false)
+    }
+
+    /// Number of `SetSubAttack` / `AddSubAttack` patterns an enchantment declares.
+    /// Used to tell whether a weapon's extra firing pattern can belong to it.
+    pub fn enchant_sub_attack_count(&self, type_id: u16) -> usize {
+        self.try_load();
+        self.enchantments
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|list| list.sub_attacks(type_id).len())
+            .unwrap_or(0)
+    }
+
+    /// The enchantment, container object and index an enchantment assigns to
+    /// `slot`, from the first equipped enchant that defines it. Copies the target
+    /// so the caller can resolve it without holding the enchantments lock.
+    fn enchant_sub_attack_target(
+        &self,
+        enchant_ids: &[u16],
+        slot: usize,
+    ) -> Option<(u16, String, usize)> {
+        let guard = self.enchantments.read().unwrap();
+        let list = guard.as_ref()?;
+        for &id in enchant_ids {
+            if let Some(entry) = list
+                .sub_attacks(id)
+                .iter()
+                .find(|entry| entry.slot == slot as i32)
+            {
+                return Some((
+                    id,
+                    entry.container.clone(),
+                    entry.container_index.max(0) as usize,
+                ));
+            }
+        }
+        None
+    }
+
+    /// A sub-attack container's projectile `(min, max, armor_piercing)`.
+    ///
+    /// The element text names the container entry, which is a projectile index
+    /// in every catalog observed so far; some containers instead expose the
+    /// index through their `<Subattack>` table, and a container with a single
+    /// entry can only mean 0, so those are tried in turn.
+    fn container_projectile(&self, container: &str, index: usize) -> Option<(i32, i32, bool)> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        let list = guard.as_ref()?;
+        let asset = list.get_by_name(container)?;
+        let resolvable = |i: usize| asset.projectiles.get(i);
+        let projectile = resolvable(index)
+            .or_else(|| {
+                list.subattack_projectile_index(asset.id, index)
+                    .and_then(resolvable)
+            })
+            .or_else(|| (asset.projectiles.len() == 1).then(|| &asset.projectiles[0]))?;
+        Some((
+            projectile.min_damage,
+            projectile.max_damage,
+            projectile.armor_piercing,
         ))
     }
 
@@ -4803,6 +4929,88 @@ pub fn find_assets_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enchant_sub_attack_resolves_the_container_projectile() {
+        // Demon Blade + Hellfire Edge: the enchant replaces slot 0 and adds slot
+        // 1, both sourced from the "Hellfire Edge Enchantment Proc" container
+        // (105-125). Without the enchant the weapon's own 150-175 projectile is
+        // used and slot 1 does not exist at all.
+        let dir = std::env::temp_dir().join(format!("rh_subattack_test_{}", std::process::id()));
+        let xml_dir = dir.join("xml");
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        std::fs::write(
+            dir.join("ObjectID.list"),
+            concat!(
+                "3073;;Equipment;;150:175:0;abyssOfDemonsObjects8x8:1;EQUIPMENT,WEAPON,SWORD;Demon Blade;;;;1;0;1\n",
+                "12150;;Equipment;;105:125:0,105:125:0;abyssOfDemonsObjects8x8:1;SUBATTACK_CONTAINER;Hellfire Edge Enchantment Proc;;;;1;0;1\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            xml_dir.join("equipSubs.xml"),
+            r#"<Objects>
+  <Object id="Hellfire Edge Enchantment Proc" type="0x2F76">
+    <Class>Equipment</Class>
+    <Projectile id="0"><MinDamage>105</MinDamage><MaxDamage>125</MaxDamage></Projectile>
+    <Subattack index="0" projectileId="0"><NumProjectiles>2</NumProjectiles></Subattack>
+    <Projectile id="1"><MinDamage>105</MinDamage><MaxDamage>125</MaxDamage></Projectile>
+    <Subattack index="1" projectileId="1"><NumProjectiles>1</NumProjectiles></Subattack>
+    <Labels>SUBATTACK_CONTAINER</Labels>
+  </Object>
+</Objects>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            xml_dir.join("enchantments.xml"),
+            r#"<Enchantments>
+  <Enchantment id="AWAKENED_DEMON_BLADE" type="0x4008">
+    <DisplayId>Hellfire Edge</DisplayId>
+    <Mutators>
+      <SetSubAttack subAttackIndex="0" subAttackObject="Hellfire Edge Enchantment Proc">0</SetSubAttack>
+      <AddSubAttack subAttackIndex="1" subAttackObject="Hellfire Edge Enchantment Proc">1</AddSubAttack>
+    </Mutators>
+  </Enchantment>
+</Enchantments>"#,
+        )
+        .unwrap();
+
+        let mut list = ObjectList::load_from_file(dir.join("ObjectID.list")).unwrap();
+        merge_equipment_xml_files(&mut list, &dir);
+
+        let manager = AssetManager::new();
+        manager.set_assets_dir(&dir);
+        *manager.objects.write().unwrap() = Some(list);
+        *manager.enchantments.write().unwrap() =
+            Some(EnchantmentList::load_from_file(&xml_dir.join("enchantments.xml")).unwrap());
+
+        // Unenchanted: slot 0 uses the weapon's own projectile, slot 1 is gone.
+        assert_eq!(
+            manager.weapon_projectile_with_enchants(3073, 0, &[]),
+            Some((150, 175, false, 1, None))
+        );
+        assert_eq!(manager.weapon_projectile_with_enchants(3073, 1, &[]), None);
+
+        // Hellfire Edge: both slots resolve to the container's 105-125, credited
+        // to the enchant that supplied them.
+        let hellfire = [0x4008u16];
+        assert_eq!(
+            manager.weapon_projectile_with_enchants(3073, 0, &hellfire),
+            Some((105, 125, false, 1, Some(0x4008)))
+        );
+        assert_eq!(
+            manager.weapon_projectile_with_enchants(3073, 1, &hellfire),
+            Some((105, 125, false, 1, Some(0x4008))),
+            "an added sub-attack slot resolves through the container"
+        );
+        // An unknown enchant id leaves the weapon's own resolution in place.
+        assert_eq!(
+            manager.weapon_projectile_with_enchants(3073, 0, &[0x9999]),
+            Some((150, 175, false, 1, None))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn loads_supplemental_equipment_catalogs() {

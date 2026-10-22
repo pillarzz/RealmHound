@@ -995,6 +995,12 @@ struct LocalVolleyHit {
     /// The fight the hit landed in, for the same reason as
     /// [`LocalDamageEvent::destination`].
     destination: FightDestination,
+    /// True when the local client fired this projectile itself from an ability
+    /// activation (`PlayerShoot.weaponId` named the ability slot), false for a
+    /// volley the server fired. A client-fired ability shot has already proved
+    /// which item owns it, so it is credited to that item's latest activation
+    /// without the attribution window the server volleys still need.
+    owns_ability: bool,
 }
 
 /// The stable identity of one fight's damage destination. A normal boss is its
@@ -1308,9 +1314,13 @@ pub struct CombatTracker {
     /// arrive before a seed cannot be rolled.
     rng_seeded: bool,
     /// Whether local self-damage can be trusted for the current map. Cleared for
-    /// the rest of a map if the RNG is unseeded when a shot arrives or a weapon's
-    /// asset data is unavailable (either would desync the sequence).
+    /// the rest of a map if the RNG is unseeded when a shot arrives (that would
+    /// desync every later roll). An unresolvable projectile does NOT clear it:
+    /// that single shot stays unresolved instead.
     self_damage_available: bool,
+    /// Whether the one-per-map warning about an unresolvable projectile has been
+    /// logged, so a weapon firing one every tick cannot flood the log.
+    unresolved_projectile_logged: bool,
     /// Rolled local shots awaiting their `EnemyHit`, keyed by bullet id.
     pending_shots: HashMap<i16, PendingShot>,
     /// Client `time` of the most recent local shot trigger (from the outgoing
@@ -1535,6 +1545,7 @@ impl CombatTracker {
             rng: Rng::new(0),
             rng_seeded: false,
             self_damage_available: false,
+            unresolved_projectile_logged: false,
             pending_shots: HashMap::new(),
             last_shot_trigger: None,
             lethal_strike_windows: VecDeque::new(),
@@ -1671,6 +1682,7 @@ impl CombatTracker {
         self.rng = Rng::new(map_seed);
         self.rng_seeded = true;
         self.self_damage_available = true;
+        self.unresolved_projectile_logged = false;
         self.pending_shots.clear();
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
@@ -1722,6 +1734,7 @@ impl CombatTracker {
         // The RNG state does not survive a disconnect; a new map seed is required.
         self.rng_seeded = false;
         self.self_damage_available = false;
+        self.unresolved_projectile_logged = false;
         self.pending_shots.clear();
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
@@ -3608,7 +3621,26 @@ impl CombatTracker {
             return;
         }
         // The local player's stats must be known to compute the attack multiplier.
-        let Some(local) = self.objects.get(&self.local_object_id) else {
+        // Snapshotted rather than borrowed: the unresolved-projectile path below
+        // mutates `self`, which a live borrow of `self.objects` forbids.
+        let local_snapshot = self.objects.get(&self.local_object_id).map(|local| {
+            (
+                local.attack_seen,
+                // Mastery and the seasonal Crucible/Blood Ritual multipliers are
+                // character data rather than object stats, so they are folded in
+                // from the tracker (see `set_shot_damage_bonus`) -- the game scales
+                // the weapon's whole damage range by them, and the server-side
+                // spell values the ability rows use already include them.
+                AttackerStats {
+                    mastery_mult: self.shot_damage_bonus.mastery,
+                    challenge_mult: self.shot_damage_bonus.challenge,
+                    ..local.attacker_stats()
+                },
+                local.equipment,
+                local.equipment_enchants.clone(),
+            )
+        });
+        let Some((attack_seen, atk, local_equipment, local_enchants)) = local_snapshot else {
             tracing::warn!(
                 "[COMBAT] self-compute disabled for this map: local object {} not in \
                  the object table at weapon={weapon_id} projectile_id={projectile_id}",
@@ -3617,7 +3649,7 @@ impl CombatTracker {
             self.self_damage_available = false;
             return;
         };
-        if !local.attack_seen {
+        if !attack_seen {
             tracing::warn!(
                 "[COMBAT] self-compute disabled for this map: local ATT stat not \
                  observed yet at weapon={weapon_id} projectile_id={projectile_id}"
@@ -3673,8 +3705,12 @@ impl CombatTracker {
             damage::roll_base_damage(&mut self.rng, min, max, min_mult, max_mult, slot, &atk);
         // The gear this shot is credited to, snapshotted now: the hit may arrive
         // after a swap (see `PendingShot::shot_gear`).
-        let mut shot_gear = (local.equipment, local.equipment_enchants.clone());
-        if shot_gear.0[WEAPON_SLOT] != weapon_id {
+        let mut shot_gear = (local_equipment, local_enchants);
+        if ability_item.is_some() {
+            // The firing item is the ability, not a weapon, so the weapon slot
+            // keeps the gear actually worn: overwriting it here is what turned an
+            // ability's shots into a weapon row named after the ability.
+        } else if shot_gear.0[WEAPON_SLOT] != weapon_id {
             // The equipment snapshot lags the swap (same condition the damage-roll
             // guard above covers): trust the packet's weapon and drop the stale
             // weapon enchants rather than pair one weapon with another's.
@@ -3692,8 +3728,51 @@ impl CombatTracker {
                 procs_credited: false,
                 extra_projectile,
                 shot_geo: Some((shot_x, shot_y, angle)),
+                enchant_source,
+                raw_projectile_id: projectile_id,
+                ls_cloak,
+                ability_item,
             },
         );
+    }
+
+    /// The damage range an ability's own shot is rolled from.
+    ///
+    /// An item's `<Activate>` shoot effect carries `scalingStat`,
+    /// `statModScalingMin` and `statModDamage`: per shot its damage is the item's
+    /// `<Projectile>` range plus `statModDamage * max(0, stat - statModScalingMin)`
+    /// for whichever of the eight stats it names. `None` when the item declares no
+    /// shoot effect, in which case the raw projectile range stands.
+    ///
+    /// Readers go through the effect's own `min_for` / `max_for`, which the
+    /// Character Stats readout also uses, so the two paths share one formula
+    /// instead of two copies of it.
+    fn ability_shot_range(&self, item: i32) -> Option<(i32, i32, bool)> {
+        use crate::assets::AbilityEffect;
+        let effects = get_asset_manager().ability_effects(item)?;
+        let local = self.objects.get(&self.local_object_id)?;
+        for effect in &effects.effects {
+            match effect {
+                // `min_hex` above zero is an orb's on-hex-consume burst, which the
+                // server fires; only the on-activate burst is the client's own shot.
+                AbilityEffect::ProjectileBurst { burst, min_hex, .. } if *min_hex == 0 => {
+                    let stat = burst
+                        .scaling_stat
+                        .and_then(|s| local.effective_scaling_stat(s))
+                        .unwrap_or(0);
+                    return Some((burst.min_for(stat), burst.max_for(stat), burst.armor_piercing));
+                }
+                AbilityEffect::Shuriken(sh) => {
+                    let stat = sh
+                        .scaling_stat
+                        .and_then(|s| local.effective_scaling_stat(s))
+                        .unwrap_or(0);
+                    return Some((sh.min_for(stat), sh.max_for(stat), sh.armor_piercing));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Snapshot the local player's Lethal Strike state at shoot time: the
@@ -4136,7 +4215,10 @@ impl CombatTracker {
                     entry.source_enchants = enchants;
                 }
             }
-        } else if let Some(item_id) = volley_item {
+        } else if let Some((item_id, owns_ability)) = ability_shot_item
+            .map(|item| (item, true))
+            .or_else(|| volley_item.map(|item| (item, false)))
+        {
             // An ability volley's hit: the packet named the ability that fired it,
             // so the damage belongs to that ability's own activation. It stays out
             // of the loadout bucket, which is the weapon breakdown and holds
@@ -4147,6 +4229,7 @@ impl CombatTracker {
                 item_id,
                 damage: dmg,
                 destination,
+                owns_ability,
             });
             self.trim_local_event_logs();
         } else {
@@ -7359,6 +7442,31 @@ mod tests {
     }
 
     #[test]
+    fn unresolvable_projectile_does_not_disable_the_map() {
+        // One projectile the asset layer cannot resolve (in tests no assets are
+        // loaded, which is the same shape as an unmodelled enchant sub-attack)
+        // must leave that shot unvalued instead of zeroing every later fight on
+        // the map (issue #73).
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 100)]), 5);
+        t.on_local_shot(0x333, 1, 7, 10, 0.0, 0.0, 0.0, 10);
+        assert!(
+            t.self_damage_available,
+            "an unresolved projectile keeps self-compute alive"
+        );
+        assert!(
+            !t.pending_shots.contains_key(&7),
+            "the unresolved shot is not given a value"
+        );
+        // A second one is equally harmless (and does not log again).
+        t.on_local_shot(0x333, 2, 8, 20, 0.0, 0.0, 0.0, 20);
+        assert!(t.self_damage_available);
+        assert!(t.unresolved_projectile_logged);
+    }
+
+    #[test]
     fn shot_without_seed_disables_self_damage() {
         let mut t = CombatTracker::new();
         // Force the "available but unseeded" edge (capture starting mid-map).
@@ -9148,6 +9256,7 @@ mod tests {
                 item_id: 999,
                 damage,
                 destination,
+                owns_ability: false,
             });
         }
 

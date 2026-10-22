@@ -74,6 +74,23 @@ impl EnchantEffectKind {
     }
 }
 
+/// One `SetSubAttack` / `AddSubAttack` mutator: the enchantment replaces or adds
+/// the firing pattern at `slot`, sourcing it from a sub-attack container object.
+///
+/// The client reports the *sub-attack slot* in `PlayerShoot.projectileId`, so a
+/// slot overridden here must be resolved against the container rather than the
+/// weapon's own `<Projectile>` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnchantSubAttack {
+    /// Weapon sub-attack slot this entry defines (`subAttackIndex`).
+    pub slot: i32,
+    /// Internal id of the container object (`subAttackObject`), resolved by name.
+    pub container: String,
+    /// Index into the container's `Subattack` / `Projectile` tables (element
+    /// text). `-1` when the text was missing or unparsable.
+    pub container_index: i32,
+}
+
 /// One parsed `<ActivateOnEquip>` mutator from an enchantment's `<Mutators>`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EnchantEffect {
@@ -215,6 +232,9 @@ pub struct EnchantmentDef {
     pub rollable: bool,
     /// Parsed `<Mutators>` effects (stat/loot/xp/dust bonuses).
     pub effects: Vec<EnchantEffect>,
+    /// `SetSubAttack` / `AddSubAttack` entries: weapon slots whose firing
+    /// pattern comes from a sub-attack container object.
+    pub sub_attacks: Vec<EnchantSubAttack>,
 }
 
 /// Uppercase family key for an enchantment internal id: the id with any
@@ -307,6 +327,9 @@ impl EnchantmentList {
         let mut pending_effect_stat: Option<StatKind> = None;
         let mut pending_effect_amount: f32 = 0.0;
         let mut pending_effect_rel: Option<StatKind> = None;
+        // `(slot, container)` of an open SetSubAttack / AddSubAttack; its text is
+        // the container index.
+        let mut pending_sub_attack: Option<(i32, String)> = None;
 
         loop {
             match xml_reader.read_event_into(&mut buf) {
@@ -324,6 +347,7 @@ impl EnchantmentList {
                                 tier_num: None,
                                 rollable: false,
                                 effects: Vec::new(),
+                                sub_attacks: Vec::new(),
                             };
 
                             for attr in e.attributes().flatten() {
@@ -439,6 +463,24 @@ impl EnchantmentList {
                                 }
                             }
                         }
+                        // Sub-attack replacement/addition: `subAttackIndex` is the
+                        // weapon slot, `subAttackObject` names the container, and
+                        // the element text is the container's own index.
+                        b"SetSubAttack" | b"AddSubAttack" if in_mutators => {
+                            let mut slot = -1i32;
+                            let mut container = String::new();
+                            for attr in e.attributes().flatten() {
+                                let v = String::from_utf8_lossy(&attr.value);
+                                match attr.key.as_ref() {
+                                    b"subAttackIndex" => {
+                                        slot = v.trim().parse().unwrap_or(-1);
+                                    }
+                                    b"subAttackObject" => container = v.trim().to_string(),
+                                    _ => {}
+                                }
+                            }
+                            pending_sub_attack = Some((slot, container));
+                        }
                         _ => {}
                     }
                 }
@@ -480,6 +522,9 @@ impl EnchantmentList {
                     b"MultiplyMinDamage" | b"MultiplyMaxDamage" | b"MultiplyRateOfFire" => {
                         in_mult_damage = None;
                     }
+                    b"SetSubAttack" | b"AddSubAttack" => {
+                        pending_sub_attack = None;
+                    }
                     _ => {}
                 },
                 Ok(Event::Text(ref e)) => {
@@ -500,6 +545,12 @@ impl EnchantmentList {
                                 amount: text.trim().parse().unwrap_or(1.0),
                                 stat_relative_to: None,
                                 projectile_id: pending_mult_projectile,
+                            });
+                        } else if let Some((slot, container)) = pending_sub_attack.take() {
+                            enchant.sub_attacks.push(EnchantSubAttack {
+                                slot,
+                                container,
+                                container_index: text.trim().parse().unwrap_or(-1),
                             });
                         } else if in_display_id {
                             enchant.display_name = text;
@@ -549,6 +600,14 @@ impl EnchantmentList {
         self.by_id
             .get(&type_id)
             .map(|e| e.effects.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// `SetSubAttack` / `AddSubAttack` entries for an enchantment, or empty.
+    pub fn sub_attacks(&self, type_id: u16) -> &[EnchantSubAttack] {
+        self.by_id
+            .get(&type_id)
+            .map(|e| e.sub_attacks.as_slice())
             .unwrap_or(&[])
     }
 
@@ -738,6 +797,36 @@ mod tests {
         assert_eq!(rof[0].kind, EnchantEffectKind::MultiplyRateOfFire);
         assert!((rof[0].amount - 1.03).abs() < 1e-4);
         assert_eq!(rof[0].projectile_id, -1);
+    }
+
+    #[test]
+    fn test_parse_sub_attack_mutators() {
+        // Hellfire Edge: slot 0 is replaced by container entry 0 and slot 1 is
+        // added from container entry 1.
+        let xml = r#"<Enchantments>
+  <Enchantment id="AWAKENED_DEMON_BLADE" type="0x4008">
+    <DisplayId>Hellfire Edge</DisplayId>
+    <Mutators>
+      <SetSubAttack subAttackIndex="0" subAttackObject="Hellfire Edge Enchantment Proc">0</SetSubAttack>
+      <AddSubAttack subAttackIndex="1" subAttackObject="Hellfire Edge Enchantment Proc">1</AddSubAttack>
+      <ActivateOnEquip amount="33" stat="DEX" statRelativeTo="VIT">BonusStatRelative</ActivateOnEquip>
+    </Mutators>
+  </Enchantment>
+</Enchantments>"#;
+        let list = EnchantmentList::parse_xml(xml.as_bytes()).unwrap();
+        let subs = list.sub_attacks(0x4008);
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].slot, 0);
+        assert_eq!(subs[0].container, "Hellfire Edge Enchantment Proc");
+        assert_eq!(subs[0].container_index, 0);
+        assert_eq!(subs[1].slot, 1);
+        assert_eq!(subs[1].container_index, 1);
+        // The stat mutator still parses alongside them.
+        let effects = list.effects(0x4008);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].kind, EnchantEffectKind::BonusStatRelative);
+        // Enchants without sub-attack mutators report an empty slice.
+        assert!(list.sub_attacks(0x9999).is_empty());
     }
 
     #[test]

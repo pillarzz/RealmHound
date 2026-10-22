@@ -924,6 +924,24 @@ pub struct ShurikenEffect {
     pub stat_mod_damage: f32,
 }
 
+impl ShurikenEffect {
+    fn sb(&self, s: i32) -> f32 {
+        (s as f32 - self.stat_mod_scaling_min).max(0.0)
+    }
+    /// Minimum per-shot damage at scaling stat `s`.
+    pub fn min_for(&self, s: i32) -> i32 {
+        (self.min_damage + self.stat_mod_damage * self.sb(s))
+            .round()
+            .max(0.0) as i32
+    }
+    /// Maximum per-shot damage at scaling stat `s`.
+    pub fn max_for(&self, s: i32) -> i32 {
+        (self.max_damage + self.stat_mod_damage * self.sb(s))
+            .round()
+            .max(0.0) as i32
+    }
+}
+
 /// A hex-stack-gated condition duration override from `OnDetonateHexActivate
 /// ApplyCondition`. When a `DetonateHex` consumes at least `min_hex` stacks,
 /// this condition is applied for `duration` seconds (overriding the base
@@ -3621,6 +3639,44 @@ pub fn decode_tex(tex: u32) -> TexInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_scaling_stat_the_game_data_uses_parses() {
+        // The eight RotMG stats the live `<Activate>` elements scale off. `MAHMP`
+        // is not a typo on this side: Kaiju Skull declares it, and dropping the
+        // name silently zeroed the summon's bonus.
+        for (name, want) in [
+            ("WIS", ScalingStat::Wisdom),
+            ("ATT", ScalingStat::Attack),
+            ("DEF", ScalingStat::Defense),
+            ("DEX", ScalingStat::Dexterity),
+            ("VIT", ScalingStat::Vitality),
+            ("SPD", ScalingStat::Speed),
+            ("MAXMP", ScalingStat::MaxMp),
+            ("MAXHP", ScalingStat::MaxHp),
+            ("HP", ScalingStat::MaxHp),
+            ("MAHMP", ScalingStat::MaxHp),
+        ] {
+            assert_eq!(ScalingStat::parse(name), Some(want), "{name} must parse");
+        }
+        assert_eq!(ScalingStat::parse("NOPE"), None);
+    }
+
+    #[test]
+    fn a_shuriken_scales_its_damage_off_its_stat() {
+        let sh = ShurikenEffect {
+            min_damage: 400.0,
+            max_damage: 500.0,
+            num_projectiles: 1,
+            armor_piercing: false,
+            scaling_stat: Some(ScalingStat::Dexterity),
+            stat_mod_scaling_min: 50.0,
+            stat_mod_damage: 4.0,
+        };
+        assert_eq!((sh.min_for(50), sh.max_for(50)), (400, 500), "at the floor");
+        assert_eq!((sh.min_for(80), sh.max_for(80)), (520, 620), "+4 per point");
+        assert_eq!((sh.min_for(20), sh.max_for(20)), (400, 500), "below the floor clamps");
+    }
 
     #[test]
     fn test_parse_object_line() {

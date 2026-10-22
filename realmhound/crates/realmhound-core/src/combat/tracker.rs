@@ -3902,7 +3902,11 @@ impl CombatTracker {
                         .scaling_stat
                         .and_then(|s| local.effective_scaling_stat(s))
                         .unwrap_or(0);
-                    return Some((burst.min_for(stat), burst.max_for(stat), burst.armor_piercing));
+                    return Some((
+                        burst.min_for(stat),
+                        burst.max_for(stat),
+                        burst.armor_piercing,
+                    ));
                 }
                 AbilityEffect::Shuriken(sh) => {
                     let stat = sh
@@ -9801,7 +9805,8 @@ mod tests {
             10,
         );
         t.on_object_status(1000, &status(1000, vec![name_stat("You")]), 10);
-        t.local_ability_uses.push_back(ability_use(100, 0xC07, None));
+        t.local_ability_uses
+            .push_back(ability_use(100, 0xC07, None));
         t.pending_shots.insert(
             9,
             PendingShot {
@@ -9826,7 +9831,10 @@ mod tests {
             p.damage_by_pattern.is_empty(),
             "nor does it open a firing-pattern row under a weapon"
         );
-        assert!(p.ls_by_weapon.is_empty(), "ability shots get no Lethal Strike");
+        assert!(
+            p.ls_by_weapon.is_empty(),
+            "ability shots get no Lethal Strike"
+        );
     }
 
     #[test]
@@ -9853,7 +9861,8 @@ mod tests {
             10,
         );
         t.on_object_status(1000, &status(1000, vec![name_stat("You")]), 10);
-        t.local_ability_uses.push_back(ability_use(100, 0xC07, None));
+        t.local_ability_uses
+            .push_back(ability_use(100, 0xC07, None));
         t.pending_shots.insert(
             9,
             PendingShot {
@@ -9906,7 +9915,10 @@ mod tests {
         );
         t.on_local_shot(0xC07, -1, 7, 100, 0.0, 0.0, 0.0, 150);
 
-        let shot = t.pending_shots.get(&7).expect("the ability's shot recorded");
+        let shot = t
+            .pending_shots
+            .get(&7)
+            .expect("the ability's shot recorded");
         assert_eq!(shot.ability_item, Some(0xC07));
         assert_eq!(
             shot.shot_gear.0[WEAPON_SLOT], 3072,
@@ -9918,7 +9930,10 @@ mod tests {
              got {}",
             shot.base_damage
         );
-        assert!(shot.lethal_strike.is_none(), "no Lethal Strike on ability shots");
+        assert!(
+            shot.lethal_strike.is_none(),
+            "no Lethal Strike on ability shots"
+        );
     }
 
     #[test]
@@ -10031,7 +10046,8 @@ mod tests {
         // is inside the window. Losing it would leave the damage in the fight
         // total while no row showed it (observed: 8 hits landed, 7 credited).
         let mut t = CombatTracker::new();
-        t.local_ability_uses.push_back(ability_use(500, 0xC07, None));
+        t.local_ability_uses
+            .push_back(ability_use(500, 0xC07, None));
         t.local_volley_hits.push_back(LocalVolleyHit {
             time_ms: 100,
             item_id: 0xC07,
@@ -11366,10 +11382,7 @@ mod tests {
             34570,
             &status(
                 500,
-                vec![
-                    stat(StatType::MaxHP, 18_500),
-                    stat(StatType::HP, 18_500),
-                ],
+                vec![stat(StatType::MaxHP, 18_500), stat(StatType::HP, 18_500)],
             ),
             0,
         );

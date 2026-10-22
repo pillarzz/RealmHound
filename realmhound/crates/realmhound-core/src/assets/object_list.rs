@@ -1909,27 +1909,23 @@ impl ObjectList {
             let mut current: Option<i32> = None;
             loop {
                 match reader.read_event_into(&mut buf) {
-                    Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                        match e.name().as_ref() {
-                            b"Object" => {
-                                current = e
-                                    .attributes()
-                                    .flatten()
-                                    .find(|a| a.key.as_ref() == b"type")
-                                    .and_then(|a| {
-                                        parse_hex_type(&String::from_utf8_lossy(&a.value))
-                                    });
-                            }
-                            b"AlwaysPositiveHealth" => {
-                                if let Some(id) = current {
-                                    if self.always_positive_health_types.insert(id) {
-                                        found += 1;
-                                    }
+                    Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => match e.name().as_ref() {
+                        b"Object" => {
+                            current = e
+                                .attributes()
+                                .flatten()
+                                .find(|a| a.key.as_ref() == b"type")
+                                .and_then(|a| parse_hex_type(&String::from_utf8_lossy(&a.value)));
+                        }
+                        b"AlwaysPositiveHealth" => {
+                            if let Some(id) = current {
+                                if self.always_positive_health_types.insert(id) {
+                                    found += 1;
                                 }
                             }
-                            _ => {}
                         }
-                    }
+                        _ => {}
+                    },
                     Ok(Event::End(ref e)) => {
                         if e.name().as_ref() == b"Object" {
                             current = None;
@@ -3787,7 +3783,11 @@ mod tests {
         };
         assert_eq!((sh.min_for(50), sh.max_for(50)), (400, 500), "at the floor");
         assert_eq!((sh.min_for(80), sh.max_for(80)), (520, 620), "+4 per point");
-        assert_eq!((sh.min_for(20), sh.max_for(20)), (400, 500), "below the floor clamps");
+        assert_eq!(
+            (sh.min_for(20), sh.max_for(20)),
+            (400, 500),
+            "below the floor clamps"
+        );
     }
 
     #[test]
@@ -4934,4 +4934,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

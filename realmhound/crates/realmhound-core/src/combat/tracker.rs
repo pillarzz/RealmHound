@@ -3473,7 +3473,24 @@ impl CombatTracker {
             let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
                 use_.item_id == hit.item_id
                     && hit.time_ms >= use_.time_ms
-                    && hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
+                    // A shot the client fired from an activation has already
+                    // proved which item owns it, so it is the latest activation of
+                    // that item however long the projectile took to land. The
+                    // window only bounds server volleys, where a late packet could
+                    // otherwise be blamed on an activation that could not have
+                    // produced it.
+                    && (hit.owns_ability
+                        || hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS)
+            });
+            // A hit that no activation can own yet would otherwise stay in the
+            // fight total while appearing in no row at all (a quiver's first bolt
+            // can land before the fight's own first activation is in window). Fall
+            // back to the item's earliest activation so the damage is always shown
+            // against the ability that fired it.
+            let owner = owner.or_else(|| {
+                uses.iter()
+                    .position(|use_| use_.item_id == hit.item_id)
+                    .map(|i| (i, &uses[i]))
             });
             if let Some((i, _)) = owner {
                 credited[i].0 += hit.damage;

@@ -1155,6 +1155,9 @@ struct FightState {
     /// back; phase HP resets count the same way. The overkill cap uses this so a
     /// heal is not mistaken for overkill.
     healed_hp: i64,
+    /// A MaxHP change arrived without its matching HP reading. The next HP
+    /// update is the rescale's scaled current HP, not a heal.
+    rescale_pending: bool,
     /// Local player's char id when this fight began (0 if unknown then).
     local_char_id: i32,
     /// Count of local-player "close calls" (HP dropped below 20% of max,
@@ -2040,15 +2043,17 @@ impl CombatTracker {
         } else {
             0
         };
-        let (new_hp, obj_type, obj_max_hp, previous_hp) = {
+        let (new_hp, obj_type, obj_max_hp, previous_hp, previous_max_hp) = {
             let entry = self.objects.entry(object_id).or_default();
             let previous_hp = entry.hp as i64;
+            let previous_max_hp = entry.max_hp;
             apply_stats(entry, status, time_ms);
             (
                 entry.hp as i64,
                 entry.object_type,
                 entry.max_hp,
                 previous_hp,
+                previous_max_hp,
             )
         };
         // Diff the local player's boost-relevant stats against the snapshot taken
@@ -2186,11 +2191,26 @@ impl CombatTracker {
             // is the general healer case: the fight's real pool is the starting
             // HP plus every heal/reset, not the starting HP alone. Gate on prior
             // damage so a first sighting at full (or a spawn packet) is not a
-            // heal, and on a stable max HP so an HP rescale is not either.
+            // heal, and on a max HP that is stable across *this* update so the
+            // scaling delta itself is not either. Comparing against the previous
+            // object state (not the frozen accounting pool) keeps genuine heals
+            // counted after a mid-fight rescale.
+            let max_rescaled = previous_max_hp as i64 != obj_max_hp as i64;
+            let scaling_update = max_rescaled || fight.rescale_pending;
+            // A MaxHP-only packet can precede its matching HP packet. Remember
+            // that pending scale (and consume it on the HP packet) so the scaled
+            // current HP is not mistaken for healing.
+            fight.rescale_pending = if max_rescaled {
+                !has_hp_stat
+            } else if has_hp_stat {
+                false
+            } else {
+                fight.rescale_pending
+            };
             if previous_hp > 0
                 && new_hp > previous_hp
                 && fight.min_hp_seen < fight.boss_start_hp as i64
-                && obj_max_hp as i64 == fight.boss_max_hp as i64
+                && !scaling_update
             {
                 fight.healed_hp = fight.healed_hp.saturating_add(new_hp - previous_hp);
             }
@@ -2515,6 +2535,7 @@ impl CombatTracker {
                 killed: false,
                 min_hp_seen: max_hp as i64,
                 healed_hp: 0,
+                rescale_pending: false,
                 local_char_id: self.local_char_id,
                 local_close_calls: 0,
                 attackers: HashMap::new(),
@@ -4278,6 +4299,7 @@ impl CombatTracker {
                 killed: false,
                 min_hp_seen: start_hp as i64,
                 healed_hp: 0,
+                rescale_pending: false,
                 local_char_id: self.local_char_id,
                 local_close_calls: carried_close_calls,
                 attackers: HashMap::new(),
@@ -4343,6 +4365,7 @@ impl CombatTracker {
                 killed: false,
                 min_hp_seen: 0,
                 healed_hp: 0,
+                rescale_pending: false,
                 local_char_id,
                 local_close_calls: 0,
                 attackers: HashMap::new(),
@@ -5826,6 +5849,7 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
     dst.last_activity = dst.last_activity.max(src.last_activity);
     dst.min_hp_seen = dst.min_hp_seen.min(src.min_hp_seen);
     dst.healed_hp = dst.healed_hp.saturating_add(src.healed_hp);
+    dst.rescale_pending |= src.rescale_pending;
     dst.killed = dst.killed || src.killed;
     dst.joined_late = dst.joined_late || src.joined_late;
     dst.local_close_calls += src.local_close_calls;
@@ -6427,6 +6451,7 @@ mod tests {
             killed: false,
             min_hp_seen: 300_000,
             healed_hp: 0,
+            rescale_pending: false,
             local_char_id: 42,
             local_close_calls,
             attackers: HashMap::new(),

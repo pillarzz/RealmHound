@@ -808,6 +808,17 @@ pub struct ChatPanel {
     history_author_filters: Vec<AuthorFilter>,
     /// Distinct authors seen in the loaded history, for the filter suggestions.
     history_author_catalog: Vec<AuthorFilter>,
+    /// Lowercased names parallel to `history_author_catalog`, so suggestions do
+    /// not repeatedly allocate a lowercase copy of every catalogue name.
+    history_author_catalog_lower: Vec<String>,
+    /// Bumped whenever the catalogue is rebuilt; invalidates the suggestion cache.
+    history_author_catalog_rev: u64,
+    /// Cached suggestion rows for [`Self::history_author_suggestions_query`].
+    history_author_suggestions: Vec<AuthorFilter>,
+    /// The already-normalized query the cached suggestions were built for.
+    history_author_suggestions_query: String,
+    /// Catalogue revision the cached suggestions were built from.
+    history_author_suggestions_rev: u64,
     /// Whether the author suggestion popup is open.
     history_author_popup_open: bool,
     /// Parsed history entries loaded from disk for the current selection.
@@ -881,6 +892,11 @@ impl Default for ChatPanel {
             history_search_scope: SearchScope::default(),
             history_author_filters: Vec::new(),
             history_author_catalog: Vec::new(),
+            history_author_catalog_lower: Vec::new(),
+            history_author_catalog_rev: 0,
+            history_author_suggestions: Vec::new(),
+            history_author_suggestions_query: String::new(),
+            history_author_suggestions_rev: 0,
             history_author_popup_open: false,
             history_entries: Vec::new(),
             history_loaded: None,
@@ -1418,6 +1434,10 @@ impl ChatPanel {
     fn load_history(&mut self, sel: LoadedSel) {
         self.history_entries.clear();
         self.history_author_catalog.clear();
+        self.history_author_catalog_lower.clear();
+        // Invalidate the suggestion cache immediately: the catalogue is empty
+        // until the load finishes, including when it fails early.
+        self.history_author_catalog_rev = self.history_author_catalog_rev.wrapping_add(1);
         self.history_truncated = false;
         self.history_error = None;
 
@@ -1483,11 +1503,20 @@ impl ChatPanel {
                     if !filters.should_show(parsed.chat_type) {
                         continue;
                     }
+                    // Index both whisper participants: author filtering matches
+                    // either name, so a contact seen only as the recipient of our
+                    // outgoing whispers must still be suggested. Recipients carry
+                    // no sender metadata of their own.
                     let author = author_catalog
                         .entry(parsed.sender.clone())
                         .or_insert((0, false));
                     author.0 = author.0.max(parsed.stars);
                     author.1 |= parsed.is_supporter;
+                    if let Some(recipient) = &parsed.recipient {
+                        author_catalog
+                            .entry(recipient.clone())
+                            .or_insert((0, false));
+                    }
                     if !passes_author_filters(author_filters, &parsed) {
                         continue;
                     }
@@ -1507,6 +1536,31 @@ impl ChatPanel {
             .collect();
         self.history_author_catalog
             .sort_by_key(|a| a.name.to_ascii_lowercase());
+        self.history_author_catalog_lower = self
+            .history_author_catalog
+            .iter()
+            .map(|a| a.name.to_ascii_lowercase())
+            .collect();
+    }
+
+    /// Rebuild the cached author suggestions for `query` (already trimmed and
+    /// lowercased). The cache is reused across repaints until the query or the
+    /// loaded catalogue changes.
+    fn rebuild_author_suggestions(&mut self, query: &str) {
+        self.history_author_suggestions = if query.is_empty() {
+            Vec::new()
+        } else {
+            self.history_author_catalog
+                .iter()
+                .zip(&self.history_author_catalog_lower)
+                .filter(|(_, lower)| lower.contains(query))
+                .map(|(author, _)| author.clone())
+                .take(8)
+                .collect()
+        };
+        self.history_author_suggestions_query.clear();
+        self.history_author_suggestions_query.push_str(query);
+        self.history_author_suggestions_rev = self.history_author_catalog_rev;
     }
 
     /// Render the chat history browser (date range, search, results list).
@@ -1666,23 +1720,18 @@ impl ChatPanel {
                 // selected.
                 if self.history_search_scope == SearchScope::Name {
                     let author_query = self.history_search.trim().to_ascii_lowercase();
-                    let suggestions: Vec<AuthorFilter> = if author_query.is_empty() {
-                        Vec::new()
-                    } else {
-                        self.history_author_catalog
-                            .iter()
-                            .filter(|a| a.name.to_ascii_lowercase().contains(&author_query))
-                            .take(8)
-                            .cloned()
-                            .collect()
-                    };
+                    if author_query != self.history_author_suggestions_query
+                        || self.history_author_suggestions_rev != self.history_author_catalog_rev
+                    {
+                        self.rebuild_author_suggestions(&author_query);
+                    }
                     if search_resp.has_focus() && !author_query.is_empty() {
                         self.history_author_popup_open = true;
                     }
                     let enter_pressed =
                         search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if enter_pressed && !author_query.is_empty() {
-                        if let Some(author) = suggestions.first().cloned() {
+                        if let Some(author) = self.history_author_suggestions.first().cloned() {
                             self.add_author_filter(author);
                         } else {
                             self.add_author_filter(AuthorFilter {
@@ -1710,14 +1759,14 @@ impl ChatPanel {
                                     egui::ScrollArea::vertical()
                                         .max_height(220.0)
                                         .show(ui, |ui| {
-                                            if suggestions.is_empty() {
+                                            if self.history_author_suggestions.is_empty() {
                                                 ui.label(
                                                     RichText::new("No matching authors")
                                                         .italics()
                                                         .color(Color32::GRAY),
                                                 );
                                             } else {
-                                                for author in &suggestions {
+                                                for author in &self.history_author_suggestions {
                                                     if ui
                                                         .selectable_label(false, author.label())
                                                         .clicked()
@@ -2162,6 +2211,48 @@ mod tests {
         assert_eq!(
             count, 1,
             "one daily chat log written under the injected dir"
+        );
+    }
+
+    #[test]
+    fn author_catalog_includes_whisper_recipients() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_dir = temp.path().join("chat");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("chat_2026-01-01.log"),
+            "12:00:00 [WHISPER] Pillar → Lovens: hi\n",
+        )
+        .unwrap();
+        let settings = realmhound_core::settings::ChatSettings::default();
+        let mut panel = ChatPanel::new_with_settings(&settings, log_dir);
+
+        panel.load_history(LoadedSel::All);
+
+        let names: Vec<&str> = panel
+            .history_author_catalog
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert!(names.contains(&"Pillar"), "sender is catalogued");
+        assert!(
+            names.contains(&"Lovens"),
+            "a contact seen only as a whisper recipient is catalogued"
+        );
+        let recipient = panel
+            .history_author_catalog
+            .iter()
+            .find(|a| a.name == "Lovens")
+            .expect("recipient catalogued");
+        assert_eq!(
+            (recipient.stars, recipient.is_supporter),
+            (0, false),
+            "sender metadata is not copied onto the recipient"
+        );
+        assert_eq!(
+            panel.history_author_catalog_lower.len(),
+            panel.history_author_catalog.len(),
+            "lowercase search keys stay aligned with the catalogue"
         );
     }
 

@@ -32,11 +32,53 @@ pub fn contains_word(text: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let haystack = text.to_lowercase();
-    let needle = needle.to_lowercase();
+    NormalizedChatBody::new(text).contains_word(needle)
+}
 
+/// A message body lowercased once, so every trigger checked against the same
+/// message reuses the normalized text instead of allocating a fresh copy.
+#[derive(Debug, Clone)]
+pub struct NormalizedChatBody(String);
+
+impl NormalizedChatBody {
+    /// Normalize a message body for matching.
+    pub fn new(body: &str) -> Self {
+        Self(body.to_lowercase())
+    }
+
+    /// True if the body contains `needle` as a whole word,
+    /// ASCII-case-insensitively. Same semantics as [`contains_word`].
+    pub fn contains_word(&self, needle: &str) -> bool {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return false;
+        }
+        contains_word_normalized(&self.0, &needle.to_lowercase())
+    }
+
+    /// True if the body contains any variant in a comma-separated trigger field
+    /// as a whole word.
+    pub fn matches_any_trigger(&self, words: &str) -> bool {
+        split_trigger_words(words).any(|word| self.contains_word(word))
+    }
+
+    /// Extra pings for this normalized message. `body` is the original text, used
+    /// only for the presence-notice check.
+    pub fn pings_for(&self, body: &str, ign: Option<&str>, trigger: &str) -> ChatPings {
+        ChatPings {
+            // A guild presence notice names the member without anyone mentioning
+            // them, so it never raises the character-name ping.
+            ign_mention: !is_presence_notice(body)
+                && ign.is_some_and(|name| self.contains_word(name)),
+            custom_chat: self.contains_word(trigger),
+        }
+    }
+}
+
+/// Whole-word search over an already-lowercased haystack and needle.
+fn contains_word_normalized(haystack: &str, needle: &str) -> bool {
     let mut searched = 0;
-    while let Some(offset) = haystack[searched..].find(&needle) {
+    while let Some(offset) = haystack[searched..].find(needle) {
         let start = searched + offset;
         let end = start + needle.len();
         let before_is_boundary = haystack[..start]
@@ -68,7 +110,7 @@ pub fn split_trigger_words(text: &str) -> impl Iterator<Item = &str> {
 /// True if `body` contains any variant in a comma-separated trigger field as a
 /// whole word.
 pub fn matches_any_trigger(body: &str, words: &str) -> bool {
-    split_trigger_words(words).any(|word| contains_word(body, word))
+    NormalizedChatBody::new(body).matches_any_trigger(words)
 }
 
 /// Normalise a comma-separated trigger field: trim variants, cap each at
@@ -142,12 +184,7 @@ impl ChatPings {
 /// triggers a mention by itself. `ign` is the local character name; `trigger` is
 /// the configured custom chat text.
 pub fn pings_for(body: &str, ign: Option<&str>, trigger: &str) -> ChatPings {
-    ChatPings {
-        // A guild presence notice names the member without anyone mentioning
-        // them, so it never raises the character-name ping.
-        ign_mention: !is_presence_notice(body) && ign.is_some_and(|name| contains_word(body, name)),
-        custom_chat: contains_word(body, trigger),
-    }
+    NormalizedChatBody::new(body).pings_for(body, ign, trigger)
 }
 
 #[cfg(test)]

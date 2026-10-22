@@ -2729,11 +2729,17 @@ impl PacketProcessor {
                                     | ChatType::Guild
                                     | ChatType::Whisper
                             ) {
+                                // Normalize the body once and reuse it for every
+                                // configured alert instead of per variant.
+                                let normalized_body =
+                                    realmhound_core::chat_ping::NormalizedChatBody::new(
+                                        &chat_msg.text,
+                                    );
                                 let (mention_ping, custom_pings) = self
                                     .settings
                                     .read()
                                     .map(|s| {
-                                        let pings = realmhound_core::chat_ping::pings_for(
+                                        let pings = normalized_body.pings_for(
                                             &chat_msg.text,
                                             me.as_deref(),
                                             "",
@@ -2743,10 +2749,8 @@ impl PacketProcessor {
                                                 .custom_chat_alerts
                                                 .iter()
                                                 .filter(|alert| {
-                                                    realmhound_core::chat_ping::matches_any_trigger(
-                                                        &chat_msg.text,
-                                                        &alert.words,
-                                                    )
+                                                    normalized_body
+                                                        .matches_any_trigger(&alert.words)
                                                 })
                                                 .map(|alert| {
                                                     let key = alert.sound_key();

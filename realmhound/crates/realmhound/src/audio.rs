@@ -265,6 +265,9 @@ fn run(
     let mut last_played: HashMap<SoundType, Instant> = HashMap::new();
     // Discovered instances coalesce independently while sharing a sound file.
     let mut last_event: HashMap<(String, Option<i32>), Instant> = HashMap::new();
+    // Each configured custom-chat alert coalesces independently, so a burst of
+    // matching messages cannot stack overlapping playback of distinct alerts.
+    let mut last_custom_chat: HashMap<String, Instant> = HashMap::new();
     #[cfg(feature = "latency-diagnostics")]
     let mut stale_drops = StaleDropDiagnostics::default();
     #[cfg(feature = "latency-diagnostics")]
@@ -415,6 +418,16 @@ fn run(
                         )
                     })
                     .unwrap_or((1.0, None));
+                let now = Instant::now();
+                last_custom_chat.retain(|_, at| now.duration_since(*at) < COALESCE_WINDOW);
+                if last_custom_chat.contains_key(&custom_key) {
+                    tracing::trace!(
+                        "[AUDIO] coalescing duplicate custom chat alert {}",
+                        custom_key
+                    );
+                    continue;
+                }
+                last_custom_chat.insert(custom_key, now);
                 engine.play(
                     SoundType::CustomChat,
                     custom_path,

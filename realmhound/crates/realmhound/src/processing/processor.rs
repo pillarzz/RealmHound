@@ -1063,7 +1063,10 @@ impl PacketProcessor {
             }
             // Capture-lifecycle messages are handled by the worker loop, not the
             // processor; ignore them here for exhaustiveness.
-            ControlMsg::StartCapture(_) | ControlMsg::StopCapture | ControlMsg::Shutdown => {}
+            ControlMsg::StartCapture(_)
+            | ControlMsg::StopCapture
+            | ControlMsg::Shutdown
+            | ControlMsg::StartHistoricalMaintenance => {}
         }
     }
 
@@ -1492,6 +1495,27 @@ impl PacketProcessor {
     /// Whether lifecycle updates are waiting to be forwarded without packets.
     pub fn has_pending_updates(&self) -> bool {
         !self.updates.is_empty()
+    }
+
+    pub fn historical_maintenance_batch(&mut self) -> Result<(bool, bool), String> {
+        let char_ids: Vec<_> = self
+            .account_data
+            .characters
+            .characters
+            .iter()
+            .chain(self.account_data.characters.dead_characters.iter())
+            .map(|c| c.char_id)
+            .collect();
+        let result = self
+            .combat
+            .historical_maintenance_batch(&char_ids)
+            .map_err(|e| e.to_string())?;
+        self.fold_deferred_combat();
+        Ok(result)
+    }
+
+    pub fn publish_repaired_history(&mut self) {
+        self.emit(UiPayload::CombatHistoryChanged);
     }
 
     /// Process a batch of raw captured packets, returning the ordered updates
@@ -3297,7 +3321,7 @@ impl PacketProcessor {
                     self.combat.on_boss_loot(
                         drop.mob_type,
                         drop.player.map_seed,
-                        time_ms as i64,
+                        drop.timestamp,
                         &drop
                             .items
                             .iter()

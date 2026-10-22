@@ -53,6 +53,8 @@ pub struct CombatManager {
     /// view only polls the fight count, so the processor drains these to tell it
     /// to re-read its summaries.
     pending_history_changes: Vec<FightSelection>,
+    loot_path: Option<std::path::PathBuf>,
+    totals_sync_cursor: Option<i32>,
 }
 
 /// Tracks the current dungeon run so its elapsed time can be accumulated into
@@ -89,22 +91,21 @@ impl CombatManager {
             pending_loot_completions: std::collections::HashSet::new(),
             pending_kill_proofs: std::collections::HashSet::new(),
             pending_history_changes: Vec::new(),
+            loot_path: None,
+            totals_sync_cursor: Some(i32::MIN),
         }
     }
 
     /// Open (or create) the combat database for persistence at an explicit path.
-    /// `loot_path` pairs it with the loot-history DB so loot-correlating
-    /// migrations (the Legacy Lair of Draconis completion backfill) can read it.
+    /// `loot_path` pairs it with the loot-history DB for deferred completion
+    /// repairs.
     /// Logs and continues without persistence on failure.
     pub fn open_database(&mut self, path: &std::path::Path, loot_path: Option<&std::path::Path>) {
         match CombatDatabase::open_writer_with_loot(path, loot_path) {
             Ok(db) => {
                 self.database = Some(db);
+                self.loot_path = loot_path.map(std::path::Path::to_path_buf);
                 tracing::info!("[COMBAT] Combat history database opened");
-                // First reconciliation backfills every historical qualifying card
-                // into the award ledger and buffers the increments.
-                self.reconcile_awards();
-                self.reconcile_close_calls();
             }
             Err(e) => {
                 tracing::error!("[COMBAT] Failed to open combat database: {}", e);
@@ -116,7 +117,7 @@ impl CombatManager {
     /// degrading to in-memory. Selected-profile startup opens the combat writer
     /// before the loot writer (the loot backfill consults the combat DB) and
     /// must not silently continue without persistence. `loot_path` pairs it with
-    /// the loot-history DB for loot-correlating migrations.
+    /// the loot-history DB for deferred completion repairs.
     pub fn open_database_strict(
         &mut self,
         path: &std::path::Path,
@@ -124,10 +125,36 @@ impl CombatManager {
     ) -> Result<(), rusqlite::Error> {
         let db = CombatDatabase::open_writer_with_loot(path, loot_path)?;
         self.database = Some(db);
+        self.loot_path = loot_path.map(std::path::Path::to_path_buf);
         tracing::info!("[COMBAT] Combat history database opened (strict)");
-        self.reconcile_awards();
-        self.reconcile_close_calls();
         Ok(())
+    }
+
+    /// Run only after the UI is usable, between capture batches.
+    pub fn historical_maintenance_batch(
+        &mut self,
+        char_ids: &[i32],
+    ) -> Result<(bool, bool), rusqlite::Error> {
+        let Some(db) = self.database.as_mut() else {
+            return Ok((false, false));
+        };
+        let mut batch = db.historical_repair_batch(self.loot_path.as_deref())?;
+        self.pending_stat_awards.extend(batch.stat_awards);
+        self.pending_close_call_totals.extend(batch.close_calls);
+        if !batch.pending {
+            if let Some(cursor) = self.totals_sync_cursor {
+                let mut ids: Vec<_> = char_ids.iter().copied().filter(|id| *id > cursor).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                ids.truncate(16);
+                let restored = db.persisted_combat_totals(&ids)?;
+                self.pending_stat_awards.extend(restored.stat_awards);
+                self.pending_close_call_totals.extend(restored.close_calls);
+                self.totals_sync_cursor = ids.last().copied();
+                batch.pending = self.totals_sync_cursor.is_some();
+            }
+        }
+        Ok((batch.history_changed, batch.pending))
     }
 
     /// Checkpoint and close the combat database. No-op in in-memory mode.
@@ -135,21 +162,6 @@ impl CombatManager {
         match self.database.take() {
             Some(db) => db.close(),
             None => Ok(()),
-        }
-    }
-
-    /// Reconcile the award ledger and stage the authoritative per-character
-    /// lifetime totals for the processor to apply to the character cache.
-    fn reconcile_awards(&mut self) {
-        if let Some(db) = self.database.as_mut() {
-            match db.reconcile_stat_awards() {
-                Ok(totals) => {
-                    // Preserve targeted zeroes already staged for a previous
-                    // owner that no longer has a row in the ledger.
-                    self.pending_stat_awards.extend(totals);
-                }
-                Err(e) => tracing::error!("[COMBAT] Failed to reconcile stat awards: {}", e),
-            }
         }
     }
 
@@ -163,19 +175,12 @@ impl CombatManager {
         let Some(db) = self.database.as_mut() else {
             return;
         };
-        let totals = match db.reconcile_stat_awards_for_selections(selections) {
-            Ok(totals) => Ok(totals),
-            Err(e) => {
-                tracing::error!(
-                    "[COMBAT] Failed to reconcile changed stat awards: {}; retrying full reconciliation",
-                    e
-                );
-                db.reconcile_stat_awards()
-            }
-        };
-        match totals {
+        match db.reconcile_stat_awards_for_selections(selections) {
             Ok(totals) => self.pending_stat_awards.extend(totals),
-            Err(e) => tracing::error!("[COMBAT] Failed to reconcile stat awards: {}", e),
+            Err(e) => tracing::error!(
+                "[COMBAT] Failed to reconcile changed stat awards; queued for retry: {}",
+                e
+            ),
         }
     }
 

@@ -184,6 +184,9 @@ pub fn spawn(
         #[cfg(feature = "latency-diagnostics")]
         capture_drops: CaptureDropTotals::default(),
         last_save: Instant::now(),
+        next_maintenance: None,
+        maintenance_history_dirty: false,
+        next_maintenance_refresh: Instant::now(),
         pub_char_gen: u64::MAX,
         pub_account_gen: u64::MAX,
         pub_vault_gen: u64::MAX,
@@ -225,6 +228,9 @@ struct Worker {
     #[cfg(feature = "latency-diagnostics")]
     capture_drops: CaptureDropTotals,
     last_save: Instant,
+    next_maintenance: Option<Instant>,
+    maintenance_history_dirty: bool,
+    next_maintenance_refresh: Instant,
     pub_char_gen: u64,
     pub_account_gen: u64,
     pub_vault_gen: u64,
@@ -409,7 +415,6 @@ impl Worker {
             }
 
             // 2. Obtain a batch of packets.
-            #[cfg(feature = "latency-diagnostics")]
             let mut queue_remaining = 0usize;
             #[cfg(feature = "latency-diagnostics")]
             let mut capture_queue_drops = self.capture_drops.total();
@@ -433,10 +438,7 @@ impl Worker {
                         }
                         self.receiver = None;
                     }
-                    #[cfg(feature = "latency-diagnostics")]
-                    {
-                        queue_remaining = result.queue_remaining;
-                    }
+                    queue_remaining = result.queue_remaining;
                     result.packets
                 }
                 None => {
@@ -547,6 +549,40 @@ impl Worker {
                     segments.snapshot = snapshot_started.elapsed();
                 }
                 self.ctx.request_repaint();
+            }
+
+            if queue_remaining == 0
+                && self
+                    .next_maintenance
+                    .is_some_and(|due| Instant::now() >= due)
+            {
+                let delay = match self.processor.historical_maintenance_batch() {
+                    Ok((changed, pending)) => {
+                        self.maintenance_history_dirty |= changed;
+                        if self.maintenance_history_dirty
+                            && (!pending || Instant::now() >= self.next_maintenance_refresh)
+                        {
+                            self.processor.publish_repaired_history();
+                            self.maintenance_history_dirty = false;
+                            self.next_maintenance_refresh = Instant::now() + Duration::from_secs(5);
+                        }
+                        if pending {
+                            Duration::from_millis(50)
+                        } else {
+                            Duration::from_secs(1)
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "[WORKER] Historical maintenance failed; retrying: {error}"
+                        );
+                        Duration::from_secs(5)
+                    }
+                };
+                self.next_maintenance = Some(Instant::now() + delay);
+                if self.publish_snapshot() {
+                    self.ctx.request_repaint();
+                }
             }
 
             // 4. Interim periodic persistence.
@@ -872,6 +908,9 @@ impl Worker {
     fn handle_control(&mut self, msg: ControlMsg) -> bool {
         match msg {
             ControlMsg::Shutdown => return true,
+            ControlMsg::StartHistoricalMaintenance => {
+                self.next_maintenance.get_or_insert_with(Instant::now);
+            }
             ControlMsg::StartCapture(receiver) => {
                 self.processor.on_capture_start();
                 #[cfg(feature = "latency-diagnostics")]
@@ -1498,5 +1537,48 @@ mod staging_tests {
         worker.activate();
         worker.shutdown(std::time::Duration::from_secs(5));
         assert_eq!(stored_generation(&account), 0);
+    }
+
+    #[test]
+    fn historical_maintenance_waits_for_the_first_completed_ui_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = StorageRoot::from_path(temp.path()).unwrap();
+        let account = selected_context(&root);
+        let processor = processor(&account);
+        let reader = realmhound_core::combat::CombatDatabase::open_reader_at(
+            account.persistence().combat_database(),
+        )
+        .unwrap();
+        let before = reader.data_version().unwrap();
+        let mut worker = spawn(
+            processor,
+            egui::Context::default(),
+            AudioSender::disconnected(),
+            Arc::new(AtomicU8::new(0)),
+            account,
+        )
+        .unwrap();
+        worker.activate();
+        std::thread::sleep(Duration::from_millis(250));
+        let before_ready = reader.data_version().unwrap();
+        worker.send_control(ControlMsg::StartHistoricalMaintenance);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut changed = false;
+        while Instant::now() < deadline {
+            if reader.data_version().unwrap() != before {
+                changed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        worker.shutdown(Duration::from_secs(5));
+        assert_eq!(
+            before_ready, before,
+            "activation alone must not start repairs"
+        );
+        assert!(
+            changed,
+            "the UI-ready signal automatically starts repairs without capture"
+        );
     }
 }

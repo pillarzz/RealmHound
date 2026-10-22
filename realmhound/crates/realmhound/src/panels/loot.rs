@@ -2,7 +2,9 @@
 //!
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration as StdDuration, Instant};
 
 use crate::ui_ext::HoverTooltipExt;
 use chrono::{Duration, Local, NaiveDate, TimeZone, Utc};
@@ -121,6 +123,141 @@ enum SearchResult {
     },
 }
 
+type FightLinkResult = Result<Vec<(i64, Option<FightSelection>)>, String>;
+
+struct PendingFightLinks {
+    generation: u64,
+    start: usize,
+    result: Receiver<FightLinkResult>,
+}
+
+#[derive(Default)]
+struct FightLinkCache {
+    links: HashMap<i64, FightSelection>,
+    resolved: usize,
+    generation: u64,
+    data_version: Option<i64>,
+    pending: Option<PendingFightLinks>,
+    retry_at: Option<Instant>,
+}
+
+impl FightLinkCache {
+    const BATCH_SIZE: usize = 100;
+    const RETRY_DELAY: StdDuration = StdDuration::from_secs(1);
+
+    fn reset(&mut self) {
+        self.links.clear();
+        self.resolved = 0;
+        self.generation = self.generation.wrapping_add(1);
+        self.retry_at = None;
+        // Keep the receiver until the old batch finishes so resets cannot spawn
+        // overlapping workers. Its generation prevents stale results applying.
+    }
+
+    fn refresh(
+        &mut self,
+        drops: &[LootDropRecord],
+        db: &CombatDatabase,
+        path: &Path,
+        ctx: &egui::Context,
+    ) {
+        if let Some(retry_at) = self.retry_at {
+            if retry_at > Instant::now() {
+                ctx.request_repaint_after(retry_at.saturating_duration_since(Instant::now()));
+                return;
+            }
+            self.retry_at = None;
+        }
+
+        let version = match db.data_version() {
+            Ok(version) => version,
+            Err(error) => {
+                self.failed(format!("checking combat history changes: {error}"), ctx);
+                return;
+            }
+        };
+        if self.data_version != Some(version) {
+            self.reset();
+            self.data_version = Some(version);
+        }
+        // Catch committed updates/deletions even when no packet update wakes
+        // the UI. A fight count cannot detect these changes.
+        ctx.request_repaint_after(Self::RETRY_DELAY);
+
+        if let Some(pending) = &self.pending {
+            let result = match pending.result.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("fight-link worker disconnected before returning results".to_string())
+                }
+            };
+            let pending = self.pending.take().unwrap();
+            if pending.generation == self.generation {
+                match result {
+                    Ok(links) => {
+                        self.resolved = pending.start + links.len();
+                        for (id, selection) in links {
+                            if let Some(selection) = selection {
+                                self.links.insert(id, selection);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.failed(error, ctx);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if self.resolved >= drops.len() {
+            return;
+        }
+        let end = (self.resolved + Self::BATCH_SIZE).min(drops.len());
+        let batch: Vec<_> = drops[self.resolved..end]
+            .iter()
+            .map(|drop| (drop.id, drop.map_seed, drop.mob_type, drop.timestamp))
+            .collect();
+        let path = path.to_path_buf();
+        let (tx, result) = mpsc::channel();
+        let repaint = ctx.clone();
+        match std::thread::Builder::new()
+            .name("loot-fight-links".to_string())
+            .spawn(move || {
+                let result = (|| {
+                    let reader = CombatDatabase::open_reader_at(&path)?;
+                    batch
+                        .into_iter()
+                        .map(|(id, seed, mob, timestamp)| {
+                            reader
+                                .find_killed_fight(seed, mob, timestamp)
+                                .map(|selection| (id, selection))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })()
+                .map_err(|error| format!("resolving loot fight links: {error}"));
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            }) {
+            Ok(_) => {
+                self.pending = Some(PendingFightLinks {
+                    generation: self.generation,
+                    start: self.resolved,
+                    result,
+                });
+            }
+            Err(error) => self.failed(format!("starting fight-link worker: {error}"), ctx),
+        }
+    }
+
+    fn failed(&mut self, error: String, ctx: &egui::Context) {
+        tracing::warn!("[LOOT] {error}; retrying fight links");
+        self.retry_at = Some(Instant::now() + Self::RETRY_DELAY);
+        ctx.request_repaint_after(Self::RETRY_DELAY);
+    }
+}
+
 /// Loot panel state.
 pub struct LootPanel {
     /// Bag type filters (display filters)
@@ -134,11 +271,7 @@ pub struct LootPanel {
     /// History: cached drops from DB
     history_drops: Vec<LootDropRecord>,
     /// Drop id to correlated fight/encounter selection.
-    fight_links: HashMap<i64, FightSelection>,
-    /// Fight-link cache needs recomputing after history changes.
-    fight_links_dirty: bool,
-    /// Last observed combat fight count, so new fights refresh back-links.
-    last_fight_count: i64,
+    fight_links: FightLinkCache,
     /// Pending cross-panel fight open action.
     pending_open_fight: Option<FightSelection>,
     /// History: current page offset
@@ -195,9 +328,7 @@ impl Default for LootPanel {
             source_filters,
             history_date_filter: DateFilter::AllTime,
             history_drops: Vec::new(),
-            fight_links: HashMap::new(),
-            fight_links_dirty: true,
-            last_fight_count: -1,
+            fight_links: FightLinkCache::default(),
             pending_open_fight: None,
             history_offset: 0,
             history_has_more: false,
@@ -246,9 +377,7 @@ impl LootPanel {
             source_filters,
             history_date_filter: DateFilter::AllTime,
             history_drops: Vec::new(),
-            fight_links: HashMap::new(),
-            fight_links_dirty: true,
-            last_fight_count: -1,
+            fight_links: FightLinkCache::default(),
             pending_open_fight: None,
             history_offset: 0,
             history_has_more: false,
@@ -271,8 +400,10 @@ impl LootPanel {
         }
     }
 
-    /// Bind the loot/combat database paths used by the short-lived delete writer.
+    /// Bind paths for deletion and the background combat-history reader.
     pub fn set_database_paths(&mut self, loot_db_path: PathBuf, combat_db_path: PathBuf) {
+        self.fight_links.reset();
+        self.fight_links.data_version = None;
         self.loot_db_path = loot_db_path;
         self.combat_db_path = combat_db_path;
     }
@@ -1129,7 +1260,7 @@ impl LootPanel {
                     let id = drop.id;
                     let mut checked = self.selected_for_delete.contains(&id);
                     let was_checked = checked;
-                    let has_fight_link = self.fight_links.contains_key(&id);
+                    let has_fight_link = self.fight_links.links.contains_key(&id);
 
                     if let Some(action) = Self::render_loot_card(
                         ui,
@@ -1213,7 +1344,7 @@ impl LootPanel {
                     self.set_item_filter(item_id, item_name);
                 }
                 HistoryClickAction::OpenFight(drop_id) => {
-                    if let Some(selection) = self.fight_links.get(&drop_id).cloned() {
+                    if let Some(selection) = self.fight_links.links.get(&drop_id).cloned() {
                         self.pending_open_fight = Some(selection);
                     }
                 }
@@ -1539,12 +1670,12 @@ impl LootPanel {
             Ok(drops) => {
                 self.history_has_more = drops.len() == limit as usize;
                 if self.history_offset == 0 {
+                    self.fight_links.reset();
                     self.history_drops = drops;
                 } else {
                     self.history_drops.extend(drops);
                 }
                 self.history_needs_refresh = false;
-                self.fight_links_dirty = true;
 
                 // Update cached bag type counts
                 self.history_white_count = self
@@ -1581,30 +1712,11 @@ impl LootPanel {
         }
     }
 
-    fn refresh_fight_links(&mut self, combat_db: &CombatDatabase) {
-        if !self.fight_links_dirty {
-            return;
-        }
-
-        self.fight_links.clear();
-        for drop in &self.history_drops {
-            match combat_db.find_killed_fight(drop.map_seed, drop.mob_type, drop.timestamp) {
-                Ok(Some(selection)) => {
-                    self.fight_links.insert(drop.id, selection);
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("[LOOT] find_killed_fight failed: {}", e),
-            }
-        }
-        self.fight_links_dirty = false;
-    }
-
     /// Reset history state for a fresh load (when filters change).
     fn reset_history(&mut self) {
         self.history_offset = 0;
         self.history_drops.clear();
-        self.fight_links.clear();
-        self.fight_links_dirty = true;
+        self.fight_links.reset();
         self.history_total_count = None;
         self.history_needs_refresh = true;
         self.history_white_count = 0;
@@ -2055,15 +2167,8 @@ impl Panel for LootPanel {
             self.load_autocomplete_cache(db);
         }
         if let Some(db) = ctx.combat_database {
-            // New/deleted fights can create or remove back-links, so recompute
-            // when the fight count changes even if the drop list is unchanged.
-            if let Ok(count) = db.fight_count() {
-                if count != self.last_fight_count {
-                    self.fight_links_dirty = true;
-                    self.last_fight_count = count;
-                }
-            }
-            self.refresh_fight_links(db);
+            self.fight_links
+                .refresh(&self.history_drops, db, &self.combat_db_path, ui.ctx());
         }
 
         let labels = ctx.labels;
@@ -2086,5 +2191,308 @@ impl Panel for LootPanel {
             actions.push(AppAction::OpenFight { selection });
         }
         actions
+    }
+}
+
+#[cfg(test)]
+mod fight_link_tests {
+    use super::*;
+    use realmhound_core::combat::CompletedFight;
+
+    fn drop_record(id: i64) -> LootDropRecord {
+        LootDropRecord {
+            id,
+            timestamp: 61_000,
+            dungeon: "Realm".to_string(),
+            map_seed: 1,
+            char_id: 1,
+            char_name: String::new(),
+            class_id: 768,
+            skin_id: 0,
+            tex1: 0,
+            tex2: 0,
+            fame: 0,
+            is_seasonal: false,
+            exalt_bonus: 0,
+            loot_drop_active: false,
+            loot_tier_active: false,
+            bag_type: 7,
+            mob_type: 8200,
+            display_object_type: 8200,
+            mob_name: String::new(),
+            items: Vec::new(),
+        }
+    }
+
+    fn fight(killed: bool) -> CompletedFight {
+        CompletedFight {
+            started_at: 1_000,
+            ended_at: 61_000,
+            dungeon: "Realm".to_string(),
+            dungeon_entered_at: None,
+            map_seed: 1,
+            boss_object_type: 8200,
+            boss_name: String::new(),
+            boss_max_hp: 100_000,
+            boss_start_hp: 100_000,
+            local_object_id: 1,
+            local_char_id: 1,
+            killed,
+            reached_zero: killed,
+            joined_late: false,
+            encounter_id: None,
+            encounter_run_id: None,
+            local_close_calls: 0,
+            aux_member_count: None,
+            spirits: 0,
+            boss_uptime_ms: 0,
+            leisurely: false,
+            petless: false,
+            spectral_hm: false,
+            shatters_hm: false,
+            boosts: Vec::new(),
+            abilities: Vec::new(),
+            participants: Vec::new(),
+        }
+    }
+
+    fn settle(
+        cache: &mut FightLinkCache,
+        drops: &[LootDropRecord],
+        reader: &CombatDatabase,
+        path: &Path,
+        ctx: &egui::Context,
+    ) -> Vec<usize> {
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        let mut starts = Vec::new();
+        loop {
+            cache.refresh(drops, reader, path, ctx);
+            assert!(
+                cache.retry_at.is_none(),
+                "unexpected background query failure"
+            );
+            if let Some(pending) = &cache.pending {
+                if starts.last() != Some(&pending.start) {
+                    starts.push(pending.start);
+                }
+            } else if cache.resolved == drops.len() {
+                return starts;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fight-link batch did not complete"
+            );
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn pagination_resolves_only_new_drops_and_caches_misses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let id = writer.insert_fight(&fight(true)).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let ctx = egui::Context::default();
+        let mut cache = FightLinkCache::default();
+        let mut drops = Vec::new();
+        let mut starts = Vec::new();
+        let started = Instant::now();
+
+        for page in 0..20 {
+            drops.extend((page * 100 + 1..=page * 100 + 100).map(drop_record));
+            drops.last_mut().unwrap().map_seed = 999;
+            starts.extend(settle(&mut cache, &drops, &reader, &path, &ctx));
+            assert_eq!(cache.resolved, drops.len());
+            assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+        }
+        assert_eq!(starts, (0..2_000).step_by(100).collect::<Vec<_>>());
+        assert_eq!(cache.links.len(), 1_980);
+        assert!(!cache.links.contains_key(&100));
+        let generation = cache.generation;
+        assert!(settle(&mut cache, &drops, &reader, &path, &ctx).is_empty());
+        assert_eq!(cache.generation, generation);
+        println!(
+            "Resolved {} drops in {} background batches: {:?}",
+            cache.resolved,
+            starts.len(),
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn history_loading_preserves_links_on_append_and_resets_on_replacement() {
+        use realmhound_core::loot::{NewLootDrop, PlayerStateTracker};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        writer.insert_fight(&fight(true)).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let mut loot = LootDatabase::open_in_memory().unwrap();
+        let mut player = PlayerStateTracker::new();
+        player.on_create_success(1, 1);
+        player.on_new_map("Realm", 1);
+        for _ in 0..201 {
+            loot.insert_loot_drop(&NewLootDrop {
+                timestamp: 61_000,
+                player: player.capture_snapshot().unwrap(),
+                bag_type: LootBagType::White,
+                mob_type: 8200,
+                mob_name: String::new(),
+                items: Vec::new(),
+            })
+            .unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut panel = LootPanel::default();
+        panel.set_database_paths(PathBuf::new(), path.clone());
+        panel.load_history(&loot);
+        settle(
+            &mut panel.fight_links,
+            &panel.history_drops,
+            &reader,
+            &path,
+            &ctx,
+        );
+        assert_eq!(panel.fight_links.links.len(), 100);
+        let generation = panel.fight_links.generation;
+
+        panel.history_offset = 100;
+        panel.history_needs_refresh = true;
+        panel.load_history(&loot);
+        assert_eq!(panel.fight_links.links.len(), 100);
+        assert_eq!(panel.fight_links.generation, generation);
+        assert_eq!(
+            settle(
+                &mut panel.fight_links,
+                &panel.history_drops,
+                &reader,
+                &path,
+                &ctx
+            ),
+            vec![100]
+        );
+        assert_eq!(panel.fight_links.links.len(), 200);
+
+        panel.history_offset = 0;
+        panel.history_needs_refresh = true;
+        panel.load_history(&loot);
+        assert!(panel.fight_links.links.is_empty());
+        assert_ne!(panel.fight_links.generation, generation);
+        assert_eq!(panel.fight_links.resolved, 0);
+    }
+
+    #[test]
+    fn combat_changes_retry_misses_and_remove_deleted_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let ctx = egui::Context::default();
+        let mut cache = FightLinkCache::default();
+        let drops = [drop_record(1)];
+
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert!(cache.links.is_empty());
+        let id = writer.insert_fight(&fight(false)).unwrap();
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert!(cache.links.is_empty());
+
+        writer
+            .mark_boss_killed_by_loot(1, 8200, 61_000)
+            .unwrap()
+            .expect("escaped fight completed without adding a fight");
+        assert_eq!(reader.fight_count().unwrap(), 1);
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+
+        writer.delete_fight(id).unwrap();
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert!(cache.links.is_empty());
+        let mut grouped = fight(true);
+        grouped.encounter_id = Some("dungeon_run".to_string());
+        grouped.encounter_run_id = Some("new-run".to_string());
+        writer.insert_fight(&grouped).unwrap();
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert_eq!(
+            cache.links.get(&1),
+            Some(&FightSelection::Encounter("new-run".to_string()))
+        );
+    }
+
+    #[test]
+    fn history_reset_discards_in_flight_results_without_overlapping_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let id = writer.insert_fight(&fight(true)).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let ctx = egui::Context::default();
+        let mut cache = FightLinkCache::default();
+        cache.refresh(&[drop_record(1)], &reader, &path, &ctx);
+        let old_generation = cache.pending.as_ref().unwrap().generation;
+        cache.reset();
+        assert_eq!(
+            cache.pending.as_ref().unwrap().generation,
+            old_generation,
+            "a reset retains the old receiver until that worker finishes"
+        );
+        let mut replacement = drop_record(2);
+        replacement.map_seed = 99;
+        settle(&mut cache, &[replacement], &reader, &path, &ctx);
+        assert!(cache.links.is_empty());
+        assert_eq!(cache.resolved, 1);
+        assert!(!cache
+            .links
+            .values()
+            .any(|link| *link == FightSelection::Single(id)));
+    }
+
+    #[test]
+    fn combat_change_discards_in_flight_results_before_revalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let id = writer.insert_fight(&fight(true)).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let ctx = egui::Context::default();
+        let mut cache = FightLinkCache::default();
+        let drops = [drop_record(1)];
+        cache.refresh(&drops, &reader, &path, &ctx);
+        let generation = cache.generation;
+        writer.delete_fight(id).unwrap();
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert_ne!(cache.generation, generation);
+        assert!(cache.links.is_empty());
+    }
+
+    #[test]
+    fn background_failure_keeps_work_pending_and_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let id = writer.insert_fight(&fight(true)).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let missing = temp.path().join("missing.db");
+        let ctx = egui::Context::default();
+        let mut cache = FightLinkCache::default();
+        let drops = [drop_record(1)];
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while cache.retry_at.is_none() {
+            cache.refresh(&drops, &reader, &missing, &ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+        assert_eq!(cache.resolved, 0);
+        assert!(cache.links.is_empty());
+        cache.refresh(&drops, &reader, &path, &ctx);
+        assert!(
+            cache.pending.is_none(),
+            "failed queries are not retried every frame"
+        );
+        cache.retry_at = None;
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
     }
 }

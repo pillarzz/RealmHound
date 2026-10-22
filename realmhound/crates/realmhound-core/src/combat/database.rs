@@ -529,6 +529,12 @@ impl CombatDatabase {
         Ok(Self { conn })
     }
 
+    /// Changes committed by other connections, compared on this connection only.
+    pub fn data_version(&self) -> SqlResult<i64> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+    }
+
     /// Open an in-memory database (for tests).
     pub fn open_in_memory() -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
@@ -6911,6 +6917,48 @@ mod tests {
             .conn
             .execute("CREATE TABLE should_fail (x INTEGER)", [])
             .is_err());
+    }
+
+    #[test]
+    fn reader_data_version_detects_inserts_updates_regrouping_and_deletes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat_history.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let mut version = reader.data_version().unwrap();
+        assert_eq!(reader.data_version().unwrap(), version);
+
+        let mut fight = sample_fight();
+        fight.killed = false;
+        let id = writer.insert_fight(&fight).unwrap();
+        let next = reader.data_version().unwrap();
+        assert_ne!(next, version);
+        version = next;
+
+        writer
+            .mark_boss_killed_by_loot(fight.map_seed, fight.boss_object_type, fight.ended_at)
+            .unwrap()
+            .expect("loot proof updates the existing fight");
+        let next = reader.data_version().unwrap();
+        assert_ne!(next, version);
+        assert_eq!(reader.fight_count().unwrap(), 1);
+        version = next;
+
+        writer
+            .conn
+            .execute(
+                "UPDATE fights SET encounter_run_id = 'regrouped' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let next = reader.data_version().unwrap();
+        assert_ne!(next, version);
+        assert_eq!(reader.fight_count().unwrap(), 1);
+        version = next;
+
+        writer.delete_fight(id).unwrap();
+        assert_ne!(reader.data_version().unwrap(), version);
+        assert_eq!(reader.fight_count().unwrap(), 0);
     }
 
     #[test]

@@ -2771,6 +2771,12 @@ impl AssetManager {
                 // the map on its first non-zero pattern.
                 merge_equipment_xml_files(&mut list, &assets_dir);
 
+                // Index the objects whose HP the game keeps off zero. Their
+                // catalogs are not merged here, so their HP refills used to
+                // be booked as healing (see the method's docs).
+                let aphi = list.index_always_positive_health(&assets_dir.join("xml"));
+                tracing::info!("Indexed {} always-positive-health objects", aphi);
+
                 // Index which items spawn which summoned creatures, so a credited
                 // summon can be traced back to its source (Pocket Rat, Summoner
                 // maces, Flowering Kimono, ...). Reads the item files plus
@@ -3414,6 +3420,21 @@ impl AssetManager {
     /// when the party dealt ~all of the boss's remaining HP.
     pub fn is_self_destruct_boss(&self, id: i32) -> bool {
         is_self_destruct_boss_type(id)
+    }
+
+    /// Whether the game keeps this object's HP number off zero and refills it
+    /// (`<AlwaysPositiveHealth />`). Its HP bar is not a record of damage taken,
+    /// so HP that climbs back mid-fight is not healing and must not widen the
+    /// fight's damage pool: the realm's Artificial Sprite God snaps from 12,775
+    /// to its 18,500 maximum without being healed, which used to add 5,725 to the
+    /// pool and let a fight report 24,225 damage against an 18,500 boss.
+    pub fn always_positive_health(&self, id: i32) -> bool {
+        self.try_load();
+        self.objects
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(false, |list| list.always_positive_health(id))
     }
 
     /// Whether `id` is a curated treasure crate ([`TREASURE_CRATE_TYPES`]): a

@@ -1249,10 +1249,28 @@ impl FightState {
     fn effective_damage_pool(&self) -> i64 {
         let removed = self.boss_start_hp as i64 - self.min_hp_seen;
         if removed <= 0 {
-            0
-        } else {
-            (self.boss_start_hp as i64).saturating_add(self.healed_hp.max(0))
+            // A boss the game keeps off the HP bar -- the `<AlwaysPositiveHealth />`
+            // objects, of which the realm's Artificial Sprite God is one -- dies
+            // without ever reporting its HP leaving full, so `removed` stays 0 even
+            // though the whole pool was absorbed. Returning 0 there left the
+            // overkill trim with no pool to scale to, and a killed fight could
+            // report more damage than the boss had (22,569 against an 18,500 pool).
+            //
+            // Mechanics bosses whose HP genuinely never moves are excluded: an
+            // invulnerable finish, a Moonlight Village encounter and an aggregated
+            // aux row deal real damage that the bar never reflected, so their raw
+            // figures are kept. The unchanged plausibility bound in
+            // `trim_plausible_overkill` still guards phase-gated and healed damage.
+            let never_moved = self.min_hp_seen >= self.boss_start_hp as i64;
+            let mechanics = crate::assets::is_invuln_finish_boss(self.boss_object_type)
+                || crate::assets::is_mv_boss(self.boss_object_type)
+                || crate::assets::aux_target_for_type(self.boss_object_type).is_some();
+            if self.killed && never_moved && !mechanics {
+                return (self.boss_start_hp as i64).saturating_add(self.healed_hp.max(0));
+            }
+            return 0;
         }
+        (self.boss_start_hp as i64).saturating_add(self.healed_hp.max(0))
     }
 
     /// Accrue boss uptime up to `now_ms`, counting the elapsed slice only while
@@ -2260,6 +2278,12 @@ impl CombatTracker {
                 && new_hp > previous_hp
                 && fight.min_hp_seen < fight.boss_start_hp as i64
                 && !scaling_update
+                // `<AlwaysPositiveHealth />` bosses refill their HP number without
+                // being healed (the Artificial Sprite God snaps back to full from
+                // 12,775). Counting that as healing widens the damage pool past
+                // anything that was dealt, so the overkill trim would then let the
+                // card report more than the boss's HP.
+                && !get_asset_manager().always_positive_health(fight.boss_object_type)
             {
                 fight.healed_hp = fight.healed_hp.saturating_add(new_hp - previous_hp);
             }
@@ -11313,6 +11337,112 @@ mod tests {
     }
 
     #[test]
+    fn an_hp_refill_on_an_always_positive_health_boss_is_not_healing() {
+        // The realm's Artificial Sprite God (0x870A) carries
+        // `<AlwaysPositiveHealth />`: its bar snaps from 12,775 back to 18,500
+        // without being healed. Booking that as 5,725 of healing widened the
+        // damage pool past anything dealt, so the overkill trim let the card read
+        // 24,225 for an 18,500 boss.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        assert!(am.always_positive_health(34570), "the boss is indexed");
+        assert!(
+            !am.always_positive_health(0x0B5B),
+            "an ordinary boss is not, so its heals still count"
+        );
+
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            34570,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 18_500),
+                    stat(StatType::HP, 18_500),
+                ],
+            ),
+            0,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 6_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 12_775)]), 11);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 18_500)]), 12);
+
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.healed_hp, 0, "the refill is not a heal");
+        assert_eq!(
+            fight.effective_damage_pool(),
+            18_500,
+            "so the pool stays the boss's own HP"
+        );
+    }
+
+    #[test]
+    fn healing_after_a_mid_fight_rescale_is_counted() {
+        // A boss can rescale its HP pool after real damage has landed (dungeon
+        // player-count scaling). The rescale moves current HP too, so it must not
+        // be counted as healing -- but a genuine heal that follows must be, even
+        // while the frozen accounting pool still holds the pre-rescale max.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Some Dungeon", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 100_000), stat(StatType::HP, 100_000)],
+            ),
+            0,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 60_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 11);
+
+        // Rescale to a 200k pool at 40% current (80k). The MaxHP and HP readings
+        // can arrive separately; neither jump is a heal, and the frozen fight
+        // pool stays at 100k.
+        t.on_object_status(500, &status(500, vec![stat(StatType::MaxHP, 200_000)]), 20);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 80_000)]), 21);
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.boss_max_hp, 100_000, "accounting pool stays frozen");
+        assert_eq!(fight.healed_hp, 0, "the split scaling delta is not healing");
+
+        // A real 60k heal after the rescale must count, even though the current
+        // max (200k) differs from the frozen accounting pool (100k).
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 140_000)]), 30);
+        assert_eq!(
+            t.fights.get(&500).expect("fight live").healed_hp,
+            60_000,
+            "post-rescale heal is counted"
+        );
+    }
+
+    #[test]
     fn pre_damage_max_hp_rescale_adopts_the_new_pool() {
         // Royal Cnidarian-style: the local player registers the fight while the
         // boss is invulnerable at a smaller player-scaled pool, then more players
@@ -11811,6 +11941,57 @@ mod tests {
     fn effective_pool_is_zero_when_boss_never_lost_hp() {
         // Nominal max HP is not a damage pool if no HP was removed.
         let fight = fight_state(0, 0);
+        assert_eq!(fight.effective_damage_pool(), 0);
+    }
+
+    #[test]
+    fn a_killed_boss_that_never_showed_hp_loss_still_has_its_pool() {
+        // `<AlwaysPositiveHealth />` bosses (the realm's Artificial Sprite God,
+        // 18,500 HP) die without the server ever reporting HP leaving full. Their
+        // whole pool was absorbed, so the overkill trim must scale to it -- before
+        // this the fight reported 22,569 damage against an 18,500 boss.
+        let mut fight = fight_state(0, 0);
+        fight.boss_max_hp = 18_500;
+        fight.boss_start_hp = 18_500;
+        fight.min_hp_seen = 18_500;
+        fight.killed = true;
+        assert_eq!(fight.effective_damage_pool(), 18_500);
+
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 15_000;
+        ps[1].damage = 7_569;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage + ps[1].damage, 18_500);
+    }
+
+    #[test]
+    fn artificial_sprite_god_pool_is_its_starting_hp() {
+        // The realm's Artificial Sprite God (0x870A) carries
+        // `<AlwaysPositiveHealth />` and self-destructs at low HP, so no HP loss is
+        // ever reported and its pool came out zero -- leaving the overkill trim
+        // with nothing to scale to (the card read 19,825 against 18,500).
+        let mut fight = fight_state(0, 0);
+        fight.boss_object_type = 34570;
+        fight.boss_max_hp = 18_500;
+        fight.boss_start_hp = 18_500;
+        fight.min_hp_seen = 18_500;
+        fight.killed = true;
+        assert_eq!(fight.effective_damage_pool(), 18_500);
+
+        let mut ps = vec![participant(1, true)];
+        ps[0].damage = 19_825;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 18_500, "never more than the boss had");
+    }
+
+    #[test]
+    fn a_mechanics_boss_that_never_showed_hp_loss_keeps_its_raw_damage() {
+        // An invulnerable-finish / Moonlight Village boss absorbs damage its bar
+        // never reflects, so its pool stays 0 and nothing is trimmed.
+        let mut fight = fight_state(0, 0);
+        fight.boss_object_type = 20450; // Sage Genji, a Moonlight Village mechanics boss
+        fight.min_hp_seen = 300_000;
+        fight.killed = true;
         assert_eq!(fight.effective_damage_pool(), 0);
     }
 

@@ -626,6 +626,38 @@ pub fn resolve_custom_sound_key(settings: &SoundSettings, key: &str) -> Option<P
     }
 }
 
+/// Category-wide custom-sound key for a per-entry/per-boss key.
+///
+/// Realm-event and enchantment custom sounds are keyed as
+/// `event:<category>:<entry>` / `enchant:<category>:<entry>`, and a category
+/// default is stored under `event:<category>:default` /
+/// `enchant:<category>:default`. Returns `None` for keys with no category
+/// (custom chat, bag sounds, or an already-category-default key).
+pub(crate) fn category_custom_sound_key(key: &str) -> Option<String> {
+    let (kind, rest) = key.split_once(':')?;
+    if kind != "event" && kind != "enchant" {
+        return None;
+    }
+    let (category, entry) = rest.split_once(':')?;
+    if category.is_empty() || entry == "default" {
+        return None;
+    }
+    Some(format!("{kind}:{category}:default"))
+}
+
+/// Resolve the custom sound for a realm-event or enchantment trigger, falling
+/// back to the category-wide custom sound when that individual entry has none.
+///
+/// This is what lets a category upload replace only the default sound: entries
+/// with their own uploaded file keep it, while entries still on the default
+/// inherit the category file.
+pub fn resolve_event_custom_sound(settings: &SoundSettings, key: &str) -> Option<PathBuf> {
+    resolve_custom_sound_key(settings, key).or_else(|| {
+        category_custom_sound_key(key)
+            .and_then(|category_key| resolve_custom_sound_key(settings, &category_key))
+    })
+}
+
 impl SoundEngine {
     /// Create a new sound engine.
     ///
@@ -947,6 +979,27 @@ mod latency_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn category_custom_sound_keys_resolve_to_the_category_default() {
+        assert_eq!(
+            category_custom_sound_key("event:veteran:100").as_deref(),
+            Some("event:veteran:default")
+        );
+        assert_eq!(
+            category_custom_sound_key("event:veteran:default:100").as_deref(),
+            Some("event:veteran:default")
+        );
+        assert_eq!(
+            category_custom_sound_key("enchant:special:Flurry of Blows").as_deref(),
+            Some("enchant:special:default")
+        );
+        // Already a category default, or no category scheme at all.
+        assert_eq!(category_custom_sound_key("event:veteran:default"), None);
+        assert_eq!(category_custom_sound_key("event:veteran"), None);
+        assert_eq!(category_custom_sound_key("custom_chat_1"), None);
+        assert_eq!(category_custom_sound_key("whitebag"), None);
+    }
 
     #[test]
     fn chat_ping_sounds_are_off_by_default_and_follow_their_toggles() {

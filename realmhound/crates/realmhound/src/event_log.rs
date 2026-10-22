@@ -121,7 +121,12 @@ pub fn log_boss_call(
     // whether it was actually allowed to sound.
     let resolved = match (&diag.trigger, diag.silent_reason) {
         (Some(t), _) => {
-            let kind = if custom_sounds.contains_key(&t.custom_key) {
+            // An entry inherits the category upload when it has no custom file
+            // of its own, so count that as custom in the diagnostic too.
+            let inherits_category = crate::sound::category_custom_sound_key(&t.custom_key)
+                .map(|key| custom_sounds.contains_key(&key))
+                .unwrap_or(false);
+            let kind = if custom_sounds.contains_key(&t.custom_key) || inherits_category {
                 "custom"
             } else {
                 "default"

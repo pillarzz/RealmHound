@@ -24,7 +24,10 @@ use realmhound_core::Settings;
 use crate::processing::AudioCommand;
 #[cfg(feature = "latency-diagnostics")]
 use crate::sound::{record_audio_channel_full, record_audio_command};
-use crate::sound::{resolve_custom_sound, resolve_custom_sound_key, SoundEngine, SoundType};
+use crate::sound::{
+    resolve_custom_sound, resolve_custom_sound_key, resolve_event_custom_sound, SoundEngine,
+    SoundType,
+};
 
 /// Bound on the audio command channel. Small: audio is latency-tolerant and we
 /// coalesce duplicates anyway, so a backlog should never accumulate.
@@ -388,7 +391,7 @@ fn run(
                     .map(|s| {
                         (
                             s.sound.volume,
-                            resolve_custom_sound_key(&s.sound, &custom_key),
+                            resolve_event_custom_sound(&s.sound, &custom_key),
                         )
                     })
                     .unwrap_or((1.0, None));

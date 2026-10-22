@@ -6081,6 +6081,11 @@ impl RealmHoundApp {
 
             ui.add_space(6.0);
 
+            // Category-wide custom sound: entries still using the default
+            // sound inherit it, while entries with their own file keep theirs.
+            let category_key = format!("enchant:{}:default", prefix);
+            let has_category_custom = current.custom_sounds.contains_key(&category_key);
+
             // Category default volume + test.
             shadcn.field_row(ui, |ui| {
                 ui.set_min_height(event_row::ROW_H);
@@ -6109,7 +6114,17 @@ impl RealmHoundApp {
                 fixed_cell(ui, event_row::PCT_W, event_row::ROW_H, |ui| {
                     ui.label(format!("{:.0}%", section.default_volume * 100.0));
                 });
-                fixed_cell(ui, event_row::PICKER_W, event_row::ROW_H, |_ui| {});
+                fixed_cell(ui, event_row::PICKER_W, event_row::ROW_H, |ui| {
+                    if !has_category_custom {
+                        changed |= self.render_custom_sound_picker_tip(
+                            ui,
+                            &category_key,
+                            &mut current.custom_sounds,
+                            &mut current.custom_sound_names,
+                            "Choose a custom sound file for the whole category",
+                        );
+                    }
+                });
                 if ui
                     .small_button("🔊 Test")
                     .hover_tip("Test default sound")
@@ -6123,6 +6138,19 @@ impl RealmHoundApp {
                     });
                 }
             });
+
+            if has_category_custom {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(22.0);
+                    ui.add_space(event_row::ICON + 6.0);
+                    changed |= self.render_custom_sound_reset(
+                        ui,
+                        &category_key,
+                        &mut current.custom_sounds,
+                        &mut current.custom_sound_names,
+                    );
+                });
+            }
 
             ui.add_space(8.0);
 
@@ -6768,6 +6796,11 @@ impl RealmHoundApp {
 
             ui.add_space(6.0);
 
+            // Category-wide custom sound: entries still using the default
+            // sound inherit it, while entries with their own file keep theirs.
+            let category_key = format!("event:{}:default", prefix);
+            let has_category_custom = current.custom_sounds.contains_key(&category_key);
+
             // Section default volume + test.
             shadcn.field_row(ui, |ui| {
                 ui.set_min_height(event_row::ROW_H);
@@ -6793,7 +6826,17 @@ impl RealmHoundApp {
                 fixed_cell(ui, event_row::PCT_W, event_row::ROW_H, |ui| {
                     ui.label(format!("{:.0}%", section.default_volume * 100.0));
                 });
-                fixed_cell(ui, event_row::PICKER_W, event_row::ROW_H, |_ui| {});
+                fixed_cell(ui, event_row::PICKER_W, event_row::ROW_H, |ui| {
+                    if !has_category_custom {
+                        changed |= self.render_custom_sound_picker_tip(
+                            ui,
+                            &category_key,
+                            &mut current.custom_sounds,
+                            &mut current.custom_sound_names,
+                            "Choose a custom sound file for the whole category",
+                        );
+                    }
+                });
                 if ui
                     .small_button("🔊 Test")
                     .hover_tip("Test default sound")
@@ -6807,6 +6850,19 @@ impl RealmHoundApp {
                     });
                 }
             });
+
+            if has_category_custom {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(22.0);
+                    ui.add_space(event_row::ICON + 6.0);
+                    changed |= self.render_custom_sound_reset(
+                        ui,
+                        &category_key,
+                        &mut current.custom_sounds,
+                        &mut current.custom_sound_names,
+                    );
+                });
+            }
 
             ui.add_space(8.0);
 
@@ -7267,12 +7323,27 @@ impl RealmHoundApp {
         custom_sounds: &mut std::collections::HashMap<String, String>,
         custom_sound_names: &mut std::collections::HashMap<String, String>,
     ) -> bool {
+        self.render_custom_sound_picker_tip(
+            ui,
+            key,
+            custom_sounds,
+            custom_sound_names,
+            "Choose a custom sound file",
+        )
+    }
+
+    /// [`Self::render_custom_sound_picker`] with a caller-supplied hover tip
+    /// (category rows explain that the file applies to the whole category).
+    fn render_custom_sound_picker_tip(
+        &self,
+        ui: &mut egui::Ui,
+        key: &str,
+        custom_sounds: &mut std::collections::HashMap<String, String>,
+        custom_sound_names: &mut std::collections::HashMap<String, String>,
+        tip: &str,
+    ) -> bool {
         let mut changed = false;
-        if ui
-            .small_button("📂")
-            .hover_tip("Choose a custom sound file")
-            .clicked()
-        {
+        if ui.small_button("📂").hover_tip(tip).clicked() {
             if let Some(picked) = rfd::FileDialog::new()
                 .add_filter("Audio", &["wav", "mp3", "ogg", "flac"])
                 .pick_file()

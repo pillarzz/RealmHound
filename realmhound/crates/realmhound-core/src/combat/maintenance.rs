@@ -1,4 +1,5 @@
 use super::*;
+use crate::maintenance::MaintenanceLog;
 
 const BATCH_SIZE: i64 = 64;
 const JOBS: &[&str] = &[
@@ -136,20 +137,35 @@ impl CombatDatabase {
     /// Repair one historical batch, with its durable checkpoint in the same
     /// transaction. No paired database is opened during writer initialization.
     pub fn historical_repair_batch(&mut self, loot_path: Option<&Path>) -> SqlResult<RepairBatch> {
-        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        self.historical_repair_batch_logged(loot_path, &mut MaintenanceLog::default())
+    }
+
+    /// Reuse `log` across batches to coalesce lifecycle and retry messages.
+    pub fn historical_repair_batch_logged(
+        &mut self,
+        loot_path: Option<&Path>,
+        log: &mut MaintenanceLog,
+    ) -> SqlResult<RepairBatch> {
+        log.begin_batch("combat-maintenance");
         let result = (|| {
+            self.conn.busy_timeout(std::time::Duration::ZERO)?;
             self.conn
                 .execute_batch("SAVEPOINT historical_repair_batch")?;
-            if let Some(batch) = self.legacy_combat_repair_batch()? {
+            if let Some(batch) = self.legacy_combat_repair_batch(log)? {
                 return Ok(batch);
             }
-            let mut batch = self.historical_repair_batch_inner(loot_path)?;
+            log.task("combat-maintenance");
+            let mut batch = self.historical_repair_batch_inner(loot_path, log)?;
+            log.task("death-reconciliation");
             batch.history_changed |= self.repair_remote_deaths()? > 0;
             if crate::assets::get_asset_manager().is_loaded() {
+                log.task("retired-stat-cards");
                 let retired = self.recover_retired_stat_cards()?;
                 batch.stat_awards.extend(retired.stat_awards);
                 batch.pending |= retired.pending;
+                log.task("live-loot-proofs-v1");
                 batch.history_changed |= self.recover_loot_proofs(loot_path)?;
+                log.task("pending-stat-cards");
                 let recovered = self.recover_stat_cards()?;
                 batch.stat_awards.extend(recovered.stat_awards);
                 batch.close_calls.extend(recovered.close_calls);
@@ -158,6 +174,7 @@ impl CombatDatabase {
             Ok(batch)
         })();
         let result = result.and_then(|batch| {
+            log.task("combat-maintenance-commit");
             self.conn.execute_batch("RELEASE historical_repair_batch")?;
             Ok(batch)
         });
@@ -168,6 +185,7 @@ impl CombatDatabase {
                 tracing::error!("[COMBAT] Historical repair rollback failed: {rollback}");
             }
         }
+        log.finish(&result);
         let timeout = self.conn.busy_timeout(std::time::Duration::from_secs(5));
         match (result, timeout) {
             (Ok(batch), Ok(())) => Ok(batch),
@@ -179,6 +197,7 @@ impl CombatDatabase {
     fn historical_repair_batch_inner(
         &mut self,
         loot_path: Option<&Path>,
+        log: &mut MaintenanceLog,
     ) -> SqlResult<RepairBatch> {
         let cutoff: i64 =
             self.conn
@@ -230,6 +249,7 @@ impl CombatDatabase {
                 .optional()?;
             let Some((cutoff, cursor, seed, time, false)) = progress else {
                 if progress.is_none() {
+                    log.deferred(job, "waiting for the paired Loot database");
                     deferred = true;
                 }
                 continue;
@@ -241,9 +261,21 @@ impl CombatDatabase {
             if matches!(*job, "asset-loot-completion-v1" | "stat-awards-v1")
                 && !crate::assets::get_asset_manager().is_loaded()
             {
+                log.deferred(job, "waiting for game assets");
                 deferred = true;
                 continue;
             }
+            if job.ends_with("loot-completion-v1") && !loot_path.is_some_and(|path| path.exists()) {
+                log.deferred(job, "waiting for the paired Loot database");
+                deferred = true;
+                continue;
+            }
+            log.start(
+                job,
+                cursor,
+                cutoff,
+                cursor != 0 || seed != -2147483649 || time != i64::MIN,
+            );
             let (next, complete) = match *job {
                 "encounter-grouping-v1" => {
                     let (next, complete, seed, time, changed) =
@@ -257,6 +289,7 @@ impl CombatDatabase {
                 }
                 "curated-loot-completion-v1" | "asset-loot-completion-v1" => {
                     let Some(path) = loot_path.filter(|p| p.exists()) else {
+                        log.deferred(job, "waiting for the paired Loot database");
                         deferred = true;
                         continue;
                     };
@@ -395,15 +428,24 @@ impl CombatDatabase {
                 "UPDATE historical_repairs SET cursor=?2, complete=?3 WHERE repair_id=?1",
                 params![job, next, complete],
             )?;
+            if complete {
+                log.complete(job, next);
+            }
             return Ok(batch);
         }
-        self.conn.execute(
+        log.task("encounter-grouping-cleanup");
+        let deleted = self.conn.execute(
             "DELETE FROM historical_repair_groups WHERE rowid IN
              (SELECT rowid FROM historical_repair_groups LIMIT ?1)
              AND EXISTS(SELECT 1 FROM historical_repairs
                         WHERE repair_id='encounter-grouping-v1' AND complete=1)",
             params![BATCH_SIZE],
         )?;
+        if deleted > 0 {
+            log.start("encounter-grouping-cleanup", 0, 0, false);
+        } else {
+            log.complete("encounter-grouping-cleanup", 0);
+        }
         Ok(RepairBatch {
             pending: deferred,
             ..Default::default()

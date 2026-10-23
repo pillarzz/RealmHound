@@ -385,6 +385,7 @@ impl Worker {
             }
         }
         tracing::info!("[WORKER] processing thread started");
+        let mut maintenance_log = realmhound_core::maintenance::MaintenanceLog::default();
         loop {
             #[cfg(feature = "latency-diagnostics")]
             let iteration_started = Instant::now();
@@ -556,8 +557,10 @@ impl Worker {
                     .next_maintenance
                     .is_some_and(|due| Instant::now() >= due)
             {
+                maintenance_log.begin_batch("history-maintenance");
                 let delay = match self.processor.historical_maintenance_batch() {
                     Ok((changed, pending)) => {
+                        maintenance_log.finish(&Ok(()));
                         self.maintenance_history_dirty |= changed;
                         if self.maintenance_history_dirty
                             && (!pending || Instant::now() >= self.next_maintenance_refresh)
@@ -573,9 +576,7 @@ impl Worker {
                         }
                     }
                     Err(error) => {
-                        tracing::error!(
-                            "[WORKER] Historical maintenance failed; retrying: {error}"
-                        );
+                        maintenance_log.failed(&error);
                         Duration::from_secs(5)
                     }
                 };

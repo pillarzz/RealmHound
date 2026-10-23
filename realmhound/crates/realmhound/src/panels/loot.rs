@@ -147,6 +147,10 @@ impl FightLinkCache {
 
     fn reset(&mut self) {
         self.links.clear();
+        self.revalidate();
+    }
+
+    fn revalidate(&mut self) {
         self.resolved = 0;
         self.generation = self.generation.wrapping_add(1);
         self.retry_at = None;
@@ -177,7 +181,7 @@ impl FightLinkCache {
             }
         };
         if self.data_version != Some(version) {
-            self.reset();
+            self.revalidate();
             self.data_version = Some(version);
         }
         // Catch committed updates/deletions even when no packet update wakes
@@ -200,6 +204,8 @@ impl FightLinkCache {
                         for (id, selection) in links {
                             if let Some(selection) = selection {
                                 self.links.insert(id, selection);
+                            } else {
+                                self.links.remove(&id);
                             }
                         }
                     }
@@ -2443,6 +2449,41 @@ mod fight_link_tests {
     }
 
     #[test]
+    fn metadata_changes_keep_links_visible_during_revalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let id = writer.insert_fight(&fight(true)).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let ctx = egui::Context::default();
+        let mut cache = FightLinkCache::default();
+        let drops = [drop_record(1)];
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        let generation = cache.generation;
+        writer
+            .insert_death_broadcast(
+                "Unmatched player",
+                "Test",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+        writer.repair_remote_deaths().unwrap();
+
+        cache.refresh(&drops, &reader, &path, &ctx);
+        assert_ne!(cache.generation, generation);
+        assert!(cache.pending.is_some());
+        assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+
+        writer.delete_fight(id).unwrap();
+        cache.refresh(&drops, &reader, &path, &ctx);
+        assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert!(cache.links.is_empty());
+    }
+
+    #[test]
     fn history_reset_discards_in_flight_results_without_overlapping_workers() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat.db");
@@ -2489,6 +2530,43 @@ mod fight_link_tests {
     }
 
     #[test]
+    fn revalidation_keeps_links_and_rejects_old_results_while_a_worker_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut writer = CombatDatabase::open_writer(&path).unwrap();
+        let id = writer.insert_fight(&fight(true)).unwrap();
+        let reader = CombatDatabase::open_reader_at(&path).unwrap();
+        let ctx = egui::Context::default();
+        let mut cache = FightLinkCache::default();
+        let drops = [drop_record(1)];
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        let generation = cache.generation;
+        let (tx, result) = mpsc::channel();
+        cache.pending = Some(PendingFightLinks {
+            generation,
+            start: 0,
+            result,
+        });
+        writer.delete_fight(id).unwrap();
+        let mut replacement = fight(true);
+        replacement.encounter_id = Some("dungeon_run".to_string());
+        replacement.encounter_run_id = Some("replacement-run".to_string());
+        writer.insert_fight(&replacement).unwrap();
+
+        cache.refresh(&drops, &reader, &path, &ctx);
+        assert_ne!(cache.generation, generation);
+        assert_eq!(cache.pending.as_ref().unwrap().generation, generation);
+        assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+        tx.send(Ok(vec![(1, Some(FightSelection::Single(id)))]))
+            .unwrap();
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert_eq!(
+            cache.links.get(&1),
+            Some(&FightSelection::Encounter("replacement-run".to_string()))
+        );
+    }
+
+    #[test]
     fn background_failure_keeps_work_pending_and_retries() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat.db");
@@ -2515,5 +2593,17 @@ mod fight_link_tests {
         cache.retry_at = None;
         settle(&mut cache, &drops, &reader, &path, &ctx);
         assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+
+        writer.delete_fight(id).unwrap();
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while cache.retry_at.is_none() {
+            cache.refresh(&drops, &reader, &missing, &ctx);
+            assert_eq!(cache.links.get(&1), Some(&FightSelection::Single(id)));
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+        cache.retry_at = None;
+        settle(&mut cache, &drops, &reader, &path, &ctx);
+        assert!(cache.links.is_empty());
     }
 }

@@ -46,6 +46,7 @@ pub mod dungeon_modifiers;
 pub mod dust;
 pub mod keyper;
 pub mod loot;
+pub mod maintenance;
 pub mod party_cache;
 pub mod profiling;
 pub mod protocol;

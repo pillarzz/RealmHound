@@ -7091,26 +7091,56 @@ mod tests {
         );
     }
 
+    struct RepairTestAssets {
+        directory: tempfile::TempDir,
+        previous_directory: Option<std::path::PathBuf>,
+    }
+
+    impl RepairTestAssets {
+        fn load_if_needed() -> Option<Self> {
+            let manager = crate::assets::get_asset_manager();
+            if manager.is_loaded() {
+                return None;
+            }
+            let fixture = Self {
+                directory: tempfile::tempdir().unwrap(),
+                previous_directory: manager.assets_dir(),
+            };
+            std::fs::write(
+                fixture.directory.path().join("ObjectID.list"),
+                concat!(
+                    "100;The Forgotten King;Character;;;;ENEMY,BOSS;The Forgotten King\n",
+                    "45712;Crystal Worm Mother;Character;;;;ENEMY,BOSS;Crystal Worm Mother\n",
+                    "20789;MV Fishing Loot 1;Character;;;;ENEMY;MV Fishing Loot 1\n",
+                ),
+            )
+            .unwrap();
+            manager.set_assets_dir(fixture.directory.path());
+            assert!(manager.try_load(), "{:?}", manager.last_error());
+            Some(fixture)
+        }
+    }
+
+    impl Drop for RepairTestAssets {
+        fn drop(&mut self) {
+            crate::assets::get_asset_manager().set_assets_dir(
+                self.previous_directory
+                    .clone()
+                    .unwrap_or_else(|| self.directory.path().join("unloaded")),
+            );
+        }
+    }
+
     fn finish_recurring_repairs(db: &mut CombatDatabase, loot_path: Option<&Path>) {
         let temp = tempfile::tempdir().unwrap();
         let empty_loot = temp.path().join("loot.db");
         let _loot = crate::loot::LootDatabase::open_writer(&empty_loot, None).unwrap();
         let path = loot_path.unwrap_or(&empty_loot);
         let _ = a_boss_mark_id();
+        let _assets = RepairTestAssets::load_if_needed();
         for _ in 0..10_000 {
-            let before: i64 = db
-                .conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
-                .unwrap();
             let batch = db.historical_repair_batch(Some(path)).unwrap();
             if !batch.pending {
-                return;
-            }
-            let after: i64 = db
-                .conn
-                .query_row("SELECT total_changes()", [], |r| r.get(0))
-                .unwrap();
-            if before == after && !crate::assets::get_asset_manager().is_loaded() {
                 return;
             }
         }

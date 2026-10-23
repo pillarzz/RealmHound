@@ -1,4 +1,5 @@
 use super::*;
+use crate::maintenance::MaintenanceLog;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -226,18 +227,29 @@ impl LootDatabase {
 
     /// Run one resumable historical correction between capture batches.
     pub fn historical_repair_batch(&mut self) -> SqlResult<(bool, bool)> {
-        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        self.historical_repair_batch_logged(&mut MaintenanceLog::default())
+    }
+
+    /// Reuse `log` across batches to coalesce lifecycle and retry messages.
+    pub fn historical_repair_batch_logged(
+        &mut self,
+        log: &mut MaintenanceLog,
+    ) -> SqlResult<(bool, bool)> {
+        log.begin_batch("loot-maintenance");
         let result = (|| {
+            self.conn.busy_timeout(std::time::Duration::ZERO)?;
             let tx = self.conn.unchecked_transaction()?;
-            let batch = self.loot_repair_batch_inner()?;
+            let batch = self.loot_repair_batch_inner(log)?;
+            log.task("loot-maintenance-commit");
             tx.commit()?;
             Ok(batch)
         })();
+        log.finish(&result);
         self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         result
     }
 
-    fn loot_repair_batch_inner(&self) -> SqlResult<(bool, bool)> {
+    fn loot_repair_batch_inner(&self, log: &mut MaintenanceLog) -> SqlResult<(bool, bool)> {
         let progress: Option<(String, i64, Option<i64>, i64, i64, i64, i64)> = self
             .conn
             .query_row(
@@ -261,13 +273,25 @@ impl LootDatabase {
         else {
             return Ok((false, false));
         };
-        if !get_asset_manager().is_loaded() {
-            return Ok((false, true));
-        }
-        let Some((_, _, kind)) = JOBS.iter().find(|(_, id, _)| *id == job) else {
+        let Some((_, id, kind)) = JOBS.iter().find(|(_, id, _)| *id == job) else {
             tracing::error!("[LOOT] Unrecognized historical repair: {job}");
             return Err(rusqlite::Error::InvalidQuery);
         };
+        let job = *id;
+        if !get_asset_manager().is_loaded() {
+            log.deferred(job, "waiting for game assets");
+            return Ok((false, true));
+        }
+        if matches!(kind, Kind::Combat) && combat_cutoff.is_none() {
+            log.deferred(job, "waiting for a pre-capture Combat snapshot");
+            return Ok((false, true));
+        }
+        log.start(
+            job,
+            cursor,
+            cutoff,
+            cursor != 0 || seed != -2147483649 || boss != -2147483649 || time != i64::MIN,
+        );
         let mut changed = false;
         let count = match kind {
             Kind::Cleanup(table, family) => {
@@ -345,13 +369,11 @@ impl LootDatabase {
                 };
                 let combat = if matches!(kind, Kind::Combat) {
                     let Some(limit) = combat_cutoff else {
-                        tracing::warn!(
-                            "[LOOT] Historical correlation awaits a pre-capture Combat snapshot"
-                        );
                         return Ok((false, true));
                     };
                     if self.combat_path.is_none() {
-                        self.finish_loot_job(&job)?;
+                        self.finish_loot_job(job)?;
+                        log.complete(job, cursor);
                         return Ok((false, true));
                     }
                     let conn = self.repair_combat_reader()?;
@@ -360,7 +382,8 @@ impl LootDatabase {
                         [limit], |r| r.get(0),
                     )?;
                     if !has_kills {
-                        self.finish_loot_job(&job)?;
+                        self.finish_loot_job(job)?;
+                        log.complete(job, cursor);
                         return Ok((false, true));
                     }
                     Some((conn, limit))
@@ -401,6 +424,9 @@ impl LootDatabase {
              time_cursor=?5,complete=?6 WHERE repair_id=?1",
             params![job, cursor, seed, boss, time, count < BATCH as usize],
         )?;
+        if count < BATCH as usize {
+            log.complete(job, cursor);
+        }
         Ok((changed, true))
     }
 

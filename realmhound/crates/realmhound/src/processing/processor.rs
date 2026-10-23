@@ -335,6 +335,7 @@ pub struct PacketProcessor {
     updates: Vec<UiUpdate>,
     repaired_combat_dirty: bool,
     repaired_loot_dirty: bool,
+    loot_maintenance_log: realmhound_core::maintenance::MaintenanceLog,
 
     /// Optional raw-packet recorder. Activated at capture start when the
     /// `REALMHOUND_RECORD` env var is set (spike/dev tool for Combat History).
@@ -509,6 +510,7 @@ impl PacketProcessor {
             updates: Vec::new(),
             repaired_combat_dirty: false,
             repaired_loot_dirty: false,
+            loot_maintenance_log: realmhound_core::maintenance::MaintenanceLog::default(),
             recorder: None,
             realm_entered_at: None,
             keyper_towers_announced: false,
@@ -605,6 +607,7 @@ impl PacketProcessor {
             updates: Vec::new(),
             repaired_combat_dirty: false,
             repaired_loot_dirty: false,
+            loot_maintenance_log: realmhound_core::maintenance::MaintenanceLog::default(),
             recorder: None,
             realm_entered_at: None,
             keyper_towers_announced: false,
@@ -653,6 +656,7 @@ impl PacketProcessor {
             updates: Vec::new(),
             repaired_combat_dirty: false,
             repaired_loot_dirty: false,
+            loot_maintenance_log: realmhound_core::maintenance::MaintenanceLog::default(),
             recorder: None,
             realm_entered_at: None,
             keyper_towers_announced: false,
@@ -1529,12 +1533,17 @@ impl PacketProcessor {
                         .map_err(|error| error.to_string())?
                 {
                     let (changed, pending) = db
-                        .historical_repair_batch()
+                        .historical_repair_batch_logged(&mut self.loot_maintenance_log)
                         .map_err(|error| error.to_string())?;
                     self.repaired_loot_dirty |= changed;
                     if changed || pending {
                         return Ok((changed, true));
                     }
+                } else {
+                    self.loot_maintenance_log.deferred(
+                        "loot-023-combat-final",
+                        "waiting for Combat kill-proof repairs",
+                    );
                 }
             }
         }
@@ -5625,6 +5634,78 @@ mod new_selected_tests {
 
     fn settings() -> Arc<RwLock<Settings>> {
         Arc::new(RwLock::new(Settings::default()))
+    }
+
+    #[test]
+    fn maintenance_logs_named_jobs_once_and_retries_without_false_completion() {
+        use realmhound_core::combat::CombatDatabase;
+        use realmhound_core::maintenance::MaintenanceLog;
+
+        let temp = tempfile::tempdir().unwrap();
+        let combat_path = temp.path().join("combat.db");
+        let log_path = temp.path().join("maintenance.log");
+        let mut db = CombatDatabase::open_writer(&combat_path).unwrap();
+        let control = rusqlite::Connection::open(&combat_path).unwrap();
+        control
+            .execute_batch(
+                "CREATE TRIGGER fail_logged_repair BEFORE UPDATE ON historical_repairs
+                 WHEN NEW.repair_id='encounter-grouping-v1'
+                 BEGIN SELECT RAISE(ABORT,'maintenance log test'); END;",
+            )
+            .unwrap();
+        let output = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || output.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut log = MaintenanceLog::default();
+            for _ in 0..3 {
+                assert!(db.historical_repair_batch_logged(None, &mut log).is_err());
+            }
+            let failed = std::fs::read_to_string(&log_path).unwrap();
+            assert!(!failed.contains("[MAINTENANCE] Completed"));
+            assert_eq!(failed.matches("[MAINTENANCE] Failed;").count(), 1);
+            assert_eq!(failed.matches("[MAINTENANCE] Retrying").count(), 1);
+            control
+                .execute_batch("DROP TRIGGER fail_logged_repair")
+                .unwrap();
+            db.historical_repair_batch_logged(None, &mut log).unwrap();
+            let recovered = std::fs::read_to_string(&log_path).unwrap();
+            assert_eq!(recovered.matches("[MAINTENANCE] Started").count(), 1);
+            assert!(recovered.contains("[MAINTENANCE] Recovered after retry"));
+            assert_eq!(
+                recovered
+                    .lines()
+                    .filter(|line| line.contains("[MAINTENANCE] Completed")
+                        && line.contains("encounter-grouping-v1"))
+                    .count(),
+                1
+            );
+            assert!(recovered.contains("encounter-grouping-v1"));
+            assert!(!recovered.contains("name="));
+            assert!(recovered.contains("elapsed_ms="));
+
+            log.deferred("test-assets", "waiting for game assets");
+            log.deferred("test-assets", "waiting for game assets");
+            log.start("test-assets", 64, 100, true);
+            log.complete("test-assets", 100);
+            log.finish(&Ok(()));
+            let completed = std::fs::read_to_string(&log_path).unwrap();
+            assert_eq!(completed.matches("[MAINTENANCE] Deferred").count(), 1);
+            assert!(completed.contains("[MAINTENANCE] Resumed"));
+            assert!(completed.contains("cursor=64"));
+
+            for _ in 0..32 {
+                db.historical_repair_batch_logged(None, &mut log).unwrap();
+            }
+            let idle = std::fs::read_to_string(&log_path).unwrap();
+            for _ in 0..4 {
+                db.historical_repair_batch_logged(None, &mut log).unwrap();
+            }
+            assert_eq!(std::fs::read_to_string(&log_path).unwrap(), idle);
+        });
     }
 
     #[test]

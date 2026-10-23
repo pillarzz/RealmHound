@@ -55,6 +55,7 @@ pub struct CombatManager {
     pending_history_changes: Vec<FightSelection>,
     loot_path: Option<std::path::PathBuf>,
     totals_sync_cursor: Option<i32>,
+    maintenance_log: crate::maintenance::MaintenanceLog,
 }
 
 /// Tracks the current dungeon run so its elapsed time can be accumulated into
@@ -93,6 +94,7 @@ impl CombatManager {
             pending_history_changes: Vec::new(),
             loot_path: None,
             totals_sync_cursor: Some(i32::MIN),
+            maintenance_log: crate::maintenance::MaintenanceLog::default(),
         }
     }
 
@@ -103,6 +105,7 @@ impl CombatManager {
     pub fn open_database(&mut self, path: &std::path::Path, loot_path: Option<&std::path::Path>) {
         match CombatDatabase::open_writer_with_loot(path, loot_path) {
             Ok(db) => {
+                self.maintenance_log = crate::maintenance::MaintenanceLog::default();
                 self.database = Some(db);
                 self.loot_path = loot_path.map(std::path::Path::to_path_buf);
                 tracing::info!("[COMBAT] Combat history database opened");
@@ -124,6 +127,7 @@ impl CombatManager {
         loot_path: Option<&std::path::Path>,
     ) -> Result<(), rusqlite::Error> {
         let db = CombatDatabase::open_writer_with_loot(path, loot_path)?;
+        self.maintenance_log = crate::maintenance::MaintenanceLog::default();
         self.database = Some(db);
         self.loot_path = loot_path.map(std::path::Path::to_path_buf);
         tracing::info!("[COMBAT] Combat history database opened (strict)");
@@ -160,7 +164,8 @@ impl CombatManager {
         let Some(db) = self.database.as_mut() else {
             return Ok((false, false));
         };
-        let mut batch = db.historical_repair_batch(self.loot_path.as_deref())?;
+        let mut batch = db
+            .historical_repair_batch_logged(self.loot_path.as_deref(), &mut self.maintenance_log)?;
         self.pending_stat_awards.extend(batch.stat_awards);
         self.pending_close_call_totals.extend(batch.close_calls);
         if !batch.pending {

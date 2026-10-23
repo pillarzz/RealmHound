@@ -1,4 +1,5 @@
 use super::*;
+use crate::maintenance::MaintenanceLog;
 
 const BATCH: i64 = 64;
 const GAP: i64 = 30 * 60 * 1000;
@@ -163,7 +164,10 @@ impl CombatDatabase {
         result
     }
 
-    pub(super) fn legacy_combat_repair_batch(&mut self) -> SqlResult<Option<RepairBatch>> {
+    pub(super) fn legacy_combat_repair_batch(
+        &mut self,
+        log: &mut MaintenanceLog,
+    ) -> SqlResult<Option<RepairBatch>> {
         for &(_, job, ref kind) in JOBS {
             let progress: Option<(i64, i64, i64, String)> = self
                 .conn
@@ -178,11 +182,18 @@ impl CombatDatabase {
                 continue;
             };
             if matches!(kind, Kind::Classify) && !crate::assets::get_asset_manager().is_loaded() {
+                log.deferred(job, "waiting for game assets");
                 return Ok(Some(RepairBatch {
                     pending: true,
                     ..Default::default()
                 }));
             }
+            log.start(
+                job,
+                cursor,
+                cutoff,
+                cursor != 0 || time != i64::MIN || !text.is_empty(),
+            );
             let (next, next_time, next_text, count, changed) = if matches!(
                 kind,
                 Kind::Runs | Kind::PruneRuns | Kind::TimeRuns
@@ -307,24 +318,30 @@ impl CombatDatabase {
                  WHERE repair_id=?1",
                 params![job, next, next_time, next_text, count < BATCH as usize],
             )?;
+            if count < BATCH as usize {
+                log.complete(job, next);
+            }
             return Ok(Some(RepairBatch {
                 history_changed: changed,
                 pending: true,
                 ..Default::default()
             }));
         }
+        log.task("legacy-combat-cleanup");
         for table in ["legacy_combat_groups", "legacy_combat_run_spans"] {
             let deleted = self.conn.execute(
                 &format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} LIMIT ?1)"),
                 [BATCH],
             )?;
             if deleted > 0 {
+                log.start("legacy-combat-cleanup", 0, 0, false);
                 return Ok(Some(RepairBatch {
                     pending: true,
                     ..Default::default()
                 }));
             }
         }
+        log.complete("legacy-combat-cleanup", 0);
         Ok(None)
     }
 

@@ -4,6 +4,7 @@
 
 mod embedded_icons;
 pub(crate) mod emotes;
+pub(crate) mod modifier_chips;
 mod modifier_icons;
 pub(crate) mod rarity;
 pub(crate) mod sprite_renderer;

@@ -15,7 +15,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 67;
+pub const SCHEMA_VERSION: i32 = 68;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -56,6 +56,9 @@ pub struct FightRecord {
     /// `None` outside a groupable dungeon and for rows recorded before this was
     /// tracked. Drives the encounter card's total dungeon time.
     pub dungeon_entered_at: Option<i64>,
+    /// Dungeon modifier id tokens active for this fight's map instance. Empty
+    /// for realms/hubs and for rows recorded before mods were tracked.
+    pub dungeon_modifiers: Vec<String>,
     /// Map seed.
     pub map_seed: i32,
     /// Boss object type.
@@ -1650,6 +1653,17 @@ impl CombatDatabase {
             )?;
             tx.commit()?;
         }
+        if from_version < 68 {
+            // v67 -> v68: dungeon modifier tokens active for the fight's map
+            // instance, captured from MapInfo. NULL for rows recorded before
+            // mods were tracked; an empty string means a genuinely modless run.
+            let mut batch = String::new();
+            if !self.column_exists("fights", "mods")? {
+                batch.push_str("ALTER TABLE fights ADD COLUMN mods TEXT;");
+            }
+            batch.push_str("PRAGMA user_version = 68;");
+            self.conn.execute_batch(&batch)?;
+        }
         Ok(())
     }
 
@@ -2759,7 +2773,8 @@ impl CombatDatabase {
                 shatters_hm INTEGER NOT NULL DEFAULT 0,
                 boss_uptime_ms INTEGER NOT NULL DEFAULT 0,
                 boosts TEXT,
-                abilities TEXT
+                abilities TEXT,
+                mods TEXT
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -3014,8 +3029,8 @@ impl CombatDatabase {
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
                 dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, petless, spectral_hm,
-                shatters_hm, boss_uptime_ms, boosts, abilities)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"#,
+                shatters_hm, boss_uptime_ms, boosts, abilities, mods)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -3044,6 +3059,7 @@ impl CombatDatabase {
                 fight.boss_uptime_ms,
                 serialize_boosts(&fight.boosts),
                 serialize_abilities(&fight.abilities),
+                serialize_mods(&fight.dungeon_modifiers),
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -3136,7 +3152,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -3172,6 +3188,7 @@ impl CombatDatabase {
             boss_uptime_ms: row.get(20)?,
             boosts: parse_boosts(row.get::<_, Option<String>>(21)?.as_deref()),
             abilities: parse_abilities(row.get::<_, Option<String>>(22)?.as_deref()),
+            dungeon_modifiers: parse_mods(row.get::<_, Option<String>>(23)?.as_deref()),
             participants: Vec::new(),
         })
     }
@@ -4208,7 +4225,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -4238,7 +4255,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -4282,7 +4299,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -5667,6 +5684,25 @@ fn serialize_boosts(boosts: &[BoostWindow]) -> Option<String> {
     )
 }
 
+/// Serialize dungeon modifier tokens as a `;`-separated list. Tokens are
+/// uppercase alphanumerics, and `;` matches the MapInfo wire separator.
+fn serialize_mods(mods: &[String]) -> String {
+    mods.join(";")
+}
+
+/// Parse a stored `mods` column. `NULL` (rows recorded before mod tracking) and
+/// empty strings both yield an empty list.
+fn parse_mods(data: Option<&str>) -> Vec<String> {
+    data.map(|d| {
+        d.split(';')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Parse the stored boost windows. Malformed lines are skipped rather than
 /// failing the read, so a partially written row cannot hide the whole fight.
 fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
@@ -6162,6 +6198,7 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
                 .filter_map(|g| g.dungeon_entered_at)
                 .min()
                 .or(p.dungeon_entered_at),
+            dungeon_modifiers: p.dungeon_modifiers.clone(),
             map_seed: p.map_seed,
             boss_object_type: aux.repr_type,
             boss_name: aux.display_name.to_string(),
@@ -6244,6 +6281,7 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
                 .filter_map(|g| g.dungeon_entered_at)
                 .min()
                 .or(p.dungeon_entered_at),
+            dungeon_modifiers: p.dungeon_modifiers.clone(),
             map_seed: p.map_seed,
             boss_object_type: p.boss_object_type,
             boss_name: p.boss_name.clone(),
@@ -6775,6 +6813,7 @@ mod tests {
             ended_at: 61_000,
             dungeon: "Mad Lab".to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 42,
             boss_object_type: 0x10E4,
             boss_name: "Dr Terrible".to_string(),
@@ -6861,6 +6900,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fight_round_trips_dungeon_modifiers() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = sample_fight();
+        fight.dungeon_modifiers = vec!["CHEF".to_string(), "REWARDING".to_string()];
+        let id = db.insert_fight(&fight).unwrap();
+
+        let loaded = db.fight_detail(id).unwrap().expect("fight");
+        assert_eq!(loaded.dungeon_modifiers, vec!["CHEF", "REWARDING"]);
+        let recent = db.recent_fights(10).unwrap();
+        assert_eq!(recent[0].dungeon_modifiers, vec!["CHEF", "REWARDING"]);
+    }
+
+    #[test]
+    fn v67_database_gains_the_mods_column() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Simulate a database written before mods were stored.
+        db.conn
+            .execute_batch(
+                "ALTER TABLE fights DROP COLUMN mods;
+                 PRAGMA user_version = 67;",
+            )
+            .unwrap();
+        assert!(!db.column_exists("fights", "mods").unwrap());
+
+        db.migrate(67).unwrap();
+
+        assert!(db.column_exists("fights", "mods").unwrap());
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The migrated column is readable through the normal insert/read path.
+        let mut fight = sample_fight();
+        fight.dungeon_modifiers = vec!["CHEF".to_string()];
+        let id = db.insert_fight(&fight).unwrap();
+        assert_eq!(
+            db.fight_detail(id)
+                .unwrap()
+                .expect("fight")
+                .dungeon_modifiers,
+            vec!["CHEF"]
+        );
+    }
+
+    #[test]
+    fn legacy_null_dungeon_modifiers_read_as_empty() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let id = db.insert_fight(&sample_fight()).unwrap();
+        db.conn
+            .execute(
+                "UPDATE fights SET mods = NULL WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+
+        let loaded = db.fight_detail(id).unwrap().expect("fight");
+        assert!(loaded.dungeon_modifiers.is_empty());
+    }
+
     fn flawless_part(
         object_id: i32,
         name: &str,
@@ -6908,6 +7008,7 @@ mod tests {
             ended_at: 61_000,
             dungeon: dungeon.to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 1,
             boss_object_type: boss_type,
             boss_name: String::new(),
@@ -13865,6 +13966,7 @@ mod tests {
             ended_at: started_at + 1000,
             dungeon: "The Hive".to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 0,
             boss_object_type: boss_type,
             boss_name: name.to_string(),

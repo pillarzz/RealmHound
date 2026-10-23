@@ -2251,6 +2251,7 @@ mod fight_link_tests {
             ended_at: 61_000,
             dungeon: "Realm".to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 1,
             boss_object_type: 8200,
             boss_name: String::new(),

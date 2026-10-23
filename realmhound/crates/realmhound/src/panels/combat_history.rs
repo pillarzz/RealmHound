@@ -28,6 +28,9 @@ use realmhound_core::{
 
 use crate::panels::loot::DateFilter;
 use crate::panels::{empty_state, empty_state_lines, AppAction, Panel, PanelContext};
+use crate::rendering::modifier_chips::{
+    self, DIMITUS_OBJECT_ID, WHITE_BAG_OBJECT_ID, XP_BOOSTER_OBJECT_ID,
+};
 use crate::rendering::EmbeddedIcon;
 
 /// How often to poll the fight count for new fights (wall clock).
@@ -618,6 +621,110 @@ fn merge_run_abilities(enc: &EncounterRecord) -> Vec<AbilityActivation> {
     }
     out.sort_by_key(|a| a.start_offset_ms);
     out
+}
+
+/// Draw the dungeon-modifier rows shown directly under a fight card's
+/// `Dungeon · Date time` line: the modifier chips first, then the total
+/// Loot/Dust/XP bonuses they grant. Both rows are omitted when the instance
+/// recorded no mods (realms, hubs, unmodified dungeons, pre-tracking cards).
+fn draw_dungeon_mod_rows(
+    ui: &mut egui::Ui,
+    sprite_renderer: &mut crate::rendering::SpriteRenderer,
+    tokens: &[String],
+) {
+    if tokens.is_empty() {
+        return;
+    }
+    let chips = modifier_chips::chips_from_tokens(tokens);
+    let text_color = Color32::GRAY;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (idx, chip) in chips.iter().enumerate() {
+            if idx > 0 {
+                ui.label(RichText::new(",").color(text_color));
+            }
+            let chip_response = ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                let icon_size = egui::vec2(20.0, 20.0);
+                if chip.is_dimitus {
+                    let (rect, _) = ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                    sprite_renderer.draw_outlined_sprite_in_rect(ui, DIMITUS_OBJECT_ID, rect);
+                } else if let Some(icon) = chip.modifier_icon {
+                    let (rect, _) = ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                    sprite_renderer.draw_modifier_icon(ui, icon, rect);
+                } else if let Some(icon) = modifier_chips::mod_type_icon(chip.mod_type) {
+                    let (rect, _) = ui.allocate_exact_size(icon_size, egui::Sense::hover());
+                    sprite_renderer.draw_embedded_icon(ui, icon, rect);
+                } else if let Some(glyph) = modifier_chips::mod_type_glyph(chip.mod_type) {
+                    ui.label(RichText::new(glyph).color(text_color));
+                }
+                ui.label(RichText::new(&chip.name).color(text_color));
+            });
+            if chip_response.response.hovered() {
+                if let Some(tooltip) = modifier_tooltip(&chip.token) {
+                    chip_response.response.hover_tip(tooltip);
+                }
+            }
+        }
+    });
+
+    let bonus = realmhound_core::dungeon_modifiers::total_bonus(tokens);
+    if bonus.loot <= 0 && bonus.dust <= 0 && bonus.xp <= 0 {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        if bonus.loot > 0 {
+            draw_reward_icon(ui, sprite_renderer, None, WHITE_BAG_OBJECT_ID);
+            ui.label(RichText::new(format!("Loot +{}%", bonus.loot)).color(text_color));
+        }
+        if bonus.dust > 0 {
+            draw_reward_icon(ui, sprite_renderer, Some(EmbeddedIcon::DustGrey), -1);
+            ui.label(RichText::new(format!("Dust +{}%", bonus.dust)).color(text_color));
+        }
+        if bonus.xp > 0 {
+            draw_reward_icon(ui, sprite_renderer, None, XP_BOOSTER_OBJECT_ID);
+            ui.label(RichText::new(format!("XP +{}%", bonus.xp)).color(text_color));
+        }
+    });
+}
+
+/// Draw one reward icon (white bag, grey dust, or XP booster) at chip size.
+fn draw_reward_icon(
+    ui: &mut egui::Ui,
+    sprite_renderer: &mut crate::rendering::SpriteRenderer,
+    embedded: Option<EmbeddedIcon>,
+    object_id: i32,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+    match embedded {
+        Some(icon) => {
+            sprite_renderer.draw_embedded_icon(ui, icon, rect);
+        }
+        None => {
+            sprite_renderer.draw_outlined_sprite_in_rect(ui, object_id, rect);
+        }
+    }
+}
+
+/// Hover text for a modifier: its in-game description plus reward bonuses,
+/// resolved from the locally extracted `mods.xml`. `None` when nothing is known.
+fn modifier_tooltip(token: &str) -> Option<String> {
+    let def = get_asset_manager().modifier_def(token)?;
+    let mut lines = Vec::new();
+    let description = def.description.trim();
+    if !description.is_empty() {
+        lines.push(description.to_string());
+    }
+    let bonuses: Vec<String> = [(def.loot, "Loot"), (def.dust, "Dust"), (def.xp, "XP")]
+        .into_iter()
+        .filter(|(value, _)| *value > 0)
+        .map(|(value, label)| format!("{label} +{value}%"))
+        .collect();
+    if !bonuses.is_empty() {
+        lines.push(bonuses.join(" · "));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 fn dungeon_display_name(portal_map: &DungeonPortalMap, dungeon: &str, modes: RunModes) -> String {
@@ -3052,6 +3159,7 @@ impl CombatHistoryPanel {
                         ))
                         .color(Color32::GRAY),
                     );
+                    draw_dungeon_mod_rows(ui, ctx.sprite_renderer, &fight.dungeon_modifiers);
                     ui.label(
                         RichText::new(format!("Duration: {}", fmt_duration(fight.duration_ms())))
                             .color(Color32::GRAY),
@@ -3946,6 +4054,7 @@ impl CombatHistoryPanel {
             ended_at: enc.ended_at,
             dungeon: enc.dungeon.clone(),
             dungeon_entered_at: anchor.dungeon_entered_at,
+            dungeon_modifiers: anchor.dungeon_modifiers.clone(),
             map_seed: anchor.map_seed,
             boss_object_type: enc.anchor_object_type,
             boss_name: enc.display_name.clone(),
@@ -5397,6 +5506,12 @@ impl CombatHistoryPanel {
                         ))
                         .color(Color32::GRAY),
                     );
+                    let tokens = enc
+                        .phases
+                        .first()
+                        .map(|p| p.dungeon_modifiers.as_slice())
+                        .unwrap_or(&[]);
+                    draw_dungeon_mod_rows(ui, ctx.sprite_renderer, tokens);
                     ui.label(
                         RichText::new(format!(
                             "Active combat time: {}",

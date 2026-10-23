@@ -2473,7 +2473,8 @@ impl PacketProcessor {
                 // Location update + encounter clearing handled by LiveFeedPanel (broadcast).
                 // Remaining: notify loot tracker of new map.
                 self.loot_tracker.on_map_info(display_name, fp);
-                self.combat.on_map_change(display_name, fp, now_ms());
+                self.combat
+                    .on_map_change(display_name, fp, now_ms(), dungeon_modifiers);
 
                 // Lost Halls Rune monuments: surface a single combined entry when
                 // the player enters Oryx's Sanctuary, listing only the monuments a

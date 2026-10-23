@@ -83,6 +83,7 @@ objc2-foundation = { version = "0.3", features = ["NSBundle", "NSData"] }
 [dev-dependencies]
 # Hermetic temporary directories for path-injection tests.
 tempfile = "3"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [features]
 # Enable the in-app puffin profiler overlay (toggle with F12) and pipeline scopes.

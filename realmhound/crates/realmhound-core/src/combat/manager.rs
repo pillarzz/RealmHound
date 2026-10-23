@@ -130,6 +130,21 @@ impl CombatManager {
         Ok(())
     }
 
+    /// Snapshot before capture starts so legacy loot cannot borrow new fights.
+    pub fn historical_fight_cutoff(&self) -> Result<Option<i64>, rusqlite::Error> {
+        self.database
+            .as_ref()
+            .map(CombatDatabase::historical_fight_cutoff)
+            .transpose()
+    }
+
+    pub fn has_legacy_repairs(&self) -> Result<bool, rusqlite::Error> {
+        match self.database.as_ref() {
+            Some(db) => db.has_legacy_repairs(),
+            None => Ok(false),
+        }
+    }
+
     /// Run only after the UI is usable, between capture batches.
     pub fn historical_maintenance_batch(
         &mut self,

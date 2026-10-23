@@ -110,6 +110,22 @@ struct Header {
 }
 
 impl CombatDatabase {
+    pub fn historical_fight_cutoff(&self) -> SqlResult<i64> {
+        self.conn
+            .query_row("SELECT COALESCE(MAX(id),0) FROM fights", [], |r| r.get(0))
+    }
+
+    pub fn has_legacy_repairs(&self) -> SqlResult<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM historical_repairs
+                 WHERE repair_id LIKE 'legacy-combat-%' AND complete=0)
+             OR EXISTS(SELECT 1 FROM legacy_combat_groups)
+             OR EXISTS(SELECT 1 FROM legacy_combat_run_spans)",
+            [],
+            |r| r.get(0),
+        )
+    }
+
     pub(super) fn register_legacy_combat_repairs(&self, version: i32) -> SqlResult<()> {
         self.conn.execute_batch(maintenance::PROGRESS_SCHEMA)?;
         for (column, definition) in [("text_cursor", "TEXT NOT NULL DEFAULT ''")] {

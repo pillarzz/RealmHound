@@ -333,6 +333,8 @@ pub struct PacketProcessor {
     seq: u64,
     /// Scratch buffer of updates emitted for the current `process_available` call.
     updates: Vec<UiUpdate>,
+    repaired_combat_dirty: bool,
+    repaired_loot_dirty: bool,
 
     /// Optional raw-packet recorder. Activated at capture start when the
     /// `REALMHOUND_RECORD` env var is set (spike/dev tool for Combat History).
@@ -454,9 +456,16 @@ impl PacketProcessor {
             session
         };
 
-        // The loot writer creates the schema before the UI reader opens, and its
-        // v13 backfill correlates against the paired combat history database.
-        let mut loot_tracker = match LootTracker::with_database(&loot_path, Some(&combat_path)) {
+        let mut combat = CombatManager::new();
+        combat.open_database(&combat_path, Some(&loot_path));
+        if let Ok(s) = settings.read() {
+            combat.set_history_settings(s.combat_history.clone());
+        }
+
+        let mut loot_tracker = match combat
+            .historical_fight_cutoff()
+            .and_then(|cutoff| LootTracker::with_database(&loot_path, Some(&combat_path), cutoff))
+        {
             Ok(tracker) => {
                 tracing::info!("[LOOT] Initialized loot tracker with database");
                 tracker
@@ -471,12 +480,6 @@ impl PacketProcessor {
         };
         if let Ok(s) = settings.read() {
             loot_tracker.set_tracking_settings(&s.loot_tracking);
-        }
-
-        let mut combat = CombatManager::new();
-        combat.open_database(&combat_path, Some(&loot_path));
-        if let Ok(s) = settings.read() {
-            combat.set_history_settings(s.combat_history.clone());
         }
 
         Self {
@@ -504,6 +507,8 @@ impl PacketProcessor {
             vault_view_gen: 0,
             seq: 0,
             updates: Vec::new(),
+            repaired_combat_dirty: false,
+            repaired_loot_dirty: false,
             recorder: None,
             realm_entered_at: None,
             keyper_towers_announced: false,
@@ -554,14 +559,21 @@ impl PacketProcessor {
             combat.set_history_settings(s.combat_history.clone());
         }
 
+        let combat_cutoff =
+            combat
+                .historical_fight_cutoff()
+                .map_err(|source| ProcessorInitError::Database {
+                    label: "combat",
+                    detail: source.to_string(),
+                })?;
         // Loot writer second: creates the schema before the UI reader opens.
         let mut loot_tracker =
-            LootTracker::with_database(&loot_path, Some(&combat_path)).map_err(|source| {
-                ProcessorInitError::Database {
+            LootTracker::with_database(&loot_path, Some(&combat_path), combat_cutoff).map_err(
+                |source| ProcessorInitError::Database {
                     label: "loot",
                     detail: source.to_string(),
-                }
-            })?;
+                },
+            )?;
         if let Ok(s) = settings.read() {
             loot_tracker.set_tracking_settings(&s.loot_tracking);
         }
@@ -591,6 +603,8 @@ impl PacketProcessor {
             vault_view_gen: 0,
             seq: 0,
             updates: Vec::new(),
+            repaired_combat_dirty: false,
+            repaired_loot_dirty: false,
             recorder: None,
             realm_entered_at: None,
             keyper_towers_announced: false,
@@ -637,6 +651,8 @@ impl PacketProcessor {
             vault_view_gen: 0,
             seq: 0,
             updates: Vec::new(),
+            repaired_combat_dirty: false,
+            repaired_loot_dirty: false,
             recorder: None,
             realm_entered_at: None,
             keyper_towers_announced: false,
@@ -1498,6 +1514,21 @@ impl PacketProcessor {
     }
 
     pub fn historical_maintenance_batch(&mut self) -> Result<(bool, bool), String> {
+        if !self
+            .combat
+            .has_legacy_repairs()
+            .map_err(|error| error.to_string())?
+        {
+            if let Some(db) = self.loot_tracker.database_mut() {
+                let (changed, pending) = db
+                    .historical_repair_batch()
+                    .map_err(|error| error.to_string())?;
+                self.repaired_loot_dirty |= changed;
+                if changed || pending {
+                    return Ok((changed, true));
+                }
+            }
+        }
         let char_ids: Vec<_> = self
             .account_data
             .characters
@@ -1511,11 +1542,17 @@ impl PacketProcessor {
             .historical_maintenance_batch(&char_ids)
             .map_err(|e| e.to_string())?;
         self.fold_deferred_combat();
+        self.repaired_combat_dirty |= result.0;
         Ok(result)
     }
 
     pub fn publish_repaired_history(&mut self) {
-        self.emit(UiPayload::CombatHistoryChanged);
+        if std::mem::take(&mut self.repaired_combat_dirty) {
+            self.emit(UiPayload::CombatHistoryChanged);
+        }
+        if std::mem::take(&mut self.repaired_loot_dirty) {
+            self.emit(UiPayload::LootBatchAdded);
+        }
     }
 
     /// Process a batch of raw captured packets, returning the ordered updates
@@ -5579,6 +5616,129 @@ mod new_selected_tests {
 
     fn settings() -> Arc<RwLock<Settings>> {
         Arc::new(RwLock::new(Settings::default()))
+    }
+
+    #[test]
+    fn repaired_history_refreshes_only_the_changed_history() {
+        use super::UiPayload;
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.repaired_combat_dirty = true;
+        processor.publish_repaired_history();
+        assert_eq!(processor.updates.len(), 1);
+        assert!(matches!(
+            processor.updates[0].payload,
+            UiPayload::CombatHistoryChanged
+        ));
+        processor.updates.clear();
+        processor.publish_repaired_history();
+        assert!(processor.updates.is_empty());
+        processor.repaired_loot_dirty = true;
+        processor.publish_repaired_history();
+        assert_eq!(processor.updates.len(), 1);
+        assert!(matches!(
+            processor.updates[0].payload,
+            UiPayload::LootBatchAdded
+        ));
+    }
+
+    #[test]
+    fn legacy_combat_finishes_before_loot_and_snapshot_excludes_new_fights() {
+        let assets = realmhound_core::assets::get_asset_manager();
+        if let Some(dir) = realmhound_core::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        if !assets.try_load() {
+            eprintln!("skipping asset-dependent historical repair test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let combat = temp.path().join("combat.db");
+        let loot = temp.path().join("loot.db");
+        CombatDatabase::open_writer(&combat)
+            .unwrap()
+            .close()
+            .unwrap();
+        let conn = rusqlite::Connection::open(&combat).unwrap();
+        conn.execute(
+            "INSERT INTO fights(started_at,ended_at,dungeon,map_seed,boss_object_type,boss_name,
+                 boss_max_hp,boss_start_hp,local_object_id,local_char_id,killed)
+             VALUES(0,1000,'The Shatters',77,?1,'Old Queen',100,100,10,1,1)",
+            [realmhound_core::assets::SHATTERS_QUEEN_TYPE],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version=53").unwrap();
+        drop(conn);
+        LootDatabase::open_writer(&loot, None)
+            .unwrap()
+            .close()
+            .unwrap();
+        let conn = rusqlite::Connection::open(&loot).unwrap();
+        conn.execute_batch(
+            "INSERT INTO loot_drops(timestamp,dungeon,map_seed,char_id,char_name,class_id,fame,bag_type,mob_type,mob_name)
+             VALUES(1001,'Synthetic Dungeon',77,1,'Player',768,0,1292,0,'Unknown');
+             INSERT INTO loot_items(drop_id,slot,item_id,item_name) VALUES(1,0,7718,'Mark');
+             PRAGMA user_version=22;"
+        ).unwrap();
+        drop(conn);
+        let mut processor = PacketProcessor::new_selected(
+            settings(),
+            AccountData::new(),
+            AccountDataRepository::for_profile(temp.path().join("account_data.json")),
+            loot.clone(),
+            combat.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&combat).unwrap();
+        conn.execute(
+            "INSERT INTO fights(started_at,ended_at,dungeon,map_seed,boss_object_type,boss_name,
+                 boss_max_hp,boss_start_hp,local_object_id,local_char_id,killed)
+             VALUES(2000,3000,'Other',77,999999,'Later Live Boss',100,100,10,1,1)",
+            [],
+        )
+        .unwrap();
+        let reader = rusqlite::Connection::open(&loot).unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT mob_type FROM loot_drops WHERE id=1", [], |r| r
+                    .get::<_, i32>(0))
+                .unwrap(),
+            0
+        );
+        assert!(processor.combat.has_legacy_repairs().unwrap());
+        processor.historical_maintenance_batch().unwrap();
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT cursor FROM legacy_loot_repairs WHERE repair_id='loot-023-combat'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let mut repaired = false;
+        for _ in 0..200 {
+            processor.historical_maintenance_batch().unwrap();
+            let name: String = reader
+                .query_row("SELECT mob_name FROM loot_drops WHERE id=1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if name != "Unknown" {
+                assert_eq!(name, "The Shattered Queen");
+                repaired = true;
+                break;
+            }
+        }
+        assert!(
+            repaired,
+            "legacy Loot must eventually use the corrected historical fight"
+        );
+        assert_eq!(reader.query_row(
+            "SELECT combat_cutoff FROM legacy_loot_repairs WHERE repair_id='loot-023-combat'",
+            [],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 
     #[test]

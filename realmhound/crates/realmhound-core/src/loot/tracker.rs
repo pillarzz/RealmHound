@@ -19,9 +19,9 @@ use super::detection::{LootDetector, PendingBag};
 use super::player_state::{PlayerSnapshot, PlayerStateTracker};
 
 /// How long after a boss kill a bag may still be correlated to it (millis).
-const KILL_CORRELATION_MAX_LAG_MS: i64 = 90_000;
+pub(super) const KILL_CORRELATION_MAX_LAG_MS: i64 = 90_000;
 /// Tolerance for a bag whose timestamp slightly precedes the fight finalize.
-const KILL_CORRELATION_EARLY_TOLERANCE_MS: i64 = 15_000;
+pub(super) const KILL_CORRELATION_EARLY_TOLERANCE_MS: i64 = 15_000;
 
 /// Tight window for correlating an *Unknown, colourless* Killer Bee Nest bag to
 /// a Beehemoth kill: bags drop ~1s after their bee dies, so a short lag keeps
@@ -339,13 +339,19 @@ impl LootTracker {
     /// Create a new loot tracker with a database opened at explicit paths.
     ///
     /// `loot_path` is the loot history database; `combat_path` is the paired
-    /// combat history database consulted by the v13 Unknown-source backfill.
+    /// combat history database consulted by historical attribution repairs.
+    /// `combat_cutoff` comes from its writer before capture starts.
     pub fn with_database(
         loot_path: &std::path::Path,
         combat_path: Option<&std::path::Path>,
+        combat_cutoff: Option<i64>,
     ) -> Result<Self, rusqlite::Error> {
         let mut tracker = Self::new();
-        tracker.database = Some(LootDatabase::open_writer(loot_path, combat_path)?);
+        tracker.database = Some(LootDatabase::open_writer_at_combat_cutoff(
+            loot_path,
+            combat_path,
+            combat_cutoff,
+        )?);
         Ok(tracker)
     }
 

@@ -20,6 +20,7 @@ pub enum SettingsCategory {
     WidgetBar,
     Taskbar,
     Debug,
+    Overlays,
 }
 
 impl SettingsCategory {
@@ -38,6 +39,7 @@ impl SettingsCategory {
             SettingsCategory::WidgetBar => "widget_bar",
             SettingsCategory::Taskbar => "taskbar",
             SettingsCategory::Debug => "debug",
+            SettingsCategory::Overlays => "overlays",
         }
     }
 
@@ -55,6 +57,7 @@ impl SettingsCategory {
             "widget_bar" => SettingsCategory::WidgetBar,
             "taskbar" => SettingsCategory::Taskbar,
             "debug" => SettingsCategory::Debug,
+            "overlays" => SettingsCategory::Overlays,
             _ => SettingsCategory::Loot,
         }
     }

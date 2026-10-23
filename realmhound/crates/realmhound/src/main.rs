@@ -34,6 +34,7 @@ mod enchant_sound;
 mod event_log;
 mod memo;
 mod modals;
+mod overlay;
 mod panels;
 mod processing;
 mod profiling;
@@ -124,7 +125,12 @@ fn main() -> Result<()> {
         // (which scales a single bitmap to system-metric sizes and blurs on high-DPI
         // taskbars). Windows then uses the crisp multi-size .ico embedded as a
         // resource by build.rs, picking the correct frame per DPI.
-        .with_icon(egui::IconData::default());
+        .with_icon(egui::IconData::default())
+        // eframe derives the GL config's alpha support from the *root* viewport
+        // alone, so the overlay child windows can only be see-through if this one
+        // asks for transparency too. The main window still looks opaque because
+        // its panels paint a solid background over the whole client area.
+        .with_transparent(true);
 
     if let Some((x, y)) = window_pos {
         #[cfg(windows)]
@@ -586,6 +592,15 @@ impl RootApp {
 }
 
 impl eframe::App for RootApp {
+    /// Clear every viewport to fully transparent.
+    ///
+    /// eframe uses a single clear color for all viewports, and the overlay
+    /// windows need theirs to be transparent so the game shows through. The
+    /// main window is unaffected: its top/bottom panels and central panel paint
+    /// an opaque background across the entire client area.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let RootState::Active(app) = &mut self.state {
             app.on_exit(gl);

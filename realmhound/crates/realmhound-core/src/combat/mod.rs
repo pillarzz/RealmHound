@@ -30,5 +30,6 @@ pub use tracker::{
 pub use types::{
     AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
     FightParticipant, FightSelection, ItemProcContribution, LethalStrikeContribution,
-    ParticipantEndStatus, PatternContribution, PetInfo, SummonContribution, WeaponContribution,
+    LiveFightSnapshot, ParticipantEndStatus, PatternContribution, PetInfo, SummonContribution,
+    WeaponContribution,
 };

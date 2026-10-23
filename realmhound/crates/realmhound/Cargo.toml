@@ -74,10 +74,20 @@ fs2 = "0.4"
 # Socket -> owning process lookup for the forge-fire relaunch safeguard,
 # replacing GetExtendedTcpTable/GetProcessTimes.
 libproc = "0.14"
-# A bundle-less Mach-O has nowhere to carry an icon, so AppKit's Dock tile is the
-# only place the plain binary can show one; NSBundle tells a bundled build apart.
+# Overlay window promotion: winit's always-on-top maps to NSFloatingWindowLevel,
+# which sits *below* a game in native Full Screen mode. Raising the overlay to
+# NSScreenSaverWindowLevel with an all-Spaces collection behavior needs AppKit.
+# AppKit's Dock tile is also the only place a bundle-less binary can show an
+# icon, and NSBundle tells a bundled build apart.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSEvent",
+    "NSImage",
+    "NSResponder",
+    "NSScreen",
+    "NSWindow",
+] }
 objc2-foundation = { version = "0.3", features = ["NSBundle", "NSData"] }
 
 [dev-dependencies]

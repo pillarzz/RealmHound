@@ -362,7 +362,7 @@ impl LootDatabase {
             self.migrate(version, combat_cutoff)?;
         }
 
-        Ok(())
+        self.ensure_final_combat_correlation()
     }
 
     /// Get current schema version.
@@ -3419,6 +3419,66 @@ mod tests {
         assert_eq!(drop_source(&db, winner).1, "Winner");
         assert_eq!(drop_source(&db, first_other).0, 0);
         assert_eq!(drop_source(&db, runner + 1), (boss, "Winner".to_string()));
+    }
+
+    #[test]
+    fn final_combat_correlation_inherits_completed_job_cutoffs() {
+        for version in [22, SCHEMA_VERSION] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("loot.db");
+            let db = LootDatabase::open_writer(&path, None).unwrap();
+            assert!(!db.awaits_combat_completion().unwrap());
+            db.conn.execute_batch(
+            "INSERT INTO loot_drops(timestamp,dungeon,map_seed,char_id,char_name,class_id,fame,bag_type,mob_type,mob_name)
+             VALUES(1,'Realm',77,1,'Player',768,0,1292,0,'Unknown'),
+                   (2,'Realm',77,1,'Player',768,0,1292,0,'Unknown'),
+                   (3,'Realm',77,1,'Player',768,0,1292,0,'Unknown');
+             INSERT INTO legacy_loot_repairs
+                 (repair_id,ordinal,cutoff,combat_cutoff,cursor,complete)
+             VALUES('loot-023-combat',26,1,7,1,1);"
+        ).unwrap();
+            db.conn
+                .execute_batch(&format!("PRAGMA user_version={version}"))
+                .unwrap();
+            db.close().unwrap();
+
+            let db = LootDatabase::open_writer_at_combat_cutoff(&path, None, Some(99)).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE legacy_loot_repairs SET complete=1
+             WHERE repair_id!='loot-023-combat-final'",
+                    [],
+                )
+                .unwrap();
+            assert!(db.awaits_combat_completion().unwrap());
+            let checkpoint_sql = "SELECT cursor,cutoff,combat_cutoff,complete
+            FROM legacy_loot_repairs WHERE repair_id='loot-023-combat-final'";
+            let checkpoint: (i64, i64, i64, bool) = db
+                .conn
+                .query_row(checkpoint_sql, [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint, (0, 1, 7, false));
+            db.conn
+                .execute(
+                    "UPDATE legacy_loot_repairs SET cursor=1,complete=1
+                 WHERE repair_id='loot-023-combat-final'",
+                    [],
+                )
+                .unwrap();
+            db.close().unwrap();
+
+            let db = LootDatabase::open_writer_at_combat_cutoff(&path, None, Some(100)).unwrap();
+            assert!(!db.awaits_combat_completion().unwrap());
+            let checkpoint: (i64, i64, i64, bool) = db
+                .conn
+                .query_row(checkpoint_sql, [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint, (1, 1, 7, true));
+        }
     }
 
     #[test]

@@ -123,6 +123,16 @@ pub struct RepairBatch {
 }
 
 impl CombatDatabase {
+    pub fn loot_completion_repairs_complete(&self) -> SqlResult<bool> {
+        self.conn.query_row(
+            "SELECT COUNT(*)=3 FROM historical_repairs
+             WHERE repair_id IN ('curated-loot-completion-v1',
+                 'asset-loot-completion-v1','ivory-completion-v1') AND complete=1",
+            [],
+            |r| r.get(0),
+        )
+    }
+
     /// Repair one historical batch, with its durable checkpoint in the same
     /// transaction. No paired database is opened during writer initialization.
     pub fn historical_repair_batch(&mut self, loot_path: Option<&Path>) -> SqlResult<RepairBatch> {

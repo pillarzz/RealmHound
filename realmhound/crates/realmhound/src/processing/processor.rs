@@ -1520,12 +1520,21 @@ impl PacketProcessor {
             .map_err(|error| error.to_string())?
         {
             if let Some(db) = self.loot_tracker.database_mut() {
-                let (changed, pending) = db
-                    .historical_repair_batch()
-                    .map_err(|error| error.to_string())?;
-                self.repaired_loot_dirty |= changed;
-                if changed || pending {
-                    return Ok((changed, true));
+                if !db
+                    .awaits_combat_completion()
+                    .map_err(|error| error.to_string())?
+                    || self
+                        .combat
+                        .loot_completion_repairs_complete()
+                        .map_err(|error| error.to_string())?
+                {
+                    let (changed, pending) = db
+                        .historical_repair_batch()
+                        .map_err(|error| error.to_string())?;
+                    self.repaired_loot_dirty |= changed;
+                    if changed || pending {
+                        return Ok((changed, true));
+                    }
                 }
             }
         }
@@ -5739,6 +5748,160 @@ mod new_selected_tests {
         assert_eq!(reader.query_row(
             "SELECT combat_cutoff FROM legacy_loot_repairs WHERE repair_id='loot-023-combat'",
             [],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn legacy_loot_correlation_uses_deferred_kill_proofs() {
+        let assets = realmhound_core::assets::get_asset_manager();
+        if let Some(dir) = realmhound_core::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        if !assets.try_load() {
+            eprintln!("skipping asset-dependent historical repair test");
+            return;
+        }
+        let red = realmhound_core::loot::RED_BEEHEMOTH_OBJECT_TYPE;
+        assert!(assets.bag_attribution_proves_kill(red));
+        for version in [12, 22] {
+            let temp = tempfile::tempdir().unwrap();
+            let combat = temp.path().join("combat.db");
+            let loot = temp.path().join("loot.db");
+            CombatDatabase::open_writer(&combat)
+                .unwrap()
+                .close()
+                .unwrap();
+            let combat_reader = rusqlite::Connection::open(&combat).unwrap();
+            combat_reader.execute(
+                "INSERT INTO fights(started_at,ended_at,dungeon,map_seed,boss_object_type,boss_name,
+                     boss_max_hp,boss_start_hp,local_object_id,local_char_id,killed)
+                 VALUES(1000,2000,'Realm',77,?1,'Red Beehemoth',100,100,10,1,0)",
+                [red],
+            ).unwrap();
+            LootDatabase::open_writer(&loot, None)
+                .unwrap()
+                .close()
+                .unwrap();
+            let reader = rusqlite::Connection::open(&loot).unwrap();
+            reader.execute_batch(
+                "INSERT INTO loot_drops(timestamp,dungeon,map_seed,char_id,char_name,class_id,fame,bag_type,mob_type,mob_name)
+                 VALUES(2002,'Realm',77,1,'Player',768,0,1292,0,'Unknown');
+                 WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<63)
+                 INSERT INTO loot_drops(timestamp,dungeon,map_seed,char_id,char_name,class_id,fame,bag_type,mob_type,mob_name)
+                 SELECT 2002,'Other',900+n,1,'Player',768,0,1280,0,'Unknown' FROM seq;
+                 INSERT INTO loot_drops(timestamp,dungeon,map_seed,char_id,char_name,class_id,fame,bag_type,mob_type,mob_name)
+                 VALUES(2002,'Realm',77,1,'Player',768,0,1292,0,'Unknown');"
+            ).unwrap();
+            reader.execute(
+                "INSERT INTO loot_drops(timestamp,dungeon,map_seed,char_id,char_name,class_id,fame,bag_type,mob_type,mob_name)
+                 VALUES(2001,'Realm',77,1,'Player',768,0,1292,?1,'Red Beehemoth')",
+                [red],
+            ).unwrap();
+            reader
+                .execute_batch(&format!("PRAGMA user_version={version}"))
+                .unwrap();
+            let mut processor = PacketProcessor::new_selected(
+                settings(),
+                AccountData::new(),
+                AccountDataRepository::for_profile(temp.path().join("account_data.json")),
+                loot.clone(),
+                combat.clone(),
+                None,
+                None,
+            )
+            .unwrap();
+            combat_reader.execute(
+                "INSERT INTO fights(started_at,ended_at,dungeon,map_seed,boss_object_type,boss_name,
+                     boss_max_hp,boss_start_hp,local_object_id,local_char_id,killed)
+                 VALUES(1000,2002,'Realm',77,?1,'Blue Beehemoth',100,100,10,1,1)",
+                [realmhound_core::loot::BLUE_BEEHEMOTH_OBJECT_TYPE],
+            ).unwrap();
+            reader.execute_batch(
+                "INSERT INTO loot_drops(timestamp,dungeon,map_seed,char_id,char_name,class_id,fame,bag_type,mob_type,mob_name)
+                 VALUES(2002,'Realm',77,1,'Player',768,0,1292,0,'Unknown');"
+            ).unwrap();
+            assert_eq!(
+                combat_reader
+                    .query_row("SELECT killed FROM fights WHERE id=1", [], |r| r
+                        .get::<_, i32>(0))
+                    .unwrap(),
+                0
+            );
+            let mut finished = false;
+            let mut resumed = false;
+            let checkpoint_sql = "SELECT cursor,cutoff,combat_cutoff,complete
+                FROM legacy_loot_repairs WHERE repair_id='loot-023-combat-final'";
+            for _ in 0..500 {
+                let pending = processor.historical_maintenance_batch().unwrap().1;
+                let checkpoint: (i64, i64, i64, bool) = reader
+                    .query_row(checkpoint_sql, [], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })
+                    .unwrap();
+                if !resumed && checkpoint.0 == 64 {
+                    assert_eq!(checkpoint, (64, 66, 1, false));
+                    assert!(processor.combat.loot_completion_repairs_complete().unwrap());
+                    drop(processor);
+                    processor = PacketProcessor::new_selected(
+                        settings(),
+                        AccountData::new(),
+                        AccountDataRepository::for_profile(temp.path().join("account_data.json")),
+                        loot.clone(),
+                        combat.clone(),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let restored: (i64, i64, i64, bool) = reader
+                        .query_row(checkpoint_sql, [], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        })
+                        .unwrap();
+                    assert_eq!(restored, checkpoint);
+                    resumed = true;
+                }
+                if !pending {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "maintenance must finish for Loot v{version}");
+            assert!(resumed, "final correlation must resume across batches");
+            assert_eq!(
+                combat_reader
+                    .query_row("SELECT killed FROM fights WHERE id=1", [], |r| r
+                        .get::<_, i32>(0))
+                    .unwrap(),
+                1
+            );
+            let source: (i32, String) = reader
+                .query_row(
+                    "SELECT mob_type,mob_name FROM loot_drops WHERE id=1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                source,
+                (red, "Red Beehemoth".to_string()),
+                "Loot v{version} must use the deferred kill proof, not a later live fight"
+            );
+            assert_eq!(
+                reader
+                    .query_row("SELECT mob_type FROM loot_drops WHERE id=65", [], |r| r
+                        .get::<_, i32>(0))
+                    .unwrap(),
+                red,
+                "the resumed batch must still use the frozen fight cutoff"
+            );
+            assert_eq!(
+                reader
+                    .query_row("SELECT mob_type FROM loot_drops WHERE id=67", [], |r| r
+                        .get::<_, i32>(0))
+                    .unwrap(),
+                0,
+                "later live bags stay outside the historical cutoff"
+            );
+        }
     }
 
     #[test]

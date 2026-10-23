@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 const BATCH: i64 = 64;
+const FINAL_COMBAT_REPAIR: &str = "loot-023-combat-final";
 
 pub(super) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS legacy_loot_repairs (
@@ -103,6 +104,8 @@ const JOBS: &[(i32, &str, Kind)] = &[
     ),
     (23, "loot-023-combat", Kind::Combat),
     (24, "loot-024-names", Kind::Simple(24)),
+    // Revisit Unknown bags after Combat has consumed the corrected Loot sources.
+    (23, FINAL_COMBAT_REPAIR, Kind::Combat),
 ];
 
 const SPEC_BOSSES: [(i32, &str); 4] = [
@@ -143,6 +146,30 @@ impl Bag {
 }
 
 impl LootDatabase {
+    pub(super) fn ensure_final_combat_correlation(&self) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO legacy_loot_repairs
+                 (repair_id,ordinal,cutoff,combat_cutoff)
+             SELECT ?1,?2,cutoff,combat_cutoff FROM legacy_loot_repairs
+             WHERE repair_id='loot-023-combat'",
+            params![FINAL_COMBAT_REPAIR, (JOBS.len() - 1) as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn awaits_combat_completion(&self) -> SqlResult<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT repair_id=?1 FROM legacy_loot_repairs
+                 WHERE complete=0 ORDER BY ordinal LIMIT 1",
+                [FINAL_COMBAT_REPAIR],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     pub(super) fn create_repair_tables(&self) -> SqlResult<()> {
         self.conn.execute_batch(SCHEMA)?;
         self.conn.execute_batch(STAGING_SCHEMA)
@@ -178,7 +205,7 @@ impl LootDatabase {
         };
         let tx = self.conn.unchecked_transaction()?;
         for (ordinal, &(target, job, _)) in JOBS.iter().enumerate() {
-            if version < target {
+            if version < target && job != FINAL_COMBAT_REPAIR {
                 tx.execute(
                     "INSERT OR IGNORE INTO legacy_loot_repairs
                      (repair_id,ordinal,cutoff,combat_cutoff) VALUES (?1,?2,?3,?4)",
@@ -193,6 +220,7 @@ impl LootDatabase {
             )?;
         }
         tx.commit()?;
+        self.ensure_final_combat_correlation()?;
         self.conn.execute_batch(STAGING_SCHEMA)
     }
 

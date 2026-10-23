@@ -145,6 +145,13 @@ impl CombatManager {
         }
     }
 
+    pub fn loot_completion_repairs_complete(&self) -> Result<bool, rusqlite::Error> {
+        match self.database.as_ref() {
+            Some(db) => db.loot_completion_repairs_complete(),
+            None => Ok(false),
+        }
+    }
+
     /// Run only after the UI is usable, between capture batches.
     pub fn historical_maintenance_batch(
         &mut self,
@@ -775,6 +782,33 @@ mod tests {
     use super::super::types::{DamageProvenance, FightParticipant};
     use super::*;
     use crate::combat::ParticipantEndStatus;
+
+    #[test]
+    fn loot_completion_requires_all_persisted_kill_repairs() {
+        let mut manager = CombatManager::new();
+        assert!(!manager.loot_completion_repairs_complete().unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        manager.open_database_strict(&path, None).unwrap();
+        assert!(!manager.loot_completion_repairs_complete().unwrap());
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO historical_repairs(repair_id,cutoff,complete) VALUES
+             ('curated-loot-completion-v1',0,1),
+             ('asset-loot-completion-v1',0,1),
+             ('ivory-completion-v1',0,0);",
+        )
+        .unwrap();
+        assert!(!manager.loot_completion_repairs_complete().unwrap());
+        conn.execute(
+            "UPDATE historical_repairs SET complete=1 WHERE repair_id='ivory-completion-v1'",
+            [],
+        )
+        .unwrap();
+        assert!(manager.loot_completion_repairs_complete().unwrap());
+        manager.close().unwrap();
+        assert!(!manager.loot_completion_repairs_complete().unwrap());
+    }
 
     fn fight(dungeon: &str, boss: &str, solo: bool) -> CompletedFight {
         let mut participants = vec![FightParticipant {

@@ -1,6 +1,9 @@
 # Platform
 * Added macOS support.
 
+# Performance
+* Reduced startup time, optimized Loot/Combat History searching.
+
 # Combat History
 * New My Performance tab breaks down everything that contributed to your damage, with your stats and gear saved at the time of the fight.
 * Fixed bosses sometimes shown as escaped even though their loot confirmed the kill.

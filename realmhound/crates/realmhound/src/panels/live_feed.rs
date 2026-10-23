@@ -18,7 +18,7 @@ use crate::panels::chat::ChatType;
 use crate::panels::loot_filters::{render_filter_bar, LootFilters, PropertyFilters};
 use crate::panels::{AppAction, Panel, PanelContext};
 use crate::processing::realm_discovery::{
-    DiscoveryEvent, ABSENCE_TIMEOUT, CRYSTAL_TYPE, JAILER_TYPE,
+    DiscoveryEvent, ABSENCE_TIMEOUT, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE,
 };
 use crate::rendering::emotes::{self, EmoteSegment, EMOTE_PADDING};
 use crate::rendering::modifier_chips::{
@@ -2125,6 +2125,7 @@ impl LiveFeedPanel {
             let name = match object_type {
                 CRYSTAL_TYPE => "Mysterious Crystal",
                 JAILER_TYPE => "Spectral Jailer",
+                TOTALIA_TYPE => "Totalia the Malevolent",
                 _ => return false,
             };
             let mut boss = BossCallEntry::new(
@@ -6401,6 +6402,24 @@ mod tests {
             Some(DiscoveryEvent::CrystalMessage { notify: false, .. })
         ));
         assert_eq!(boss_call_count(&panel), 2);
+    }
+
+    #[test]
+    fn totalia_discovery_adds_a_feed_entry() {
+        let mut panel = LiveFeedPanel::new();
+        panel.realm_name = Some("Realm".to_string());
+        panel.apply_realm_discovery(DiscoveryEvent::Discovered {
+            object_id: 259_817,
+            object_type: TOTALIA_TYPE,
+            notify: true,
+            timestamp: Local::now(),
+        });
+        let FeedEntry::BossCall(boss) = &panel.entries[0] else {
+            panic!("expected Totalia entry");
+        };
+        assert_eq!(boss.boss_id, TOTALIA_TYPE);
+        assert_eq!(boss.boss_name, "Totalia the Malevolent");
+        assert!(boss.discovery.is_some());
     }
 
     #[test]

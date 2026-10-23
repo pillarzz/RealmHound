@@ -8,6 +8,7 @@
 * The escape and nexus marker now applies only to the section it belongs to.
 * Fixed dead allies being recorded as Escaped instead of Dead.
 * Dead characters now show their last seen skin and dyes in Combat History and Loot History.
+* Fight cards save dungeon mods along with the total Loot, Dust, and XP bonuses they granted.
 
 # Damage Tracking
 * Fixed items scaled by Vitality or Speed not counting toward your damage.
@@ -32,6 +33,7 @@
 
 # Live Feed
 * Added proximity-based Mysterious Crystal and Spectral Jailer entries to the Live Feed, with optional event sounds.
+* Fixed Totalia the Malevolent not producing a Live Feed entry/notification sound when selected in the settings.
 
 # Missions
 * Repeatable missions that come off cooldown return to In Progress, and missions behind them stay unlocked.

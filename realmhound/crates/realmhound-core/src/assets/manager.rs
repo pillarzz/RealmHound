@@ -4879,6 +4879,10 @@ pub struct AssetStats {
 
 /// Get the default assets directory.
 pub fn default_assets_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if let Some(data) = dirs::data_local_dir() {
+        return data.join("RealmHound").join("assets");
+    }
     // Prefer LocalAppData on Windows
     #[cfg(target_os = "windows")]
     {
@@ -4906,6 +4910,10 @@ pub fn default_asset_dirs() -> Vec<PathBuf> {
 
     // Current working directory
     dirs.push(PathBuf::from("assets"));
+    #[cfg(target_os = "linux")]
+    if let Some(data) = dirs::data_local_dir() {
+        dirs.push(data.join("RealmHound").join("assets"));
+    }
 
     // Executable directory
     if let Ok(exe_path) = std::env::current_exe() {
@@ -4968,6 +4976,14 @@ pub fn find_assets_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extracted_assets_use_xdg_data_directory() {
+        let expected = dirs::data_local_dir().unwrap().join("RealmHound/assets");
+        assert_eq!(default_assets_dir(), expected);
+        assert!(default_asset_dirs().contains(&expected));
+    }
 
     #[test]
     fn enchant_sub_attack_resolves_the_container_projectile() {

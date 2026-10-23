@@ -88,6 +88,20 @@ pub fn parse_tcp_segment(packet: &RawPacket) -> Option<TcpSegment> {
             }
             SlicedPacket::from_ip(&packet.data[4..]).ok()?
         }
+        PacketFormat::LinuxSll => {
+            // SLL v1: protocol (EtherType) is at bytes 14..16.
+            if packet.data.get(14..16)? != [0x08, 0x00] {
+                return None;
+            }
+            SlicedPacket::from_ip(packet.data.get(16..)?).ok()?
+        }
+        PacketFormat::LinuxSll2 => {
+            // SLL v2: protocol is at bytes 0..2, header is 20 bytes.
+            if packet.data.get(0..2)? != [0x08, 0x00] {
+                return None;
+            }
+            SlicedPacket::from_ip(packet.data.get(20..)?).ok()?
+        }
     };
 
     // Extract IPv4 header
@@ -196,6 +210,16 @@ mod tests {
             PacketFormat::RawIp => Vec::new(),
             PacketFormat::Loopback => 2u32.to_ne_bytes().to_vec(),
             PacketFormat::LoopbackNetwork => 2u32.to_be_bytes().to_vec(),
+            PacketFormat::LinuxSll => {
+                let mut header = vec![0; 16];
+                header[14..16].copy_from_slice(&[0x08, 0x00]);
+                header
+            }
+            PacketFormat::LinuxSll2 => {
+                let mut header = vec![0; 20];
+                header[0..2].copy_from_slice(&[0x08, 0x00]);
+                header
+            }
         };
         data.extend_from_slice(ip);
         RawPacket {
@@ -232,6 +256,12 @@ mod tests {
     #[test]
     fn parses_raw_ip_tcp() {
         assert_tcp_packet(&framed(&ipv4_tcp(), PacketFormat::RawIp));
+    }
+
+    #[test]
+    fn parses_linux_cooked_tcp() {
+        assert_tcp_packet(&framed(&ipv4_tcp(), PacketFormat::LinuxSll));
+        assert_tcp_packet(&framed(&ipv4_tcp(), PacketFormat::LinuxSll2));
     }
 
     #[test]

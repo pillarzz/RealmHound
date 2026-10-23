@@ -24,6 +24,15 @@ pub struct CaptureManager {
     detected_interface_rx: Option<tokio::sync::oneshot::Receiver<String>>,
 }
 
+#[cfg(target_os = "linux")]
+impl Drop for CaptureManager {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.capture_handle {
+            handle.stop();
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl CaptureManager {
     /// Create a new `CaptureManager`.

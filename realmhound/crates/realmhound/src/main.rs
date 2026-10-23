@@ -852,23 +852,28 @@ impl BoundedApp {
 
     fn discovery(discovery: DiscoveryStartup) -> Self {
         let interfaces = realmhound_core::capture::NetworkInterface::list_all();
-        let (capture_handle, candidate_rx) = match interfaces {
+        let (capture_handle, candidate_rx, capture_error) = match interfaces {
             Ok(ref ifaces) if !ifaces.is_empty() => {
                 match discovery::start_discovery_capture(ifaces) {
-                    Ok((handle, rx)) => (Some(handle), Some(rx)),
+                    Ok((handle, rx)) => (Some(handle), Some(rx), None),
                     Err(e) => {
                         tracing::warn!("[DISCOVERY] Failed to start capture: {e}");
-                        (None, None)
+                        let visible_error = cfg!(target_os = "linux").then_some(e);
+                        (None, None, visible_error)
                     }
                 }
             }
             Ok(_) => {
                 tracing::warn!("[DISCOVERY] No network interfaces found");
-                (None, None)
+                let visible_error =
+                    cfg!(target_os = "linux").then(|| "No network interfaces found".to_string());
+                (None, None, visible_error)
             }
             Err(e) => {
                 tracing::warn!("[DISCOVERY] Failed to list interfaces: {e}");
-                (None, None)
+                let visible_error =
+                    cfg!(target_os = "linux").then(|| format!("Failed to list interfaces: {e}"));
+                (None, None, visible_error)
             }
         };
 
@@ -884,7 +889,7 @@ impl BoundedApp {
             candidate_rx,
             candidates: Vec::new(),
             selected_idx: None,
-            action_error: None,
+            action_error: capture_error,
             committed: false,
         }
     }
@@ -1478,6 +1483,16 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
 /// Get the directory for log files.
 fn get_log_directory() -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| std::path::Path::new(value).is_absolute())
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")));
+        if let Some(base) = base {
+            return base.join("RealmHound/logs");
+        }
+    }
     if let Some(data_dir) = dirs::data_local_dir() {
         data_dir.join("RealmHound").join("logs")
     } else {

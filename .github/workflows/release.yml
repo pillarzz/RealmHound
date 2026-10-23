@@ -14,6 +14,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build-linux:
+    name: Build Linux archive
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev libpcap-dev libudev-dev libxkbcommon-dev
+
+      - name: Build both Linux executables
+        working-directory: realmhound
+        run: cargo build --release --locked --workspace
+
+      - name: Package Linux archive
+        run: |
+          tar -czf RealmHound-linux-x86_64.tar.gz \
+            README.md LICENSE packaging/linux/install.sh packaging/linux/realmhound.desktop packaging/linux/realmhound.png \
+            realmhound/target/release/RealmHound realmhound/target/release/realmhound-capture
+          sha256sum RealmHound-linux-x86_64.tar.gz > RealmHound-linux-x86_64.tar.gz.sha256
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-archive
+          path: |
+            RealmHound-linux-x86_64.tar.gz
+            RealmHound-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
   build-macos:
     name: Build macOS binary
     runs-on: macos-14
@@ -131,7 +168,7 @@ jobs:
     name: Build and Release
     runs-on: windows-latest
     # A release must not advertise a macOS build that failed to produce one.
-    needs: build-macos
+    needs: [build-macos, build-linux]
     permissions:
       contents: write
 
@@ -269,6 +306,12 @@ jobs:
           name: macos-binary
           path: realmhound/target/release
 
+      - name: Download Linux archive
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-archive
+          path: realmhound/target/release
+
       - name: Create checksum
         id: checksum
         shell: pwsh
@@ -296,6 +339,8 @@ jobs:
             realmhound/target/release/RealmHound.exe.sha256
             realmhound/target/release/RealmHound-macos-app.zip
             realmhound/target/release/RealmHound-macos-app.zip.sha256
+            realmhound/target/release/RealmHound-linux-x86_64.tar.gz
+            realmhound/target/release/RealmHound-linux-x86_64.tar.gz.sha256
             LICENSE
             THIRD-PARTY-LICENSES.md
           draft: false

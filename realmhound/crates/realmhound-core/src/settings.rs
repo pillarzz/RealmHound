@@ -2688,6 +2688,11 @@ impl Default for Settings {
 impl Settings {
     /// Get the path to the settings file.
     pub fn settings_path() -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            dirs::config_dir().map(|d| d.join("RealmHound").join("settings.json"))
+        }
+        #[cfg(not(target_os = "linux"))]
         dirs::data_local_dir().map(|d| d.join("RealmHound").join("settings.json"))
     }
 
@@ -2864,6 +2869,14 @@ pub enum SettingsSaveError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_follow_xdg_config_directory() {
+        assert_eq!(
+            super::Settings::settings_path(),
+            dirs::config_dir().map(|dir| dir.join("RealmHound/settings.json"))
+        );
+    }
     use super::*;
 
     #[test]

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RealmHound
+Comment=Realm of the Mad God account and packet viewer
+Exec=RealmHound
+Icon=realmhound
+Terminal=false
+Categories=Game;Utility;

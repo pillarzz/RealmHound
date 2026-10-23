@@ -11,8 +11,9 @@
 //!
 //! Each supported platform answers the same two questions, "which process owns
 //! this socket" and "when did that process start", from whatever the kernel
-//! exposes: `GetExtendedTcpTable` + `GetProcessTimes` on Windows, and `libproc`
-//! on macOS. Anywhere else the safeguard stays conservative and never unlocks.
+//! exposes: `GetExtendedTcpTable` + `GetProcessTimes` on Windows, `libproc` on
+//! macOS, and `/proc` on Linux. Anywhere else the safeguard stays conservative
+//! and never unlocks.
 
 use realmhound_core::stream::ConnectionKey;
 
@@ -20,7 +21,7 @@ use realmhound_core::stream::ConnectionKey;
 /// install -- talks to the world server on this port, and effectively nothing
 /// else on the machine connects out to it, so it reliably marks a socket as
 /// belonging to a RotMG client without matching any file name.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const GAME_SERVER_PORT: u16 = 2050;
 
 /// Convert a Windows `FILETIME` (100-ns intervals since 1601-01-01 UTC, split
@@ -50,7 +51,12 @@ pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
     macos_impl::process_creation_unix(pid)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
+    linux_impl::connection_process_start_unix(conn)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn connection_process_start_unix(_conn: &ConnectionKey) -> Option<i64> {
     None
 }
@@ -83,9 +89,425 @@ pub fn earliest_rotmg_client_start_unix() -> ClientStart {
     macos_impl::earliest_client_start_unix()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn earliest_rotmg_client_start_unix() -> ClientStart {
+    linux_impl::earliest_client_start_unix()
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn earliest_rotmg_client_start_unix() -> ClientStart {
     ClientStart::NoneRunning
+}
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::{ClientStart, ConnectionKey, GAME_SERVER_PORT};
+    use std::collections::{HashMap, HashSet};
+    use std::net::Ipv4Addr;
+    use std::path::Path;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TcpEntry {
+        local_addr: Ipv4Addr,
+        local_port: u16,
+        remote_addr: Ipv4Addr,
+        remote_port: u16,
+        uid: u32,
+        inode: u64,
+    }
+
+    fn parse_endpoint(value: &str) -> Option<(Ipv4Addr, u16)> {
+        let (address, port) = value.split_once(':')?;
+        if address.len() != 8 {
+            return None;
+        }
+        let address = u32::from_str_radix(address, 16).ok()?;
+        let port = u16::from_str_radix(port, 16).ok()?;
+        Some((Ipv4Addr::from(address.to_le_bytes()), port))
+    }
+
+    fn parse_tcp_table(text: &str) -> Option<Vec<TcpEntry>> {
+        text.lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                let (local_addr, local_port) = parse_endpoint(*fields.get(1)?)?;
+                let (remote_addr, remote_port) = parse_endpoint(*fields.get(2)?)?;
+                Some(TcpEntry {
+                    local_addr,
+                    local_port,
+                    remote_addr,
+                    remote_port,
+                    uid: fields.get(7)?.parse().ok()?,
+                    inode: fields.get(9)?.parse().ok()?,
+                })
+            })
+            .collect()
+    }
+
+    fn tcp_entries(proc_root: &Path) -> Option<Vec<TcpEntry>> {
+        parse_tcp_table(&std::fs::read_to_string(proc_root.join("net/tcp")).ok()?)
+    }
+
+    fn effective_uid(proc_root: &Path) -> Option<u32> {
+        let status = std::fs::read_to_string(proc_root.join("self/status")).ok()?;
+        let uid = status.lines().find(|line| line.starts_with("Uid:"))?;
+        uid.split_whitespace().nth(2)?.parse().ok()
+    }
+
+    fn process_uid(path: &Path) -> Option<u32> {
+        let status = std::fs::read_to_string(path.join("status")).ok()?;
+        let uid = status.lines().find(|line| line.starts_with("Uid:"))?;
+        uid.split_whitespace().nth(2)?.parse().ok()
+    }
+
+    fn socket_inode(path: &Path) -> Option<u64> {
+        let target = std::fs::read_link(path).ok()?;
+        let target = target.to_str()?;
+        target
+            .strip_prefix("socket:[")?
+            .strip_suffix(']')?
+            .parse()
+            .ok()
+    }
+
+    struct OwnerScan {
+        owners: HashMap<u64, Vec<u32>>,
+        unchecked_process: bool,
+    }
+
+    fn socket_owners(proc_root: &Path, uid: u32, inodes: &HashSet<u64>) -> Option<OwnerScan> {
+        let mut owners: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut unchecked_process = false;
+        for entry in std::fs::read_dir(proc_root).ok()? {
+            let Ok(entry) = entry else {
+                unchecked_process = true;
+                continue;
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            if process_uid(&entry.path()) != Some(uid) {
+                continue;
+            }
+            let fds = match std::fs::read_dir(entry.path().join("fd")) {
+                Ok(fds) => fds,
+                Err(_) => {
+                    // A process may have exited between the directory and fd reads.
+                    if entry.path().exists() {
+                        unchecked_process = true;
+                    }
+                    continue;
+                }
+            };
+            for fd in fds.flatten() {
+                let Some(inode) = socket_inode(&fd.path()) else {
+                    continue;
+                };
+                if inodes.contains(&inode) {
+                    owners.entry(inode).or_default().push(pid);
+                }
+            }
+        }
+        Some(OwnerScan {
+            owners,
+            unchecked_process,
+        })
+    }
+
+    fn boot_time(proc_root: &Path) -> Option<i64> {
+        std::fs::read_to_string(proc_root.join("stat"))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .parse()
+            .ok()
+    }
+
+    fn start_ticks(stat: &str) -> Option<u64> {
+        // The command name is parenthesized and may itself contain spaces or ')'.
+        // Split after its final closing parenthesis; starttime is field 22, or
+        // index 19 in the remaining sequence beginning with field 3 (state).
+        stat.rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()
+    }
+
+    fn process_creation_unix_at(proc_root: &Path, pid: u32, ticks_per_second: u64) -> Option<i64> {
+        if ticks_per_second == 0 {
+            return None;
+        }
+        let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+        let seconds_after_boot = start_ticks(&stat)? / ticks_per_second;
+        boot_time(proc_root)?.checked_add(i64::try_from(seconds_after_boot).ok()?)
+    }
+
+    fn clock_ticks_per_second() -> Option<u64> {
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (ticks > 0).then_some(ticks as u64)
+    }
+
+    pub(super) fn process_creation_unix(pid: u32) -> Option<i64> {
+        process_creation_unix_at(Path::new("/proc"), pid, clock_ticks_per_second()?)
+    }
+
+    pub(super) fn owning_pid(conn: &ConnectionKey) -> Option<u32> {
+        let proc_root = Path::new("/proc");
+        let uid = effective_uid(proc_root)?;
+        let entry = tcp_entries(proc_root)?.into_iter().find(|entry| {
+            entry.uid == uid
+                && entry.local_addr == conn.client_ip
+                && entry.local_port == conn.client_port
+                && entry.remote_addr == conn.server_ip
+                && entry.remote_port == conn.server_port
+        })?;
+        let targets = HashSet::from([entry.inode]);
+        socket_owners(proc_root, uid, &targets)?
+            .owners
+            .remove(&entry.inode)?
+            .into_iter()
+            .min()
+    }
+
+    pub(super) fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
+        owning_pid(conn)
+            .and_then(process_creation_unix)
+            // Reading another process's fd symlinks is subject to Linux ptrace
+            // policy even when both processes have the same uid.  Steam/Proton
+            // therefore commonly exposes the socket in /proc/net/tcp but denies
+            // the inode -> pid walk.  A verified RealmHound connection still
+            // proves that a game is running; use the oldest actual game process
+            // (not the launcher) as the conservative multibox-safe fallback.
+            .or_else(|| earliest_named_client_start_unix().confirmed_start())
+    }
+
+    fn is_rotmg_client_name(name: &str) -> bool {
+        // Linux task names are capped at 15 bytes.  The official client's name
+        // is exactly 15 bytes, while "RotMG Exalt Launcher.exe" is deliberately
+        // excluded: launching/updating alone must not unlock an API refresh.
+        name.trim().eq_ignore_ascii_case("RotMG Exalt.exe")
+    }
+
+    fn earliest_named_client_start_unix_at(
+        proc_root: &Path,
+        uid: u32,
+        ticks_per_second: u64,
+    ) -> ClientStart {
+        let Ok(entries) = std::fs::read_dir(proc_root) else {
+            return ClientStart::Indeterminate;
+        };
+        let mut earliest = None;
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if process_uid(&entry.path()) != Some(uid) {
+                continue;
+            }
+            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+                continue;
+            };
+            if !is_rotmg_client_name(&comm) {
+                continue;
+            }
+            let Some(start) = process_creation_unix_at(proc_root, pid, ticks_per_second) else {
+                return ClientStart::Indeterminate;
+            };
+            if start <= 0 {
+                return ClientStart::Indeterminate;
+            }
+            earliest = Some(earliest.map_or(start, |best: i64| best.min(start)));
+        }
+        earliest.map_or(ClientStart::NoneRunning, ClientStart::Earliest)
+    }
+
+    fn earliest_named_client_start_unix() -> ClientStart {
+        let proc_root = Path::new("/proc");
+        let Some(uid) = effective_uid(proc_root) else {
+            return ClientStart::Indeterminate;
+        };
+        let Some(ticks) = clock_ticks_per_second() else {
+            return ClientStart::Indeterminate;
+        };
+        earliest_named_client_start_unix_at(proc_root, uid, ticks)
+    }
+
+    fn earliest_client_start_unix_at(
+        proc_root: &Path,
+        game_port: u16,
+        ticks_per_second: u64,
+    ) -> ClientStart {
+        let Some(uid) = effective_uid(proc_root) else {
+            return ClientStart::Indeterminate;
+        };
+        let Some(entries) = tcp_entries(proc_root) else {
+            return ClientStart::Indeterminate;
+        };
+        let inodes: HashSet<u64> = entries
+            .iter()
+            .filter(|entry| entry.uid == uid && entry.remote_port == game_port && entry.inode != 0)
+            .map(|entry| entry.inode)
+            .collect();
+        if inodes.is_empty() {
+            return ClientStart::NoneRunning;
+        }
+        let Some(scan) = socket_owners(proc_root, uid, &inodes) else {
+            return ClientStart::Indeterminate;
+        };
+        if scan.unchecked_process || inodes.iter().any(|inode| !scan.owners.contains_key(inode)) {
+            return ClientStart::Indeterminate;
+        }
+        let earliest = scan
+            .owners
+            .values()
+            .flatten()
+            .filter_map(|&pid| process_creation_unix_at(proc_root, pid, ticks_per_second))
+            .filter(|&start| start > 0)
+            .min();
+        earliest.map_or(ClientStart::Indeterminate, ClientStart::Earliest)
+    }
+
+    pub(super) fn earliest_client_start_unix() -> ClientStart {
+        let Some(ticks) = clock_ticks_per_second() else {
+            return ClientStart::Indeterminate;
+        };
+        let socket_result =
+            earliest_client_start_unix_at(Path::new("/proc"), GAME_SERVER_PORT, ticks);
+        match socket_result {
+            ClientStart::Earliest(_) => socket_result,
+            // The name fallback also covers the short interval between world
+            // sockets during an area change.  Prefer an indeterminate socket
+            // result when no named client can be confirmed.
+            ClientStart::NoneRunning | ClientStart::Indeterminate => {
+                match earliest_named_client_start_unix() {
+                    named @ ClientStart::Earliest(_) => named,
+                    _ => socket_result,
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_linux_tcp_rows() {
+            let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:C350 0200007F:0802 01 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0\n";
+            assert_eq!(
+                parse_tcp_table(table),
+                Some(vec![TcpEntry {
+                    local_addr: Ipv4Addr::new(127, 0, 0, 1),
+                    local_port: 50_000,
+                    remote_addr: Ipv4Addr::new(127, 0, 0, 2),
+                    remote_port: 2050,
+                    uid: 1000,
+                    inode: 4242,
+                }])
+            );
+        }
+
+        #[test]
+        fn resolves_fixture_socket_to_process_start() {
+            use std::os::unix::fs::symlink;
+
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::create_dir_all(root.join("net")).unwrap();
+            std::fs::create_dir_all(root.join("self")).unwrap();
+            std::fs::create_dir_all(root.join("123/fd")).unwrap();
+            std::fs::write(root.join("self/status"), "Uid:\t1000\t1000\t1000\t1000\n").unwrap();
+            std::fs::write(root.join("123/status"), "Uid:\t1000\t1000\t1000\t1000\n").unwrap();
+            std::fs::write(root.join("stat"), "cpu 0 0 0 0\nbtime 1700000000\n").unwrap();
+            let mut fields = vec!["0"; 20];
+            fields[0] = "S";
+            fields[19] = "500";
+            std::fs::write(
+                root.join("123/stat"),
+                format!("123 (RotMG Exalt.exe) {}\n", fields.join(" ")),
+            )
+            .unwrap();
+            symlink("socket:[4242]", root.join("123/fd/7")).unwrap();
+            std::fs::write(
+                root.join("net/tcp"),
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:C350 0200007F:0802 01 00000000:00000000 00:00000000 00000000  1000        0 4242\n",
+            )
+            .unwrap();
+
+            assert_eq!(
+                earliest_client_start_unix_at(root, GAME_SERVER_PORT, 100),
+                ClientStart::Earliest(1_700_000_005)
+            );
+            // Repeated refresh checks retain the same observable launch time.
+            assert_eq!(
+                earliest_client_start_unix_at(root, GAME_SERVER_PORT, 100),
+                ClientStart::Earliest(1_700_000_005)
+            );
+            assert_eq!(
+                process_creation_unix_at(root, 123, 100),
+                Some(1_700_000_005)
+            );
+
+            // Once the connection disappears, the gate sees no running client
+            // instead of retaining stale state from the previous scan.
+            std::fs::write(
+                root.join("net/tcp"),
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+            )
+            .unwrap();
+            assert_eq!(
+                earliest_client_start_unix_at(root, GAME_SERVER_PORT, 100),
+                ClientStart::NoneRunning
+            );
+        }
+
+        #[test]
+        fn named_client_fallback_ignores_launcher_and_uses_oldest_game() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::write(root.join("stat"), "cpu 0 0 0 0\nbtime 1700000000\n").unwrap();
+
+            for (pid, name, ticks) in [
+                (100, "RotMG Exalt Launcher.exe", 100),
+                (200, "RotMG Exalt.exe", 900),
+                (300, "rotmg exalt.exe", 500),
+            ] {
+                std::fs::create_dir_all(root.join(pid.to_string())).unwrap();
+                std::fs::write(
+                    root.join(pid.to_string()).join("status"),
+                    "Uid:\t1000\t1000\t1000\t1000\n",
+                )
+                .unwrap();
+                std::fs::write(root.join(pid.to_string()).join("comm"), format!("{name}\n"))
+                    .unwrap();
+                let mut fields = vec!["0".to_owned(); 20];
+                fields[0] = "S".to_owned();
+                fields[19] = ticks.to_string();
+                std::fs::write(
+                    root.join(pid.to_string()).join("stat"),
+                    format!("{pid} ({name}) {}\n", fields.join(" ")),
+                )
+                .unwrap();
+            }
+
+            assert_eq!(
+                earliest_named_client_start_unix_at(root, 1000, 100),
+                ClientStart::Earliest(1_700_000_005)
+            );
+        }
+    }
 }
 
 /// What a scan of the running game clients could establish.
@@ -460,6 +882,8 @@ mod tests {
         assert_eq!(filetime_to_unix_secs(low, high), 1_609_459_200);
     }
 
+    #[cfg(target_os = "linux")]
+    use super::linux_impl::{owning_pid, process_creation_unix};
     #[cfg(target_os = "macos")]
     use super::macos_impl::{owning_pid, process_creation_unix};
     /// The remaining tests exercise the real platform lookups (table/descriptor
@@ -469,7 +893,7 @@ mod tests {
     #[cfg(windows)]
     use super::windows_impl::{owning_pid, process_creation_unix};
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     fn resolves_own_process_creation_time() {
         let start = process_creation_unix(std::process::id()).expect("own process start time");
@@ -481,7 +905,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     #[test]
     fn resolves_own_loopback_connection_to_this_pid() {
         use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};

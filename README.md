@@ -17,7 +17,7 @@ Join our Discord!
 
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg)
 
 ## Features
@@ -45,6 +45,7 @@ Releases ship a build for each platform:
 | --- | --- | --- |
 | Windows | `RealmHound.exe` | Download and run it. |
 | macOS | `RealmHound-macos-app.zip` | Universal (Apple Silicon and Intel). Unzip and drag `RealmHound.app` to Applications. |
+| Linux | `RealmHound-linux-x86_64.tar.gz` | Extract, install Debian dependencies, then run `./packaging/linux/install.sh`. |
 
 macOS quarantines anything downloaded through a browser, so the first launch is
 blocked with "cannot be opened because the developer cannot be verified". Clear
@@ -98,6 +99,60 @@ platform.
   ([Markdown source](docs/research/damage-sources-status.md))
 
 ## Building from Source
+
+### Linux (Debian trixie, Steam/Proton)
+
+Install the stable Rust toolchain from [rustup.rs](https://rustup.rs/), then
+install the native build prerequisites once:
+
+```sh
+sudo apt install build-essential pkg-config libpcap-dev libasound2-dev libssl-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgtk-3-dev libcap2-bin
+cd realmhound
+cargo build --workspace --release
+cd ..
+./packaging/linux/install.sh
+```
+
+The installer copies the GUI and a separate root-owned capture helper into
+`/usr/local/bin`, grants only `CAP_NET_RAW` to the helper, and installs a
+desktop launcher. It is the explicit one-time privileged setup. Check it with
+`/usr/sbin/getcap /usr/local/bin/realmhound-capture` (some user shells omit
+`/usr/sbin` from `PATH`); the expected output includes
+`cap_net_raw=ep`. Never grant capabilities to `RealmHound` itself. Re-run the
+installer after rebuilding because replacing the helper file clears its file
+capability. Ordinary launches need no sudo:
+
+```sh
+RealmHound
+```
+
+Steam/Proton traffic normally crosses the host network stack. The helper
+listens passively on libpcap's Linux `any` device with a fixed `tcp port 2050`
+filter, so starting either program first and changing network interfaces do
+not require configuration. For debugging, set
+`REALMHOUND_CAPTURE_INTERFACE=eth0` before launch to select one interface.
+The helper sends packets only to the unprivileged GUI through a private pipe;
+it does not modify traffic or run as a persistent service.
+
+RealmHound reads Steam's `libraryfolders.vdf` and RotMG's app manifest in the
+usual Steam locations, including additional libraries and Flatpak Steam. It
+checks the Steam install and matching Proton prefix for Unity's
+`resources.assets`. Override discovery with `REALMHOUND_GAME_DIR=/path/to/game`
+if necessary. Game files are read only. Extracted assets and account data live
+under `$XDG_DATA_HOME/RealmHound` (normally `~/.local/share/RealmHound`),
+settings under `$XDG_CONFIG_HOME/RealmHound`, and logs under
+`$XDG_STATE_HOME/RealmHound/logs` (normally `~/.local/state/RealmHound/logs`).
+
+If capture fails, verify the helper and its capability with `/usr/sbin/getcap`, and read
+`~/.local/state/RealmHound/logs` for the capture error. If the window reports
+waiting for a connection, enter a realm or change maps to create a fresh game
+connection; the cipher cannot be reconstructed from the middle of an existing
+stream. If sprites or names are missing, check that Steam has downloaded the
+Unity client and inspect `REALMHOUND_GAME_DIR`. Linux automatic self-update is
+disabled; rebuild and rerun the installer for updates. The existing protocol
+pipeline decodes IPv4 game connections; IPv6 game connections are a current
+limitation. Live Steam/Proton packet decoding still requires a game-session
+smoke test on the target machine.
 
 ### Prerequisites
 

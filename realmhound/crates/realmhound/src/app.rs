@@ -2179,10 +2179,17 @@ impl RealmHoundApp {
                                 use realmhound_core::update::SelfUpdateState;
                                 match self.self_updater.state() {
                                     SelfUpdateState::Idle => {
-                                        if shadcn
+                                        if cfg!(target_os = "linux") {
+                                            ui.label(
+                                                "Install Linux updates through your package or source build.",
+                                            );
+                                        } else if shadcn
                                             .btn(
                                                 ui,
-                                                format!("⬇ Update to v{}", manifest.latest_version),
+                                                format!(
+                                                    "⬇ Update to v{}",
+                                                    manifest.latest_version
+                                                ),
                                             )
                                             .clicked()
                                         {
@@ -2206,8 +2213,10 @@ impl RealmHoundApp {
                                         });
                                     }
                                     SelfUpdateState::ReadyToApply => {
-                                        if shadcn.btn(ui, "✓ Restart to apply update").clicked() {
-                                            self.pending_relaunch = Some(RelaunchReason::Updated);
+                                        if shadcn.btn(ui, "✓ Restart to apply update").clicked()
+                                        {
+                                            self.pending_relaunch =
+                                                Some(RelaunchReason::Updated);
                                         }
                                     }
                                     SelfUpdateState::Failed(msg) => {
@@ -2224,9 +2233,12 @@ impl RealmHoundApp {
                             }
                             UpdateState::Error(err) => {
                                 ui.label(
-                                    RichText::new(format!("Update check failed: {}", err.message))
-                                        .color(Color32::from_rgb(200, 150, 100))
-                                        .small(),
+                                    RichText::new(format!(
+                                        "Update check failed: {}",
+                                        err.message
+                                    ))
+                                    .color(Color32::from_rgb(200, 150, 100))
+                                    .small(),
                                 );
                                 ui.add_space(4.0);
                                 if shadcn.btn(ui, "Retry").clicked() {

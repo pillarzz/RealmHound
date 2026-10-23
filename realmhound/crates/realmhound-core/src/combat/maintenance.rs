@@ -11,15 +11,19 @@ const JOBS: &[&str] = &[
     "close-calls-v1",
 ];
 
-pub(super) const SCHEMA: &str = "
+pub(super) const PROGRESS_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS historical_repairs (
         repair_id TEXT PRIMARY KEY,
         cutoff INTEGER NOT NULL,
         cursor INTEGER NOT NULL DEFAULT 0,
         seed_cursor INTEGER NOT NULL DEFAULT -2147483649,
         time_cursor INTEGER NOT NULL DEFAULT -9223372036854775808,
-        complete INTEGER NOT NULL DEFAULT 0
+        complete INTEGER NOT NULL DEFAULT 0,
+        text_cursor TEXT NOT NULL DEFAULT ''
     );
+";
+
+pub(super) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS historical_repair_groups (
         encounter TEXT NOT NULL, char_id INTEGER NOT NULL,
         dungeon TEXT NOT NULL, map_seed INTEGER NOT NULL,
@@ -57,7 +61,25 @@ pub(super) const SCHEMA: &str = "
             VALUES (NEW.id, NEW.local_char_id, NEW.local_close_calls)
             ON CONFLICT(fight_id) DO UPDATE SET char_id=excluded.char_id, total=excluded.total;
     END;
-    CREATE TRIGGER IF NOT EXISTS queue_updated_stat_card AFTER UPDATE ON fights BEGIN
+    CREATE TABLE IF NOT EXISTS pending_stat_card_retirements(card_key TEXT PRIMARY KEY);
+    DROP TRIGGER IF EXISTS queue_updated_stat_card;
+    CREATE TRIGGER queue_updated_stat_card AFTER UPDATE ON fights BEGIN
+        INSERT OR IGNORE INTO pending_stat_card_retirements(card_key)
+            SELECT CASE WHEN OLD.encounter_run_id IS NULL THEN 'S' || OLD.id
+                        ELSE 'E' || OLD.encounter_run_id END
+            WHERE OLD.encounter_run_id IS NOT NEW.encounter_run_id
+              AND EXISTS(SELECT 1 FROM stat_awards WHERE card_key=
+                  CASE WHEN OLD.encounter_run_id IS NULL THEN 'S' || OLD.id
+                       ELSE 'E' || OLD.encounter_run_id END);
+        INSERT OR IGNORE INTO pending_stat_cards(card_key)
+            SELECT 'E' || OLD.encounter_run_id
+            WHERE OLD.encounter_run_id IS NOT NEW.encounter_run_id
+              AND EXISTS(SELECT 1 FROM fights WHERE encounter_run_id=OLD.encounter_run_id);
+        DELETE FROM pending_stat_cards
+            WHERE card_key=CASE WHEN OLD.encounter_run_id IS NULL THEN 'S' || OLD.id
+                                ELSE 'E' || OLD.encounter_run_id END
+              AND OLD.encounter_run_id IS NOT NEW.encounter_run_id
+              AND NOT EXISTS(SELECT 1 FROM fights WHERE encounter_run_id=OLD.encounter_run_id);
         INSERT OR IGNORE INTO pending_stat_cards(card_key)
             VALUES (CASE WHEN NEW.encounter_run_id IS NULL THEN 'S' || NEW.id
                          ELSE 'E' || NEW.encounter_run_id END);
@@ -72,6 +94,23 @@ pub(super) const SCHEMA: &str = "
                         ELSE 'E' || encounter_run_id END
             FROM fights WHERE id=NEW.fight_id;
     END;
+    CREATE TABLE IF NOT EXISTS legacy_combat_groups (
+        phase TEXT NOT NULL, first_id INTEGER NOT NULL, char_id INTEGER NOT NULL,
+        dungeon TEXT NOT NULL, map_seed INTEGER NOT NULL,
+        started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL,
+        run_id TEXT NOT NULL, live_run TEXT, conflict INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(phase, first_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_legacy_combat_groups
+        ON legacy_combat_groups(phase, char_id, dungeon, map_seed, started_at DESC);
+    CREATE TABLE IF NOT EXISTS legacy_combat_run_spans (
+        phase TEXT NOT NULL, run_id TEXT NOT NULL, encounter TEXT NOT NULL,
+        char_id INTEGER NOT NULL, dungeon TEXT NOT NULL, map_seed INTEGER NOT NULL,
+        started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL, killed INTEGER NOT NULL,
+        PRIMARY KEY(phase, run_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_legacy_combat_spans
+        ON legacy_combat_run_spans(phase, char_id, map_seed, encounter, dungeon);
 ";
 
 /// Changes committed by one bounded maintenance batch.
@@ -91,9 +130,15 @@ impl CombatDatabase {
         let result = (|| {
             self.conn
                 .execute_batch("SAVEPOINT historical_repair_batch")?;
+            if let Some(batch) = self.legacy_combat_repair_batch()? {
+                return Ok(batch);
+            }
             let mut batch = self.historical_repair_batch_inner(loot_path)?;
             batch.history_changed |= self.repair_remote_deaths()? > 0;
             if crate::assets::get_asset_manager().is_loaded() {
+                let retired = self.recover_retired_stat_cards()?;
+                batch.stat_awards.extend(retired.stat_awards);
+                batch.pending |= retired.pending;
                 batch.history_changed |= self.recover_loot_proofs(loot_path)?;
                 let recovered = self.recover_stat_cards()?;
                 batch.stat_awards.extend(recovered.stat_awards);

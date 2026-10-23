@@ -14,12 +14,14 @@ use super::types::{
     ParticipantEndStatus, PatternContribution, PetInfo, SummonContribution, WeaponContribution,
 };
 
+#[path = "legacy_repairs.rs"]
+mod legacy_repairs;
 #[path = "maintenance.rs"]
 mod maintenance;
 pub use maintenance::RepairBatch;
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 68;
+pub const SCHEMA_VERSION: i32 = 69;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -568,6 +570,7 @@ impl CombatDatabase {
             .unwrap_or(0);
         if version == 0 {
             self.create_tables()?;
+            self.conn.execute_batch(maintenance::PROGRESS_SCHEMA)?;
             self.conn.execute_batch(maintenance::SCHEMA)?;
             self.conn
                 .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
@@ -742,8 +745,125 @@ impl CombatDatabase {
         Ok(())
     }
 
-    /// Apply incremental migrations from `from_version` to the current schema.
+    /// Upgrade the schema without running historical data corrections.
     fn migrate(&mut self, from_version: i32) -> SqlResult<()> {
+        self.register_legacy_combat_repairs(from_version)?;
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS encounter_runs (
+                run_id TEXT PRIMARY KEY, encounter_id TEXT NOT NULL, dungeon TEXT NOT NULL,
+                started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL, killed INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS stat_awards (
+                card_key TEXT PRIMARY KEY, char_id INTEGER NOT NULL,
+                lone INTEGER NOT NULL DEFAULT 0, last INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS dungeon_time_totals (
+                dungeon TEXT PRIMARY KEY, total_time_ms INTEGER NOT NULL DEFAULT 0,
+                completions INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS death_broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, player TEXT NOT NULL,
+                killer TEXT NOT NULL DEFAULT '', occurred_at INTEGER NOT NULL);",
+        )?;
+        for (table, column, definition) in [
+            (
+                "encounter_runs",
+                "live_origin",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fights", "local_char_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "encounter_id", "TEXT"),
+            ("fights", "encounter_run_id", "TEXT"),
+            ("fights", "boss_group", "TEXT"),
+            ("fights", "local_close_calls", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "aux_member_count", "INTEGER"),
+            ("fights", "dungeon_entered_at", "INTEGER"),
+            ("fights", "reached_zero", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "joined_late", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "spirits", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "leisurely", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "shatters_hm", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "petless", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "spectral_hm", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "boss_uptime_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "boosts", "TEXT"),
+            ("fights", "abilities", "TEXT"),
+            ("fight_participants", "enchants", "TEXT"),
+            (
+                "fight_participants",
+                "skin_id",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fight_participants", "tex1", "INTEGER NOT NULL DEFAULT 0"),
+            ("fight_participants", "tex2", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "fight_participants",
+                "end_status",
+                "TEXT NOT NULL DEFAULT 'present'",
+            ),
+            (
+                "fight_participants",
+                "grave_type",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "fight_participants",
+                "pet_type",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fight_participants", "pet_abilities", "TEXT"),
+            ("fight_participants", "damage_taken", "INTEGER"),
+            ("fight_participants", "damage_taken_provenance", "TEXT"),
+            ("fight_participants", "guarded_damage", "INTEGER"),
+            ("fight_participants", "guarded_hits", "INTEGER"),
+            ("fight_participants", "damage_blocked", "INTEGER"),
+            ("fight_participants", "damage_taken_hits", "INTEGER"),
+            (
+                "fight_participants",
+                "summon_damage",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "fight_participants",
+                "summon_hits",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fight_participants", "summons", "TEXT"),
+            ("fight_participants", "weapons", "TEXT"),
+            (
+                "fight_participants",
+                "packet_damage",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "fight_participants",
+                "packet_hits",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("stat_awards", "most", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "death_broadcasts",
+                "processed",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "death_broadcasts",
+                "next_attempt_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !self.column_exists(table, column)? {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+                ))?;
+            }
+        }
+        self.create_tables()?;
+        self.conn.execute_batch(maintenance::SCHEMA)?;
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn migrate_legacy_reference(&mut self, from_version: i32) -> SqlResult<()> {
         if from_version < 2 {
             // v1 -> v2: add the stable local character id (0 for pre-existing rows).
             let tx = self.conn.transaction()?;
@@ -1647,6 +1767,7 @@ impl CombatDatabase {
     /// (no curated encounter) contribute individually. Realm / hubs are excluded.
     /// Legacy runs measured time from first boss engagement rather than dungeon
     /// entry, so these totals are a lower bound -- still far better than zeros.
+    #[cfg(test)]
     fn backfill_dungeon_time_totals(&self) -> SqlResult<()> {
         // dungeon -> (total_time_ms, completions)
         let mut totals: HashMap<String, (i64, i64)> = HashMap::new();
@@ -1718,6 +1839,7 @@ impl CombatDatabase {
     /// touches currently-standalone fights (`encounter_run_id IS NULL`) that map
     /// to a realm-grouped encounter outside a groupable dungeon, keyed by
     /// (character, map seed, encounter) with a time-gap split.
+    #[cfg(test)]
     fn regroup_realm_encounters(&mut self) -> SqlResult<()> {
         const RUN_GAP_MS: i64 = 30 * 60 * 1000;
 
@@ -1939,6 +2061,7 @@ impl CombatDatabase {
     /// (character, dungeon, map seed) instance when one exists within a time-gap
     /// window; otherwise leftovers of one instance form their own run. Only
     /// touches `encounter_run_id IS NULL` rows so it is idempotent.
+    #[cfg(test)]
     fn regroup_dungeon_instances(&mut self) -> SqlResult<()> {
         const RUN_GAP_MS: i64 = 30 * 60 * 1000;
 
@@ -2132,6 +2255,7 @@ impl CombatDatabase {
     /// Populate the `boss_group` column for rows where it is NULL, classifying
     /// each from its persisted dungeon name, boss object type, and boss name.
     /// Idempotent: only untouched (NULL) rows are updated.
+    #[cfg(test)]
     fn backfill_boss_groups(&mut self) -> SqlResult<()> {
         let rows: Vec<(i64, String, i32, String)> = {
             let mut stmt = self.conn.prepare(
@@ -2160,6 +2284,7 @@ impl CombatDatabase {
     /// and update rows whose classification changed. Used when the group
     /// taxonomy changes (v7 -> v8: Biome Minibosses split into Heroes of Oryx
     /// tiers). Unlike [`backfill_boss_groups`] this touches non-NULL rows too.
+    #[cfg(test)]
     fn reclassify_boss_groups(&mut self) -> SqlResult<()> {
         let rows: Vec<(i64, String, i32, String, Option<String>)> = {
             let mut stmt = self.conn.prepare(
@@ -2192,6 +2317,7 @@ impl CombatDatabase {
     /// in `types`, then drop any encounter run left with no phases. Used to purge
     /// objects that were tracked as fights before being curated out of the boss
     /// set (e.g. Challenge Gate, MV Easy Dropper).
+    #[cfg(test)]
     fn purge_fights_by_type(&mut self, types: &[i32]) -> SqlResult<()> {
         if types.is_empty() {
             return Ok(());
@@ -2579,6 +2705,7 @@ impl CombatDatabase {
     /// keep whatever grouping they already had (curated or standalone) rather
     /// than risk a bad merge. `encounter_runs` is rebuilt from the final fight
     /// assignments so no orphan rows survive.
+    #[cfg(test)]
     fn migrate_generic_grouping(&mut self) -> SqlResult<()> {
         const RUN_GAP_MS: i64 = 30 * 60 * 1000;
 
@@ -2768,7 +2895,8 @@ impl CombatDatabase {
                 dungeon TEXT NOT NULL,
                 started_at INTEGER NOT NULL,
                 ended_at INTEGER NOT NULL,
-                killed INTEGER NOT NULL DEFAULT 0
+                killed INTEGER NOT NULL DEFAULT 0,
+                live_origin INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS fight_participants (
@@ -3058,8 +3186,8 @@ impl CombatDatabase {
         // inserted first (curated ids live only on the individual fight rows).
         if let (Some(_enc_id), Some(run_id)) = (&fight.encounter_id, &fight.encounter_run_id) {
             tx.execute(
-                r#"INSERT INTO encounter_runs (run_id, encounter_id, dungeon, started_at, ended_at, killed)
-                   VALUES (?1, 'dungeon_run', ?2, ?3, ?4, ?5)
+                r#"INSERT INTO encounter_runs (run_id, encounter_id, dungeon, started_at, ended_at, killed, live_origin)
+                   VALUES (?1, 'dungeon_run', ?2, ?3, ?4, ?5, 1)
                    ON CONFLICT(run_id) DO UPDATE SET
                        started_at = MIN(started_at, excluded.started_at),
                        ended_at   = MAX(ended_at, excluded.ended_at),
@@ -6708,6 +6836,261 @@ mod tests {
         CompletedFight, DamageProvenance, FightParticipant, ParticipantEndStatus,
     };
 
+    #[test]
+    fn legacy_combat_repairs_are_deferred_bounded_atomic_and_resumable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        for n in 0..70 {
+            let mut fight = sample_fight();
+            fight.boss_object_type = crate::assets::SHATTERS_QUEEN_TYPE;
+            fight.boss_name = "Shatters A22".into();
+            fight.started_at = n * 1000;
+            fight.ended_at = n * 1000 + 500;
+            db.insert_fight(&fight).unwrap();
+        }
+        db.conn.execute_batch("PRAGMA user_version=53").unwrap();
+        db.initialize(None).unwrap();
+        let renamed = |db: &CombatDatabase| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fights WHERE boss_name='The Shattered Queen'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(renamed(&db), 0, "schema upgrades must not repair history");
+        db.conn.execute_batch(
+            "CREATE TRIGGER fail_legacy BEFORE UPDATE ON fights BEGIN SELECT RAISE(FAIL,'test repair failure'); END;"
+        ).unwrap();
+        assert!(db.historical_repair_batch(None).is_err());
+        assert_eq!(renamed(&db), 0);
+        assert_eq!(db.conn.query_row(
+            "SELECT cursor FROM historical_repairs WHERE repair_id='legacy-combat-054-label'",
+            [], |r|r.get::<_,i64>(0),
+        ).unwrap(),0);
+        db.conn.execute_batch("DROP TRIGGER fail_legacy").unwrap();
+        db.historical_repair_batch(None).unwrap();
+        assert_eq!(renamed(&db), 64);
+        let mut late = sample_fight();
+        late.boss_object_type = crate::assets::SHATTERS_QUEEN_TYPE;
+        late.boss_name = "Shatters A22".into();
+        db.insert_fight(&late).unwrap();
+        drop(db);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(
+            renamed(&db),
+            70,
+            "late writes are outside the migration cutoff"
+        );
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(renamed(&db), 70);
+    }
+
+    #[test]
+    fn legacy_combat_repairs_match_the_previous_migration_results() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut reference = CombatDatabase::open_in_memory().unwrap();
+        for n in 0..70 {
+            let mut fight = escaped_fight("Snake Pit", 123, 7);
+            fight.local_char_id = 1;
+            fight.started_at = n * 1000;
+            fight.ended_at = n * 1000 + 500;
+            if n == 0 || n == 64 {
+                fight.encounter_id = Some("dungeon_run".into());
+                fight.encounter_run_id = Some(format!("live-{n}"));
+            }
+            db.insert_fight(&fight).unwrap();
+            reference.insert_fight(&fight).unwrap();
+        }
+        reference.migrate_legacy_reference(4).unwrap();
+        finish_recurring_repairs(&mut reference, None);
+        db.migrate(4).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let headers = |db: &CombatDatabase| {
+            db.conn.prepare(
+                "SELECT id,encounter_id,encounter_run_id,dungeon,boss_name,boss_group FROM fights ORDER BY id"
+            ).unwrap().query_map([],|r|Ok((
+                r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,
+                r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,
+            ))).unwrap().collect::<SqlResult<Vec<_>>>().unwrap()
+        };
+        assert_eq!(headers(&db), headers(&reference));
+        let totals = |db: &CombatDatabase| {
+            db.dungeon_time_totals()
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.dungeon, r.total_time_ms, r.completions))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(totals(&db), totals(&reference));
+    }
+
+    #[test]
+    fn regrouping_retires_old_awards_but_history_deletion_keeps_them() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        for n in 0..2 {
+            let mut fight = flawless_fight(
+                "Fungal Cavern",
+                45712,
+                vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+            );
+            fight.local_char_id = 1;
+            fight.map_seed = 7;
+            fight.started_at = n * 1000;
+            fight.ended_at = n * 1000 + 500;
+            db.insert_fight(&fight).unwrap();
+        }
+        assert_eq!(db.reconcile_stat_awards().unwrap().get(&1).unwrap().0, 2);
+        db.migrate(19).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let totals = db.persisted_combat_totals(&[1]).unwrap();
+        assert_eq!(totals.stat_awards.get(&1).unwrap().0, 1);
+        db.clear_all().unwrap();
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(
+            db.persisted_combat_totals(&[1]).unwrap().stat_awards,
+            totals.stat_awards
+        );
+    }
+
+    #[test]
+    fn legacy_repair_registration_survives_schema_failure_without_moving_cutoffs() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        db.insert_fight(&sample_fight()).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_fights_loot_link;
+             CREATE TABLE idx_fights_loot_link(blocker INTEGER);
+             PRAGMA user_version=53;",
+            )
+            .unwrap();
+        assert!(db.migrate(53).is_err());
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            53
+        );
+        let cutoff = |db: &CombatDatabase| {
+            db.conn.query_row(
+            "SELECT cutoff FROM historical_repairs WHERE repair_id='legacy-combat-054-label'",
+            [],|r|r.get::<_,i64>(0),
+        ).unwrap()
+        };
+        assert_eq!(cutoff(&db), 1);
+        db.insert_fight(&sample_fight()).unwrap();
+        db.conn
+            .execute_batch("DROP TABLE idx_fights_loot_link")
+            .unwrap();
+        db.migrate(53).unwrap();
+        assert_eq!(
+            cutoff(&db),
+            1,
+            "replaying schema work cannot expand registered repairs"
+        );
+    }
+
+    #[test]
+    fn legacy_run_cutoff_rejects_a_new_orphan_even_when_sqlite_reuses_its_rowid() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut old = sample_fight();
+        old.encounter_id = Some("dungeon_run".into());
+        old.encounter_run_id = Some("old-run".into());
+        db.insert_fight(&old).unwrap();
+        db.conn
+            .execute("UPDATE encounter_runs SET live_origin=0", [])
+            .unwrap();
+        let old_rowid: i64 = db
+            .conn
+            .query_row("SELECT rowid FROM encounter_runs", [], |r| r.get(0))
+            .unwrap();
+        db.migrate(42).unwrap();
+        db.conn
+            .execute_batch(
+                "DELETE FROM fight_participants; DELETE FROM fights; DELETE FROM encounter_runs;",
+            )
+            .unwrap();
+        old.encounter_run_id = Some("new-live-run".into());
+        db.insert_fight(&old).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("SELECT rowid FROM encounter_runs", [], |r| r
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            old_rowid
+        );
+        db.conn
+            .execute_batch("DELETE FROM fight_participants; DELETE FROM fights;")
+            .unwrap();
+        finish_recurring_repairs(&mut db, None);
+        assert!(db.dungeon_time_totals().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT run_id FROM encounter_runs", [], |r| r
+                    .get::<_, String>(0),)
+                .unwrap(),
+            "new-live-run",
+            "legacy pruning cannot delete a newly orphaned live run"
+        );
+    }
+
+    #[test]
+    fn legacy_time_seed_precedes_later_purges_and_preserves_live_totals() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut old = sample_fight();
+        old.dungeon = "Legacy The Shatters".into();
+        old.boss_object_type = 52513;
+        old.encounter_id = Some("dungeon_run".into());
+        old.encounter_run_id = Some("old-run".into());
+        old.started_at = 1000;
+        old.ended_at = 6000;
+        old.killed = true;
+        db.insert_fight(&old).unwrap();
+        db.migrate(42).unwrap();
+        db.add_dungeon_time("Legacy The Shatters", 10_000, true)
+            .unwrap();
+        let mut live = old.clone();
+        live.boss_object_type = 52560;
+        live.encounter_run_id = Some("live-run".into());
+        live.started_at = 10_000;
+        live.ended_at = 20_000;
+        let live_id = db.insert_fight(&live).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let total = db
+            .dungeon_time_totals()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dungeon == "Legacy The Shatters")
+            .unwrap();
+        assert_eq!(total.total_time_ms, 15_000);
+        assert_eq!(total.completions, 2);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM fights", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT id FROM fights", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            live_id
+        );
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(
+            db.dungeon_time_totals()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.dungeon == "Legacy The Shatters")
+                .unwrap()
+                .total_time_ms,
+            15_000
+        );
+    }
+
     fn finish_recurring_repairs(db: &mut CombatDatabase, loot_path: Option<&Path>) {
         let temp = tempfile::tempdir().unwrap();
         let empty_loot = temp.path().join("loot.db");
@@ -8010,10 +8393,97 @@ mod tests {
     }
 
     #[test]
-    fn stat_sql_pages_and_selections_at_large_database_size() {
+    fn legacy_combat_repairs_at_large_database_size() {
+        let _ = a_boss_mark_id();
+        if !crate::assets::get_asset_manager().is_loaded() {
+            eprintln!("skipping asset-dependent large legacy repair comparison");
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat.db");
-        let db = CombatDatabase::open_writer(&path).unwrap();
+        let db = large_combat_fixture(&path);
+        db.conn.execute_batch("PRAGMA user_version=4").unwrap();
+        db.close().unwrap();
+        let reference_path = temp.path().join("reference.db");
+        std::fs::copy(&path, &reference_path).unwrap();
+        let mut reference = CombatDatabase {
+            conn: Connection::open(&reference_path).unwrap(),
+        };
+        let started = std::time::Instant::now();
+        reference.migrate_legacy_reference(4).unwrap();
+        println!("Former legacy Combat migration: {:?}", started.elapsed());
+        let initial_size = std::fs::metadata(&path).unwrap().len();
+        let started = std::time::Instant::now();
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        println!("Deferred legacy schema-only open: {:?}", started.elapsed());
+        let mut batches = 0;
+        let mut slowest = std::time::Duration::ZERO;
+        let started = std::time::Instant::now();
+        loop {
+            let step = std::time::Instant::now();
+            db.historical_repair_batch(None).unwrap();
+            slowest = slowest.max(step.elapsed());
+            batches += 1;
+            assert!(batches < 10_000);
+            let pending:bool=db.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM historical_repairs WHERE repair_id LIKE 'legacy-combat-%' AND complete=0)
+                 OR EXISTS(SELECT 1 FROM legacy_combat_groups)
+                 OR EXISTS(SELECT 1 FROM legacy_combat_run_spans)",
+                [],|r|r.get(0),
+            ).unwrap();
+            if !pending {
+                break;
+            }
+        }
+        println!(
+            "Deferred legacy repairs: {batches} batches, work={:?}, slowest={slowest:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_stat_card_retirements",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "unawarded fights must not generate a per-fight retirement queue"
+        );
+        let headers = |db: &CombatDatabase| {
+            db.conn.prepare(
+            "SELECT id,encounter_id,encounter_run_id,dungeon,boss_name,boss_group FROM fights ORDER BY id"
+        ).unwrap().query_map([],|r|Ok((
+            r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,
+            r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,
+        ))).unwrap().collect::<SqlResult<Vec<_>>>().unwrap()
+        };
+        assert_eq!(headers(&db), headers(&reference));
+        let totals = |db: &CombatDatabase| {
+            db.dungeon_time_totals()
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.dungeon, r.total_time_ms, r.completions))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(totals(&db), totals(&reference));
+        db.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        reference
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        println!(
+            "Same-schema legacy fixture: before={:.2} MiB, former repair={:.2} MiB, deferred repair={:.2} MiB",
+            initial_size as f64/1_048_576.0,
+            std::fs::metadata(&reference_path).unwrap().len() as f64/1_048_576.0,
+            std::fs::metadata(&path).unwrap().len() as f64/1_048_576.0,
+        );
+    }
+
+    fn large_combat_fixture(path: &Path) -> CombatDatabase {
+        let db = CombatDatabase::open_writer(path).unwrap();
         db.conn
             .execute_batch(
                 "BEGIN;
@@ -8050,6 +8520,14 @@ mod tests {
              PRAGMA wal_checkpoint(TRUNCATE);",
             )
             .unwrap();
+        db
+    }
+
+    #[test]
+    fn stat_sql_pages_and_selections_at_large_database_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let db = large_combat_fixture(&path);
         let reader = CombatDatabase::open_reader_at(&path).unwrap();
         let mut expected: Vec<(FightSelection, i64)> = (1..=2000)
             .filter(|n| n % 251 == 0)
@@ -10352,6 +10830,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         let version: i32 = db
             .conn
@@ -12006,6 +12485,7 @@ mod tests {
         db.conn.execute_batch("PRAGMA user_version = 5").unwrap();
 
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         assert_eq!(
             db.conn
@@ -12639,6 +13119,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12710,6 +13191,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         // The two distinct live instances are NOT merged.
         let runs: i64 = db
@@ -12753,6 +13235,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12809,6 +13292,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12917,6 +13401,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12936,6 +13421,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Moonlight Village run recorded before the fix: a Challenge Gate and
         // MV Easy Dropper (now curated non-bosses), a dancer, and Fishing Loot.
         db.conn
@@ -12976,6 +13462,7 @@ mod tests {
         // Re-run migrations from v23.
         db.conn.execute_batch("PRAGMA user_version = 23").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13048,6 +13535,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Lich King run recorded before the fix: the real boss plus Lich
         // King Grave adds (34587) that were tracked as their own fights, one of
         // which defines the run's earliest start and latest end.
@@ -13088,6 +13576,7 @@ mod tests {
         // Re-run migrations from v24.
         db.conn.execute_batch("PRAGMA user_version = 24").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13156,6 +13645,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Realm visit recorded before the fix: the real Adult Baneserpent
         // body (34456, killed) plus a spurious head segment (34459) that shares
         // the DisplayId "Adult Baneserpent" but was fought without the body in
@@ -13194,6 +13684,7 @@ mod tests {
         // Re-run migrations from v28.
         db.conn.execute_batch("PRAGMA user_version = 28").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13237,6 +13728,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Spectral Penitentiary run recorded before the fix: a CellBranch
         // tutorial object (24456) and an Administration Turret (24061) tracked as
         // spurious cards, plus the real Murcian Overseer boss (23508, killed).
@@ -13275,6 +13767,7 @@ mod tests {
         // Re-run migrations from v37.
         db.conn.execute_batch("PRAGMA user_version = 37").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13344,6 +13837,7 @@ mod tests {
         assert!(!db.column_exists("fights", "aux_member_count").unwrap());
 
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         let version: i32 = db
             .conn
@@ -13362,6 +13856,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A database written before the canonical-dungeon table covered the
         // Season 31 reskins stored their realm-spawned Oryx's Castle bosses under
         // the raw realm map name.
@@ -13383,6 +13878,7 @@ mod tests {
         // Re-run migrations from v58.
         db.conn.execute_batch("PRAGMA user_version = 58").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13480,6 +13976,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         db.conn
             .execute_batch(
                 r#"
@@ -13496,6 +13993,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 59").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         let chamber: i64 = db
             .conn
@@ -13523,6 +14021,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A database that reached v39 during earlier testing still holds an
         // Administration Turret (24061) row because the v38 purge gained that type
         // only after this database had already advanced past v38.
@@ -13543,6 +14042,7 @@ mod tests {
         // Re-run migrations from v39.
         db.conn.execute_batch("PRAGMA user_version = 39").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13575,6 +14075,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Spectral Penitentiary run recorded before the fix: a branch Door
         // Switch (23840), a colored Torture floor switch (44357) and a Gretch
         // gravestone (23708) all logged as spurious cards via the HP fallback,
@@ -13617,6 +14118,7 @@ mod tests {
         // Re-run migrations from v40.
         db.conn.execute_batch("PRAGMA user_version = 40").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13673,6 +14175,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Rat Extermination visit recorded before the fix: the real Mammoth
         // City Rat (18007) plus event-scaled minion rats (18000, 18047) that were
         // logged as their own spam cards.
@@ -13711,6 +14214,7 @@ mod tests {
         // Re-run migrations from v30.
         db.conn.execute_batch("PRAGMA user_version = 30").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13754,6 +14258,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Lost Halls run recorded before the fix, with the old segment names.
         db.conn
             .execute_batch(
@@ -13772,6 +14277,7 @@ mod tests {
         // Re-run migrations from v31.
         db.conn.execute_batch("PRAGMA user_version = 31").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13802,6 +14308,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // Legacy MBC cards recorded before the taunt-driven split:
         //  - run A: a collapsed full-kill whose split never fired, local player
         //    SURVIVED (end_status 'present'), no Post-survival sibling -> relabel.
@@ -13838,6 +14345,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 45").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13888,6 +14396,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Legacy The Shatters run: three real bosses (Forgotten Sentinel 52556,
         // Twilight Archmage 52557, the King 52560), a kept aux bird (Blizzard
         // 52564) and trash (Royal Guardian 52558). A Legacy Woodland Labyrinth
@@ -13926,6 +14435,7 @@ mod tests {
         // Re-run migrations from v46.
         db.conn.execute_batch("PRAGMA user_version = 46").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13973,6 +14483,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Moonlight Village fight recorded before Challenge Mode was tracked:
         // the row predates the column, so it has to default to "not petless".
         db.conn
@@ -13990,6 +14501,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 54").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -14015,6 +14527,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Spectral Penitentiary run recorded before hard mode was tracked: the
         // row predates the column, so it has to default to "not hard mode".
         db.conn
@@ -14032,6 +14545,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 55").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -14096,6 +14610,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A hard-mode Shatters run recorded while the queen's object still fell
         // back to its internal catalog name.
         db.conn
@@ -14114,6 +14629,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 53").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -14147,6 +14663,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Bilgewater's Galleon run: the tracked boss (20475) plus a Galleon
         // Admiral add (34465) that must be purged.
         db.conn
@@ -14165,6 +14682,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 49").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -14234,6 +14752,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

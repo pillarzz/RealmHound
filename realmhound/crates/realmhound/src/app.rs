@@ -1674,7 +1674,7 @@ impl RealmHoundApp {
             }
             UiPayload::RealmDiscovery(event) => {
                 use crate::processing::realm_discovery::{
-                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE,
+                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE,
                 };
 
                 let notification = match &event {
@@ -1692,6 +1692,15 @@ impl RealmHoundApp {
                     | DiscoveryEvent::CrystalMessage { notify, .. } => {
                         Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify, None))
                     }
+                    // Totalia has no chat announcement: her object update (sent
+                    // even far outside view) is the only trigger. Several
+                    // instances spawn together, so share one sound key to let
+                    // the audio layer coalesce them.
+                    DiscoveryEvent::Discovered {
+                        object_type: TOTALIA_TYPE,
+                        notify,
+                        ..
+                    } => Some((TOTALIA_TYPE, "Totalia the Malevolent", *notify, None)),
                     _ => None,
                 };
                 self.live_feed_panel.apply_realm_discovery(event);

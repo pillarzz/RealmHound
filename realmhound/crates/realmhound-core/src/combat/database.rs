@@ -21,7 +21,7 @@ mod maintenance;
 pub use maintenance::RepairBatch;
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 69;
+pub const SCHEMA_VERSION: i32 = 70;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -62,6 +62,9 @@ pub struct FightRecord {
     /// `None` outside a groupable dungeon and for rows recorded before this was
     /// tracked. Drives the encounter card's total dungeon time.
     pub dungeon_entered_at: Option<i64>,
+    /// Dungeon modifier id tokens active for this fight's map instance. Empty
+    /// for realms/hubs and for rows recorded before mods were tracked.
+    pub dungeon_modifiers: Vec<String>,
     /// Map seed.
     pub map_seed: i32,
     /// Boss object type.
@@ -785,6 +788,7 @@ impl CombatDatabase {
             ("fights", "boss_uptime_ms", "INTEGER NOT NULL DEFAULT 0"),
             ("fights", "boosts", "TEXT"),
             ("fights", "abilities", "TEXT"),
+            ("fights", "mods", "TEXT"),
             ("fight_participants", "enchants", "TEXT"),
             (
                 "fight_participants",
@@ -1747,16 +1751,20 @@ impl CombatDatabase {
             )?;
             tx.commit()?;
         }
-        if from_version < 68 {
+        if from_version < 70 {
             let has_retry_time = self.column_exists("death_broadcasts", "next_attempt_at")?;
+            let has_mods = self.column_exists("fights", "mods")?;
             let tx = self.conn.transaction()?;
+            if !has_mods {
+                tx.execute_batch("ALTER TABLE fights ADD COLUMN mods TEXT;")?;
+            }
             if !has_retry_time {
                 tx.execute_batch(
                     "ALTER TABLE death_broadcasts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0;",
                 )?;
             }
             tx.execute_batch(maintenance::SCHEMA)?;
-            tx.execute_batch("PRAGMA user_version = 68")?;
+            tx.execute_batch("PRAGMA user_version = 70")?;
             tx.commit()?;
         }
         Ok(())
@@ -2878,7 +2886,8 @@ impl CombatDatabase {
                 shatters_hm INTEGER NOT NULL DEFAULT 0,
                 boss_uptime_ms INTEGER NOT NULL DEFAULT 0,
                 boosts TEXT,
-                abilities TEXT
+                abilities TEXT,
+                mods TEXT
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -3145,8 +3154,8 @@ impl CombatDatabase {
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
                 dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, petless, spectral_hm,
-                shatters_hm, boss_uptime_ms, boosts, abilities)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"#,
+                shatters_hm, boss_uptime_ms, boosts, abilities, mods)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -3175,6 +3184,7 @@ impl CombatDatabase {
                 fight.boss_uptime_ms,
                 serialize_boosts(&fight.boosts),
                 serialize_abilities(&fight.abilities),
+                serialize_mods(&fight.dungeon_modifiers),
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -3267,7 +3277,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -3303,6 +3313,7 @@ impl CombatDatabase {
             boss_uptime_ms: row.get(20)?,
             boosts: parse_boosts(row.get::<_, Option<String>>(21)?.as_deref()),
             abilities: parse_abilities(row.get::<_, Option<String>>(22)?.as_deref()),
+            dungeon_modifiers: parse_mods(row.get::<_, Option<String>>(23)?.as_deref()),
             participants: Vec::new(),
         })
     }
@@ -4339,7 +4350,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -4369,7 +4380,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -4413,7 +4424,7 @@ impl CombatDatabase {
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
                       leisurely, petless, spectral_hm, shatters_hm, boss_uptime_ms,
-                      boosts, abilities
+                      boosts, abilities, mods
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -5826,6 +5837,25 @@ fn serialize_boosts(boosts: &[BoostWindow]) -> Option<String> {
     )
 }
 
+/// Serialize dungeon modifier tokens as a `;`-separated list. Tokens are
+/// uppercase alphanumerics, and `;` matches the MapInfo wire separator.
+fn serialize_mods(mods: &[String]) -> String {
+    mods.join(";")
+}
+
+/// Parse a stored `mods` column. `NULL` (rows recorded before mod tracking) and
+/// empty strings both yield an empty list.
+fn parse_mods(data: Option<&str>) -> Vec<String> {
+    data.map(|d| {
+        d.split(';')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Parse the stored boost windows. Malformed lines are skipped rather than
 /// failing the read, so a partially written row cannot hide the whole fight.
 fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
@@ -6321,6 +6351,7 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
                 .filter_map(|g| g.dungeon_entered_at)
                 .min()
                 .or(p.dungeon_entered_at),
+            dungeon_modifiers: p.dungeon_modifiers.clone(),
             map_seed: p.map_seed,
             boss_object_type: aux.repr_type,
             boss_name: aux.display_name.to_string(),
@@ -6403,6 +6434,7 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
                 .filter_map(|g| g.dungeon_entered_at)
                 .min()
                 .or(p.dungeon_entered_at),
+            dungeon_modifiers: p.dungeon_modifiers.clone(),
             map_seed: p.map_seed,
             boss_object_type: p.boss_object_type,
             boss_name: p.boss_name.clone(),
@@ -7590,6 +7622,7 @@ mod tests {
             ended_at: 61_000,
             dungeon: "Mad Lab".to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 42,
             boss_object_type: 0x10E4,
             boss_name: "Dr Terrible".to_string(),
@@ -7676,6 +7709,223 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fight_round_trips_dungeon_modifiers() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = sample_fight();
+        fight.dungeon_modifiers = vec!["CHEF".to_string(), "REWARDING".to_string()];
+        let id = db.insert_fight(&fight).unwrap();
+
+        let loaded = db.fight_detail(id).unwrap().expect("fight");
+        assert_eq!(loaded.dungeon_modifiers, vec!["CHEF", "REWARDING"]);
+        let recent = db.recent_fights(10).unwrap();
+        assert_eq!(recent[0].dungeon_modifiers, vec!["CHEF", "REWARDING"]);
+    }
+
+    #[test]
+    fn v67_database_gains_the_mods_column() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Simulate a database written before mods were stored.
+        db.conn
+            .execute_batch(
+                "ALTER TABLE fights DROP COLUMN mods;
+                 PRAGMA user_version = 67;",
+            )
+            .unwrap();
+        assert!(!db.column_exists("fights", "mods").unwrap());
+
+        db.migrate(67).unwrap();
+
+        assert!(db.column_exists("fights", "mods").unwrap());
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The migrated column is readable through the normal insert/read path.
+        let mut fight = sample_fight();
+        fight.dungeon_modifiers = vec!["CHEF".to_string()];
+        let id = db.insert_fight(&fight).unwrap();
+        assert_eq!(
+            db.fight_detail(id)
+                .unwrap()
+                .expect("fight")
+                .dungeon_modifiers,
+            vec!["CHEF"]
+        );
+    }
+
+    #[test]
+    fn schema70_upgrades_main_and_pr_databases_without_resetting_repairs() {
+        let checkpoints = |db: &CombatDatabase| {
+            db.conn
+                .prepare(
+                    "SELECT repair_id,cutoff,cursor,seed_cursor,time_cursor,text_cursor,complete
+                     FROM historical_repairs ORDER BY repair_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, bool>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<SqlResult<Vec<_>>>()
+                .unwrap()
+        };
+        for version in [67, 68, 69] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("combat.db");
+            let mut db = CombatDatabase::open_writer(&path).unwrap();
+            let mut fight = sample_fight();
+            fight.dungeon_modifiers = vec!["CHEF".into(), "REWARDING".into()];
+            let original = db.insert_fight(&fight).unwrap();
+            assert_eq!(original, 1);
+            if version < 69 {
+                db.conn
+                    .execute_batch(
+                        "DROP TRIGGER queue_inserted_stat_card;
+                         DROP TRIGGER queue_updated_stat_card;
+                         DROP TRIGGER queue_updated_stat_participant;
+                         DROP TABLE historical_repairs;
+                         DROP TABLE historical_repair_groups;
+                         DROP TABLE pending_stat_cards;
+                         DROP TABLE pending_stat_card_retirements;
+                         DROP TABLE applied_loot_proofs;
+                         DROP TABLE pending_loot_proofs;
+                         DROP TABLE fight_close_calls;
+                         DROP TABLE legacy_combat_groups;
+                         DROP TABLE legacy_combat_run_spans;
+                         DROP INDEX idx_death_broadcasts_retry;
+                         ALTER TABLE death_broadcasts DROP COLUMN next_attempt_at;
+                         ALTER TABLE encounter_runs DROP COLUMN live_origin;",
+                    )
+                    .unwrap();
+            } else {
+                db.conn
+                    .execute_batch(
+                        "INSERT INTO historical_repairs
+                         (repair_id,cutoff,cursor,seed_cursor,time_cursor,text_cursor,complete)
+                     VALUES
+                         ('encounter-grouping-v1',1,0,7,61000,'saved-run',0),
+                         ('legacy-combat-044-classify',1,1,7,61000,'',1),
+                         ('live-loot-proofs-v1',0,57,-2147483649,-9223372036854775808,'',0);
+                     INSERT INTO historical_repair_groups
+                         (encounter,char_id,dungeon,map_seed,run_id,last_ended)
+                     VALUES('dungeon_run',1,'Mad Lab',42,'saved-run',61000);",
+                    )
+                    .unwrap();
+            }
+            db.insert_fight(&fight).unwrap();
+            if version != 68 {
+                db.conn
+                    .execute_batch("ALTER TABLE fights DROP COLUMN mods")
+                    .unwrap();
+            }
+            db.conn
+                .execute_batch(&format!("PRAGMA user_version={version}"))
+                .unwrap();
+            let saved = if version == 69 {
+                checkpoints(&db)
+            } else {
+                Vec::new()
+            };
+            db.close().unwrap();
+
+            for reopen in 0..2 {
+                let mut db = CombatDatabase::open_writer(&path).unwrap();
+                assert_eq!(
+                    db.conn
+                        .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                        .unwrap(),
+                    70,
+                    "upgrading v{version}, reopen {reopen}",
+                );
+                assert!(db.column_exists("fights", "mods").unwrap());
+                assert!(db
+                    .column_exists("death_broadcasts", "next_attempt_at")
+                    .unwrap());
+                assert_eq!(db.fight_count().unwrap(), 2 + reopen);
+                let loaded = db.fight_detail(original).unwrap().unwrap();
+                assert_eq!(loaded.boss_name, fight.boss_name);
+                assert_eq!(
+                    loaded.dungeon_modifiers,
+                    if version == 68 {
+                        fight.dungeon_modifiers.clone()
+                    } else {
+                        Vec::new()
+                    },
+                );
+                assert_eq!(
+                    checkpoints(&db),
+                    saved,
+                    "v{version} repair checkpoints changed"
+                );
+                assert_eq!(
+                    db.conn
+                        .query_row("SELECT COUNT(*) FROM historical_repair_groups", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    i64::from(version == 69),
+                );
+                if reopen == 0 {
+                    let id = db.insert_fight(&fight).unwrap();
+                    assert_eq!(
+                        db.fight_detail(id).unwrap().unwrap().dungeon_modifiers,
+                        fight.dungeon_modifiers
+                    );
+                }
+                db.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn schema70_fresh_database_has_modifiers_and_maintenance_without_legacy_jobs() {
+        let db = CombatDatabase::open_in_memory().unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            70,
+        );
+        assert!(db.column_exists("fights", "mods").unwrap());
+        assert!(db
+            .column_exists("death_broadcasts", "next_attempt_at")
+            .unwrap());
+        assert_eq!(db.fight_count().unwrap(), 0);
+        assert!(!db.has_legacy_repairs().unwrap());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM historical_repairs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[test]
+    fn legacy_null_dungeon_modifiers_read_as_empty() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let id = db.insert_fight(&sample_fight()).unwrap();
+        db.conn
+            .execute(
+                "UPDATE fights SET mods = NULL WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+
+        let loaded = db.fight_detail(id).unwrap().expect("fight");
+        assert!(loaded.dungeon_modifiers.is_empty());
+    }
+
     fn flawless_part(
         object_id: i32,
         name: &str,
@@ -7723,6 +7973,7 @@ mod tests {
             ended_at: 61_000,
             dungeon: dungeon.to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 1,
             boss_object_type: boss_type,
             boss_name: String::new(),
@@ -14983,6 +15234,7 @@ mod tests {
             ended_at: started_at + 1000,
             dungeon: "The Hive".to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 0,
             boss_object_type: boss_type,
             boss_name: name.to_string(),

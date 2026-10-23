@@ -6,6 +6,9 @@ use realmhound_core::GameEvent;
 
 pub const CRYSTAL_TYPE: i32 = 0x9A7;
 pub const JAILER_TYPE: i32 = 0xAD31;
+/// Totalia the Malevolent, the Halloween realm event boss. She has no chat
+/// announcement, so her object update is the only presence signal.
+pub const TOTALIA_TYPE: i32 = 0x3CCF;
 pub const ABSENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum DiscoveryEvent {
@@ -92,7 +95,7 @@ impl RealmDiscovery {
         let now = Instant::now();
         for object in &update.new_objects {
             let object_type = i32::from(object.object_type);
-            if !matches!(object_type, CRYSTAL_TYPE | JAILER_TYPE) {
+            if !matches!(object_type, CRYSTAL_TYPE | JAILER_TYPE | TOTALIA_TYPE) {
                 continue;
             }
             let object_id = object.object_id();
@@ -205,7 +208,7 @@ mod tests {
 
     #[test]
     fn discovery_rearms_only_after_continuous_absence() {
-        for object_type in [CRYSTAL_TYPE, JAILER_TYPE] {
+        for object_type in [CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE] {
             let mut tracker = RealmDiscovery::default();
             tracker.reset(true);
             let present = update(object_type, &[1], &[]);

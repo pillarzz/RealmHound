@@ -407,6 +407,7 @@ pub fn diagnose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processing::realm_discovery::TOTALIA_TYPE;
     use realmhound_core::settings::{EventMode, EventOverride, EventSection};
 
     use crate::processing::realm_discovery::CRYSTAL_TYPE;
@@ -564,6 +565,20 @@ mod tests {
         // Even though Veteran/Adept are on, the excluded ids produce nothing.
         assert!(resolve(&e, 900, "Commander Calbrik", &s).is_none());
         assert!(resolve(&e, 901, "UFO", &s).is_none());
+    }
+
+    #[test]
+    fn totalia_resolves_in_the_seasonal_section() {
+        let mut e = events();
+        e.seasonal.mode = EventMode::All;
+        let mut s = sets();
+        s.seasonal.insert(TOTALIA_TYPE, TOTALIA_TYPE);
+        let t = resolve(&e, TOTALIA_TYPE, "Totalia the Malevolent", &s).unwrap();
+        assert_eq!(t.sound, EventSound::Seasonal);
+        assert_eq!(
+            t.custom_key,
+            format!("event:seasonal:default:{TOTALIA_TYPE}")
+        );
     }
 
     #[test]

@@ -236,6 +236,7 @@ mod tests {
             ended_at: 4000,
             dungeon: "The Shatters".to_string(),
             dungeon_entered_at: None,
+            dungeon_modifiers: Vec::new(),
             map_seed: 42,
             boss_object_type: 5000,
             boss_name: "The Forgotten King".to_string(),

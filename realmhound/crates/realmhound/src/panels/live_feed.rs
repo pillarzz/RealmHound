@@ -18,10 +18,13 @@ use crate::panels::chat::ChatType;
 use crate::panels::loot_filters::{render_filter_bar, LootFilters, PropertyFilters};
 use crate::panels::{AppAction, Panel, PanelContext};
 use crate::processing::realm_discovery::{
-    DiscoveryEvent, ABSENCE_TIMEOUT, CRYSTAL_TYPE, JAILER_TYPE,
+    DiscoveryEvent, ABSENCE_TIMEOUT, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE,
 };
 use crate::rendering::emotes::{self, EmoteSegment, EMOTE_PADDING};
-use crate::rendering::{EmbeddedIcon, ModTierIcon, SpriteRenderer};
+use crate::rendering::modifier_chips::{
+    self, ModChip, DIMITUS_OBJECT_ID, WHITE_BAG_OBJECT_ID, XP_BOOSTER_OBJECT_ID,
+};
+use crate::rendering::{EmbeddedIcon, SpriteRenderer};
 use crate::shadcn_ui::Shadcn;
 use crate::tab_icons::{TabIconSprite, TAB_ICON_SIZE};
 
@@ -541,23 +544,6 @@ impl WarningEntry {
     }
 }
 
-/// A single modifier's display data for the Live Feed second line:
-/// its name, in-game type (icon), and danger category (text color).
-#[derive(Debug, Clone)]
-pub struct ModChip {
-    /// Display name (e.g. "Weak Boss III").
-    pub name: String,
-    /// In-game mod type, drives the leading type icon.
-    pub mod_type: ModType,
-    /// Danger category, drives the name text color.
-    pub danger: ModDanger,
-    /// Whether this is the Dimitus modifier (shows its portrait, not a glyph).
-    pub is_dimitus: bool,
-    /// Tier-specific modifier icon, if this is one of the boss/minion or player
-    /// mods. Drawn as the leading icon in place of the (absent) Normal type icon.
-    pub modifier_icon: Option<ModTierIcon>,
-}
-
 /// Result of a DM entry interaction.
 enum DmAction {
     /// No interaction.
@@ -721,26 +707,7 @@ impl DungeonEntry {
         anchor: std::time::Instant,
         estimated: bool,
     ) -> Self {
-        let modifiers: Vec<String> = modifier_tokens
-            .iter()
-            .map(|token| {
-                realmhound_core::dungeon_modifiers::modifier_display_name(token)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| prettify_modifier(token))
-            })
-            .collect();
-        let mods: Vec<ModChip> = modifier_tokens
-            .iter()
-            .zip(modifiers.iter())
-            .map(|(token, name)| ModChip {
-                name: name.clone(),
-                mod_type: realmhound_core::dungeon_modifiers::mod_type(token)
-                    .unwrap_or(ModType::Normal),
-                danger: realmhound_core::dungeon_modifiers::mod_danger(token),
-                is_dimitus: realmhound_core::dungeon_modifiers::canonical(token) == "DIMITUS",
-                modifier_icon: ModTierIcon::from_token(token),
-            })
-            .collect();
+        let mods: Vec<ModChip> = modifier_chips::chips_from_tokens(modifier_tokens);
         let outline = realmhound_core::dungeon_modifiers::outline_kind(modifier_tokens);
         let bonus = realmhound_core::dungeon_modifiers::total_bonus(modifier_tokens);
         let is_dimitus =
@@ -834,12 +801,6 @@ fn format_run_timer(d: std::time::Duration) -> String {
     } else {
         format!("{}:{:02}", m, s)
     }
-}
-
-/// Convert a raw modifier id token (e.g. "SOUVENIR_1") into a display string
-/// (e.g. "Souvenir 1") by splitting on underscores and title-casing each word.
-fn prettify_modifier(token: &str) -> String {
-    title_case_words(&token.replace('_', " "))
 }
 
 /// Format a raw map display name for the feed.
@@ -2164,6 +2125,7 @@ impl LiveFeedPanel {
             let name = match object_type {
                 CRYSTAL_TYPE => "Mysterious Crystal",
                 JAILER_TYPE => "Spectral Jailer",
+                TOTALIA_TYPE => "Totalia the Malevolent",
                 _ => return false,
             };
             let mut boss = BossCallEntry::new(
@@ -4699,14 +4661,6 @@ impl LiveFeedPanel {
         clickable && response.clicked()
     }
 
-    const WHITE_BAG_OBJECT_ID: i32 = 1292;
-
-    /// Dimitus boss object id, used as a distinct icon for Dimitus dungeons.
-    const DIMITUS_OBJECT_ID: i32 = 8813;
-
-    /// XP Booster object id, used as the XP-bonus symbol.
-    const XP_BOOSTER_OBJECT_ID: i32 = 3179;
-
     /// Text color for a modifier name by its danger category.
     fn danger_color(danger: ModDanger) -> Color32 {
         match danger {
@@ -4723,23 +4677,13 @@ impl LiveFeedPanel {
     /// diamond for Unique, spark for Special, none for Normal. Used as a fallback
     /// when the embedded type icon fails to load.
     fn mod_type_glyph(mod_type: ModType) -> Option<&'static str> {
-        match mod_type {
-            ModType::Reward => Some("🎁"),
-            ModType::Unique => Some("💎"),
-            ModType::Special => Some("✨"),
-            ModType::Normal => None,
-        }
+        modifier_chips::mod_type_glyph(mod_type)
     }
 
     /// Embedded type icon for a modifier's in-game type. `None` for
-    /// Normal mods (no icon).
+    /// Normal mods (no icon). Shared with Combat History.
     fn mod_type_icon(mod_type: ModType) -> Option<EmbeddedIcon> {
-        match mod_type {
-            ModType::Reward => Some(EmbeddedIcon::ModTypeReward),
-            ModType::Unique => Some(EmbeddedIcon::ModTypeUnique),
-            ModType::Special => Some(EmbeddedIcon::ModTypeSpecial),
-            ModType::Normal => None,
-        }
+        modifier_chips::mod_type_icon(mod_type)
     }
 
     /// Embedded grade-badge icon for a grade string. An absent or
@@ -4859,7 +4803,7 @@ impl LiveFeedPanel {
         let mut text_left = rect.left() + 80.0;
         let icon_id = dungeon.portal_id.or_else(|| {
             if dungeon.is_dimitus {
-                Some(Self::DIMITUS_OBJECT_ID)
+                Some(DIMITUS_OBJECT_ID)
             } else {
                 None
             }
@@ -4929,7 +4873,7 @@ impl LiveFeedPanel {
                 dungeon.loot_bonus,
                 loot_color,
                 "Loot",
-                Self::WHITE_BAG_OBJECT_ID,
+                WHITE_BAG_OBJECT_ID,
                 None,
             ),
             (
@@ -4939,13 +4883,7 @@ impl LiveFeedPanel {
                 -1,
                 Some(EmbeddedIcon::DustGrey),
             ),
-            (
-                dungeon.xp_bonus,
-                xp_color,
-                "XP",
-                Self::XP_BOOSTER_OBJECT_ID,
-                None,
-            ),
+            (dungeon.xp_bonus, xp_color, "XP", XP_BOOSTER_OBJECT_ID, None),
         ] {
             if value <= 0 {
                 continue;
@@ -5155,11 +5093,7 @@ impl LiveFeedPanel {
                     egui::pos2(cursor, center_y - icon_size / 2.0),
                     egui::vec2(icon_size, icon_size),
                 );
-                if sprite_renderer.draw_outlined_sprite_in_rect(
-                    ui,
-                    Self::DIMITUS_OBJECT_ID,
-                    icon_rect,
-                ) {
+                if sprite_renderer.draw_outlined_sprite_in_rect(ui, DIMITUS_OBJECT_ID, icon_rect) {
                     if expired {
                         ui.painter().rect_filled(
                             icon_rect,
@@ -6471,6 +6405,24 @@ mod tests {
     }
 
     #[test]
+    fn totalia_discovery_adds_a_feed_entry() {
+        let mut panel = LiveFeedPanel::new();
+        panel.realm_name = Some("Realm".to_string());
+        panel.apply_realm_discovery(DiscoveryEvent::Discovered {
+            object_id: 259_817,
+            object_type: TOTALIA_TYPE,
+            notify: true,
+            timestamp: Local::now(),
+        });
+        let FeedEntry::BossCall(boss) = &panel.entries[0] else {
+            panic!("expected Totalia entry");
+        };
+        assert_eq!(boss.boss_id, TOTALIA_TYPE);
+        assert_eq!(boss.boss_name, "Totalia the Malevolent");
+        assert!(boss.discovery.is_some());
+    }
+
+    #[test]
     fn crystal_packet_tracking_overrides_message_staleness() {
         let mut panel = LiveFeedPanel::new();
         panel.realm_name = Some("Mesa".to_string());
@@ -6791,9 +6743,15 @@ mod tests {
 
     #[test]
     fn prettify_modifier_formats_tokens() {
-        assert_eq!(prettify_modifier("CHEF"), "Chef");
-        assert_eq!(prettify_modifier("SOUVENIR_1"), "Souvenir 1");
-        assert_eq!(prettify_modifier("PETCOLLECTOR"), "Petcollector");
+        assert_eq!(modifier_chips::prettify_modifier("CHEF"), "Chef");
+        assert_eq!(
+            modifier_chips::prettify_modifier("SOUVENIR_1"),
+            "Souvenir 1"
+        );
+        assert_eq!(
+            modifier_chips::prettify_modifier("PETCOLLECTOR"),
+            "Petcollector"
+        );
     }
 
     #[test]

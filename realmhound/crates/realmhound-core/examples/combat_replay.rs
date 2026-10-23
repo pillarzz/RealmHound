@@ -132,7 +132,7 @@ fn main() {
                         "map change: {name} (fp={}, {}x{}, clock={clock})",
                         m.fp, m.width, m.height
                     );
-                    finished.extend(tracker.on_map_change(&name, m.fp, clock));
+                    finished.extend(tracker.on_map_change(&name, m.fp, clock, &[]));
                 }
                 Some(ParsedPacket::CreateSuccess(c)) => {
                     local_object_id = c.object_id;

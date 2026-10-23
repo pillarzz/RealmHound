@@ -430,6 +430,9 @@ pub struct CompletedFight {
     /// dungeon (realm/nexus/hubs) or for fights recorded before this was tracked.
     /// Drives the encounter card's "Total dungeon time" (entry -> final boss death).
     pub dungeon_entered_at: Option<i64>,
+    /// Dungeon modifier id tokens active for this map instance (e.g. `CHEF`).
+    /// Empty for realms/hubs and for fights recorded before mods were tracked.
+    pub dungeon_modifiers: Vec<String>,
     /// Map seed of the fight instance.
     pub map_seed: i32,
     /// Boss object type (resolves to a name/sprite via assets).

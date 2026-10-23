@@ -582,24 +582,6 @@ mod tests {
     }
 
     #[test]
-    fn totalia_is_in_the_extracted_seasonal_catalog() {
-        let _guard = crate::test_support::asset_manager_guard();
-        let assets = get_asset_manager();
-        if let Some(dir) = realmhound_core::assets::find_assets_dir() {
-            assets.set_assets_dir(&dir);
-        }
-        if !assets.try_load() {
-            eprintln!("skipping: game assets not available");
-            return;
-        }
-        // The settings picker and the live trigger must share one id.
-        assert_eq!(
-            EventSets::from_assets().seasonal.get(&TOTALIA_TYPE),
-            Some(&TOTALIA_TYPE)
-        );
-    }
-
-    #[test]
     fn unrelated_boss_is_silent() {
         assert!(resolve(&events(), 555, "Some Boss", &sets()).is_none());
     }

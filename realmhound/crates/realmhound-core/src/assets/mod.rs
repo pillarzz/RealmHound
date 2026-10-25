@@ -50,9 +50,10 @@ mod stat_bonus;
 pub mod unity;
 
 pub use boss_group::{
-    boss_earns_secret_stats, boss_exempt_from_flawless, boss_group, dungeon_for_mark_name,
-    encounter_spawn_limited, normalize_train_sprite, BossGroup, CatalogEntry,
-    KOGBOLD_TRAIN_DISPLAY_NAME, KOGBOLD_TRAIN_LOCOMOTIVE_SPRITE, SEASONAL_NOTIFY_EXCLUDED_IDS,
+    boss_earns_secret_stats, boss_exempt_from_flawless, boss_group, dungeon_for_mark_item,
+    dungeon_for_mark_name, encounter_spawn_limited, main_boss_for_dungeon, normalize_train_sprite,
+    BossGroup, CatalogEntry, KOGBOLD_TRAIN_DISPLAY_NAME, KOGBOLD_TRAIN_LOCOMOTIVE_SPRITE,
+    SEASONAL_NOTIFY_EXCLUDED_IDS,
 };
 pub use dungeon_category::{build_categories, DungeonCategory};
 pub use dungeon_data::dungeon_difficulty;

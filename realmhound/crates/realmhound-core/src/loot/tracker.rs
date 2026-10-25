@@ -1096,15 +1096,24 @@ impl LootTracker {
         // Any boss completion Mark is a guaranteed, exclusive drop of its
         // dungeon's main boss, so a bag holding one is definitively that boss's
         // drop even if proximity left it Unknown or pinned it to a nearby
-        // minion. The Mark itself proves the main boss died this instance;
-        // attribute the bag to the boss the combat tracker recorded killed here
-        // (variant-safe: e.g. Archdemon Malphas vs Malphas, Gilded Forgemaster),
-        // or -- since the Mark proves the kill -- to the escaped fight the tracker
-        // could not score as killed.
+        // minion. The Mark also names its own dungeon, which is more specific
+        // than the last boss that happened to die: the bag can be pinned to
+        // another member of the encounter (Ice Citadel's Munin) while the main
+        // boss's fight is still open and therefore in neither list. Resolve it
+        // first, then fall back to the recorded-kill heuristic.
         // Curated dungeons run their own Mark logic (Geb, Soulwarden) below, so
         // skip them here. Legacy bags with no recorded kill are handled by the
         // per-dungeon consensus migration instead.
         if !super::has_curated_boss_attribution(dungeon) && super::bag_has_boss_mark(item_ids) {
+            if let Some(hit) = Self::mark_main_boss(
+                dungeon,
+                item_ids,
+                recent_boss_kills,
+                escaped_boss_fights,
+                map_seed,
+            ) {
+                return Some(hit);
+            }
             if let Some(hit) = Self::select_last_boss_in_instance(recent_boss_kills, map_seed)
                 .or_else(|| Self::select_last_boss_in_instance(escaped_boss_fights, map_seed))
             {
@@ -1439,6 +1448,57 @@ impl LootTracker {
         map_seed: i32,
     ) -> Option<(i32, String)> {
         Self::select_last_boss_where(kills, map_seed, |_| true)
+    }
+
+    /// Resolve a bag that holds a boss Mark to the main boss the Mark names.
+    ///
+    /// The Mark itself identifies its dungeon's main boss, so this works even
+    /// while that boss's fight is still open. Ice Citadel is the motivating case:
+    /// proximity pins the bag to the summoned Munin, while Esben's own fight has
+    /// not finalized yet, so neither `recent_boss_kills` nor
+    /// `escaped_boss_fights` can name him. The recorded object type wins when the
+    /// boss already appears in either list, so reskin variants keep their own row.
+    fn mark_main_boss(
+        dungeon: &str,
+        item_ids: &[i32],
+        recent_boss_kills: &[RecentBossKill],
+        escaped_boss_fights: &[RecentBossKill],
+        map_seed: i32,
+    ) -> Option<(i32, String)> {
+        if map_seed == 0 {
+            return None;
+        }
+        for &item in item_ids {
+            let Some(mark_dungeon) = crate::assets::dungeon_for_mark_item(item) else {
+                continue;
+            };
+            if !mark_dungeon.eq_ignore_ascii_case(dungeon.trim()) {
+                continue;
+            }
+            let Some((main_type, fallback_name)) =
+                crate::assets::main_boss_for_dungeon(mark_dungeon)
+            else {
+                continue;
+            };
+            let recorded = recent_boss_kills
+                .iter()
+                .chain(escaped_boss_fights.iter())
+                .filter(|k| {
+                    k.map_seed == map_seed
+                        && crate::assets::same_boss_for_loot(k.object_type, main_type)
+                })
+                .max_by_key(|k| (k.ended_at_ms, k.started_at_ms));
+            return Some(match recorded {
+                Some(kill) => (kill.object_type, kill.name.clone()),
+                None => (
+                    main_type,
+                    get_asset_manager()
+                        .object_name(main_type)
+                        .unwrap_or_else(|| fallback_name.to_string()),
+                ),
+            });
+        }
+        None
     }
 
     /// [`Self::select_last_boss_in_instance`] with an extra per-kill filter, for
@@ -3075,6 +3135,43 @@ mod tests {
         assert_eq!(
             hit.as_ref().map(|(object_type, _)| *object_type),
             Some(30_026)
+        );
+    }
+
+    #[test]
+    fn mark_bag_names_the_main_boss_while_its_fight_is_still_open() {
+        // Ice Citadel: proximity pins the bag to Munin, but it holds the Mark of
+        // Esben and Esben's own fight has not finalized yet, so neither kill
+        // list can name him. The Mark's dungeon resolves the main boss.
+        let assets = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        let _ = assets.try_load();
+        let Some(mark) = assets.object_id_for_display_name("Mark of Esben") else {
+            eprintln!("skipping: game assets not available");
+            return;
+        };
+        if !assets.boss_mark_item_ids().contains(&mark) {
+            eprintln!("skipping: Mark of Esben is not indexed");
+            return;
+        }
+        let munin = kill(42, 40_177, "Munin", 10_000);
+        let hit = LootTracker::resolve_boss_override_with_fights(
+            &[munin],
+            &[],
+            LootBagType::White,
+            "Ice Citadel",
+            40_177,
+            &[mark],
+            42,
+            55_000,
+            false,
+        );
+        assert_eq!(
+            hit.as_ref().map(|(object_type, _)| *object_type),
+            Some(40_166),
+            "the Mark of Esben attributes the bag to Esben, not Munin"
         );
     }
 

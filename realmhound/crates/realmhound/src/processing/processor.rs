@@ -2473,8 +2473,14 @@ impl PacketProcessor {
             } => {
                 self.combat.on_player_hit(bullet_id, enemy_id, now_ms());
             }
-            GameEvent::LocalItemUsed { item_id, x, y } => {
-                self.combat.on_use_item(item_id, x, y, now_ms());
+            GameEvent::LocalItemUsed {
+                item_id,
+                x,
+                y,
+                use_item_flag,
+            } => {
+                self.combat
+                    .on_use_item(item_id, x, y, use_item_flag, now_ms());
             }
             GameEvent::DamageDealt {
                 target_id,

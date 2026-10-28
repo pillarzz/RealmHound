@@ -959,6 +959,83 @@ pub struct ConditionHexTier {
     pub duration: f32,
 }
 
+/// A `<Meter>` declared by an item (druid sigils, and any other meter-gated
+/// gear). The wire reports the live value in the ability slot's
+/// `UniqueDataString`; this is the definition it fills against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeterDef {
+    pub id: u32,
+    pub max_value: u32,
+    pub start_value: u32,
+}
+
+/// The event that adds to a meter (`FillMeter`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeterFillTrigger {
+    /// `OnPlayerAbilityActivate`: the item's own use.
+    AbilityUse,
+    /// `OnEnemyHitActivate`: one of the player's hits landed.
+    EnemyHit,
+    /// `OnPlayerHitActivate`: the player took a hit.
+    HitTaken,
+}
+
+/// One `FillMeter` rule on an item.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterFill {
+    pub trigger: MeterFillTrigger,
+    pub meter_id: u32,
+    /// `amountWorn`: added while the item is worn (the usual sigil value).
+    pub amount_worn: f32,
+    /// `amount`: added regardless of whether the item is worn.
+    pub amount: f32,
+    pub cooldown_s: f32,
+}
+
+impl MeterFill {
+    /// Charge added by one qualifying event while the item is worn.
+    pub fn amount_worn(&self) -> f32 {
+        self.amount_worn + self.amount
+    }
+}
+
+/// `BoostRange` on a switch ability: a self speed/life boost for `duration_s`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoostRangeEffect {
+    pub radius: f32,
+    pub life_boost: f32,
+    pub speed_boost: f32,
+    pub duration: f32,
+}
+
+/// The alternate "switch" ability a meter-gated item activates when its meter
+/// is full (a druid sigil's animal form).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwitchAbility {
+    pub meter_id: u32,
+    /// `minimumMeter` the activation requires.
+    pub minimum_meter: u32,
+    /// `meterCost` the activation consumes.
+    pub meter_cost: u32,
+    /// `SelfTransform` skin, when the switch transforms the player.
+    pub transform_skin: Option<i32>,
+    /// `SelfTransform` duration, and the longest declared effect duration.
+    pub duration: f32,
+    /// `StatBoostSelf` buffs granted for the switch's duration.
+    pub stat_boosts: Vec<StatBoostEffect>,
+    /// `ConditionEffectSelf`/`Sneak` applied by the switch (e.g. a form's heal
+    /// or stealth), kept out of the normal ability's effect list.
+    pub conditions: Vec<ConditionSelfEffect>,
+    /// `LethalStrike` granted for the switch's own duration.
+    pub lethal_strike: Option<LethalStrikeParams>,
+    /// `BoostRange` granted on the switch.
+    pub boost_range: Option<BoostRangeEffect>,
+    /// The switch form's own attack bursts (the animal-form volley), kept apart
+    /// from the normal ability's bursts so a hit can be priced by the mode it
+    /// was fired in.
+    pub bursts: Vec<ProjectileBurstEffect>,
+}
+
 /// Locally-computable ability effects parsed from an item's equip.xml entry.
 /// Used to self-compute AoE ability damage/heals/buffs that never appear in
 /// packets, and to display an ability readout on the character stats page.
@@ -974,6 +1051,15 @@ pub struct AbilityEffects {
     pub on_detonate_poison: Vec<HexThresholdPoison>,
     /// Hex-stack-gated condition overrides (e.g. Slowed at 25/50 stacks).
     pub condition_hex_tiers: Vec<ConditionHexTier>,
+    /// `<Meter>` definitions. Empty for items with no meter.
+    pub meters: Vec<MeterDef>,
+    /// `FillMeter` rules, one per declaring trigger.
+    pub fills: Vec<MeterFill>,
+    /// The meter-gated switch ability, when the item has one.
+    pub switch: Option<SwitchAbility>,
+    /// Bursts fired by the normal (charging-mode) ability. `effects` also holds
+    /// them for the readout; this split is what lets a hit be priced by mode.
+    pub normal_bursts: Vec<ProjectileBurstEffect>,
     /// Additional typed effects (damage/heal/buff/mobility) for the readout.
     pub effects: Vec<AbilityEffect>,
 }
@@ -988,7 +1074,28 @@ impl AbilityEffects {
 
     /// Whether this item produced any readable effect (damage, heal, buff, etc.).
     pub fn has_readout(&self) -> bool {
-        self.deals_damage() || !self.effects.is_empty()
+        self.deals_damage()
+            || !self.effects.is_empty()
+            || !self.meters.is_empty()
+            || self.switch.is_some()
+    }
+
+    /// The item's primary meter, if it declares one.
+    pub fn meter(&self) -> Option<&MeterDef> {
+        self.meters.first()
+    }
+
+    /// Whether this item is meter-gated (a druid sigil or similar).
+    pub fn has_meter(&self) -> bool {
+        !self.meters.is_empty()
+    }
+
+    /// How long the switch ability lasts, in milliseconds.
+    pub fn switch_duration_ms(&self) -> Option<i64> {
+        self.switch
+            .as_ref()
+            .map(|s| (s.duration.max(0.0) * 1000.0) as i64)
+            .filter(|&ms| ms > 0)
     }
 
     /// How long after an activation this ability can still be the source of a
@@ -2193,6 +2300,11 @@ impl ObjectList {
         let mut pending_attrs: HashMap<String, String> = HashMap::new();
         let mut in_on_detonate = false;
         let mut in_on_enemy_hit = false;
+        // Meter/switch bookkeeping for druid sigils and other meter-gated gear.
+        let mut in_on_player_ability = false;
+        let mut in_on_player_hit = false;
+        let mut in_switch_activate = false;
+        let mut in_switch_ability_block = false;
         let mut ability_map: HashMap<i32, AbilityEffects> = HashMap::new();
         // Ability item `<Projectile>` damage (min, max, armor_piercing) for the
         // current object, used to resolve Shoot/BulletNova per-shot damage.
@@ -2204,12 +2316,13 @@ impl ObjectList {
         // Deferred Shoot/BulletNova/BulletCreate specs (min_hex, max_hex, attrs,
         // default_shots) resolved against `pending_proj` at Object end (projectile
         // may be parsed after the effect element).
-        let mut pending_bursts: Vec<(u32, u32, HashMap<String, String>, i32)> = Vec::new();
+        let mut pending_bursts: Vec<(u32, u32, HashMap<String, String>, i32, bool)> = Vec::new();
         // Deferred BulletCreate entries whose `type` references an external
         // projectile object. Resolved after the full parse loop once all objects
         // (and their projectile data) are loaded.
         // (owner_type_id, external_type_id, attrs, num_shots)
-        let mut deferred_bullet_creates: Vec<(i32, i32, HashMap<String, String>, i32)> = Vec::new();
+        let mut deferred_bullet_creates: Vec<(i32, i32, HashMap<String, String>, i32, bool)> =
+            Vec::new();
         // Deferred SpawnCreep/RaiseDead entries whose objectId/undeadId
         // references an entity by name. Resolved after the full parse loop.
         // (owner_type_id, entity_name, scaling attrs, is_undead)
@@ -2266,6 +2379,10 @@ impl ObjectList {
                             pending_shuriken = None;
                             pending_dash_damage = None;
                             current_weapon_procs.clear();
+                            in_on_player_ability = false;
+                            in_on_player_hit = false;
+                            in_switch_activate = false;
+                            in_switch_ability_block = false;
 
                             // Parse type and setName attributes
                             for attr in e.attributes().flatten() {
@@ -2346,37 +2463,42 @@ impl ObjectList {
                         b"OnConditionEndActivate" => {
                             // Parse the proc params now; only commit them if the
                             // element's text turns out to be "LethalStrike".
-                            let mut p = LethalStrikeParams {
-                                ignore_flat: 0.0,
-                                ignore_perc: 0.0,
-                                stat_mod_flat: 0.0,
-                                stat_mod_perc: 0.0,
-                                stat_mod_scaling_min: 0.0,
-                                scaling_stat: ScalingStat::Wisdom,
-                                duration: 0.0,
-                                extra_shots: 0,
-                            };
-                            for attr in e.attributes().flatten() {
-                                let v = String::from_utf8_lossy(&attr.value);
-                                match attr.key.as_ref() {
-                                    b"ignoreFlat" => p.ignore_flat = v.parse().unwrap_or(0.0),
-                                    b"ignorePerc" => p.ignore_perc = v.parse().unwrap_or(0.0),
-                                    b"statModFlat" => p.stat_mod_flat = v.parse().unwrap_or(0.0),
-                                    b"statModPerc" => p.stat_mod_perc = v.parse().unwrap_or(0.0),
-                                    b"statModScalingMin" => {
-                                        p.stat_mod_scaling_min = v.parse().unwrap_or(0.0)
-                                    }
-                                    b"scalingStat" => {
-                                        if let Some(s) = ScalingStat::parse(&v) {
-                                            p.scaling_stat = s;
-                                        }
-                                    }
-                                    b"duration" => p.duration = v.parse().unwrap_or(0.0),
-                                    _ => {}
-                                }
-                            }
-                            pending_lethal_strike = Some(p);
+                            pending_lethal_strike =
+                                Some(parse_lethal_strike_params(&attrs_to_map(e)));
                             in_cond_end_activate = true;
+                        }
+                        b"Meter" => {
+                            let attrs = attrs_to_map(e);
+                            current_ability.meters.push(MeterDef {
+                                id: au(&attrs, "id", 0),
+                                max_value: au(&attrs, "maxValue", 0),
+                                start_value: au(&attrs, "startValue", 0),
+                            });
+                        }
+                        b"Ability" => {
+                            // Sigils declare a "Normal Ability" and a switch form
+                            // (e.g. "Shark Form"). Track which block is open so
+                            // duplicated tooltip-only effects can still be read
+                            // for the switch block.
+                            let name = e
+                                .attributes()
+                                .flatten()
+                                .find(|a| a.key.as_ref() == b"name")
+                                .map(|a| String::from_utf8_lossy(&a.value).to_string())
+                                .unwrap_or_default();
+                            in_switch_ability_block = !name.eq_ignore_ascii_case("Normal Ability");
+                        }
+                        b"OnSwitchAbilityActivate" => {
+                            pending_attrs = attrs_to_map(e);
+                            in_switch_activate = true;
+                        }
+                        b"OnPlayerAbilityActivate" => {
+                            pending_attrs = attrs_to_map(e);
+                            in_on_player_ability = true;
+                        }
+                        b"OnPlayerHitActivate" => {
+                            pending_attrs = attrs_to_map(e);
+                            in_on_player_hit = true;
                         }
                         b"Activate" => {
                             pending_activate_id = e
@@ -2408,6 +2530,16 @@ impl ObjectList {
                         }
                         _ => {}
                     }
+                }
+                // Self-closing elements (`<Meter ... />`) arrive as `Empty`
+                // rather than as a Start/End pair.
+                Ok(Event::Empty(ref e)) if e.name().as_ref() == b"Meter" => {
+                    let attrs = attrs_to_map(e);
+                    current_ability.meters.push(MeterDef {
+                        id: au(&attrs, "id", 0),
+                        max_value: au(&attrs, "maxValue", 0),
+                        start_value: au(&attrs, "startValue", 0),
+                    });
                 }
                 Ok(Event::Text(ref e)) => {
                     let text = e.unescape().unwrap_or_default();
@@ -2499,6 +2631,171 @@ impl ObjectList {
                         }
                     } else if in_cond_end_activate && text.as_ref() == "LethalStrike" {
                         current_lethal_strike = pending_lethal_strike;
+                    } else if in_switch_activate {
+                        // Effects on a meter-gated switch ability (a sigil's
+                        // animal form). These are what the switch grants, so
+                        // they are both read as effects (for the readout and
+                        // stat/condition source checks) and recorded as switch
+                        // metadata the tracker times the form with.
+                        match text.as_ref() {
+                            "StatBoostSelf" | "StatBoostAura" => {
+                                let boost = StatBoostEffect {
+                                    stat: pending_attrs.get("stat").cloned().unwrap_or_default(),
+                                    amount: af(&pending_attrs, "amount", 0.0) as i32,
+                                    duration: af(&pending_attrs, "duration", 0.0),
+                                };
+                                let sw = current_ability
+                                    .switch
+                                    .get_or_insert_with(SwitchAbility::default);
+                                sw.duration = sw.duration.max(boost.duration);
+                                sw.stat_boosts.push(boost);
+                            }
+                            "SelfTransform" => {
+                                let duration = af(&pending_attrs, "duration", 0.0);
+                                let skin =
+                                    pending_attrs.get("skin").and_then(|v| parse_hex_type(v));
+                                let sw = current_ability
+                                    .switch
+                                    .get_or_insert_with(SwitchAbility::default);
+                                sw.duration = sw.duration.max(duration);
+                                if skin.is_some() {
+                                    sw.transform_skin = skin;
+                                }
+                            }
+                            "LethalStrike" => {
+                                let params = parse_lethal_strike_params(&pending_attrs);
+                                let sw = current_ability
+                                    .switch
+                                    .get_or_insert_with(SwitchAbility::default);
+                                sw.duration = sw.duration.max(params.duration);
+                                sw.lethal_strike = Some(params);
+                                current_lethal_strike = Some(params);
+                            }
+                            "BoostRange" => {
+                                let boost = BoostRangeEffect {
+                                    radius: af(&pending_attrs, "radius", 0.0),
+                                    life_boost: af(&pending_attrs, "lifeBoost", 0.0),
+                                    speed_boost: af(&pending_attrs, "speedBoost", 0.0),
+                                    duration: af(&pending_attrs, "duration", 0.0),
+                                };
+                                let sw = current_ability
+                                    .switch
+                                    .get_or_insert_with(SwitchAbility::default);
+                                sw.duration = sw.duration.max(boost.duration);
+                                sw.boost_range = Some(boost);
+                            }
+                            "ConditionEffectSelf" | "Sneak" => {
+                                let effect = pending_attrs
+                                    .get("effect")
+                                    .or_else(|| pending_attrs.get("conditionEffect"))
+                                    .cloned()
+                                    .unwrap_or_else(|| "Invisible".to_string());
+                                let condition = ConditionSelfEffect {
+                                    effect,
+                                    duration: af(&pending_attrs, "duration", 0.0),
+                                };
+                                let sw = current_ability
+                                    .switch
+                                    .get_or_insert_with(SwitchAbility::default);
+                                sw.conditions.push(condition);
+                            }
+                            "SpawnCreep" | "RaiseDead" => {
+                                let id_key = if text.as_ref() == "SpawnCreep" {
+                                    "objectId"
+                                } else {
+                                    "undeadId"
+                                };
+                                if let (Some(obj_id), Some(owner)) =
+                                    (pending_attrs.get(id_key).cloned(), current_type_id)
+                                {
+                                    deferred_spawn_creeps.push((
+                                        owner,
+                                        obj_id,
+                                        pending_attrs.clone(),
+                                        text.as_ref() == "RaiseDead",
+                                    ));
+                                }
+                            }
+                            "BulletCreate" => {
+                                let shots = pending_attrs
+                                    .get("numShots")
+                                    .and_then(|v| v.parse::<i32>().ok())
+                                    .unwrap_or(1);
+                                match pending_attrs.get("type") {
+                                    Some(t) => {
+                                        if let (Some(ext), Some(owner)) =
+                                            (parse_hex_type(t), current_type_id)
+                                        {
+                                            deferred_bullet_creates.push((
+                                                owner,
+                                                ext,
+                                                pending_attrs.clone(),
+                                                shots,
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                    None => pending_bursts.push((
+                                        0,
+                                        100,
+                                        pending_attrs.clone(),
+                                        shots,
+                                        true,
+                                    )),
+                                }
+                            }
+                            "Shoot" | "BulletNova" => {
+                                pending_bursts.push((
+                                    0,
+                                    100,
+                                    pending_attrs.clone(),
+                                    current_num_projectiles.max(1),
+                                    true,
+                                ));
+                            }
+                            "Heal" => {
+                                current_ability.effects.push(AbilityEffect::Restore(
+                                    parse_restore(&pending_attrs, false),
+                                ));
+                            }
+                            _ => {}
+                        }
+                        // All switch effects share the meter gate; record it on
+                        // the first one that declares it.
+                        if let Some(sw) = current_ability.switch.as_mut() {
+                            let min = au(&pending_attrs, "minimumMeter", 0);
+                            if min > 0 {
+                                sw.minimum_meter = min;
+                            }
+                            sw.meter_id = au(&pending_attrs, "idMeter", sw.meter_id);
+                            let cost = au(&pending_attrs, "meterCost", 0);
+                            if cost > 0 {
+                                sw.meter_cost = cost;
+                            }
+                        }
+                    } else if in_on_player_ability && text.as_ref() == "FillMeter" {
+                        current_ability.fills.push(parse_meter_fill(
+                            &pending_attrs,
+                            MeterFillTrigger::AbilityUse,
+                        ));
+                    } else if in_on_player_ability
+                        && (text.as_ref() == "Sneak" || text.as_ref() == "ConditionEffectSelf")
+                    {
+                        let effect = pending_attrs
+                            .get("effect")
+                            .or_else(|| pending_attrs.get("conditionEffect"))
+                            .cloned()
+                            .unwrap_or_else(|| "Invisible".to_string());
+                        current_ability.effects.push(AbilityEffect::Condition(
+                            ConditionSelfEffect {
+                                effect,
+                                duration: af(&pending_attrs, "duration", 0.0),
+                            },
+                        ));
+                    } else if in_on_player_hit && text.as_ref() == "FillMeter" {
+                        current_ability
+                            .fills
+                            .push(parse_meter_fill(&pending_attrs, MeterFillTrigger::HitTaken));
                     } else if in_activate && text.as_ref() == "UnlockForgeBlueprint" {
                         current_unlock_target = pending_activate_id.take();
                     } else if in_activate && text.as_ref() == "UnlockPetSkin" {
@@ -2545,6 +2842,7 @@ impl ObjectList {
                             au(&pending_attrs, "maxHex", 100),
                             pending_attrs.clone(),
                             au(&pending_attrs, "numShots", 1) as i32,
+                            false,
                         ));
                     } else if in_on_detonate && text.as_ref() == "ApplyCondition" {
                         let condition = pending_attrs.get("effect").cloned().unwrap_or_default();
@@ -2563,12 +2861,18 @@ impl ObjectList {
                             100,
                             pending_attrs.clone(),
                             current_num_projectiles.max(1),
+                            in_switch_ability_block,
                         ));
                     } else if in_activate && text.as_ref() == "BulletCreate" {
-                        let dominated = pending_attrs
-                            .get("ignoreOnTooltip")
-                            .map(|v| v == "true" || v == "1")
-                            .unwrap_or(false);
+                        // `ignoreOnTooltip` hides the line from the in-game
+                        // tooltip, not the effect: sigils mark their real
+                        // damage bursts with it, so only skip it for items
+                        // that are neither meter-gated nor in a switch block.
+                        let dominated = !(in_switch_ability_block || current_ability.has_meter())
+                            && pending_attrs
+                                .get("ignoreOnTooltip")
+                                .map(|v| v == "true" || v == "1")
+                                .unwrap_or(false);
                         if !dominated {
                             let shots = pending_attrs
                                 .get("numShots")
@@ -2584,11 +2888,18 @@ impl ObjectList {
                                             ext,
                                             pending_attrs.clone(),
                                             shots,
+                                            in_switch_ability_block,
                                         ));
                                     }
                                 }
                                 None => {
-                                    pending_bursts.push((0, 100, pending_attrs.clone(), shots));
+                                    pending_bursts.push((
+                                        0,
+                                        100,
+                                        pending_attrs.clone(),
+                                        shots,
+                                        in_switch_ability_block,
+                                    ));
                                 }
                             }
                         }
@@ -2617,10 +2928,11 @@ impl ObjectList {
                             .effects
                             .push(AbilityEffect::DamageNova(parse_damage_nova(&pending_attrs)));
                     } else if in_activate && text.as_ref() == "EffectBlast" {
-                        let dominated = pending_attrs
-                            .get("ignoreOnTooltip")
-                            .map(|v| v == "true" || v == "1")
-                            .unwrap_or(false);
+                        let dominated = !(in_switch_ability_block || current_ability.has_meter())
+                            && pending_attrs
+                                .get("ignoreOnTooltip")
+                                .map(|v| v == "true" || v == "1")
+                                .unwrap_or(false);
                         if !dominated {
                             let condition = pending_attrs
                                 .get("condEffect")
@@ -2638,10 +2950,11 @@ impl ObjectList {
                             ));
                         }
                     } else if in_activate && text.as_ref() == "SpawnCreep" {
-                        let dominated = pending_attrs
-                            .get("ignoreOnTooltip")
-                            .map(|v| v == "true" || v == "1")
-                            .unwrap_or(false);
+                        let dominated = !(in_switch_ability_block || current_ability.has_meter())
+                            && pending_attrs
+                                .get("ignoreOnTooltip")
+                                .map(|v| v == "true" || v == "1")
+                                .unwrap_or(false);
                         if !dominated {
                             if let (Some(obj_id), Some(owner)) =
                                 (pending_attrs.get("objectId").cloned(), current_type_id)
@@ -2655,10 +2968,11 @@ impl ObjectList {
                             }
                         }
                     } else if in_activate && text.as_ref() == "RaiseDead" {
-                        let dominated = pending_attrs
-                            .get("ignoreOnTooltip")
-                            .map(|v| v == "true" || v == "1")
-                            .unwrap_or(false);
+                        let dominated = !(in_switch_ability_block || current_ability.has_meter())
+                            && pending_attrs
+                                .get("ignoreOnTooltip")
+                                .map(|v| v == "true" || v == "1")
+                                .unwrap_or(false);
                         if !dominated {
                             if let (Some(undead_id), Some(owner)) =
                                 (pending_attrs.get("undeadId").cloned(), current_type_id)
@@ -2721,6 +3035,10 @@ impl ObjectList {
                         {
                             pending_dash_damage = Some(d);
                         }
+                    } else if in_on_enemy_hit && text.as_ref() == "FillMeter" {
+                        current_ability
+                            .fills
+                            .push(parse_meter_fill(&pending_attrs, MeterFillTrigger::EnemyHit));
                     } else if in_on_enemy_hit
                         && text.as_ref() == "ApplyCondition"
                         && pending_attrs.get("effect").map(|s| s.as_str()) == Some("Hex")
@@ -2739,16 +3057,28 @@ impl ObjectList {
                             // Resolve deferred Shoot/BulletNova bursts now that the
                             // object's <Projectile> damage is known.
                             let proj = pending_proj.unwrap_or((0.0, 0.0, false));
-                            for (min_hex, max_hex, attrs, default_shots) in pending_bursts.drain(..)
+                            for (min_hex, max_hex, attrs, default_shots, is_switch) in
+                                pending_bursts.drain(..)
                             {
                                 let burst = parse_projectile_burst(&attrs, proj, default_shots);
-                                current_ability
-                                    .effects
-                                    .push(AbilityEffect::ProjectileBurst {
-                                        min_hex,
-                                        max_hex,
-                                        burst,
-                                    });
+                                // Keep the mode's own list so a hit/readout can
+                                // price the ability by the mode it fired in.
+                                if is_switch {
+                                    current_ability
+                                        .switch
+                                        .get_or_insert_with(SwitchAbility::default)
+                                        .bursts
+                                        .push(burst);
+                                } else {
+                                    current_ability
+                                        .effects
+                                        .push(AbilityEffect::ProjectileBurst {
+                                            min_hex,
+                                            max_hex,
+                                            burst,
+                                        });
+                                    current_ability.normal_bursts.push(burst);
+                                }
                             }
                             // Attach the counted LS extra shots to the params.
                             if let Some(ref mut ls) = current_lethal_strike {
@@ -2850,6 +3180,10 @@ impl ObjectList {
                         b"OnDetonateHexActivate" => in_on_detonate = false,
                         b"OnEnemyHitActivate" => in_on_enemy_hit = false,
                         b"OnPlayerShootActivate" => in_on_player_shoot = false,
+                        b"OnPlayerAbilityActivate" => in_on_player_ability = false,
+                        b"OnPlayerHitActivate" => in_on_player_hit = false,
+                        b"OnSwitchAbilityActivate" => in_switch_activate = false,
+                        b"Ability" => in_switch_ability_block = false,
                         _ => {}
                     }
                 }
@@ -2873,7 +3207,7 @@ impl ObjectList {
         // Resolve deferred BulletCreate entries that reference external
         // projectile objects (type="0xNNNN"). Now that every object is loaded we
         // can look up the referenced object's <Projectile> damage.
-        for (owner, ext_id, attrs, shots) in deferred_bullet_creates {
+        for (owner, ext_id, attrs, shots, is_switch) in deferred_bullet_creates {
             let proj = self
                 .objects
                 .get(&ext_id)
@@ -2885,11 +3219,20 @@ impl ObjectList {
                 let entry = ability_map
                     .entry(owner)
                     .or_insert_with(AbilityEffects::default);
-                entry.effects.push(AbilityEffect::ProjectileBurst {
-                    min_hex: 0,
-                    max_hex: 100,
-                    burst,
-                });
+                if is_switch {
+                    entry
+                        .switch
+                        .get_or_insert_with(SwitchAbility::default)
+                        .bursts
+                        .push(burst);
+                } else {
+                    entry.effects.push(AbilityEffect::ProjectileBurst {
+                        min_hex: 0,
+                        max_hex: 100,
+                        burst,
+                    });
+                    entry.normal_bursts.push(burst);
+                }
             }
         }
 
@@ -3448,6 +3791,49 @@ fn af(m: &HashMap<String, String>, k: &str, d: f32) -> f32 {
 /// Read a u32 attribute, defaulting when absent/unparsable.
 fn au(m: &HashMap<String, String>, k: &str, d: u32) -> u32 {
     m.get(k).and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// Parse `LethalStrike` proc attributes. Shared by the `OnConditionEndActivate`
+/// cloak form and the `OnSwitchAbilityActivate` sigil form.
+fn parse_lethal_strike_params(m: &HashMap<String, String>) -> LethalStrikeParams {
+    let mut p = LethalStrikeParams {
+        ignore_flat: 0.0,
+        ignore_perc: 0.0,
+        stat_mod_flat: 0.0,
+        stat_mod_perc: 0.0,
+        stat_mod_scaling_min: 0.0,
+        scaling_stat: ScalingStat::Wisdom,
+        duration: 0.0,
+        extra_shots: 0,
+    };
+    for (key, value) in m {
+        match key.as_str() {
+            "ignoreFlat" => p.ignore_flat = value.parse().unwrap_or(0.0),
+            "ignorePerc" => p.ignore_perc = value.parse().unwrap_or(0.0),
+            "statModFlat" => p.stat_mod_flat = value.parse().unwrap_or(0.0),
+            "statModPerc" => p.stat_mod_perc = value.parse().unwrap_or(0.0),
+            "statModScalingMin" => p.stat_mod_scaling_min = value.parse().unwrap_or(0.0),
+            "scalingStat" => {
+                if let Some(s) = ScalingStat::parse(value) {
+                    p.scaling_stat = s;
+                }
+            }
+            "duration" => p.duration = value.parse().unwrap_or(0.0),
+            _ => {}
+        }
+    }
+    p
+}
+
+/// Parse one `FillMeter` element's attributes.
+fn parse_meter_fill(m: &HashMap<String, String>, trigger: MeterFillTrigger) -> MeterFill {
+    MeterFill {
+        trigger,
+        meter_id: au(m, "idMeter", 0),
+        amount_worn: af(m, "amountWorn", 0.0),
+        amount: af(m, "amount", 0.0),
+        cooldown_s: af(m, "cooldown", 0.0),
+    }
 }
 
 fn parse_detonate_hex(m: &HashMap<String, String>) -> DetonateHexEffect {
@@ -4930,6 +5316,115 @@ mod tests {
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].required_conditions.as_deref(), Some("0x2257"));
         assert!((procs[0].proc_rate - 0.05).abs() < 1e-4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_parses_sigil_meter_and_switch_ability() {
+        let mut list = ObjectList::new();
+        let mut sigil = weapon_shell(0x7b73, "Sharktooth Sigil");
+        sigil.projectiles = vec![Projectile {
+            min_damage: 380,
+            max_damage: 450,
+            armor_piercing: true,
+            slot_type: 7,
+            display_id: None,
+            ignore_on_tooltip: false,
+        }];
+        let mut projectile = weapon_shell(0x7b79, "Shark Projectile");
+        projectile.projectiles = vec![Projectile {
+            min_damage: 285,
+            max_damage: 365,
+            armor_piercing: false,
+            slot_type: 7,
+            display_id: None,
+            ignore_on_tooltip: false,
+        }];
+        list.insert_asset(0x7b73, sigil);
+        list.insert_asset(0x7b79, projectile);
+
+        let xml = r#"<Objects>
+  <Object type="0x7b73" id="Sharktooth Sigil">
+    <Class>Equipment</Class>
+    <Projectile>
+      <MinDamage>380</MinDamage>
+      <MaxDamage>450</MaxDamage>
+      <ArmorPiercing />
+    </Projectile>
+    <Meter id="0" maxValue="425" startValue="0" />
+    <Ability name="Normal Ability">
+      <Activate ignoreOnTooltip="true" numShots="3" type="0x7b73"
+        statModDamage="3.5" scalingStat="SPD" statModScalingMin="50">BulletCreate</Activate>
+      <OnPlayerAbilityActivate idMeter="0" wornFlat="true" amountWorn="75" amount="0">FillMeter</OnPlayerAbilityActivate>
+      <OnEnemyHitActivate idMeter="0" wornFlat="true" amountWorn="1" amount="0">FillMeter</OnEnemyHitActivate>
+    </Ability>
+    <Ability name="Shark Form">
+      <OnSwitchAbilityActivate idMeter="0" minimumMeter="425" meterCost="0" amount="25"
+        duration="7.0" stat="DEX">StatBoostSelf</OnSwitchAbilityActivate>
+      <OnSwitchAbilityActivate minimumMeter="425" meterCost="0" ignoreFlat="25"
+        scalingStat="SPD" statModScalingMin="50" statModFlat="0.33" duration="7">LethalStrike</OnSwitchAbilityActivate>
+      <OnSwitchAbilityActivate idMeter="0" minimumMeter="425" meterCost="425"
+        duration="7.0" skin="0x7b17">SelfTransform</OnSwitchAbilityActivate>
+      <OnSwitchAbilityActivate radius="1" lifeBoost="0.75" speedBoost="1"
+        duration="7.0">BoostRange</OnSwitchAbilityActivate>
+      <Activate ignoreOnTooltip="true" numShots="3" type="0x7b79"
+        statModDamage="2" scalingStat="SPD" statModScalingMin="50">BulletCreate</Activate>
+    </Ability>
+  </Object>
+  <Object type="0x7b79" id="Shark Projectile">
+    <Class>Equipment</Class>
+    <Projectile>
+      <MinDamage>285</MinDamage>
+      <MaxDamage>365</MaxDamage>
+    </Projectile>
+  </Object>
+</Objects>"#;
+        let dir = std::env::temp_dir().join(format!("rh_sigil_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("equip.xml");
+        std::fs::write(&path, xml).unwrap();
+        list.merge_equipment_xml(&path).unwrap();
+
+        let eff = list.ability_effects(0x7b73).expect("sigil effects");
+        let meter = eff.meter().expect("meter");
+        assert_eq!((meter.id, meter.max_value, meter.start_value), (0, 425, 0));
+        assert_eq!(eff.fills.len(), 2);
+        assert_eq!(eff.fills[0].trigger, MeterFillTrigger::AbilityUse);
+        assert!((eff.fills[0].amount_worn() - 75.0).abs() < 1e-4);
+        assert_eq!(eff.fills[1].trigger, MeterFillTrigger::EnemyHit);
+
+        let switch = eff.switch.as_ref().expect("switch ability");
+        assert_eq!(switch.minimum_meter, 425);
+        assert_eq!(switch.meter_cost, 425);
+        assert!((switch.duration - 7.0).abs() < 1e-4);
+        assert_eq!(switch.transform_skin, Some(0x7b17));
+        assert_eq!(switch.stat_boosts.len(), 1);
+        assert_eq!(switch.stat_boosts[0].stat, "DEX");
+        assert_eq!(switch.stat_boosts[0].amount, 25);
+        let ls = switch.lethal_strike.expect("LethalStrike");
+        assert!((ls.ignore_flat - 25.0).abs() < 1e-4);
+        assert!((ls.duration - 7.0).abs() < 1e-4);
+        assert!(switch.boost_range.is_some());
+
+        // The tooltip-only normal burst and the form's own burst are split by
+        // mode, and both remain in `effects` for the readout.
+        assert_eq!(eff.normal_bursts.len(), 1);
+        assert_eq!(eff.switch.as_ref().unwrap().bursts.len(), 1);
+        assert_eq!(eff.normal_bursts[0].min_damage as i32, 380);
+        assert_eq!(eff.normal_bursts[0].num_shots, 3);
+        assert_eq!(
+            eff.switch.as_ref().unwrap().bursts[0].min_damage as i32,
+            285
+        );
+        assert!(eff
+            .effects
+            .iter()
+            .any(|e| matches!(e, AbilityEffect::ProjectileBurst { .. })));
+
+        // The switch's LethalStrike is also exposed on the object, which is what
+        // the tracker snapshots at shoot time.
+        assert!(list.get(0x7b73).and_then(|o| o.lethal_strike).is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

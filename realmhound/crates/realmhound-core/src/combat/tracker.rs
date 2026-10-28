@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
-use crate::api::character::parse_enchant_ids;
+use crate::api::character::{parse_enchant_ids, parse_enchant_slots};
 use crate::assets::get_asset_manager;
 use crate::assets::LethalStrikeParams;
 use crate::assets::SummonTrigger;
@@ -394,6 +394,11 @@ struct TrackedObject {
     /// Per-slot enchant ids (weapon, ability, armor, ring) decoded from the
     /// `UniqueDataString` stat; empty when none/unknown.
     equipment_enchants: [Vec<u16>; 4],
+    /// Live meter value of the ability-slot item (druid sigils), decoded from
+    /// the same `UniqueDataString` stat. `ability_meter_seen` distinguishes a
+    /// real 0 from "this item has no meter / the stat has not arrived".
+    ability_meter: i32,
+    ability_meter_seen: bool,
     /// Attack stat (id 20); relevant for the local player's damage multiplier.
     attack: i32,
     /// AttackBoost stat (id 48). Not part of the damage math (stat 20 already
@@ -473,6 +478,8 @@ impl Default for TrackedObject {
             tex2: 0,
             equipment: [-1; 4],
             equipment_enchants: Default::default(),
+            ability_meter: 0,
+            ability_meter_seen: false,
             attack: 0,
             attack_boost: 0,
             defense: 0,
@@ -815,6 +822,35 @@ struct LocalAbilityUse {
     /// activation time. `None` when the item declares no such effect, i.e. when a
     /// bulletless packet could not have come from it.
     server_effect_window_ms: Option<i64>,
+    /// Animal form the activation was fired in (`SelfTransform` skin), or
+    /// `None` for the normal ability. Captured at activation time so a volley
+    /// that lands after the form ends stays attributed to the mode it was fired
+    /// in.
+    form_skin: Option<i32>,
+}
+
+/// Live meter and animal-form state of the local player's meter-gated ability
+/// item (a druid sigil). The meter itself is authoritative on the wire (stat
+/// 80's ability-slot segment); the form is identified by the switch ability's
+/// `SelfTransform` skin, and timed by its declared duration.
+#[derive(Debug, Clone)]
+struct SigilState {
+    item_id: i32,
+    max_value: i32,
+    value: i32,
+    /// Last activation of the item (normal ability or switch).
+    last_use_ms: i64,
+    /// The active animal form, if the switch is currently up.
+    form: Option<SigilForm>,
+}
+
+/// One animal-form window opened by a sigil switch.
+#[derive(Debug, Clone)]
+struct SigilForm {
+    skin: i32,
+    ends_ms: i64,
+    /// Whether the animal-form ability was used before the form ended.
+    animal_ability_used: bool,
 }
 
 /// One item in the local player's loadout that declares a summon of the creature
@@ -1427,6 +1463,10 @@ pub struct CombatTracker {
     /// on map change. A local weapon shot fired within a window gets the LS
     /// bonus + 2 side procs attributed at hit time.
     lethal_strike_windows: VecDeque<(i64, i64)>,
+    /// Live meter and animal-form state for the local player's meter-gated
+    /// ability item (a druid sigil). Cleared when the item leaves the slot, on
+    /// map change and on disconnect.
+    sigil_state: Option<SigilState>,
     /// Summon entity id -> its summoner (owning player) id, learned from
     /// `ServerPlayerShoot`. Covers both local and remote summons; used to
     /// redirect remote summon `DamagePacket`s to the owning player.
@@ -1641,6 +1681,7 @@ impl CombatTracker {
             pending_shots: HashMap::new(),
             last_shot_trigger: None,
             lethal_strike_windows: VecDeque::new(),
+            sigil_state: None,
             summon_owners: HashMap::new(),
             pending_summon_shots: HashMap::new(),
             pending_server_shots: HashMap::new(),
@@ -1772,6 +1813,7 @@ impl CombatTracker {
         self.objects.clear();
         self.fights.clear();
         self.aux_instances.clear();
+        self.sigil_state = None;
         // Re-seed the damage RNG for the new instance and re-enable self-damage.
         self.rng = Rng::new(map_seed);
         self.rng_seeded = true;
@@ -1822,6 +1864,7 @@ impl CombatTracker {
         self.objects.clear();
         self.fights.clear();
         self.aux_instances.clear();
+        self.sigil_state = None;
         // Leaving the world clears the current dungeon; the next map change stamps
         // a fresh entry time if it loads a dungeon.
         self.dungeon_entered_at = None;
@@ -2169,6 +2212,9 @@ impl CombatTracker {
             if let Some(after) = self.objects.get(&object_id).map(BoostSnapshot::of) {
                 self.note_local_stat_changes(&before, &after, time_ms);
             }
+        }
+        if object_id == self.local_object_id && self.local_object_id != 0 {
+            self.note_sigil_state(time_ms);
         }
         if self.fights.contains_key(&object_id) {
             let vulnerable_before = old_boss_condition & COND_INVULNERABLE == 0;
@@ -3154,13 +3200,64 @@ impl CombatTracker {
     /// damage-reduction window. Non-shield activations are ignored.
     /// `UseItem` is an outgoing packet, so it only ever reflects the local
     /// player.
-    pub fn on_use_item(&mut self, item_id: i32, _x: f32, _y: f32, time_ms: i64) {
+    pub fn on_use_item(
+        &mut self,
+        item_id: i32,
+        _x: f32,
+        _y: f32,
+        use_item_flag: i32,
+        time_ms: i64,
+    ) {
         if self.local_object_id == 0 || item_id < 0 {
             return;
         }
         if let Some(pct) = get_asset_manager().shield_reduction_pct(item_id) {
             self.shield_dr_until = time_ms + SHIELD_ACTIVE_MS;
             self.shield_dr_pct = pct;
+        }
+        // Meter-gated item (a sigil): a use while the animal form is up is the
+        // form's own ability (flag 1); otherwise it is the normal ability,
+        // whose declared on-use fill is applied here for immediate feedback.
+        // The wire's meter stat stays authoritative and overwrites this.
+        if let Some(effects) = get_asset_manager().ability_effects(item_id) {
+            if effects.has_meter() {
+                if self.sigil_state.as_ref().map(|s| s.item_id) != Some(item_id) {
+                    if let Some(def) = effects.meter().copied() {
+                        let (value, seen) = self
+                            .objects
+                            .get(&self.local_object_id)
+                            .map(|o| (o.ability_meter, o.ability_meter_seen))
+                            .unwrap_or((def.start_value as i32, false));
+                        self.sigil_state = Some(SigilState {
+                            item_id,
+                            max_value: def.max_value as i32,
+                            value: if seen { value } else { def.start_value as i32 },
+                            last_use_ms: 0,
+                            form: None,
+                        });
+                    }
+                }
+                if let Some(st) = self.sigil_state.as_mut().filter(|s| s.item_id == item_id) {
+                    st.last_use_ms = time_ms;
+                    match st.form.as_mut() {
+                        Some(form) if use_item_flag != 0 => {
+                            form.animal_ability_used = true;
+                        }
+                        Some(_) => {}
+                        None => {
+                            let fill: f32 = effects
+                                .fills
+                                .iter()
+                                .filter(|f| {
+                                    f.trigger == crate::assets::MeterFillTrigger::AbilityUse
+                                })
+                                .map(|f| f.amount_worn())
+                                .sum();
+                            st.value = (st.value + fill as i32).clamp(0, st.max_value.max(0));
+                        }
+                    }
+                }
+            }
         }
         // Two facts are all the performance sections need from a use: what the
         // local player used, and when. The item is remembered as the proposed
@@ -3173,12 +3270,29 @@ impl CombatTracker {
             .filter(|o| o.equipment[ABILITY_SLOT] == item_id)
             .map(|o| o.equipment_enchants[ABILITY_SLOT].clone());
         if let Some(enchants) = ability_enchants {
+            // Capture the mode at activation time: a volley fired in the form
+            // stays transformed even if it lands after the form ends. Flag 1 is
+            // the form's own ability, so fall back to the switch skin when the
+            // skin update has not arrived yet.
+            let form_skin = self
+                .sigil_state
+                .as_ref()
+                .filter(|s| s.item_id == item_id)
+                .and_then(|s| s.form.as_ref().map(|f| f.skin))
+                .or_else(|| {
+                    (use_item_flag != 0)
+                        .then(|| get_asset_manager().ability_effects(item_id))
+                        .flatten()
+                        .and_then(|e| e.switch)
+                        .and_then(|s| s.transform_skin)
+                });
             self.local_ability_uses.push_back(LocalAbilityUse {
                 time_ms,
                 item_id,
                 enchants,
                 server_effect_window_ms: get_asset_manager()
                     .server_applied_damage_window_ms(item_id),
+                form_skin,
             });
             self.trim_local_event_logs();
         }
@@ -3208,6 +3322,154 @@ impl CombatTracker {
             });
         }
         self.trim_local_event_logs();
+    }
+
+    /// Record the live meter and animal-form state of the local player's
+    /// meter-gated ability item (a druid sigil) from the stats just applied.
+    ///
+    /// The meter is authoritative on the wire (the ability slot's segment of
+    /// `UniqueDataString`). The animal form is identified by the switch
+    /// ability's `SelfTransform` skin -- the server sends it in the same update
+    /// that drops the meter to 0 -- and timed by the switch's declared
+    /// duration. Using the skin (rather than only the meter drop) also catches
+    /// a form that begins before any meter sample has been seen.
+    fn note_sigil_state(&mut self, time_ms: i64) {
+        if self.local_object_id == 0 {
+            return;
+        }
+        let Some((item_id, meter, meter_seen, skin)) =
+            self.objects.get(&self.local_object_id).map(|o| {
+                (
+                    o.equipment[ABILITY_SLOT],
+                    o.ability_meter,
+                    o.ability_meter_seen,
+                    o.skin_id,
+                )
+            })
+        else {
+            return;
+        };
+        let Some(effects) = get_asset_manager().ability_effects(item_id) else {
+            self.sigil_state = None;
+            return;
+        };
+        let Some(def) = effects.meter().copied() else {
+            self.sigil_state = None;
+            return;
+        };
+        if self.sigil_state.as_ref().map(|s| s.item_id) != Some(item_id) {
+            self.sigil_state = Some(SigilState {
+                item_id,
+                max_value: def.max_value as i32,
+                value: if meter_seen {
+                    meter
+                } else {
+                    def.start_value as i32
+                },
+                last_use_ms: 0,
+                form: None,
+            });
+        }
+        let switch = effects.switch.as_ref();
+        let form_skin = switch.and_then(|s| s.transform_skin);
+        let switch_duration_ms = effects.switch_duration_ms().unwrap_or(0);
+        let lethal_strike_duration_ms = switch
+            .and_then(|s| s.lethal_strike)
+            .map(|ls| (ls.duration.max(0.0) * 1000.0) as i64)
+            .unwrap_or(0);
+        let mut open_ls_ms: Option<i64> = None;
+        if let Some(st) = self.sigil_state.as_mut() {
+            let previous_value = st.value;
+            if meter_seen {
+                st.value = meter.clamp(0, st.max_value.max(0));
+            }
+            // The switch spends a full meter. Requiring that drop (rather than
+            // the skin alone) keeps a player who merely wears the same skin as
+            // the form from being read as transformed.
+            let meter_spent =
+                meter_seen && st.max_value > 0 && previous_value >= st.max_value && st.value <= 0;
+            // Start: the transform skin is the form's identity.
+            if st.form.is_none() && meter_spent {
+                if let Some(skin_id) = form_skin.filter(|&s| s == skin) {
+                    st.form = Some(SigilForm {
+                        skin: skin_id,
+                        ends_ms: time_ms + switch_duration_ms,
+                        animal_ability_used: false,
+                    });
+                    if lethal_strike_duration_ms > 0 {
+                        open_ls_ms = Some(lethal_strike_duration_ms);
+                    }
+                }
+            }
+            // End: the skin left the form, or the declared duration elapsed.
+            // The duration matters when a revert is missed (no status update
+            // while out of view); the skin check covers an early end.
+            if let Some((form_skin, ends_ms)) = st.form.as_ref().map(|f| (f.skin, f.ends_ms)) {
+                let skin_left = skin != 0 && skin != form_skin;
+                if skin_left || time_ms >= ends_ms {
+                    st.form = None;
+                }
+            }
+        }
+        if let Some(duration_ms) = open_ls_ms {
+            self.open_lethal_strike_window_for(time_ms, duration_ms);
+        }
+    }
+
+    /// Price one landed hit from a meter-gated ability item when no shoot packet
+    /// explains it (see the fallback in `on_local_hit`).
+    ///
+    /// The hit carries no projectile variant, so the burst with the most
+    /// projectiles -- the main volley -- is used, at the midpoint of its
+    /// declared damage. Only a hit inside the active animal form or within the
+    /// normal ability's attribution window is claimed, so an unrelated
+    /// unresolved hit is not silently rewritten.
+    fn sigil_hit_damage(
+        &self,
+        defense: i32,
+        cond0: i32,
+        cond1: i32,
+        time_ms: i64,
+    ) -> Option<(i32, i32)> {
+        let local = self.objects.get(&self.local_object_id)?;
+        let item = local.equipment[ABILITY_SLOT];
+        let effects = get_asset_manager().ability_effects(item)?;
+        if !effects.has_meter() {
+            return None;
+        }
+        let state = self.sigil_state.as_ref().filter(|s| s.item_id == item)?;
+        let in_form = state.form.is_some();
+        if !in_form && time_ms.saturating_sub(state.last_use_ms) > ABILITY_ATTRIBUTION_WINDOW_MS {
+            return None;
+        }
+        let bursts = if in_form {
+            effects
+                .switch
+                .as_ref()
+                .map(|s| s.bursts.as_slice())
+                .unwrap_or(&[])
+        } else {
+            effects.normal_bursts.as_slice()
+        };
+        let burst = bursts.iter().max_by_key(|b| {
+            let stat = b
+                .scaling_stat
+                .and_then(|s| local.effective_scaling_stat(s))
+                .unwrap_or(0);
+            b.shots_for(stat)
+        })?;
+        let stat = burst
+            .scaling_stat
+            .and_then(|s| local.effective_scaling_stat(s))
+            .unwrap_or(0);
+        let base = (burst.min_for(stat) + burst.max_for(stat)) / 2;
+        if base <= 0 {
+            return None;
+        }
+        Some((
+            damage::damage_with_defense(base, burst.armor_piercing, defense, cond0, cond1),
+            item,
+        ))
     }
 
     /// Record the live character's Blood Ritual, Crucible and pet as they stand
@@ -3609,6 +3871,7 @@ impl CombatTracker {
                 window_ms: (until - use_.time_ms).max(0),
                 damage: credited[i].0,
                 hits: credited[i].1,
+                form_skin: use_.form_skin,
             });
         }
         out
@@ -3817,7 +4080,15 @@ impl CombatTracker {
         };
         // A weapon shot can benefit from the weapon's Lethal Strike cloak; an
         // ability's own shot cannot, and its bonus would otherwise be invented.
-        let lethal_strike = if ability_item.is_some() {
+        // The exception is a meter-gated ability that grants Lethal Strike to
+        // *all* shots (Sharktooth Sigil's shark form): then its own volley is
+        // empowered too, with the switch's own duration.
+        let ability_grants_ls = ability_item
+            .and_then(|id| get_asset_manager().ability_effects(id))
+            .and_then(|e| e.switch)
+            .and_then(|s| s.lethal_strike)
+            .is_some();
+        let lethal_strike = if ability_item.is_some() && !ability_grants_ls {
             None
         } else {
             self.lethal_strike_snapshot()
@@ -4015,8 +4286,15 @@ impl CombatTracker {
     /// a small guard so the shot that canceled sneak is still credited. Keeps the
     /// window list small and prunes stale entries.
     fn open_lethal_strike_window(&mut self, time_ms: i64) {
+        self.open_lethal_strike_window_for(time_ms, LETHAL_STRIKE_WINDOW_MS);
+    }
+
+    /// Open a Lethal Strike window of the caller's own duration (a sigil's
+    /// `OnSwitchAbilityActivate` declares its form's duration rather than the
+    /// cloak's fixed 2.4s sneak window).
+    fn open_lethal_strike_window_for(&mut self, time_ms: i64, duration_ms: i64) {
         let start = time_ms - LETHAL_STRIKE_GUARD_MS;
-        let end = time_ms + LETHAL_STRIKE_WINDOW_MS;
+        let end = time_ms + duration_ms.max(0);
         self.lethal_strike_windows.push_back((start, end));
         self.lethal_strike_windows
             .retain(|&(_, w_end)| w_end >= time_ms - 10_000);
@@ -4310,9 +4588,30 @@ impl CombatTracker {
                             volley_item = Some(item_id);
                         }
                     }
-                    volley.map(|(base, ap, _)| {
-                        damage::damage_with_defense(base, ap, defense, cond0, cond1)
-                    })
+                    match volley {
+                        Some((base, ap, _)) => {
+                            Some(damage::damage_with_defense(base, ap, defense, cond0, cond1))
+                        }
+                        // No shoot packet behind this hit. A meter-gated ability
+                        // (a sigil's burst/nova) fires bullets whose damage the
+                        // client never receives, so price it from the item's own
+                        // XML instead of leaving the boss's HP loss unattributed.
+                        None => {
+                            // Only when self-compute is healthy: with it disabled
+                            // every weapon hit is unresolved, and claiming those
+                            // as ability damage would be a misattribution.
+                            if self.self_damage_available {
+                                self.sigil_hit_damage(defense, cond0, cond1, time_ms).map(
+                                    |(dmg, item)| {
+                                        volley_item = Some(item);
+                                        dmg
+                                    },
+                                )
+                            } else {
+                                None
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -6108,8 +6407,22 @@ fn apply_stats(obj: &mut TrackedObject, status: &ObjectStatusData, time_ms: i64)
             x if x == StatType::Texture1 as u8 => obj.tex1 = stat.stat_value as u32,
             x if x == StatType::Texture2 as u8 => obj.tex2 = stat.stat_value as u32,
             x if x == StatType::UniqueDataString as u8 => {
-                obj.equipment_enchants =
-                    parse_equipment_enchants(stat.string_stat_value.as_deref());
+                let data = stat.string_stat_value.as_deref();
+                obj.equipment_enchants = parse_equipment_enchants(data);
+                // Ability-slot meter (slot 1): the first `<Meter>` value.
+                // The same segment carries the slot's enchants, so this is
+                // decoded alongside them rather than with a second pass.
+                let meters = data
+                    .and_then(|d| d.split(',').nth(ABILITY_SLOT))
+                    .map(|seg| parse_enchant_slots(seg).meters)
+                    .unwrap_or_default();
+                if let Some(&value) = meters.first() {
+                    obj.ability_meter = value as i32;
+                    obj.ability_meter_seen = true;
+                } else {
+                    obj.ability_meter = 0;
+                    obj.ability_meter_seen = false;
+                }
             }
             x if x == StatType::Attack as u8 => {
                 obj.attack = stat.stat_value;
@@ -6618,6 +6931,150 @@ mod tests {
     fn ls_proc_beyond_range_misses() {
         // Target far past the proc's travel distance is never reached.
         assert_eq!(ls_proc_hits(0.0, 0.0, 0.0, 40.0, 0.0, 2.0), 0);
+    }
+
+    #[test]
+    fn sigil_meter_charges_and_animal_form_tracks_its_declared_duration() {
+        // Sharktooth Sigil: 425 meter, 7s shark form. The wire is authoritative
+        // for the meter; the form is the switch's `SelfTransform` skin.
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        if get_asset_manager().ability_effects(0x7b73).is_none() {
+            return; // installed game assets are not available here
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Guild Hall", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Inventory1, 0x7b73),
+                    stat(StatType::SkinId, 40912),
+                    stat(StatType::Attack, 100),
+                    stat(StatType::Speed, 60),
+                    stat(StatType::Dexterity, 60),
+                ],
+            ),
+            10,
+        );
+        // The meter arrives in the ability slot's UniqueDataString segment; the
+        // decoder is covered in `storage`, so set the decoded value directly.
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 425;
+            obj.ability_meter_seen = true;
+        }
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::SkinId, 40912)]), 20);
+        assert_eq!(
+            t.sigil_state.as_ref().expect("sigil state").value,
+            425,
+            "full meter is observed"
+        );
+
+        // Switch: the form skin appears and the meter is spent in the same
+        // update, which is the server's shape for the activation.
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 0;
+            obj.ability_meter_seen = true;
+        }
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::SkinId, 0x7b17),
+                    stat(StatType::Inventory1, 0x7b73),
+                ],
+            ),
+            30,
+        );
+        let state = t.sigil_state.as_ref().expect("sigil state");
+        let form = state.form.as_ref().expect("animal form");
+        assert_eq!(form.ends_ms, 30 + 7_000, "form uses the declared duration");
+        assert_eq!(state.value, 0, "the switch spends the meter");
+        assert!(t.in_lethal_strike_window(31));
+        assert!(t.in_lethal_strike_window(7_029));
+        assert!(!t.in_lethal_strike_window(7_031));
+
+        // Flag 1 is the animal-form ability.
+        t.on_use_item(0x7b73, 0.0, 0.0, 1, 40);
+        assert_eq!(
+            t.local_ability_uses.back().and_then(|u| u.form_skin),
+            Some(0x7b17),
+            "the activation is tagged with the form it was fired in"
+        );
+        assert!(
+            t.sigil_state
+                .as_ref()
+                .unwrap()
+                .form
+                .as_ref()
+                .unwrap()
+                .animal_ability_used,
+            "the form's own ability is distinguished from a normal use"
+        );
+
+        // Back to the normal skin ends the form.
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::SkinId, 40912)]), 50);
+        assert!(
+            t.sigil_state.as_ref().unwrap().form.is_none(),
+            "reverting the skin ends the form"
+        );
+    }
+
+    #[test]
+    fn sigil_form_ends_at_its_duration_when_the_revert_is_missed() {
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        if get_asset_manager().ability_effects(0x7b73).is_none() {
+            return;
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Guild Hall", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        // Full meter first, so the switch has something to spend.
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Inventory1, 0x7b73),
+                    stat(StatType::SkinId, 40912),
+                ],
+            ),
+            5,
+        );
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 425;
+            obj.ability_meter_seen = true;
+        }
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::SkinId, 40912)]), 6);
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 0;
+        }
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::SkinId, 0x7b17)]),
+            10,
+        );
+        assert!(t.sigil_state.as_ref().unwrap().form.is_some());
+        // A later status with no skin change (the revert was never observed).
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::Speed, 60)]),
+            10 + 7_001,
+        );
+        assert!(
+            t.sigil_state.as_ref().unwrap().form.is_none(),
+            "the declared duration closes a form whose revert was missed"
+        );
     }
 
     fn stat(id: StatType, value: i32) -> StatData {
@@ -9775,7 +10232,7 @@ mod tests {
         // A consumable use immediately before the jump, so the change is sourced
         // to it (the item name may be unresolvable in tests, so only the inferred
         // marker is asserted).
-        t.on_use_item(0x0B50, 0.0, 0.0, 15);
+        t.on_use_item(0x0B50, 0.0, 0.0, 0, 15);
         t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 80)]), 20);
 
         let changes: Vec<(&str, i32, i32)> = t
@@ -9895,11 +10352,11 @@ mod tests {
             10,
         );
 
-        t.on_use_item(999, 0.0, 0.0, 100);
+        t.on_use_item(999, 0.0, 0.0, 0, 100);
         // Damage the server itself attributed to the local player afterwards.
         t.on_damage(500, 1000, 700, 120);
         // A second activation with no packet-borne damage in its window.
-        t.on_use_item(999, 0.0, 0.0, 400);
+        t.on_use_item(999, 0.0, 0.0, 0, 400);
 
         let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
         assert_eq!(acts.len(), 2);
@@ -9986,7 +10443,7 @@ mod tests {
             ),
             10,
         );
-        t.on_use_item(777, 0.0, 0.0, 100);
+        t.on_use_item(777, 0.0, 0.0, 0, 100);
         // The volley's per-bullet pre-defense damage, as on_ally_shot registers it
         // for the local player's own server-fired bullets.
         t.pending_server_shots.insert(5, (300, false, 777));
@@ -10374,7 +10831,7 @@ mod tests {
             ),
             10,
         );
-        t.on_use_item(0x04b3, 0.0, 0.0, 1_000);
+        t.on_use_item(0x04b3, 0.0, 0.0, 0, 1_000);
         // Nova pulses 0.28s and 2.5s later (inside the mushroom's life)...
         t.on_damage(500, 1000, 1_088, 1_280);
         t.on_damage(500, 1000, 1_088, 3_500);
@@ -14323,6 +14780,7 @@ mod tests {
             item_id,
             enchants: Vec::new(),
             server_effect_window_ms: window_ms,
+            form_skin: None,
         }
     }
 
@@ -14969,6 +15427,7 @@ mod tests {
             item_id,
             enchants: enchants.to_vec(),
             server_effect_window_ms: None,
+            form_skin: None,
         }
     }
 

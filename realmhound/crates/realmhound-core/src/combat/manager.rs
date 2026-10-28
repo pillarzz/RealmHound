@@ -612,8 +612,9 @@ impl CombatManager {
     /// Outgoing local `UseItem`: opens a Knight-shield damage-reduction window
     /// when the used item is a shield, and self-computes orb ability damage
     /// centered on the throw position `(x, y)`.
-    pub fn on_use_item(&mut self, item_id: i32, x: f32, y: f32, time_ms: i64) {
-        self.tracker.on_use_item(item_id, x, y, time_ms);
+    pub fn on_use_item(&mut self, item_id: i32, x: f32, y: f32, use_item_flag: i32, time_ms: i64) {
+        self.tracker
+            .on_use_item(item_id, x, y, use_item_flag, time_ms);
     }
 
     /// Periodic tick: finalize killed / timed-out fights.

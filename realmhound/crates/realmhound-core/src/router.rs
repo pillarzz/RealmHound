@@ -129,7 +129,14 @@ pub enum GameEvent {
     /// Carries the used item's type id so the combat engine can open a
     /// Knight-shield damage-reduction window when the item is a shield, plus the
     /// throw/aim world position (blast center for self-computed ability damage).
-    LocalItemUsed { item_id: i32, x: f32, y: f32 },
+    /// `use_item_flag` distinguishes a meter-gated item's normal ability (0)
+    /// from its switch/animal-form ability (1).
+    LocalItemUsed {
+        item_id: i32,
+        x: f32,
+        y: f32,
+        use_item_flag: i32,
+    },
 
     /// Character XML data received from server (NewCharacterInfo packet).
     CharacterXmlReceived { xml: String },
@@ -467,6 +474,7 @@ impl PacketRouter {
                     item_id: use_item.slot_object.item_type,
                     x: use_item.use_item_position.x,
                     y: use_item.use_item_position.y,
+                    use_item_flag: use_item.use_item_flag,
                 }])
             }
 

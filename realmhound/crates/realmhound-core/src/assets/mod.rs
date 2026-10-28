@@ -98,10 +98,11 @@ pub use manager::{
     SPECTRAL_MURCIAN_TYPE,
 };
 pub use object_list::{
-    AbilityEffect, AbilityEffects, BleedingEffect, ConditionSelfEffect, DamageNovaEffect,
-    DetonateHexEffect, HexThresholdPoison, LethalStrikeParams, LightningEffect, ObjectAsset,
-    ObjectList, ObjectTexture, PoisonGrenadeEffect, ProcEffect, ProcTrigger, ProjectileBurstEffect,
-    RestoreEffect, ScalingStat, StatBoostEffect, TexInfo, TileAsset, TileList, TrapEffect,
+    AbilityEffect, AbilityEffects, BleedingEffect, BoostRangeEffect, ConditionSelfEffect,
+    DamageNovaEffect, DetonateHexEffect, HexThresholdPoison, LethalStrikeParams, LightningEffect,
+    MeterDef, MeterFill, MeterFillTrigger, ObjectAsset, ObjectList, ObjectTexture,
+    PoisonGrenadeEffect, ProcEffect, ProcTrigger, ProjectileBurstEffect, RestoreEffect,
+    ScalingStat, StatBoostEffect, SwitchAbility, TexInfo, TileAsset, TileList, TrapEffect,
     VampireBlastEffect, WeaponProc,
 };
 pub use object_list::{SummonSource, SummonTrigger};

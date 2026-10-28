@@ -1532,7 +1532,7 @@ impl RealmHoundApp {
     ///
     /// Returns `true` if the per-frame cap was hit (more may remain), so the
     /// caller can request another repaint to keep draining.
-    fn drain_ui_updates(&mut self, ctx: &egui::Context) -> bool {
+    fn drain_ui_updates(&mut self, _ctx: &egui::Context) -> bool {
         #[cfg(feature = "latency-diagnostics")]
         let frame_started = Instant::now();
         #[cfg(feature = "latency-diagnostics")]
@@ -1627,7 +1627,14 @@ impl RealmHoundApp {
         // clipboard write therefore happens here, every frame.
         if let Some(write) = self.live_feed_panel.poll_clipboard() {
             match write {
-                crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
+                crate::panels::live_feed::ClipboardWrite::Copy(text) => {
+                    #[cfg(target_os = "linux")]
+                    if !crate::clipboard::set_text(&text) {
+                        _ctx.copy_text(text);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    _ctx.copy_text(text);
+                }
                 crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
                     // Checked and cleared in one clipboard session, so anything
                     // the user copies meanwhile cannot be caught in between.

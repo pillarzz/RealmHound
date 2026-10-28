@@ -82,6 +82,9 @@ running from `RealmHound.app`; a binary built from source has to be rebuilt.
 - `libpcap` at runtime, plus a one-time `CAP_NET_RAW` grant for the capture
   helper that `packaging/linux/install.sh` applies (see
   [Linux build steps](#linux-steamproton))
+- For a prebuilt tarball, the linked runtime libraries are `libpcap.so.1`,
+  `libasound.so.2`, `libssl.so.3`, `libsystemd.so.0`, and `libdbus-1.so.3`,
+  plus the X11/Wayland client libraries your desktop already provides
 
 ## Usage
 

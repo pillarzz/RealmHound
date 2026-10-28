@@ -6,3 +6,4 @@ Exec=RealmHound
 Icon=realmhound
 Terminal=false
 Categories=Game;Utility;
+StartupWMClass=realmhound

@@ -155,7 +155,11 @@ impl UpdatePanel {
                         // Action buttons
                         match self_updater.state() {
                             SelfUpdateState::Idle => {
-                                if shadcn
+                                if cfg!(target_os = "linux") {
+                                    ui.label(
+                                        "Install Linux updates through your package or source build.",
+                                    );
+                                } else if shadcn
                                     .btn(ui, format!("⬇ Update to v{}", manifest.latest_version))
                                     .clicked()
                                 {

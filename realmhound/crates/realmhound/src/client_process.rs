@@ -172,17 +172,30 @@ mod linux_impl {
             .ok()
     }
 
-    struct OwnerScan {
+    struct ProcessScan {
         owners: HashMap<u64, Vec<u32>>,
         unchecked_process: bool,
+        named_clients: Vec<(u32, i64)>,
+        named_unreadable: bool,
     }
 
-    fn socket_owners(proc_root: &Path, uid: u32, inodes: &HashSet<u64>) -> Option<OwnerScan> {
-        let mut owners: HashMap<u64, Vec<u32>> = HashMap::new();
-        let mut unchecked_process = false;
+    /// One pass answers both questions a refresh check asks -- socket owners and
+    /// game-client processes -- instead of walking `/proc` once per question.
+    fn scan_processes(
+        proc_root: &Path,
+        uid: u32,
+        ticks_per_second: u64,
+        inodes: &HashSet<u64>,
+    ) -> Option<ProcessScan> {
+        let mut scan = ProcessScan {
+            owners: HashMap::new(),
+            unchecked_process: false,
+            named_clients: Vec::new(),
+            named_unreadable: false,
+        };
         for entry in std::fs::read_dir(proc_root).ok()? {
             let Ok(entry) = entry else {
-                unchecked_process = true;
+                scan.unchecked_process = true;
                 continue;
             };
             let Some(pid) = entry
@@ -195,12 +208,23 @@ mod linux_impl {
             if process_uid(&entry.path()) != Some(uid) {
                 continue;
             }
+            if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
+                if is_rotmg_client_name(&comm) {
+                    match process_creation_unix_at(proc_root, pid, ticks_per_second) {
+                        Some(start) if start > 0 => scan.named_clients.push((pid, start)),
+                        _ => scan.named_unreadable = true,
+                    }
+                }
+            }
+            if inodes.is_empty() {
+                continue;
+            }
             let fds = match std::fs::read_dir(entry.path().join("fd")) {
                 Ok(fds) => fds,
                 Err(_) => {
                     // A process may have exited between the directory and fd reads.
                     if entry.path().exists() {
-                        unchecked_process = true;
+                        scan.unchecked_process = true;
                     }
                     continue;
                 }
@@ -210,14 +234,40 @@ mod linux_impl {
                     continue;
                 };
                 if inodes.contains(&inode) {
-                    owners.entry(inode).or_default().push(pid);
+                    scan.owners.entry(inode).or_default().push(pid);
                 }
             }
         }
-        Some(OwnerScan {
-            owners,
-            unchecked_process,
-        })
+        Some(scan)
+    }
+
+    fn named_start(scan: &ProcessScan) -> ClientStart {
+        if scan.named_unreadable {
+            return ClientStart::Indeterminate;
+        }
+        scan.named_clients
+            .iter()
+            .map(|&(_, start)| start)
+            .min()
+            .map_or(ClientStart::NoneRunning, ClientStart::Earliest)
+    }
+
+    fn socket_start(
+        proc_root: &Path,
+        scan: &ProcessScan,
+        inodes: &HashSet<u64>,
+        ticks_per_second: u64,
+    ) -> ClientStart {
+        if scan.unchecked_process || inodes.iter().any(|inode| !scan.owners.contains_key(inode)) {
+            return ClientStart::Indeterminate;
+        }
+        scan.owners
+            .values()
+            .flatten()
+            .filter_map(|&pid| process_creation_unix_at(proc_root, pid, ticks_per_second))
+            .filter(|&start| start > 0)
+            .min()
+            .map_or(ClientStart::Indeterminate, ClientStart::Earliest)
     }
 
     fn boot_time(proc_root: &Path) -> Option<i64> {
@@ -255,22 +305,29 @@ mod linux_impl {
         (ticks > 0).then_some(ticks as u64)
     }
 
+    #[cfg(test)]
     pub(super) fn process_creation_unix(pid: u32) -> Option<i64> {
         process_creation_unix_at(Path::new("/proc"), pid, clock_ticks_per_second()?)
     }
 
-    pub(super) fn owning_pid(conn: &ConnectionKey) -> Option<u32> {
-        let proc_root = Path::new("/proc");
-        let uid = effective_uid(proc_root)?;
-        let entry = tcp_entries(proc_root)?.into_iter().find(|entry| {
+    fn connection_entry(proc_root: &Path, uid: u32, conn: &ConnectionKey) -> Option<TcpEntry> {
+        tcp_entries(proc_root)?.into_iter().find(|entry| {
             entry.uid == uid
                 && entry.local_addr == conn.client_ip
                 && entry.local_port == conn.client_port
                 && entry.remote_addr == conn.server_ip
                 && entry.remote_port == conn.server_port
-        })?;
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn owning_pid(conn: &ConnectionKey) -> Option<u32> {
+        let proc_root = Path::new("/proc");
+        let uid = effective_uid(proc_root)?;
+        let entry = connection_entry(proc_root, uid, conn)?;
         let targets = HashSet::from([entry.inode]);
-        socket_owners(proc_root, uid, &targets)?
+        let ticks = clock_ticks_per_second().unwrap_or(0);
+        scan_processes(proc_root, uid, ticks, &targets)?
             .owners
             .remove(&entry.inode)?
             .into_iter()
@@ -278,15 +335,27 @@ mod linux_impl {
     }
 
     pub(super) fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
-        owning_pid(conn)
-            .and_then(process_creation_unix)
+        let proc_root = Path::new("/proc");
+        let uid = effective_uid(proc_root)?;
+        let ticks = clock_ticks_per_second()?;
+        let entry = connection_entry(proc_root, uid, conn);
+        let inodes: HashSet<u64> = entry.iter().map(|entry| entry.inode).collect();
+        let scan = scan_processes(proc_root, uid, ticks, &inodes)?;
+        entry
+            .and_then(|entry| {
+                scan.owners
+                    .get(&entry.inode)?
+                    .iter()
+                    .min()
+                    .and_then(|&pid| process_creation_unix_at(proc_root, pid, ticks))
+            })
             // Reading another process's fd symlinks is subject to Linux ptrace
             // policy even when both processes have the same uid.  Steam/Proton
             // therefore commonly exposes the socket in /proc/net/tcp but denies
             // the inode -> pid walk.  A verified RealmHound connection still
             // proves that a game is running; use the oldest actual game process
             // (not the launcher) as the conservative multibox-safe fallback.
-            .or_else(|| earliest_named_client_start_unix().confirmed_start())
+            .or_else(|| named_start(&scan).confirmed_start())
     }
 
     fn is_rotmg_client_name(name: &str) -> bool {
@@ -296,106 +365,69 @@ mod linux_impl {
         name.trim().eq_ignore_ascii_case("RotMG Exalt.exe")
     }
 
+    #[cfg(test)]
     fn earliest_named_client_start_unix_at(
         proc_root: &Path,
         uid: u32,
         ticks_per_second: u64,
     ) -> ClientStart {
-        let Ok(entries) = std::fs::read_dir(proc_root) else {
+        let Some(scan) = scan_processes(proc_root, uid, ticks_per_second, &HashSet::new()) else {
             return ClientStart::Indeterminate;
         };
-        let mut earliest = None;
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if process_uid(&entry.path()) != Some(uid) {
-                continue;
-            }
-            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
-                continue;
-            };
-            if !is_rotmg_client_name(&comm) {
-                continue;
-            }
-            let Some(start) = process_creation_unix_at(proc_root, pid, ticks_per_second) else {
-                return ClientStart::Indeterminate;
-            };
-            if start <= 0 {
-                return ClientStart::Indeterminate;
-            }
-            earliest = Some(earliest.map_or(start, |best: i64| best.min(start)));
-        }
-        earliest.map_or(ClientStart::NoneRunning, ClientStart::Earliest)
+        named_start(&scan)
     }
 
-    fn earliest_named_client_start_unix() -> ClientStart {
-        let proc_root = Path::new("/proc");
-        let Some(uid) = effective_uid(proc_root) else {
-            return ClientStart::Indeterminate;
-        };
-        let Some(ticks) = clock_ticks_per_second() else {
-            return ClientStart::Indeterminate;
-        };
-        earliest_named_client_start_unix_at(proc_root, uid, ticks)
-    }
-
-    fn earliest_client_start_unix_at(
+    fn earliest_client_starts_at(
         proc_root: &Path,
         game_port: u16,
         ticks_per_second: u64,
-    ) -> ClientStart {
+    ) -> (ClientStart, ClientStart) {
         let Some(uid) = effective_uid(proc_root) else {
-            return ClientStart::Indeterminate;
+            return (ClientStart::Indeterminate, ClientStart::Indeterminate);
         };
         let Some(entries) = tcp_entries(proc_root) else {
-            return ClientStart::Indeterminate;
+            return (ClientStart::Indeterminate, ClientStart::Indeterminate);
         };
         let inodes: HashSet<u64> = entries
             .iter()
             .filter(|entry| entry.uid == uid && entry.remote_port == game_port && entry.inode != 0)
             .map(|entry| entry.inode)
             .collect();
-        if inodes.is_empty() {
-            return ClientStart::NoneRunning;
-        }
-        let Some(scan) = socket_owners(proc_root, uid, &inodes) else {
-            return ClientStart::Indeterminate;
+        let Some(scan) = scan_processes(proc_root, uid, ticks_per_second, &inodes) else {
+            return (ClientStart::Indeterminate, ClientStart::Indeterminate);
         };
-        if scan.unchecked_process || inodes.iter().any(|inode| !scan.owners.contains_key(inode)) {
-            return ClientStart::Indeterminate;
-        }
-        let earliest = scan
-            .owners
-            .values()
-            .flatten()
-            .filter_map(|&pid| process_creation_unix_at(proc_root, pid, ticks_per_second))
-            .filter(|&start| start > 0)
-            .min();
-        earliest.map_or(ClientStart::Indeterminate, ClientStart::Earliest)
+        let socket = if inodes.is_empty() {
+            ClientStart::NoneRunning
+        } else {
+            socket_start(proc_root, &scan, &inodes, ticks_per_second)
+        };
+        (socket, named_start(&scan))
+    }
+
+    #[cfg(test)]
+    fn earliest_client_start_unix_at(
+        proc_root: &Path,
+        game_port: u16,
+        ticks_per_second: u64,
+    ) -> ClientStart {
+        earliest_client_starts_at(proc_root, game_port, ticks_per_second).0
     }
 
     pub(super) fn earliest_client_start_unix() -> ClientStart {
         let Some(ticks) = clock_ticks_per_second() else {
             return ClientStart::Indeterminate;
         };
-        let socket_result =
-            earliest_client_start_unix_at(Path::new("/proc"), GAME_SERVER_PORT, ticks);
-        match socket_result {
-            ClientStart::Earliest(_) => socket_result,
+        let (socket, named) =
+            earliest_client_starts_at(Path::new("/proc"), GAME_SERVER_PORT, ticks);
+        match socket {
+            ClientStart::Earliest(_) => socket,
             // The name fallback also covers the short interval between world
             // sockets during an area change.  Prefer an indeterminate socket
             // result when no named client can be confirmed.
-            ClientStart::NoneRunning | ClientStart::Indeterminate => {
-                match earliest_named_client_start_unix() {
-                    named @ ClientStart::Earliest(_) => named,
-                    _ => socket_result,
-                }
-            }
+            ClientStart::NoneRunning | ClientStart::Indeterminate => match named {
+                named @ ClientStart::Earliest(_) => named,
+                _ => socket,
+            },
         }
     }
 

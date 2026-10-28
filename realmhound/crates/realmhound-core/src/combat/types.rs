@@ -414,6 +414,10 @@ pub struct AbilityActivation {
     pub damage: i64,
     /// Number of packet-borne damage events credited to this activation.
     pub hits: u64,
+    /// The animal form the shot was fired in (`SelfTransform` skin), or `None`
+    /// for the normal charging mode. Lets the UI split a sigil's row without
+    /// guessing from the fight's overall stat changes.
+    pub form_skin: Option<i32>,
 }
 
 /// A completed boss fight ready to persist and display.

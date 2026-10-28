@@ -3887,6 +3887,10 @@ impl AssetManager {
         effects.effects.iter().any(|e| match e {
             AbilityEffect::StatBoost(b) => StatKind::parse(&b.stat) == Some(stat),
             _ => false,
+        }) || effects.switch.as_ref().is_some_and(|sw| {
+            sw.stat_boosts
+                .iter()
+                .any(|b| StatKind::parse(&b.stat) == Some(stat))
         })
     }
 
@@ -3923,6 +3927,10 @@ impl AssetManager {
             AbilityEffect::Condition(c) => c.effect.eq_ignore_ascii_case(effect),
             AbilityEffect::EffectBlast(b) => b.condition.eq_ignore_ascii_case(effect),
             _ => false,
+        }) || effects.switch.as_ref().is_some_and(|sw| {
+            sw.conditions
+                .iter()
+                .any(|c| c.effect.eq_ignore_ascii_case(effect))
         })
     }
 

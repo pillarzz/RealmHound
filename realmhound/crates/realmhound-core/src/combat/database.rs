@@ -5883,7 +5883,9 @@ fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
 }
 
 /// Serialize the local player's ability activations as one compact line each:
-/// `start,window,item_id,damage,hits,enchant:enchant:...`.
+/// `start,window,item_id,damage,hits,enchant:enchant:...,form_skin` (the last
+/// field is 0 for the normal mode and for records written before sigil forms
+/// were tracked).
 fn serialize_abilities(abilities: &[AbilityActivation]) -> Option<String> {
     if abilities.is_empty() {
         return None;
@@ -5899,8 +5901,14 @@ fn serialize_abilities(abilities: &[AbilityActivation]) -> Option<String> {
                     .collect::<Vec<_>>()
                     .join(":");
                 format!(
-                    "{},{},{},{},{},{}",
-                    a.start_offset_ms, a.window_ms, a.item_id, a.damage, a.hits, enchants
+                    "{},{},{},{},{},{},{}",
+                    a.start_offset_ms,
+                    a.window_ms,
+                    a.item_id,
+                    a.damage,
+                    a.hits,
+                    enchants,
+                    a.form_skin.unwrap_or(0)
                 )
             })
             .collect::<Vec<_>>()
@@ -5928,6 +5936,12 @@ fn parse_abilities(data: Option<&str>) -> Vec<AbilityActivation> {
                 .split(':')
                 .filter_map(|e| e.trim().parse::<u16>().ok())
                 .collect();
+            // Trailing form skin (0/absent for the normal mode and for records
+            // written before sigil forms were tracked).
+            let form_skin = parts
+                .next()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .filter(|&v| v > 0);
             Some(AbilityActivation {
                 item_id,
                 enchants,
@@ -5935,6 +5949,7 @@ fn parse_abilities(data: Option<&str>) -> Vec<AbilityActivation> {
                 window_ms,
                 damage,
                 hits,
+                form_skin,
             })
         })
         .collect()
@@ -6283,6 +6298,7 @@ fn merge_ability_activations(started_at: i64, group: &[FightRecord]) -> Vec<Abil
                 window_ms: a.window_ms,
                 damage: a.damage,
                 hits: a.hits,
+                form_skin: a.form_skin,
             });
         }
     }
@@ -6867,6 +6883,31 @@ mod tests {
     use crate::combat::types::{
         CompletedFight, DamageProvenance, FightParticipant, ParticipantEndStatus,
     };
+
+    #[test]
+    fn ability_form_skin_round_trips_and_old_rows_default_to_normal() {
+        let activation = AbilityActivation {
+            item_id: 0x7b73,
+            enchants: vec![1, 2],
+            start_offset_ms: 1_000,
+            window_ms: 2_000,
+            damage: 555,
+            hits: 3,
+            form_skin: Some(0x7b17),
+        };
+        let encoded = serialize_abilities(std::slice::from_ref(&activation)).expect("encoded");
+        let parsed = parse_abilities(Some(&encoded));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].form_skin, Some(0x7b17));
+        assert_eq!(parsed[0].damage, 555);
+        assert_eq!(parsed[0].enchants, vec![1, 2]);
+
+        // Records written before forms were tracked have six fields.
+        let old = parse_abilities(Some("1000,2000,31603,555,3,1:2"));
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].form_skin, None);
+        assert_eq!(old[0].damage, 555);
+    }
 
     #[test]
     fn legacy_combat_repairs_are_deferred_bounded_atomic_and_resumable() {
@@ -10265,6 +10306,66 @@ mod tests {
             .unwrap();
         assert_eq!(db.mark_boss_killed_by_loot(1, boss, 61_000).unwrap(), None);
         assert_eq!(killed_flag(&db, id), 1);
+    }
+
+    /// Ice Citadel's reported shape: Esben's own fight ends Escaped while Munin
+    /// was killed, so the run card anchors on the escaped Esben and reads
+    /// Escaped. A bag holding the Mark of Esben proves the main boss died and
+    /// must flip the whole run card, not just add another killed phase.
+    #[test]
+    fn a_mark_proof_completes_the_escaped_main_boss_of_a_multi_phase_run() {
+        const ESBEN: i32 = 40_166;
+        const MUNIN: i32 = 40_177;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+
+        let mut esben = escaped_fight("Ice Citadel", ESBEN, 11);
+        esben.boss_name = "Esben the Neurotic".to_string();
+        esben.started_at = 1_000;
+        esben.ended_at = 61_000;
+        esben.encounter_id = Some("ice_citadel".to_string());
+        esben.encounter_run_id = Some("ic-run".to_string());
+        db.insert_fight(&esben).unwrap();
+
+        let mut munin = escaped_fight("Ice Citadel", MUNIN, 11);
+        munin.boss_name = "Munin".to_string();
+        munin.killed = true;
+        munin.started_at = 2_000;
+        munin.ended_at = 10_000;
+        munin.encounter_id = Some("ice_citadel".to_string());
+        munin.encounter_run_id = Some("ic-run".to_string());
+        db.insert_fight(&munin).unwrap();
+
+        let card = db.list_fights(&FightQuery::default(), 10).unwrap();
+        assert_eq!(card.len(), 1);
+        assert_eq!(card[0].boss_object_type, ESBEN);
+        assert!(
+            !card[0].killed,
+            "the escaped main-boss anchor starts Escaped"
+        );
+
+        // The bag lands between Munin's death and the map change.
+        assert!(db
+            .mark_boss_killed_by_loot(11, ESBEN, 55_000)
+            .unwrap()
+            .is_some());
+
+        let card = db.list_fights(&FightQuery::default(), 10).unwrap();
+        assert_eq!(card.len(), 1);
+        assert_eq!(card[0].boss_object_type, ESBEN);
+        assert!(card[0].killed, "the Mark completes the run card");
+        assert_eq!(
+            card[0]
+                .killed_bosses
+                .iter()
+                .map(|(object_type, _)| *object_type)
+                .collect::<Vec<_>>(),
+            vec![ESBEN, MUNIN],
+            "both the proven main boss and the killed phase are listed"
+        );
+        assert!(
+            db.encounter_detail("ic-run").unwrap().unwrap().killed,
+            "the detail view matches the card"
+        );
     }
 
     /// The Head of Shaitan bags but drops no Mark, and the local player can leave

@@ -612,8 +612,9 @@ impl CombatManager {
     /// Outgoing local `UseItem`: opens a Knight-shield damage-reduction window
     /// when the used item is a shield, and self-computes orb ability damage
     /// centered on the throw position `(x, y)`.
-    pub fn on_use_item(&mut self, item_id: i32, x: f32, y: f32, time_ms: i64) {
-        self.tracker.on_use_item(item_id, x, y, time_ms);
+    pub fn on_use_item(&mut self, item_id: i32, x: f32, y: f32, use_item_flag: i32, time_ms: i64) {
+        self.tracker
+            .on_use_item(item_id, x, y, use_item_flag, time_ms);
     }
 
     /// Periodic tick: finalize killed / timed-out fights.
@@ -1019,6 +1020,61 @@ mod tests {
         assert!(
             m.take_pending_history_changes().is_empty(),
             "the change is only reported once"
+        );
+    }
+
+    /// The live ordering that used to lose Ice Citadel's main boss: the Mark bag
+    /// lands while Esben's fight is still open, so there is nothing to complete
+    /// yet; the escaped row is persisted at the next map change and the buffered
+    /// proof must finish it then.
+    #[test]
+    fn a_buffered_mark_bag_completes_the_main_boss_persisted_later() {
+        const ESBEN: i32 = 40_166;
+        let assets = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        let _ = assets.try_load();
+        let Some(mark) = assets.object_id_for_display_name("Mark of Esben") else {
+            eprintln!("skipping: game assets not available");
+            return;
+        };
+        if !assets.boss_mark_item_ids().contains(&mark) {
+            eprintln!("skipping: Mark of Esben is not indexed");
+            return;
+        }
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+
+        // The bag proves the kill while the fight is still open: no row yet.
+        m.on_boss_loot(ESBEN, 42, 55_000, &[mark]);
+        assert!(
+            m.database
+                .as_ref()
+                .unwrap()
+                .recent_fights(10)
+                .unwrap()
+                .is_empty(),
+            "the open fight has not been persisted"
+        );
+
+        // The map change finalizes the fight as Escaped and persists it.
+        let mut esben = fight("Ice Citadel", "Esben the Neurotic", false);
+        esben.map_seed = 42;
+        esben.boss_object_type = ESBEN;
+        esben.killed = false;
+        esben.reached_zero = false;
+        esben.started_at = 1_000;
+        esben.ended_at = 61_000;
+        esben.encounter_id = Some("ice_citadel".to_string());
+        esben.encounter_run_id = Some("ic-run".to_string());
+        m.persist(vec![esben]);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(
+            fights[0].killed,
+            "the buffered Mark bag completes the escaped main boss"
         );
     }
 

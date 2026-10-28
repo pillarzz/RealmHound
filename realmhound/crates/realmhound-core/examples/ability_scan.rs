@@ -56,6 +56,34 @@ fn main() {
         if eff.applies_hex {
             println!("  applies Hex on enemy hits");
         }
+        if let Some(m) = eff.meter() {
+            println!(
+                "  Meter {}: max={} start={}",
+                m.id, m.max_value, m.start_value
+            );
+        }
+        for fill in &eff.fills {
+            println!(
+                "  Fill {:?}: +{} worn (+{} always) cd={}s",
+                fill.trigger, fill.amount_worn, fill.amount, fill.cooldown_s
+            );
+        }
+        if let Some(sw) = &eff.switch {
+            println!(
+                "  Switch: min={} cost={} duration={}s skin={:?} boosts={:?} ls={} range={:?} bursts={}",
+                sw.minimum_meter,
+                sw.meter_cost,
+                sw.duration,
+                sw.transform_skin,
+                sw.stat_boosts
+                    .iter()
+                    .map(|b| format!("{} {:+}", b.stat, b.amount))
+                    .collect::<Vec<_>>(),
+                sw.lethal_strike.is_some(),
+                sw.boost_range,
+                sw.bursts.len()
+            );
+        }
         for g in &eff.poison_grenades {
             println!(
                 "  Poison: impact@0={} total@0={} dur={}s scales={:?} min={}",

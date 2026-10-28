@@ -616,6 +616,7 @@ fn merge_run_abilities(enc: &EncounterRecord) -> Vec<AbilityActivation> {
                 window_ms: a.window_ms,
                 damage: a.damage,
                 hits: a.hits,
+                form_skin: a.form_skin,
             });
         }
     }
@@ -3956,31 +3957,55 @@ impl CombatHistoryPanel {
 
         // One row per ability (item + enchants), with its activations and whatever
         // packet-borne damage could be credited across them.
+        struct FormRow {
+            skin: i32,
+            activations: usize,
+            damage: i64,
+            hits: u64,
+        }
         struct Row {
             item_id: i32,
             enchants: Vec<u16>,
             activations: usize,
             damage: i64,
             hits: u64,
+            /// Damage fired in a sigil's animal form, shown as an indented
+            /// sub-row under the item's total.
+            form: Option<FormRow>,
         }
         let mut rows: Vec<Row> = Vec::new();
         for a in &fight.abilities {
-            match rows
+            let row = match rows
                 .iter_mut()
                 .find(|r| r.item_id == a.item_id && r.enchants == a.enchants)
             {
-                Some(r) => {
-                    r.activations += 1;
-                    r.damage += a.damage;
-                    r.hits += a.hits;
+                Some(r) => r,
+                None => {
+                    rows.push(Row {
+                        item_id: a.item_id,
+                        enchants: a.enchants.clone(),
+                        activations: 0,
+                        damage: 0,
+                        hits: 0,
+                        form: None,
+                    });
+                    rows.last_mut().expect("just pushed")
                 }
-                None => rows.push(Row {
-                    item_id: a.item_id,
-                    enchants: a.enchants.clone(),
-                    activations: 1,
-                    damage: a.damage,
-                    hits: a.hits,
-                }),
+            };
+            row.activations += 1;
+            row.damage += a.damage;
+            row.hits += a.hits;
+            if let Some(skin) = a.form_skin {
+                let form = row.form.get_or_insert(FormRow {
+                    skin,
+                    activations: 0,
+                    damage: 0,
+                    hits: 0,
+                });
+                form.skin = skin;
+                form.activations += 1;
+                form.damage += a.damage;
+                form.hits += a.hits;
             }
         }
         rows.sort_by(|a, b| {
@@ -4029,6 +4054,36 @@ impl CombatHistoryPanel {
                         ui.label(RichText::new(note).color(Color32::GRAY).small());
                     }
                     ui.end_row();
+
+                    // Sub-row: the part of the item's damage fired in its
+                    // animal form, with the form's own sprite.
+                    if let Some(form) = &r.form {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.add_space(26.0);
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                            ctx.sprite_renderer
+                                .draw_outlined_sprite_in_rect_native(ui, form.skin, rect);
+                            let name = get_asset_manager()
+                                .object_name(form.skin)
+                                .unwrap_or_else(|| "Animal form".to_string());
+                            ui.label(RichText::new(name).small());
+                        });
+                        ui.label(RichText::new(form.activations.to_string()).small());
+                        if form.damage > 0 {
+                            ui.label(RichText::new(form.damage.to_string()).strong());
+                            ui.label(RichText::new(format!("{} packet hit(s)", form.hits)).small());
+                        } else {
+                            ui.label(RichText::new("-").color(Color32::GRAY));
+                            ui.label(
+                                RichText::new("no packet-borne form damage")
+                                    .color(Color32::GRAY)
+                                    .small(),
+                            );
+                        }
+                        ui.end_row();
+                    }
                 }
             });
     }

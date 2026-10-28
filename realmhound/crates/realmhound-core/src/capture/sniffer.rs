@@ -78,7 +78,7 @@ impl PacketFormat {
 }
 
 /// Configuration for the packet sniffer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SnifferConfig {
     /// Read timeout in milliseconds
     pub timeout_ms: i32,
@@ -581,8 +581,10 @@ pub fn start_capture_auto_detect(
 > {
     #[cfg(target_os = "linux")]
     {
-        let _ = (interfaces, config);
-        return super::linux_helper::start();
+        // Linux captures on libpcap's `any` device so VPN and loopback traffic is
+        // not missed; REALMHOUND_CAPTURE_INTERFACE narrows it to one interface.
+        let _ = interfaces;
+        return super::linux_helper::start(&config);
     }
     #[cfg(not(target_os = "linux"))]
     {

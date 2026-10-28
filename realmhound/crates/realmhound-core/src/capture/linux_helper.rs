@@ -6,6 +6,7 @@ use super::{
     packet_channel, CaptureError, CaptureHandle, NetworkInterface, PacketFormat, PacketReceiver,
     RawPacket, Sniffer, SnifferConfig, DEFAULT_QUEUE_CAPACITY,
 };
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,11 +15,80 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_BUFFER_SIZE: i32 = 64 * 1024;
+const MAX_BUFFER_SIZE: i32 = 256 * 1024 * 1024;
+const MAX_TIMEOUT_MS: i32 = 60_000;
 
 fn capture_interface_name(override_name: Option<String>) -> String {
     override_name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "any".into())
+}
+
+fn bounded(value: &str, flag: &str, min: i32, max: i32) -> Result<i32, String> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| format!("{flag} expects an integer, got {value:?}"))?;
+    if !(min..=max).contains(&parsed) {
+        return Err(format!(
+            "{flag} must be between {min} and {max}, got {parsed}"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Capture settings the GUI hands over at spawn; a manual launch keeps the defaults.
+fn parse_config(args: impl Iterator<Item = OsString>) -> Result<SnifferConfig, String> {
+    let mut config = SnifferConfig::default();
+    let mut args = args.map(|arg| arg.to_string_lossy().into_owned());
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or_else(|| format!("{arg} expects a value"));
+        match arg.as_str() {
+            "--filter" => {
+                let filter = value()?;
+                if filter.trim().is_empty() {
+                    return Err("--filter must not be empty".into());
+                }
+                config.filter = Some(filter);
+            }
+            "--buffer-size" => {
+                config.buffer_size =
+                    bounded(&value()?, "--buffer-size", MIN_BUFFER_SIZE, MAX_BUFFER_SIZE)?;
+            }
+            "--timeout-ms" => {
+                config.timeout_ms = bounded(&value()?, "--timeout-ms", 0, MAX_TIMEOUT_MS)?;
+            }
+            "--promiscuous" => config.promiscuous = true,
+            other => return Err(format!("unknown capture argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn helper_args(config: &SnifferConfig) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("--buffer-size"),
+        OsString::from(config.buffer_size.to_string()),
+        OsString::from("--timeout-ms"),
+        OsString::from(config.timeout_ms.to_string()),
+    ];
+    if let Some(filter) = &config.filter {
+        args.push(OsString::from("--filter"));
+        args.push(OsString::from(filter));
+    }
+    if config.promiscuous {
+        args.push(OsString::from("--promiscuous"));
+    }
+    args
+}
+
+fn report_startup_error(stdout: &mut impl Write, message: &str) -> std::io::Result<()> {
+    let bytes = message.as_bytes();
+    let len = bytes.len().min(u16::MAX as usize);
+    stdout.write_all(&[1])?;
+    stdout.write_all(&(len as u16).to_be_bytes())?;
+    stdout.write_all(&bytes[..len])?;
+    stdout.flush()
 }
 
 fn wait_for_parent_disconnect(mut input: impl Read, disconnected: &AtomicBool) {
@@ -102,6 +172,14 @@ pub fn run() -> Result<(), String> {
         wait_for_parent_disconnect(std::io::stdin(), &disconnect_signal);
     });
 
+    let config = match parse_config(std::env::args_os().skip(1)) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = report_startup_error(&mut std::io::stdout().lock(), &message);
+            return Err(message);
+        }
+    };
+
     let name = capture_interface_name(std::env::var("REALMHOUND_CAPTURE_INTERFACE").ok());
     let iface = NetworkInterface {
         name,
@@ -109,18 +187,11 @@ pub fn run() -> Result<(), String> {
         addresses: Vec::new(),
     };
     let mut stdout = std::io::stdout().lock();
-    let mut sniffer = match Sniffer::new(&iface, SnifferConfig::default()) {
+    let mut sniffer = match Sniffer::new(&iface, config) {
         Ok(sniffer) => sniffer,
         Err(error) => {
             let message = error.to_string();
-            let bytes = message.as_bytes();
-            let len = bytes.len().min(u16::MAX as usize);
-            stdout.write_all(&[1]).map_err(|e| e.to_string())?;
-            stdout
-                .write_all(&(len as u16).to_be_bytes())
-                .map_err(|e| e.to_string())?;
-            stdout.write_all(&bytes[..len]).map_err(|e| e.to_string())?;
-            stdout.flush().map_err(|e| e.to_string())?;
+            let _ = report_startup_error(&mut stdout, &message);
             return Err(message);
         }
     };
@@ -191,7 +262,9 @@ fn read_packet(input: &mut impl Read) -> std::io::Result<RawPacket> {
 }
 
 /// Spawn the helper beside the GUI and bridge its stdout into the existing queue.
-pub fn start() -> Result<
+pub fn start(
+    config: &SnifferConfig,
+) -> Result<
     (
         CaptureHandle,
         PacketReceiver,
@@ -201,7 +274,12 @@ pub fn start() -> Result<
 > {
     let exe = std::env::current_exe().map_err(|e| CaptureError::CaptureError(e.to_string()))?;
     let helper = exe.with_file_name("realmhound-capture");
-    let mut child = Command::new(&helper).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+    let mut child = Command::new(&helper)
+        .args(helper_args(config))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| CaptureError::CaptureError(format!("Cannot launch {}: {e}. Install the Linux capture helper beside RealmHound and run the one-time setup.", helper.display())))?;
     let output = child.stdout.take().unwrap();
     let errors = child.stderr.take().unwrap();
@@ -341,5 +419,45 @@ mod tests {
         assert_eq!(capture_interface_name(None), "any");
         assert_eq!(capture_interface_name(Some("eth0".into())), "eth0");
         assert_eq!(capture_interface_name(Some(" ".into())), "any");
+    }
+
+    #[test]
+    fn helper_args_round_trip_through_parser() {
+        let config = SnifferConfig {
+            timeout_ms: 250,
+            buffer_size: 1 << 20,
+            promiscuous: true,
+            filter: Some("tcp port 2050 and ip".into()),
+        };
+
+        assert_eq!(
+            parse_config(helper_args(&config).into_iter()).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn missing_args_keep_defaults() {
+        assert_eq!(
+            parse_config(std::iter::empty()).unwrap(),
+            SnifferConfig::default()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_flags_and_out_of_range_values() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+
+        for values in [
+            vec!["--unknown"],
+            vec!["--filter"],
+            vec!["--filter", ""],
+            vec!["--buffer-size", "1024"],
+            vec!["--buffer-size", "huge"],
+            vec!["--timeout-ms", "60001"],
+        ] {
+            let parsed = parse_config(args(&values).into_iter());
+            assert!(parsed.is_err(), "{values:?} should be rejected");
+        }
     }
 }

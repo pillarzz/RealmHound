@@ -1460,7 +1460,7 @@ fn fmt_duration(ms: i64) -> String {
 fn render_count_pill(ui: &mut egui::Ui, count: i64) -> bool {
     const H: f32 = 20.0;
     const LEFT_PAD: f32 = 6.0;
-    const GAP: f32 = 6.0; // text -> ✕
+    const GAP: f32 = 6.0; // text -> ×
     const X_W: f32 = 10.0;
     const RIGHT_PAD: f32 = 6.0;
 
@@ -1502,7 +1502,7 @@ fn render_count_pill(ui: &mut egui::Ui, count: i64) -> bool {
     ui.painter().text(
         x_center,
         egui::Align2::CENTER_CENTER,
-        "\u{2715}",
+        "\u{00d7}",
         font,
         x_color,
     );
@@ -1891,7 +1891,7 @@ impl CombatHistoryPanel {
                 let enter_pressed =
                     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                if !self.search.is_empty() && shadcn.btn(ui, "✕").clicked() {
+                if !self.search.is_empty() && shadcn.btn(ui, "×").clicked() {
                     self.search.clear();
                     self.search_popup_open = false;
                     self.search_selected_index = None;

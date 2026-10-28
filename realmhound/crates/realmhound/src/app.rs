@@ -888,6 +888,54 @@ struct WidgetChipCtx {
 // PendingCreate is now in realmhound_core::session
 // SettingsCategory and ModalState are in modal_state.rs
 
+/// Install the bundled UI fonts and their glyph fallbacks.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    fonts.font_data.insert(
+        "NotoSans".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/NotoSans-Regular.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "NotoEmoji".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/NotoEmoji-Regular.ttf")).into(),
+    );
+
+    // Noto Sans has no arrows or geometric glyphs; egui's monospace face does.
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "NotoSans".to_owned());
+        family.push("Hack".to_owned());
+        family.push("NotoEmoji".to_owned());
+    }
+
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        family.push("NotoEmoji".to_owned());
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod font_tests {
+    /// Every symbol the UI puts in a label must resolve to one of the loaded
+    /// fonts, or it renders as tofu.
+    #[test]
+    fn ui_symbols_have_a_font() {
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+
+        let required = "←↑→↓▼▲◆▤×✔📋⚠⚔🔄✅❌🔔⚡⏳🔊💀•ℹ✖⟳▾●";
+        let font_id = egui::FontId::proportional(14.0);
+        let missing: Vec<char> = required
+            .chars()
+            .filter(|&c| !ctx.fonts_mut(|fonts| fonts.has_glyph(&font_id, c)))
+            .collect();
+
+        assert!(missing.is_empty(), "missing glyphs: {missing:?}");
+    }
+}
+
 impl RealmHoundApp {
     /// Open the selected profile's read-only history connections.
     ///
@@ -918,55 +966,7 @@ impl RealmHoundApp {
     ) -> Result<Self, AppStartError> {
         // Set dark theme
         egui_ctx.set_visuals(Self::dark_visuals());
-
-        // Configure custom fonts with emoji support
-        let mut fonts = egui::FontDefinitions::default();
-
-        // Add Noto Sans as the primary font
-        fonts.font_data.insert(
-            "NotoSans".to_owned(),
-            egui::FontData::from_static(include_bytes!("../assets/NotoSans-Regular.ttf")).into(),
-        );
-
-        // Add Noto Emoji for emoji support
-        fonts.font_data.insert(
-            "NotoEmoji".to_owned(),
-            egui::FontData::from_static(include_bytes!("../assets/NotoEmoji-Regular.ttf")).into(),
-        );
-
-        // Try to load Segoe UI Symbol from Windows system fonts for arrows/symbols
-        // This is legal - we're using the system font, not redistributing it
-        let segoe_symbol_loaded =
-            if let Ok(font_data) = fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
-                fonts.font_data.insert(
-                    "SegoeUISymbol".to_owned(),
-                    egui::FontData::from_owned(font_data).into(),
-                );
-                tracing::info!("[FONTS] Loaded Segoe UI Symbol from system fonts");
-                true
-            } else {
-                tracing::warn!("[FONTS] Segoe UI Symbol not found, some symbols may not display");
-                false
-            };
-
-        // Set Noto Sans as the primary proportional font, with symbols and emoji as fallback
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            family.insert(0, "NotoSans".to_owned());
-            if segoe_symbol_loaded {
-                family.push("SegoeUISymbol".to_owned());
-            }
-            family.push("NotoEmoji".to_owned());
-        }
-
-        // Also add symbols and emoji support to monospace family as fallback
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            if segoe_symbol_loaded {
-                family.push("SegoeUISymbol".to_owned());
-            }
-            family.push("NotoEmoji".to_owned());
-        }
-
-        egui_ctx.set_fonts(fonts);
+        install_fonts(egui_ctx);
 
         // Initialize assets (extracts from game if needed)
         match get_asset_manager().initialize(Some(&settings)) {
@@ -2222,7 +2222,7 @@ impl RealmHoundApp {
                                         });
                                     }
                                     SelfUpdateState::ReadyToApply => {
-                                        if shadcn.btn(ui, "✓ Restart to apply update").clicked()
+                                        if shadcn.btn(ui, "✔ Restart to apply update").clicked()
                                         {
                                             self.pending_relaunch =
                                                 Some(RelaunchReason::Updated);
@@ -3320,7 +3320,7 @@ impl RealmHoundApp {
                         .hint_text(hint)
                         .desired_width(240.0),
                 );
-                if !state.text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+                if !state.text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
                     state.text.clear();
                     state.popup_open = false;
                     state.selected = None;
@@ -4297,7 +4297,7 @@ impl RealmHoundApp {
                             {
                                 settings_changed = true;
                             }
-                            ui.label(RichText::new("\u{24d8}").weak()).on_hover_text(
+                            ui.label(RichText::new("\u{2139}").weak()).on_hover_text(
                                 "OFF disables the whole dungeon callout that has this mod",
                             );
                         });
@@ -5598,7 +5598,7 @@ impl RealmHoundApp {
                             current_settings,
                         );
                         if ui
-                            .small_button("✕")
+                            .small_button("×")
                             .hover_tip("Remove trigger alert")
                             .clicked()
                         {
@@ -6374,7 +6374,7 @@ impl RealmHoundApp {
                     .hint_text("Type or select an enchant name…")
                     .desired_width(220.0),
             );
-            if !state.text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+            if !state.text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
                 state.text.clear();
                 state.popup_open = false;
                 state.selected = None;
@@ -6643,7 +6643,7 @@ impl RealmHoundApp {
                     .hint_text("Type or select a boss name…")
                     .desired_width(220.0),
             );
-            if !state.text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+            if !state.text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
                 state.text.clear();
                 state.popup_open = false;
                 state.selected = None;
@@ -7319,7 +7319,7 @@ impl RealmHoundApp {
         };
         let mut changed = false;
         if ui
-            .small_button("✕")
+            .small_button("×")
             .hover_tip("Reset to default sound")
             .clicked()
         {
@@ -8219,7 +8219,7 @@ impl RealmHoundApp {
                 ui.painter().text(
                     grect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "✓",
+                    "✔",
                     egui::FontId::proportional(10.0),
                     Color32::from_rgb(95, 120, 95),
                 );

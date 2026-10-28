@@ -181,7 +181,7 @@ impl UpdatePanel {
                                 });
                             }
                             SelfUpdateState::ReadyToApply => {
-                                if shadcn.btn(ui, "✓ Restart to apply update").clicked() {
+                                if shadcn.btn(ui, "✔ Restart to apply update").clicked() {
                                     self.relaunch_requested = true;
                                 }
                             }

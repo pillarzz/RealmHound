@@ -5400,7 +5400,7 @@ impl SpriteRenderer {
         const LEFT_PAD: f32 = 4.0;
         const ICON: f32 = 16.0;
         const GAP1: f32 = 4.0; // icon -> text
-        const GAP2: f32 = 6.0; // text -> ✕
+        const GAP2: f32 = 6.0; // text -> ×
         const X_W: f32 = 10.0;
         const RIGHT_PAD: f32 = 6.0;
 
@@ -5459,7 +5459,7 @@ impl SpriteRenderer {
         ui.painter().text(
             x_center,
             egui::Align2::CENTER_CENTER,
-            "\u{2715}",
+            "\u{00d7}",
             font,
             x_color,
         );
@@ -5539,7 +5539,7 @@ impl SpriteRenderer {
         ui.painter().text(
             x_center,
             egui::Align2::CENTER_CENTER,
-            "\u{2715}",
+            "\u{00d7}",
             font,
             x_color,
         );

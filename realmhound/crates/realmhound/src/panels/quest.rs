@@ -1485,7 +1485,7 @@ fn render_quest_status(
                 resets = true;
                 ("\u{27f3}", "Resets", text, *expired)
             }
-            QuestStatusTimer::Ends { text, expired } => ("\u{29d7}", "Ends", text, *expired),
+            QuestStatusTimer::Ends { text, expired } => ("\u{23f3}", "Ends", text, *expired),
         };
         let col = if expired { red } else { grey };
         let row = ui.horizontal(|ui| {

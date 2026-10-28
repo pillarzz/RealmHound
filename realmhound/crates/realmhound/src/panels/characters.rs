@@ -1472,7 +1472,7 @@ impl CharactersPanel {
         }
         let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-        if !self.search_query.is_empty() && shadcn.btn(ui, "✕").clicked() {
+        if !self.search_query.is_empty() && shadcn.btn(ui, "×").clicked() {
             self.search_query.clear();
             self.search_popup_open = false;
             self.search_selected_index = None;
@@ -2641,7 +2641,7 @@ impl CharactersPanel {
     /// Overlay the icon-only copy buttons at the top-right corner of a stats
     /// card, painted via [`egui::Ui::interact`] (not `ui.put`) so they never
     /// allocate layout space and shift the cards below. Statistics / Biome Kills
-    /// / Dungeons get a "Copy" button (⧉, "two pages" glyph); Dungeons also gets
+    /// / Dungeons get a "Copy" button (📋 clipboard glyph); Dungeons also gets
     /// a "Copy Debug" button (🔧 wrench) that dumps the raw PCStats alignment.
     /// Nothing is drawn for the non-exportable blocks or while collapsed.
     fn render_card_copy_buttons(
@@ -2681,7 +2681,7 @@ impl CharactersPanel {
             ui,
             ("card_copy", block),
             copy_rect,
-            "⧉",
+            "📋",
             &format!("Copy {}", category),
         ) {
             let text = match block {

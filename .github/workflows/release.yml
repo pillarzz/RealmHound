@@ -37,7 +37,11 @@ jobs:
       - name: Package Linux archive
         run: |
           tar -czf RealmHound-linux-x86_64.tar.gz \
-            README.md LICENSE packaging/linux/install.sh packaging/linux/realmhound.desktop packaging/linux/realmhound.png \
+            README.md LICENSE packaging/linux/install.sh packaging/linux/realmhound.desktop \
+            packaging/linux/icons/hicolor/64x64/apps/realmhound.png \
+            packaging/linux/icons/hicolor/128x128/apps/realmhound.png \
+            packaging/linux/icons/hicolor/256x256/apps/realmhound.png \
+            packaging/linux/icons/hicolor/512x512/apps/realmhound.png \
             realmhound/target/release/RealmHound realmhound/target/release/realmhound-capture
           sha256sum RealmHound-linux-x86_64.tar.gz > RealmHound-linux-x86_64.tar.gz.sha256
 

@@ -1436,7 +1436,7 @@ impl TreasuryPanel {
             }
 
             // Clear button
-            if !self.search_text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+            if !self.search_text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
                 self.search_text.clear();
                 self.search_popup_open = false;
                 self.search_selected_index = None;
@@ -1631,7 +1631,7 @@ impl TreasuryPanel {
             self.dungeon_search_popup_open = true;
         }
 
-        if !self.dungeon_search_text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+        if !self.dungeon_search_text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
             self.dungeon_search_text.clear();
             self.dungeon_search_popup_open = false;
             self.dungeon_search_selected_index = None;
@@ -1791,7 +1791,7 @@ impl TreasuryPanel {
         }
 
         if shadcn
-            .btn(ui, "\u{2715}")
+            .btn(ui, "\u{00d7}")
             .hover_tip("Clear all category filters")
             .clicked()
         {
@@ -1817,7 +1817,7 @@ impl TreasuryPanel {
         const LEFT_PAD: f32 = 6.0;
         const ICON: f32 = 16.0;
         const GAP1: f32 = 4.0; // icon -> text
-        const GAP2: f32 = 6.0; // text -> ✕
+        const GAP2: f32 = 6.0; // text -> ×
         const X_W: f32 = 10.0;
         const RIGHT_PAD: f32 = 6.0;
 
@@ -1865,7 +1865,7 @@ impl TreasuryPanel {
         ui.painter().text(
             x_center,
             egui::Align2::CENTER_CENTER,
-            "\u{2715}",
+            "\u{00d7}",
             font,
             x_color,
         );

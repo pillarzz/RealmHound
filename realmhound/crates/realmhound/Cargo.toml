@@ -63,8 +63,8 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Securit
 raw-window-handle = "0.6"
 
 [target.'cfg(not(windows))'.dependencies]
-# Clipboard reads for the dungeon-callout cleanup (Windows uses the Win32 API).
-arboard = "3"
+# Clipboard reads and background writes for the dungeon callout (Windows uses the Win32 API).
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [target.'cfg(unix)'.dependencies]
 # Advisory lock file standing in for the Windows named single-instance mutex.

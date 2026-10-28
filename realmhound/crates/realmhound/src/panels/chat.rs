@@ -228,7 +228,7 @@ fn render_author_pill(ui: &mut Ui, author: &AuthorFilter) -> bool {
     ui.painter().text(
         x_center,
         egui::Align2::CENTER_CENTER,
-        "\u{2715}",
+        "\u{00d7}",
         font,
         x_color,
     );
@@ -1702,7 +1702,7 @@ impl ChatPanel {
                         }),
                 );
                 if !self.history_search.is_empty()
-                    && shadcn.btn(ui, "✕").hover_tip("Clear search").clicked()
+                    && shadcn.btn(ui, "×").hover_tip("Clear search").clicked()
                 {
                     self.history_search.clear();
                     self.history_author_popup_open = false;

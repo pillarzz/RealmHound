@@ -103,6 +103,22 @@ pub fn clear_if_ours(copied: &str) -> bool {
     }
 }
 
+/// egui-winit's Wayland path drops writes while the window is unfocused, which
+/// is exactly when an automatic callout fires. X11 keeps using egui's path.
+#[cfg(target_os = "linux")]
+pub fn set_text(text: &str) -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return false;
+    }
+    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!("[CLIPBOARD] Automatic copy failed: {error}");
+            false
+        }
+    }
+}
+
 /// Empty the clipboard, but only while it still holds exactly `copied`.
 /// Returns whether it was cleared.
 #[cfg(not(windows))]

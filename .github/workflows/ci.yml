@@ -117,3 +117,8 @@ jobs:
         working-directory: realmhound
         # Some migration tests share process-global state and require serial execution.
         run: cargo test --locked -p realmhound-core -- --test-threads=1
+
+      - name: Run app tests
+        working-directory: realmhound
+        # Five GUI tests are flaky when run in parallel.
+        run: cargo test --locked -p RealmHound -- --test-threads=1

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use super::object_reader::ClassIDType;
 use super::serialized_file::SerializedFile;
@@ -234,7 +235,29 @@ impl Default for UnityExtractor {
 ///
 /// When both exist, the most recently modified file wins, since the legacy
 /// Documents location may still contain a stale copy.
+///
+/// Startup asks repeatedly (staleness check, extraction, stamp), so the depth-7
+/// Steam scan is cached until the cached file disappears.
 pub fn find_resources_assets() -> Option<PathBuf> {
+    let cached = CACHED_RESOURCES_ASSETS
+        .lock()
+        .ok()
+        .and_then(|cached| cached.clone())
+        .filter(|path| path.exists());
+    if cached.is_some() {
+        return cached;
+    }
+
+    let found = discover_newest_resources_assets();
+    if let (Some(path), Ok(mut cache)) = (&found, CACHED_RESOURCES_ASSETS.lock()) {
+        *cache = Some(path.clone());
+    }
+    found
+}
+
+static CACHED_RESOURCES_ASSETS: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn discover_newest_resources_assets() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     #[cfg(target_os = "linux")]

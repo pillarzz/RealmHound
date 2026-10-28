@@ -69,8 +69,15 @@ fn discover_under(home: &Path, override_dir: Option<&Path>) -> Vec<PathBuf> {
     if let Some(dir) = override_dir {
         resource_files(dir, 7, &mut results);
         if !results.is_empty() {
+            results.sort();
+            results.dedup();
+            tracing::debug!("[ASSETS] REALMHOUND_GAME_DIR matched {:?}", dir);
             return results;
         }
+        tracing::debug!(
+            "[ASSETS] REALMHOUND_GAME_DIR={:?} matched nothing, falling back to Steam discovery",
+            dir
+        );
     }
     let roots = [
         home.join(".steam/steam"),
@@ -84,19 +91,26 @@ fn discover_under(home: &Path, override_dir: Option<&Path>) -> Vec<PathBuf> {
         }
         libraries.insert(root.clone());
         let vdf = root.join("steamapps/libraryfolders.vdf");
-        if let Ok(text) = std::fs::read_to_string(vdf) {
-            for line in text.lines() {
-                let fields = quoted_fields(line);
-                if fields.len() >= 2 && fields[0] == "path" {
-                    libraries.insert(PathBuf::from(&fields[1]));
+        match std::fs::read_to_string(&vdf) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let fields = quoted_fields(line);
+                    if fields.len() >= 2 && fields[0] == "path" {
+                        libraries.insert(PathBuf::from(&fields[1]));
+                    }
                 }
             }
+            Err(error) => tracing::debug!("[ASSETS] Skipping unreadable {:?}: {error}", vdf),
         }
     }
     for library in libraries {
         let steamapps = library.join("steamapps");
-        let Ok(entries) = std::fs::read_dir(&steamapps) else {
-            continue;
+        let entries = match std::fs::read_dir(&steamapps) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!("[ASSETS] Skipping unreadable {:?}: {error}", steamapps);
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -106,8 +120,12 @@ fn discover_under(home: &Path, override_dir: Option<&Path>) -> Vec<PathBuf> {
             if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::debug!("[ASSETS] Skipping unreadable {:?}: {error}", path);
+                    continue;
+                }
             };
             let Some(game_name) = vdf_value(&text, "name") else {
                 continue;
@@ -134,12 +152,17 @@ fn discover_under(home: &Path, override_dir: Option<&Path>) -> Vec<PathBuf> {
                     .join("compatdata")
                     .join(appid)
                     .join("pfx/drive_c/users");
-                if let Ok(entries) = std::fs::read_dir(users) {
-                    for user in entries.flatten() {
-                        let prefix = user
-                            .path()
-                            .join("AppData/Local/RealmOfTheMadGod/Production");
-                        resource_files(&prefix, 5, &mut results);
+                match std::fs::read_dir(&users) {
+                    Ok(entries) => {
+                        for user in entries.flatten() {
+                            let prefix = user
+                                .path()
+                                .join("AppData/Local/RealmOfTheMadGod/Production");
+                            resource_files(&prefix, 5, &mut results);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!("[ASSETS] Skipping unreadable {:?}: {error}", users)
                     }
                 }
             }

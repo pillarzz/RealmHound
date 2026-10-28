@@ -1834,7 +1834,7 @@ impl LootPanel {
         }
 
         // Clear button
-        if !self.search_text.is_empty() && shadcn.btn(ui, "✕").clicked() {
+        if !self.search_text.is_empty() && shadcn.btn(ui, "×").clicked() {
             self.search_text.clear();
             self.search_popup_open = false;
             self.search_selected_index = None;

@@ -126,7 +126,9 @@ capabilities to `RealmHound` itself. Verify with
 `/usr/sbin/getcap /usr/local/bin/realmhound-capture` (some shells omit
 `/usr/sbin` from `PATH`); the expected output includes `cap_net_raw=ep`.
 Re-run the installer after every rebuild, because replacing the helper clears
-its capability. Ordinary launches need no sudo:
+its capability. The helper stays world-executable, so any local account on the
+machine can use it to capture port-2050 traffic; this assumes a single-user
+desktop (see [SECURITY.md](SECURITY.md)). Ordinary launches need no sudo:
 
 ```sh
 RealmHound

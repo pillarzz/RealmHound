@@ -138,9 +138,9 @@ RealmHound reads Steam's `libraryfolders.vdf` and RotMG's app manifest in the
 usual Steam locations, including additional libraries and Flatpak Steam. It
 checks the Steam install and matching Proton prefix for Unity's
 `resources.assets`. Override discovery with `REALMHOUND_GAME_DIR=/path/to/game`
-if necessary. Game files are read only. Extracted assets and account data live
-under `$XDG_DATA_HOME/RealmHound` (normally `~/.local/share/RealmHound`),
-settings under `$XDG_CONFIG_HOME/RealmHound`, and logs under
+if necessary. Game files are read only. Extracted assets, account data, and
+settings live under `$XDG_DATA_HOME/RealmHound` (normally
+`~/.local/share/RealmHound`), and logs under
 `$XDG_STATE_HOME/RealmHound/logs` (normally `~/.local/state/RealmHound/logs`).
 
 If capture fails, verify the helper and its capability with `/usr/sbin/getcap`, and read

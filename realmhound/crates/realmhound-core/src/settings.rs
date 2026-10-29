@@ -149,6 +149,151 @@ pub struct Settings {
     /// Trophy Hall panel settings (tracked-loot data source).
     #[serde(default)]
     pub trophy_hall: TrophyHallSettings,
+
+    /// Floating in-game overlay windows (live DPS + loot tracker).
+    #[serde(default)]
+    pub overlays: OverlaySettings,
+}
+
+/// Per-window placement and chrome state for one floating overlay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlayWindowSettings {
+    /// Whether the overlay window is shown.
+    #[serde(default)]
+    pub visible: bool,
+
+    /// Locked overlays ignore the mouse entirely: clicks pass through to the
+    /// game and the window can no longer be dragged or resized.
+    #[serde(default)]
+    pub locked: bool,
+
+    /// Collapsed to just its title bar.
+    #[serde(default)]
+    pub minimized: bool,
+
+    /// Last outer position in logical screen pixels (`None` = let the OS place it).
+    #[serde(default)]
+    pub x: Option<f32>,
+
+    /// See [`Self::x`].
+    #[serde(default)]
+    pub y: Option<f32>,
+
+    /// Last inner width in logical pixels.
+    pub width: f32,
+
+    /// Last inner height in logical pixels.
+    pub height: f32,
+}
+
+impl OverlayWindowSettings {
+    /// Placement defaults for an overlay of the given size at the given corner
+    /// offset. Used by the per-overlay `Default` impls.
+    fn at(width: f32, height: f32) -> Self {
+        Self {
+            visible: false,
+            locked: false,
+            minimized: false,
+            x: None,
+            y: None,
+            width,
+            height,
+        }
+    }
+}
+
+/// Floating always-on-top overlay windows drawn over the game client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlaySettings {
+    /// Live DPS overlay window.
+    #[serde(default = "default_dps_overlay")]
+    pub dps: OverlayWindowSettings,
+
+    /// Loot tracker overlay window.
+    #[serde(default = "default_loot_overlay")]
+    pub loot: OverlayWindowSettings,
+
+    /// Shared window opacity for every overlay, `0.2`-`1.0`.
+    #[serde(default = "default_overlay_opacity")]
+    pub opacity: f32,
+
+    /// Pin the local player's DPS row above the scrolling list.
+    #[serde(default = "default_true")]
+    pub dps_follow_me: bool,
+
+    /// Maximum number of DPS rows rendered (0 = unlimited).
+    ///
+    /// Stored as the raw slider value so the settings UI can bind it directly.
+    /// Round-tripping through an integer would feed the slider a value it did
+    /// not produce, which makes it report a change every frame and walk the
+    /// setting to the end of its range.
+    #[serde(default = "default_dps_rows")]
+    pub dps_rows: f32,
+}
+
+fn default_dps_overlay() -> OverlayWindowSettings {
+    OverlayWindowSettings::at(320.0, 240.0)
+}
+
+fn default_loot_overlay() -> OverlayWindowSettings {
+    OverlayWindowSettings::at(320.0, 180.0)
+}
+
+fn default_overlay_opacity() -> f32 {
+    0.9
+}
+
+fn default_dps_rows() -> f32 {
+    8.0
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            dps: default_dps_overlay(),
+            loot: default_loot_overlay(),
+            opacity: default_overlay_opacity(),
+            dps_follow_me: true,
+            dps_rows: default_dps_rows(),
+        }
+    }
+}
+
+impl OverlaySettings {
+    /// Clamp opacity into the range the overlay windows can actually render at.
+    /// A fully transparent overlay would be invisible but still swallow clicks.
+    pub fn clamped_opacity(&self) -> f32 {
+        self.opacity.clamp(0.2, 1.0)
+    }
+
+    /// Maximum DPS rows to render (0 = every participant).
+    ///
+    /// The ceiling is a full dungeon instance: 85 players can be in one at once,
+    /// so anything lower would silently hide part of the roster.
+    pub fn max_rows(&self) -> usize {
+        self.dps_rows.round().clamp(0.0, 85.0) as usize
+    }
+
+    /// Whether any overlay window is currently shown.
+    pub fn any_visible(&self) -> bool {
+        self.dps.visible || self.loot.visible
+    }
+
+    /// Copy the user-editable preferences from `other`, leaving window geometry
+    /// alone.
+    ///
+    /// The overlay windows own their position and size and update them as the
+    /// user drags, so the settings UI must not write back a stale copy it read
+    /// several frames ago.
+    pub fn apply_preferences(&mut self, other: &Self) {
+        self.dps.visible = other.dps.visible;
+        self.dps.locked = other.dps.locked;
+        self.loot.visible = other.loot.visible;
+        self.loot.locked = other.loot.locked;
+        self.opacity = other.opacity;
+        self.dps_follow_me = other.dps_follow_me;
+        self.dps_rows = other.dps_rows;
+    }
 }
 
 /// How tab and sub-tab headers display their icon and text.
@@ -2681,6 +2826,7 @@ impl Default for Settings {
             widget_bar: WidgetBarSettings::default(),
             taskbar: TaskbarSettings::default(),
             trophy_hall: TrophyHallSettings::default(),
+            overlays: OverlaySettings::default(),
         }
     }
 }

@@ -16,6 +16,7 @@ use realmhound_core::{
     api::AccountData as ApiAccountData,
     api::{ClientSeasons, PlayerMissions},
     capture::PacketReceiver,
+    combat::LiveFightSnapshot,
     loot::{LootBagType, ProcessedLootDrop},
     session::MainAccountStatus,
     settings::{CombatHistorySettings, LootTrackingSettings},
@@ -523,6 +524,14 @@ pub struct ModelSnapshot {
     pub live_vault_data: LiveVaultData,
     /// Currently playing character id.
     pub live_char_id: Option<i32>,
+    /// Every boss fight of the current map instance, for the live DPS overlay,
+    /// oldest engagement first. Empty when nothing has been fought here.
+    /// Republished every batch while a fight is live because DPS is
+    /// time-derived: the figures move even when no new damage arrives.
+    ///
+    /// Shared rather than owned: the UI clones this list every frame, and a
+    /// finished fight's projection never changes again.
+    pub live_fights: Vec<std::sync::Arc<LiveFightSnapshot>>,
     /// Socket of the verified main game-client connection, if tracked. Lets the
     /// UI map the connection to its owning OS process for the forge-fire
     /// relaunch safeguard.
@@ -546,6 +555,7 @@ impl ModelSnapshot {
             account_data,
             live_vault_data,
             live_char_id,
+            live_fights: Vec::new(),
             main_connection: None,
             mission_view: MissionView::default(),
         }

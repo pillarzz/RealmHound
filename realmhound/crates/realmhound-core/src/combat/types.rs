@@ -531,6 +531,71 @@ impl CompletedFight {
     }
 }
 
+/// A read-only view of the boss fight that is currently in progress, published
+/// for the live DPS overlay.
+///
+/// Unlike [`CompletedFight`] this is a best-effort mid-fight projection: the
+/// local player's damage may still be `SelfPending`/`SelfEstimated` and the
+/// end-of-fight reconciliation passes (HP-gap fill, unknown-row collapsing)
+/// have not run yet. It is never persisted.
+#[derive(Debug, Clone, Default)]
+pub struct LiveFightSnapshot {
+    /// World object id of the boss this snapshot is for.
+    pub boss_object_id: i32,
+    /// Object type of the boss, so a consumer can resolve its encounter group.
+    pub boss_object_type: i32,
+    /// Resolved boss display name.
+    pub boss_name: String,
+    /// Normalized dungeon name the fight is taking place in.
+    pub dungeon: String,
+    /// Boss HP as last reported by the server (`-1` when never observed).
+    pub boss_hp: i32,
+    /// Boss max HP (`0` when never observed).
+    pub boss_max_hp: i32,
+    /// Epoch millis of the first damage attributed to this fight. Lets the
+    /// overlay order an instance's fights and span-aggregate them.
+    pub started_at: i64,
+    /// Epoch millis the *local player* last hit this boss (0 = never). The
+    /// overlay follows this to decide which of several engaged bosses to show.
+    pub last_local_hit_at: i64,
+    /// Milliseconds since the first damage was attributed to this fight.
+    pub elapsed_ms: i64,
+    /// Participants sorted by damage descending.
+    pub participants: Vec<FightParticipant>,
+    /// True once the boss died or left view: the figures are final and the
+    /// snapshot is held for display until another boss is engaged or the map
+    /// changes.
+    pub ended: bool,
+}
+
+impl LiveFightSnapshot {
+    /// Sum of all attributed damage across participants.
+    pub fn total_damage(&self) -> i64 {
+        self.participants.iter().map(|p| p.damage).sum()
+    }
+
+    /// Damage per second for `damage` over this fight's elapsed time.
+    ///
+    /// Returns `0.0` before the fight has run for a measurable duration, so a
+    /// freshly started fight never reports an absurd spike.
+    pub fn dps(&self, damage: i64) -> f64 {
+        if self.elapsed_ms <= 0 {
+            return 0.0;
+        }
+        damage as f64 / (self.elapsed_ms as f64 / 1000.0)
+    }
+
+    /// Index of the local player's row, if present.
+    pub fn local_index(&self) -> Option<usize> {
+        self.participants.iter().position(|p| p.is_local)
+    }
+
+    /// Epoch millis this fight last had activity attributed to it.
+    pub fn ended_at(&self) -> i64 {
+        self.started_at + self.elapsed_ms.max(0)
+    }
+}
+
 /// Identity of a selectable Combat History row in the UI: either a single
 /// standalone fight (by database row id) or a grouped multi-phase encounter (by
 /// its opaque run id). A numeric row id cannot identify a group because a group's

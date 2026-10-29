@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use realmhound_core::{
     capture::{CaptureWriter, RawPacket},
-    combat::CombatManager,
+    combat::{CombatManager, LiveFightSnapshot},
     loot::{shiny_bag_tier, LootTracker, RecentBossKill},
     protocol::{ip_to_server_name, parse_packet_with_status, Packet, ParsedPacket},
     session::{AccountVerifyResult, HelloAction},
@@ -692,6 +692,17 @@ impl PacketProcessor {
 
     pub fn live_char_id(&self) -> Option<i32> {
         self.live_char_id
+    }
+
+    /// Project every boss fight of the current map instance for the live DPS
+    /// overlay, oldest engagement first.
+    ///
+    /// The list only empties when the player leaves the instance, so a
+    /// multi-phase or multi-boss encounter keeps each boss's numbers on screen
+    /// instead of the newest engagement wiping the display. Finished fights stay
+    /// in the list frozen (`LiveFightSnapshot::ended`).
+    pub fn live_fights(&self) -> Vec<std::sync::Arc<LiveFightSnapshot>> {
+        self.combat.tracker().live_snapshots(now_ms())
     }
 
     /// The socket of the verified main game-client connection, if one is

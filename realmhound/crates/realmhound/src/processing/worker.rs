@@ -13,7 +13,7 @@
 //! - worker -> audio: an [`AudioSender`] (audio commands are routed here, never
 //!   forwarded to the UI).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -153,6 +153,7 @@ pub fn spawn(
     ctx: egui::Context,
     audio_tx: AudioSender,
     active_tab: Arc<AtomicU8>,
+    overlays_open: Arc<AtomicBool>,
     account: Arc<AccountContext>,
 ) -> std::io::Result<WorkerHandle> {
     processor.set_selected_scope(account.account_key(), account.account_id().clone());
@@ -179,6 +180,7 @@ pub fn spawn(
         snapshot: snapshot.clone(),
         ctx,
         active_tab,
+        overlays_open,
         account,
         receiver: None,
         #[cfg(feature = "latency-diagnostics")]
@@ -192,6 +194,7 @@ pub fn spawn(
         pub_vault_gen: u64::MAX,
         pub_view: None,
         pub_mission_gen: u64::MAX,
+        pub_had_live_dps: false,
         #[cfg(feature = "latency-diagnostics")]
         latency: LatencyDiagnostics::default(),
     };
@@ -219,6 +222,10 @@ struct Worker {
     /// Shared active-tab signal written by the UI thread; read to decide whether
     /// an update is worth waking the UI for (relevance-gated repaints).
     active_tab: Arc<AtomicU8>,
+    /// Set by the UI while at least one overlay window is open. Overlays render
+    /// outside the tab system, so data they display (live DPS, loot) has to keep
+    /// waking the UI even when the selected tab would not care about it.
+    overlays_open: Arc<AtomicBool>,
     /// Shared immutable account context. Held so the exclusive profile lock
     /// inside it lives as long as the worker (including after a detached
     /// shutdown), keeping the selected profile owned by this process.
@@ -236,6 +243,9 @@ struct Worker {
     pub_vault_gen: u64,
     pub_view: Option<super::contract::ViewState>,
     pub_mission_gen: u64,
+    /// Whether the last publication carried a live fight. Lets the transition
+    /// back to "no fight" wake the UI once so the overlay clears.
+    pub_had_live_dps: bool,
     #[cfg(feature = "latency-diagnostics")]
     latency: LatencyDiagnostics,
 }
@@ -491,6 +501,7 @@ impl Worker {
                     segments.process = process_started.elapsed();
                 }
                 let active = ActiveTab::from_u8(self.active_tab.load(Ordering::Relaxed));
+                let overlays_open = self.overlays_open.load(Ordering::Relaxed);
                 // Wake the UI only for updates the active tab (or a global widget)
                 // actually displays; `suppressed` tracks irrelevant traffic so a
                 // slow fallback still drains the queue and covers background tabs.
@@ -502,7 +513,9 @@ impl Worker {
                     match update.payload {
                         UiPayload::Audio(cmd) => self.audio_tx.send(cmd),
                         payload => {
-                            if payload_relevant(&payload, active) {
+                            if payload_relevant(&payload, active)
+                                || (overlays_open && overlay_relevant(&payload))
+                            {
                                 wake = true;
                             } else {
                                 suppressed = true;
@@ -971,10 +984,31 @@ impl Worker {
         let mission_changed = mission_gen != self.pub_mission_gen;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
+        // Projecting the live fights walks the active roster, so it is only done
+        // while an overlay is actually open to display them.
+        let overlays_open = self.overlays_open.load(Ordering::Relaxed);
+        let live_fights = if overlays_open {
+            self.processor.live_fights()
+        } else {
+            Vec::new()
+        };
+        // DPS is time-derived, so a live fight is "changed" every batch even
+        // when no new damage landed; an idle one must not keep waking the UI.
+        // A frozen (ended) fight never changes again, so it only earns the one
+        // repaint that puts its final numbers on screen.
+        let live_running = live_fights.iter().any(|fight| !fight.ended);
+        let dps_changed = live_running || self.pub_had_live_dps;
+        self.pub_had_live_dps = live_running;
+
         if let Ok(mut snap) = self.snapshot.lock() {
             snap.view = view.clone();
             snap.live_char_id = live_char_id;
             snap.main_connection = main_connection;
+            if overlays_open {
+                snap.live_fights = live_fights;
+            } else if !snap.live_fights.is_empty() {
+                snap.live_fights = Vec::new();
+            }
             if account_changed {
                 snap.account_data = self.processor.account_data().clone();
             }
@@ -991,7 +1025,7 @@ impl Worker {
         self.pub_vault_gen = vault_gen;
         self.pub_mission_gen = mission_gen;
         self.pub_view = Some(view);
-        view_changed
+        view_changed || (overlays_open && dps_changed)
     }
 }
 
@@ -1043,6 +1077,12 @@ fn payload_relevant(payload: &UiPayload, active: ActiveTab) -> bool {
         // Handled by the audio thread before this point.
         UiPayload::Audio(_) => false,
     }
+}
+
+/// Whether a payload feeds an overlay window, which renders over the game
+/// regardless of which tab the main window has selected.
+fn overlay_relevant(payload: &UiPayload) -> bool {
+    matches!(payload, UiPayload::PushLoot(_))
 }
 
 /// Broadcast events that mutate the always-visible party status bar (leader
@@ -1507,6 +1547,7 @@ mod staging_tests {
             egui::Context::default(),
             AudioSender::disconnected(),
             Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1529,6 +1570,7 @@ mod staging_tests {
             egui::Context::default(),
             AudioSender::disconnected(),
             Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1556,6 +1598,7 @@ mod staging_tests {
             egui::Context::default(),
             AudioSender::disconnected(),
             Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
             account,
         )
         .unwrap();

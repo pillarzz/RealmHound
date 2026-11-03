@@ -89,6 +89,9 @@ objc2-foundation = { version = "0.3", features = ["NSBundle", "NSData"] }
 tempfile = "3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+[build-dependencies]
+serde_json = "1.0"
+
 [features]
 # Enable the in-app puffin profiler overlay (toggle with F12) and pipeline scopes.
 profiling = ["dep:puffin", "dep:puffin_egui", "dep:puffin_http", "realmhound-core/profiling"]

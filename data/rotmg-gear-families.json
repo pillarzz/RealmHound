@@ -1,0 +1,398 @@
+{
+  "Agents of Oryx Gear": {
+    "Weapons": [
+      "Bounty Hunter's Dagger",
+      "Predator Bow",
+      "Oppressor's Staff",
+      "Tyrant's Wand",
+      "Henchman's Claymore",
+      "Blade of the Assailant"
+    ],
+    "Ability Items": [
+      "Cloak of The Darkened Sun",
+      "Mad Javelin",
+      "Cursed Spire Spell",
+      "Tome of the Tarnished Gods",
+      "Helm of Exalted Might",
+      "Brutal Buckler",
+      "Seal of the Battle God",
+      "Tyrant's Toxin",
+      "Demon Lord's Skull",
+      "Blacklight Artifice",
+      "Orb of Conquest",
+      "Prism of Shattered Light",
+      "Siege Scepter",
+      "Rage Claws",
+      "Amaterasu",
+      "Chief's War Horn",
+      "Mechanical Mace",
+      "Blitz Sheath",
+      "Hawkmaster Sigil"
+    ],
+    "Armor": [
+      "Squadron Sheathing",
+      "Judge's Robe",
+      "Aegis Armor"
+    ],
+    "Rings": [
+      "Mayhem Medallion",
+      "Ring of Wrath",
+      "Autarch Amulet"
+    ]
+  },
+  "Alien Gear": {
+    "Weapons": [
+      "Sun's Judgement",
+      "Fire Blade",
+      "Comet of Calamity",
+      "Moonbeam Blade",
+      "Dueling Daggers",
+      "Snowblind Wand",
+      "Foramite Staff",
+      "Acidic Slasher",
+      "Corrosion Cutter",
+      "Warlord Wand",
+      "Gaseous Glaive",
+      "Blazon Bow",
+      "Laser Rifle"
+    ],
+    "Armor": [
+      "Fitted Protective Matrix",
+      "Magic Protective Matrix",
+      "Heavy Protective Matrix"
+    ],
+    "Rings": [
+      "Locked Reactor",
+      "Alien Core: Power",
+      "Alien Core: Corrosion",
+      "Alien Core: Dark Matter",
+      "Alien Core: Warp",
+      "Loaded Core",
+      "Entropy Reactor"
+    ]
+  },
+  "Ancient's Curse Gear": {
+    "Weapons": [
+      "Crescent Dagger",
+      "Blue Falcon",
+      "Staff of the Eclipse",
+      "Rod of Radiance",
+      "Khopesh",
+      "Shining Blade"
+    ],
+    "Abilities": [
+      "Cursed Canopic Jar",
+      "An Ancient's Embrace",
+      "Cobra Serpentis Scroll"
+    ],
+    "Rings": [
+      "Geb's Lost Hedjet"
+    ]
+  },
+  "Antinomy Gear": {
+    "Weapons": [
+      "Dagger of Eternal Chaos",
+      "Bow of the Sky's Glory",
+      "Staff of Silver Wings",
+      "Wand of the Summoned One",
+      "Sword of the Unending Chaos",
+      "Skybound Blade"
+    ],
+    "Armor": [
+      "Shadowbeast Hide",
+      "Robe of Dark Summoning",
+      "Armor of Heavenly Light"
+    ],
+    "Rings": [
+      "Ember of the Void",
+      "Ember of the Daeva",
+      "Antinomy Artifact"
+    ]
+  },
+  "Aspirant's Gear": {
+    "Weapons": [
+      "Aspirant's Dagger",
+      "Aspirant's Bow",
+      "Aspirant's Staff",
+      "Aspirant's Wand",
+      "Aspirant's Sword",
+      "Aspirant's Blade"
+    ],
+    "Armor": [
+      "Aspirant's Hide",
+      "Aspirant's Robes",
+      "Aspirant's Plate"
+    ],
+    "Rings": [
+      "Ring of the Magus",
+      "Ring of the Sniper",
+      "Ring of the Stalwart",
+      "Ring of the Swiftblade"
+    ]
+  },
+  "Blooming Oasis Gear": {
+    "Weapons": [
+      "Rosebite Dagger",
+      "Blossom Bow",
+      "Eternal Bloom Wand",
+      "Blooming Bouquet",
+      "Petal Strike Sword",
+      "Floral Edge Katana"
+    ],
+    "Armors": [
+      "Jacket Of Blossoms",
+      "Leaf Woven Robe",
+      "Floral Guard Armor"
+    ],
+    "Rings": [
+      "Ring Of Radiant Petals"
+    ]
+  },
+  "Construction Gear": {
+    "Weapons": [
+      "Spatula Dagger",
+      "Nail Gun Bow",
+      "Screwdriver Staff",
+      "Measuring Wand",
+      "Hammer Sword",
+      "Sawblade Katana"
+    ],
+    "Armor": [
+      "Fitted Construction Vest",
+      "Magic Construction Vest",
+      "Heavy Construction Vest"
+    ],
+    "Rings": [
+      "Laborer's Hard Hat",
+      "Operator's Hard Hat",
+      "Foreman's Hard Hat"
+    ]
+  },
+  "Heirlooms": {
+    "Ability": [
+      "Teratoma"
+    ],
+    "Armors": [
+      "Stoneborn Husk"
+    ]
+  },
+  "Mardi Gras Gear": {
+    "Weapons": [
+      "Throwing Knives",
+      "Ringmaster's Bow",
+      "Dreamcaster",
+      "Carnival's Conjurer",
+      "Lion Tamer",
+      "Acrobat's Edge"
+    ],
+    "Rings": [
+      "Mask of Anubis",
+      "Superior Mask of Anubis",
+      "Mask of Mucus",
+      "Superior Mask of Mucus",
+      "Mask of Lightning",
+      "Superior Mask of Lightning",
+      "Mask of Cnidaria",
+      "Superior Mask of Cnidaria"
+    ]
+  },
+  "Mistake Gear": {
+    "Weapons": [
+      "Mister Mango",
+      "Groovy Mango",
+      "Butter Bow",
+      "Baked Bow",
+      "K.I.D.D. Force",
+      "K.I.D.D. Force 2.0",
+      "Caduceus of Current Craziness",
+      "Caduceus Of Enlightened Chaos",
+      "MMace MMurderer",
+      "FFabulous FFlail",
+      "Blade of Ages",
+      "Blade of Blooming",
+      "Useless Katana"
+    ],
+    "Abilities": [
+      "Mirror Cloak",
+      "Archerang",
+      "Spelling Spell",
+      "Tome of Moral Support",
+      "Challenger Helm",
+      "Shield of Pogmur",
+      "Seal of Eternal Life",
+      "Lightning in a Bottle",
+      "Epiphany Skull",
+      "Helium Trap",
+      "Karma Orb",
+      "Fool's Prism",
+      "Honey Scepter Supreme",
+      "Unshuriken",
+      "NSFWakizashi",
+      "Lullaby",
+      "Recursion Mace",
+      "Paper Machete",
+      "Sigil of the Rubber Duck"
+    ],
+    "Armors": [
+      "Cheater Light Armor",
+      "Cheater Robe",
+      "Cheater Heavy Armor"
+    ],
+    "Ring and Set": [
+      "Omni-Impotence Ring"
+    ]
+  },
+  "Neo Alien Gear": {
+    "Weapons": [
+      "Neo Sun's Judgement",
+      "Neo Fire Blade",
+      "Neo Comet of Calamity",
+      "Neo Moonbeam Blade",
+      "Neo Dueling Daggers",
+      "Neo Snowblind Wand",
+      "Neo Foramite Staff",
+      "Neo Acidic Slasher",
+      "Neo Corrosion Cutter",
+      "Neo Warlord Wand",
+      "Neo Gaseous Glaive",
+      "Neo Blazon Bow",
+      "Neo Laser Rifle"
+    ],
+    "Armor": [
+      "Neo Fitted Protective Matrix",
+      "Neo Magic Protective Matrix",
+      "Neo Heavy Protective Matrix"
+    ],
+    "Rings": [
+      "Neo Alien Core: Power",
+      "Neo Alien Core: Corrosion",
+      "Neo Alien Core: Dark Matter",
+      "Neo Alien Core: Warp",
+      "Neo Loaded Core",
+      "Neo Entropy Reactor",
+      "Neo Reality Reactor"
+    ]
+  },
+  "Oryxmas Gear": {
+    "Weapons": [
+      "Frost Lich's Finger",
+      "Icicle Launcher",
+      "Frosty's Walking Stick",
+      "Winter's Breath Wand",
+      "Saint Nicolas' Blade",
+      "Yuki",
+      "Frostbite Blades",
+      "Longbow of the Great Glacier",
+      "Snowblind Spellblade",
+      "The North Star",
+      "Lament of the Frozen Prisoner",
+      "Aurora Tachi",
+      "Evergreen Dagger",
+      "Garland Bow",
+      "Sleigh Bell Staff",
+      "Brass Chamberstick",
+      "Cheerful Chipper",
+      "Candy Katana"
+    ],
+    "Ability Items": [
+      "Cloak of Winter",
+      "Coalbearing Quiver",
+      "Vigil Spell",
+      "Nativity Tome",
+      "Pathfinder's Helm",
+      "Resounding Shield",
+      "Advent Seal",
+      "Holly Poison",
+      "Skull of Krampus",
+      "Greedsnatcher Trap",
+      "Snowbound Orb",
+      "Ornamental Prism",
+      "Scepter of Sainthood",
+      "Ilex Star",
+      "Peppermint Wakizashi",
+      "Oryxmas Carol",
+      "Mace of the North Pole",
+      "Snowman's Sheath",
+      "Sigil of the Reindeer"
+    ],
+    "Armor": [
+      "Frost Drake Hide Armor",
+      "Frost Elementalist Robe",
+      "Frost Citadel Armor"
+    ],
+    "Rings": [
+      "Ornaments of Unity"
+    ]
+  },
+  "Sweettreats Gear": {
+    "Weapons": [
+      "Sweettreats Sword",
+      "Sweettreats Dagger",
+      "Sweettreats Bow",
+      "Sweettreats Staff",
+      "Sweettreats Wand",
+      "Sweettreats Katana"
+    ],
+    "Armors": [
+      "Red Riding Dress",
+      "Holy Order's Habit",
+      "Bachelor's Tuxedo",
+      "Haori of the Wind",
+      "Big Bad Fursuit",
+      "Platinum Segmentata"
+    ],
+    "Ring": [
+      "Sweettreats Ring"
+    ]
+  },
+  "Syndicate Gear": {
+    "Weapons": [
+      "Pirate's Sidearms",
+      "Frangible Longbow",
+      "Royal Sekhem",
+      "Obsidian Macuahuitl",
+      "Gilded Chain Scythe",
+      "Ritual Khopesh"
+    ],
+    "Ability Items": [
+      "Rusted Barrel",
+      "Corsair's Crown Jewel",
+      "Huntsman's Volley",
+      "Storied Blades",
+      "Forbidden Artifact",
+      "Storm Caller",
+      "Sheath of Thunderous Rites"
+    ],
+    "Armor": [
+      "Light Syndicate Attire",
+      "Mystic Syndicate Attire",
+      "Heavy Syndicate Attire"
+    ],
+    "Rings": [
+      "Sunken Fire Opal Ring",
+      "Faded Heart Scarab",
+      "Fractured Hannya"
+    ]
+  },
+  "Venerable Gear": {
+    "Weapons": [
+      "Venerable Doom Bow",
+      "Venerable Ancient Stone Sword",
+      "Venerable Staff of the Crystal Serpent",
+      "Venerable Spirit Dagger",
+      "Venerable Crystal Wand",
+      "Venerable Doku No Ken"
+    ],
+    "Armors": [
+      "Venerable Resurrected Warrior's Armor",
+      "Venerable Robe of the Mad Scientist",
+      "Venerable Coral Silk Armor"
+    ],
+    "Rings": [
+      "Venerable Ring of the Sphinx",
+      "Venerable Ring of the Nile",
+      "Venerable Ring of the Pyramid",
+      "Decades Chronicle"
+    ]
+  }
+}

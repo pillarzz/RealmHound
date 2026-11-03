@@ -86,16 +86,17 @@ pub fn get_tab_icon(tab: ActiveTab) -> TabIconSprite {
         ActiveTab::LiveFeed => TabIconSprite::Embedded(EmbeddedIcon::NexusCrystal), // Nexus Crystal
         ActiveTab::LootHistory => TabIconSprite::ObjectId(1292),                    // White Bag
         ActiveTab::TrophyHall => TabIconSprite::ObjectId(25991), // Abyssal Trophy
+        ActiveTab::Sets => TabIconSprite::ObjectId(25991),
         ActiveTab::Party => TabIconSprite::EmbeddedFilled(EmbeddedIcon::Party), // Party.png
-        ActiveTab::Vault => TabIconSprite::ObjectId(1824),       // Vault Portal
-        ActiveTab::Quests => TabIconSprite::ObjectId(5974),      // Daily Quest Portal
-        ActiveTab::Characters => TabIconSprite::ObjectId(810),   // Char Slot Unlocker
-        ActiveTab::Exaltations => exalt_trophy_icon(),           // Exalt Trophy (resolved by name)
-        ActiveTab::Treasury => TabIconSprite::ObjectId(14758),   // Secret Hoard
+        ActiveTab::Vault => TabIconSprite::ObjectId(1824),                      // Vault Portal
+        ActiveTab::Quests => TabIconSprite::ObjectId(5974), // Daily Quest Portal
+        ActiveTab::Characters => TabIconSprite::ObjectId(810), // Char Slot Unlocker
+        ActiveTab::Exaltations => exalt_trophy_icon(),      // Exalt Trophy (resolved by name)
+        ActiveTab::Treasury => TabIconSprite::ObjectId(14758), // Secret Hoard
         ActiveTab::Chat => TabIconSprite::SheetIndex("lofiObj", 515), // Player discovery: chat
         ActiveTab::CombatHistory => TabIconSprite::ObjectIdFilled(1883), // Arena Portal (classic)
         ActiveTab::PetYard => TabIconSprite::SheetIndex("lofiObj3", 0x0d), // Pet Yard Portal
-        ActiveTab::Missions => TabIconSprite::ObjectId(0x68a5),  // Seasonal Apple
+        ActiveTab::Missions => TabIconSprite::ObjectId(0x68a5), // Seasonal Apple
     }
 }
 

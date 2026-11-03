@@ -9,6 +9,7 @@ use realmhound_core::{
 use serde_json::Value;
 
 use super::{ActiveTab, AppAction, Panel, PanelContext};
+use crate::shadcn_ui::Shadcn;
 
 const SETS: &str = include_str!("../../../../../data/rotmg-sets.json");
 const SET_META: &str = include_str!("../../../../../data/rotmg-sets-sources.json");
@@ -34,7 +35,42 @@ struct Set {
 
 #[derive(Default, Clone)]
 struct Ownership {
-    locations: Vec<String>,
+    locations: Vec<OwnedLocation>,
+}
+
+#[derive(Clone)]
+struct OwnedLocation {
+    label: String,
+    seasonal: bool,
+}
+
+impl Ownership {
+    fn in_scope(&self, scope: InventoryScope) -> impl Iterator<Item = &str> {
+        self.locations
+            .iter()
+            .filter(move |location| match scope {
+                InventoryScope::Both => true,
+                InventoryScope::Regular => !location.seasonal,
+                InventoryScope::Seasonal => location.seasonal,
+            })
+            .map(|location| location.label.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum InventoryScope {
+    #[default]
+    Both,
+    Regular,
+    Seasonal,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SetSort {
+    #[default]
+    MostOwned,
+    LeastOwned,
+    Name,
 }
 
 #[derive(Default)]
@@ -48,9 +84,14 @@ pub struct SetsPanel {
     search: String,
     class: String,
     completion: usize,
+    owned_count: Option<usize>,
+    sort: SetSort,
+    inventory_scope: InventoryScope,
     expanded: BTreeSet<String>,
     loaded: bool,
     complete_coverage: bool,
+    regular_coverage: bool,
+    seasonal_coverage: bool,
 }
 
 fn normalized(s: &str) -> String {
@@ -134,6 +175,163 @@ fn classes_for(ability: &[Piece]) -> Vec<&'static str> {
 }
 
 impl SetsPanel {
+    fn render_filters(&mut self, ui: &mut egui::Ui, shadcn: &Shadcn) {
+        shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
+            shadcn.band_row_wrapped(ui, |ui| {
+                ui.label("🔍");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .desired_width(150.0)
+                        .hint_text("Set or item name"),
+                );
+                if !self.search.is_empty() && shadcn.btn_small(ui, "×").clicked() {
+                    self.search.clear();
+                }
+                shadcn.band_divider(ui);
+                ui.label("Class:");
+                egui::ComboBox::from_id_salt("sets_class")
+                    .selected_text(if self.class.is_empty() {
+                        "All classes"
+                    } else {
+                        &self.class
+                    })
+                    .width(115.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.class, String::new(), "All classes");
+                        for class in [
+                            "Rogue",
+                            "Archer",
+                            "Wizard",
+                            "Priest",
+                            "Warrior",
+                            "Knight",
+                            "Paladin",
+                            "Assassin",
+                            "Necromancer",
+                            "Huntress",
+                            "Mystic",
+                            "Trickster",
+                            "Sorcerer",
+                            "Ninja",
+                            "Samurai",
+                            "Bard",
+                            "Summoner",
+                            "Kensei",
+                            "Druid",
+                        ] {
+                            ui.selectable_value(&mut self.class, class.into(), class);
+                        }
+                    });
+                shadcn.band_divider(ui);
+                ui.label("Inventory:");
+                egui::ComboBox::from_id_salt("sets_inventory_scope")
+                    .selected_text(match self.inventory_scope {
+                        InventoryScope::Both => "All account",
+                        InventoryScope::Regular => "Regular",
+                        InventoryScope::Seasonal => "Seasonal",
+                    })
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.inventory_scope,
+                            InventoryScope::Both,
+                            "All account",
+                        );
+                        ui.selectable_value(
+                            &mut self.inventory_scope,
+                            InventoryScope::Regular,
+                            "Regular",
+                        );
+                        ui.selectable_value(
+                            &mut self.inventory_scope,
+                            InventoryScope::Seasonal,
+                            "Seasonal",
+                        );
+                    });
+                shadcn.band_divider(ui);
+                ui.label("Owned:");
+                egui::ComboBox::from_id_salt("sets_owned_count")
+                    .selected_text(self.owned_count.map_or("Any".into(), |n| format!("{n}/4")))
+                    .width(55.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.owned_count, None, "Any");
+                        for count in 0..=4 {
+                            ui.selectable_value(
+                                &mut self.owned_count,
+                                Some(count),
+                                format!("{count}/4"),
+                            );
+                        }
+                    });
+                shadcn.band_divider(ui);
+                ui.label("Status:");
+                egui::ComboBox::from_id_salt("sets_completion")
+                    .selected_text(
+                        ["All", "Complete", "Incomplete", "One missing"][self.completion],
+                    )
+                    .width(105.0)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in ["All", "Complete", "Incomplete", "One missing"]
+                            .iter()
+                            .enumerate()
+                        {
+                            ui.selectable_value(&mut self.completion, i, *name);
+                        }
+                    });
+                shadcn.band_divider(ui);
+                ui.label("Sort:");
+                egui::ComboBox::from_id_salt("sets_sort")
+                    .selected_text(match self.sort {
+                        SetSort::MostOwned => "Most complete",
+                        SetSort::LeastOwned => "Least complete",
+                        SetSort::Name => "Name A–Z",
+                    })
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.sort, SetSort::MostOwned, "Most complete");
+                        ui.selectable_value(&mut self.sort, SetSort::LeastOwned, "Least complete");
+                        ui.selectable_value(&mut self.sort, SetSort::Name, "Name A–Z");
+                    });
+            });
+        });
+        shadcn.header_band_stacked_divided(ui, shadcn.secondary_header_fill(), |ui| {
+            shadcn.band_row_wrapped(ui, |ui| {
+                ui.label("Missing-piece sources:");
+                egui::ComboBox::from_id_salt("sets_location_categories")
+                    .selected_text(if self.selected_categories.is_empty() {
+                        "All categories".into()
+                    } else {
+                        format!("{} selected", self.selected_categories.len())
+                    })
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for (id, label) in &self.categories {
+                            let mut selected = self.selected_categories.contains(id);
+                            if ui.checkbox(&mut selected, label).changed() {
+                                if selected {
+                                    self.selected_categories.insert(id.clone());
+                                } else {
+                                    self.selected_categories.remove(id);
+                                }
+                            }
+                        }
+                    });
+                if !self.selected_categories.is_empty() {
+                    if shadcn.btn_small(ui, "Clear sources").clicked() {
+                        self.selected_categories.clear();
+                    }
+                    for id in self.selected_categories.clone() {
+                        if let Some(label) = self.categories.get(&id) {
+                            if shadcn.btn_small(ui, format!("{label} ×")).clicked() {
+                                self.selected_categories.remove(&id);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     fn load(&mut self) {
         let Ok(raw_sets) = serde_json::from_str::<BTreeMap<String, Vec<String>>>(SETS) else {
             self.issues.push("Bundled set JSON is invalid".into());
@@ -232,11 +430,13 @@ impl SetsPanel {
                     .is_ok_and(|age| age <= Duration::from_secs(24 * 60 * 60))
             })
         };
-        self.complete_coverage = fresh(account.last_api_update)
+        self.regular_coverage = fresh(account.last_api_update)
             && fresh(account.regular_vault.last_updated)
+            && !account.regular_vault.pending_update;
+        self.seasonal_coverage = fresh(account.last_api_update)
             && fresh(account.seasonal_vault.last_updated)
-            && !account.regular_vault.pending_update
             && !account.seasonal_vault.pending_update;
+        self.complete_coverage = self.regular_coverage && self.seasonal_coverage;
         for ch in &account.characters.characters {
             let label = account
                 .characters
@@ -263,7 +463,10 @@ impl SetsPanel {
                             .entry(item.item_id)
                             .or_default()
                             .locations
-                            .push(format!("{label} · {where_}"));
+                            .push(OwnedLocation {
+                                label: format!("{label} · {where_}"),
+                                seasonal: ch.seasonal,
+                            });
                     }
                 }
             }
@@ -279,7 +482,10 @@ impl SetsPanel {
                             .entry(item.item_id)
                             .or_default()
                             .locations
-                            .push(format!("{season} pet {} · Inventory", pet.name));
+                            .push(OwnedLocation {
+                                label: format!("{season} pet {} · Inventory", pet.name),
+                                seasonal: season == "Seasonal",
+                            });
                     }
                 }
             }
@@ -301,7 +507,10 @@ impl SetsPanel {
                             .entry(item.item_id)
                             .or_default()
                             .locations
-                            .push(format!("{season} {where_}"));
+                            .push(OwnedLocation {
+                                label: format!("{season} {where_}"),
+                                seasonal: season == "Seasonal",
+                            });
                     }
                 }
             }
@@ -311,14 +520,26 @@ impl SetsPanel {
     fn owned(&self, slot: &[Piece]) -> usize {
         slot.iter()
             .filter_map(|p| p.id)
-            .map(|id| self.ownership.get(&id).map_or(0, |o| o.locations.len()))
+            .map(|id| {
+                self.ownership
+                    .get(&id)
+                    .map_or(0, |o| o.in_scope(self.inventory_scope).count())
+            })
             .sum()
+    }
+
+    fn coverage_known(&self) -> bool {
+        match self.inventory_scope {
+            InventoryScope::Both => self.complete_coverage,
+            InventoryScope::Regular => self.regular_coverage,
+            InventoryScope::Seasonal => self.seasonal_coverage,
+        }
     }
 
     fn slot_state(&self, slot: &[Piece]) -> &'static str {
         if self.owned(slot) > 0 {
             "Owned"
-        } else if slot.iter().any(|p| p.id.is_none()) || !self.complete_coverage {
+        } else if slot.iter().any(|p| p.id.is_none()) || !self.coverage_known() {
             "Unknown"
         } else {
             "Missing"
@@ -360,6 +581,9 @@ impl SetsPanel {
             return false;
         }
         let owned = set.slots.iter().filter(|s| self.owned(s) > 0).count();
+        if self.owned_count.is_some_and(|count| count != owned) {
+            return false;
+        }
         let missing = set
             .slots
             .iter()
@@ -382,6 +606,18 @@ impl SetsPanel {
                 };
                 relevant && self.category_match(s)
             })
+    }
+
+    fn sort_rows(&self, rows: &mut [Set]) {
+        rows.sort_by(|a, b| {
+            let owned = |set: &Set| set.slots.iter().filter(|slot| self.owned(slot) > 0).count();
+            match self.sort {
+                SetSort::MostOwned => owned(b).cmp(&owned(a)),
+                SetSort::LeastOwned => owned(a).cmp(&owned(b)),
+                SetSort::Name => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| a.name.cmp(&b.name))
+        });
     }
 }
 
@@ -408,7 +644,7 @@ impl Panel for SetsPanel {
             age(ctx.account_data.regular_vault.last_updated),
             age(ctx.account_data.seasonal_vault.last_updated)
         ));
-        if !self.complete_coverage {
+        if !self.coverage_known() {
             ui.colored_label(Color32::YELLOW, "Partial or stale inventory (over 24 hours): unobserved storage may contain other pieces. Unconfirmed slots are unknown.");
         }
         if !self.issues.is_empty() {
@@ -421,74 +657,14 @@ impl Panel for SetsPanel {
                 },
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("Search");
-            ui.text_edit_singleline(&mut self.search);
-            egui::ComboBox::from_id_salt("sets_class")
-                .selected_text(if self.class.is_empty() {
-                    "All classes"
-                } else {
-                    &self.class
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.class, String::new(), "All classes");
-                    for class in [
-                        "Rogue",
-                        "Archer",
-                        "Wizard",
-                        "Priest",
-                        "Warrior",
-                        "Knight",
-                        "Paladin",
-                        "Assassin",
-                        "Necromancer",
-                        "Huntress",
-                        "Mystic",
-                        "Trickster",
-                        "Sorcerer",
-                        "Ninja",
-                        "Samurai",
-                        "Bard",
-                        "Summoner",
-                        "Kensei",
-                        "Druid",
-                    ] {
-                        ui.selectable_value(&mut self.class, class.into(), class);
-                    }
-                });
-            egui::ComboBox::from_id_salt("sets_completion")
-                .selected_text(
-                    ["All", "Complete", "Incomplete", "Exactly one missing"][self.completion],
-                )
-                .show_ui(ui, |ui| {
-                    for (i, name) in ["All", "Complete", "Incomplete", "Exactly one missing"]
-                        .iter()
-                        .enumerate()
-                    {
-                        ui.selectable_value(&mut self.completion, i, *name);
-                    }
-                });
-        });
-        ui.collapsing(format!("Location categories ({})", self.selected_categories.len()), |ui| {
-            ui.label("Select any; matches a documented source for a confirmed missing piece. Complete sets search all pieces.");
-            for (id, label) in &self.categories {
-                let mut selected = self.selected_categories.contains(id);
-                if ui.checkbox(&mut selected, label).changed() { if selected { self.selected_categories.insert(id.clone()); } else { self.selected_categories.remove(id); } }
-            }
-        });
+        self.render_filters(ui, ctx.shadcn);
         let mut rows: Vec<_> = self
             .sets
             .iter()
             .filter(|s| self.matches(s))
             .cloned()
             .collect();
-        rows.sort_by(|a, b| {
-            let key = |s: &Set| {
-                let owned = s.slots.iter().filter(|slot| self.owned(slot) > 0).count();
-                (if owned == 4 { 1 } else { 0 }, 4 - owned)
-            };
-            key(a).cmp(&key(b)).then_with(|| a.name.cmp(&b.name))
-        });
+        self.sort_rows(&mut rows);
         ui.label(format!("{} of {} sets", rows.len(), self.sets.len()));
         if rows.is_empty() {
             super::empty_state(
@@ -497,46 +673,90 @@ impl Panel for SetsPanel {
                 Some("Try changing the search or filters."),
             );
         }
-        ScrollArea::vertical().show(ui, |ui| {
+        ScrollArea::both().show(ui, |ui| {
+            const PIECE_WIDTH: f32 = 72.0;
+            const ROW_HEIGHT: f32 = 54.0;
+            let name_width =
+                (ui.available_width() - 4.0 * PIECE_WIDTH - 5.0 * ui.spacing().item_spacing.x)
+                    .max(220.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [name_width, 20.0],
+                    egui::Label::new(RichText::new("Set · owned / 4").strong()),
+                );
+                for slot in SLOTS {
+                    ui.add_sized(
+                        [PIECE_WIDTH, 20.0],
+                        egui::Label::new(RichText::new(slot).strong()),
+                    );
+                }
+            });
+            ctx.shadcn.full_width_separator(ui);
             for set in rows {
                 let owned = set.slots.iter().filter(|s| self.owned(s) > 0).count();
                 let is_open = self.expanded.contains(&set.id);
                 ui.horizontal(|ui| {
-                    if ui.button(if is_open { "▾" } else { "▸" }).clicked() {
-                        if is_open {
-                            self.expanded.remove(&set.id);
-                        } else {
-                            self.expanded.insert(set.id.clone());
-                        }
-                    }
-                    ui.label(RichText::new(&set.name).strong());
-                    ui.label(format!(
-                        "{owned}/4 · {}",
-                        if set.classes.is_empty() {
-                            "Class unknown".into()
-                        } else {
-                            set.classes.join(", ")
-                        }
-                    ));
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(name_width, ROW_HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if ctx
+                                    .shadcn
+                                    .btn_small(ui, if is_open { "▾" } else { "▸" })
+                                    .clicked()
+                                {
+                                    if is_open {
+                                        self.expanded.remove(&set.id);
+                                    } else {
+                                        self.expanded.insert(set.id.clone());
+                                    }
+                                }
+                                ui.add_sized(
+                                    [name_width - 38.0, 20.0],
+                                    egui::Label::new(RichText::new(&set.name).strong()).truncate(),
+                                )
+                                .on_hover_text(&set.name);
+                            });
+                            let class_label = if set.classes.is_empty() {
+                                "Class unknown".into()
+                            } else {
+                                set.classes.join(", ")
+                            };
+                            ui.add_sized(
+                                [name_width, 18.0],
+                                egui::Label::new(format!("{owned}/4 · {class_label}")).truncate(),
+                            )
+                            .on_hover_text(class_label);
+                        },
+                    );
                     for slot in &set.slots {
                         let state = self.slot_state(slot);
-                        if let Some(id) = slot.first().and_then(|p| p.id) {
-                            ctx.sprite_renderer
-                                .render_item_tile_sized(ui, id, None, &[], 25.0)
-                                .on_hover_text(state);
-                        } else {
-                            ui.label("?").on_hover_text(state);
-                        }
-                        ui.colored_label(
-                            match state {
-                                "Owned" => Color32::GREEN,
-                                "Missing" => Color32::RED,
-                                _ => Color32::YELLOW,
-                            },
-                            match state {
-                                "Owned" => "✓",
-                                "Missing" => "–",
-                                _ => "?",
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(PIECE_WIDTH, ROW_HEIGHT),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                if let Some(id) = slot.first().and_then(|p| p.id) {
+                                    ctx.sprite_renderer
+                                        .render_item_tile_sized(ui, id, None, &[], 30.0)
+                                        .on_hover_text(state);
+                                } else {
+                                    ui.add_sized([30.0, 30.0], egui::Label::new("?"))
+                                        .on_hover_text(state);
+                                }
+                                ui.label(
+                                    RichText::new(match state {
+                                        "Owned" => "✓ Owned",
+                                        "Missing" => "– Missing",
+                                        _ => "? Unknown",
+                                    })
+                                    .size(10.0)
+                                    .color(match state {
+                                        "Owned" => Color32::GREEN,
+                                        "Missing" => Color32::RED,
+                                        _ => Color32::YELLOW,
+                                    }),
+                                );
                             },
                         );
                     }
@@ -575,13 +795,19 @@ impl Panel for SetsPanel {
                                 });
                                 if let Some(id) = piece.id {
                                     if let Some(own) = self.ownership.get(&id) {
-                                        ui.label(format!(
-                                            "{} owned · {}",
-                                            own.locations.len(),
-                                            own.locations.join(", ")
-                                        ));
-                                        if ui.small_button("Browse in Treasury").clicked() {
-                                            actions.push(AppAction::SwitchTab(ActiveTab::Treasury));
+                                        let locations =
+                                            own.in_scope(self.inventory_scope).collect::<Vec<_>>();
+                                        if !locations.is_empty() {
+                                            ui.label(format!(
+                                                "{} owned · {}",
+                                                locations.len(),
+                                                locations.join(", ")
+                                            ));
+                                            if ui.small_button("Browse in Treasury").clicked() {
+                                                actions.push(AppAction::SwitchTab(
+                                                    ActiveTab::Treasury,
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -675,6 +901,14 @@ mod tests {
         a.seasonal_vault.last_updated = Some(SystemTime::now());
         a
     }
+    fn recorded(seasonal: bool) -> Ownership {
+        Ownership {
+            locations: vec![OwnedLocation {
+                label: "Vault".into(),
+                seasonal,
+            }],
+        }
+    }
 
     #[test]
     fn ownership_spans_equipment_backpack_vault_and_gifts_and_updates() {
@@ -702,8 +936,12 @@ mod tests {
             .slots
             .iter()
             .all(|slot| panel.slot_state(slot) == "Owned"));
-        assert!(panel.ownership[&10].locations[0].contains("Priest #7 · Equipped"));
-        assert!(panel.ownership[&13].locations[0].contains("Seasonal Gift Chest"));
+        assert!(panel.ownership[&10].locations[0]
+            .label
+            .contains("Priest #7 · Equipped"));
+        assert!(panel.ownership[&13].locations[0]
+            .label
+            .contains("Seasonal Gift Chest"));
         account.characters.characters[0].backpack.clear();
         panel.rebuild_ownership(&account);
         assert_eq!(panel.slot_state(&set.slots[1]), "Missing");
@@ -727,6 +965,50 @@ mod tests {
         assert_eq!(panel.owned(&a.slots[0]), 2);
         assert_eq!(a.slots.iter().filter(|s| panel.owned(s) > 0).count(), 1);
         assert_eq!(b.slots.iter().filter(|s| panel.owned(s) > 0).count(), 1);
+    }
+
+    #[test]
+    fn seasonal_scope_changes_counts_locations_and_coverage() {
+        let mut account = covered();
+        let mut seasonal_ch = CachedCharacter {
+            char_id: 8,
+            class_id: 784,
+            seasonal: true,
+            ..Default::default()
+        };
+        seasonal_ch.equipment.push(CharacterItem::new(10));
+        account.characters.characters.push(seasonal_ch);
+        account
+            .regular_vault
+            .vault_items
+            .push(LiveVaultItem::new(10));
+        account
+            .seasonal_vault
+            .gift_items
+            .push(LiveVaultItem::new(11));
+        let mut panel = SetsPanel::default();
+        panel.rebuild_ownership(&account);
+        let set = sample_set();
+        assert_eq!(panel.owned(&set.slots[0]), 2);
+        panel.inventory_scope = InventoryScope::Seasonal;
+        assert_eq!(panel.owned(&set.slots[0]), 1);
+        assert_eq!(panel.owned(&set.slots[1]), 1);
+        assert!(panel.ownership[&10]
+            .in_scope(panel.inventory_scope)
+            .all(|where_| where_.contains("Priest #8")));
+        panel.inventory_scope = InventoryScope::Regular;
+        assert_eq!(panel.owned(&set.slots[0]), 1);
+        assert_eq!(panel.owned(&set.slots[1]), 0);
+        assert!(panel.ownership[&10]
+            .in_scope(panel.inventory_scope)
+            .all(|where_| where_.contains("Regular Vault")));
+        account.seasonal_vault.last_updated = None;
+        panel.rebuild_ownership(&account);
+        assert!(panel.coverage_known()); // regular coverage remains usable
+        panel.inventory_scope = InventoryScope::Seasonal;
+        assert!(!panel.coverage_known());
+        assert_eq!(panel.slot_state(&set.slots[2]), "Unknown");
+        assert_eq!(panel.slot_state(&set.slots[0]), "Owned");
     }
 
     #[test]
@@ -773,12 +1055,7 @@ mod tests {
         let mut panel = SetsPanel::default();
         panel.complete_coverage = true;
         for id in [10, 11, 12] {
-            panel.ownership.insert(
-                id,
-                Ownership {
-                    locations: vec!["Vault".into()],
-                },
-            );
+            panel.ownership.insert(id, recorded(false));
         }
         panel.completion = 3;
         panel.class = "Priest".into();
@@ -795,12 +1072,7 @@ mod tests {
         assert!(!panel.matches(&set));
         set.slots[3].push(piece(Some(15), unknown));
         assert!(panel.matches(&set));
-        panel.ownership.insert(
-            13,
-            Ownership {
-                locations: vec!["Vault".into()],
-            },
-        );
+        panel.ownership.insert(13, recorded(false));
         panel.completion = 1;
         assert!(panel.matches(&set)); // complete sets inspect owned slots too
         panel.completion = 3;
@@ -849,6 +1121,51 @@ mod tests {
             .selected_categories
             .insert("special_event_dungeons".into());
         assert!(panel.category_match(&[appearance_only]));
+    }
+
+    #[test]
+    fn owned_count_filter_and_completeness_sort_are_deterministic() {
+        let mut panel = SetsPanel::default();
+        panel.complete_coverage = true;
+        let make_set = |name: &str, base: i32| Set {
+            id: stable_id(name),
+            name: name.into(),
+            classes: vec!["Priest"],
+            slots: std::array::from_fn(|i| vec![piece(Some(base + i as i32), Value::Null)]),
+        };
+        let mut rows = vec![
+            make_set("Alpha", 10),
+            make_set("Beta", 20),
+            make_set("Gamma", 30),
+        ];
+        for id in [10, 20, 21, 22, 30, 31, 32, 33] {
+            panel.ownership.insert(id, recorded(false));
+        }
+        panel.owned_count = Some(3);
+        assert!(!panel.matches(&rows[0]));
+        assert!(panel.matches(&rows[1]));
+        assert!(!panel.matches(&rows[2]));
+        panel.class = "Wizard".into();
+        assert!(!panel.matches(&rows[1]));
+        panel.class.clear();
+        panel.owned_count = None;
+        panel.sort_rows(&mut rows);
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["Gamma", "Beta", "Alpha"]
+        );
+        panel.sort = SetSort::LeastOwned;
+        panel.sort_rows(&mut rows);
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "Beta", "Gamma"]
+        );
+        panel.sort = SetSort::Name;
+        panel.sort_rows(&mut rows);
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "Beta", "Gamma"]
+        );
     }
 
     #[test]

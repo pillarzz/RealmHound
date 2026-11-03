@@ -26,6 +26,7 @@ Join our Discord!
 - Loot history and trophy collections
 - Quest and mission tracking
 - Account-wide item search
+- Account-wide four-piece set checklist with owned pieces and documented sources
 - Character stats and overview
 - Theoretical DPS calculator
 - Party and chat logs
@@ -96,6 +97,13 @@ RealmHound on the second.
 3. The app will automatically detect your network interface and start capturing
 4. Launch Realm of the Mad God and play normally
 5. RealmHound will display game data in real-time
+
+The **Sets** tab shows current known ownership across characters and tracked
+storage. Filter by class, owned-piece count, completion, regular or seasonal
+inventory, and wiki-documented source category. Expand a set for quantities,
+locations, alternatives, and source details; owned pieces can open directly in
+Treasury. Unobserved or stale inventory is marked unknown, and documented
+sources do not guarantee current item availability.
 
 If RealmHound reports that it may not open a capture device, the capture
 permission above has not been granted yet - the message names the fix for your

@@ -10102,6 +10102,10 @@ impl RealmHoundApp {
                 AppAction::SwitchTab(tab) => {
                     self.active_tab = tab;
                 }
+                AppAction::ViewTreasuryItem { item_id, item_name } => {
+                    self.treasury_panel.focus_item(item_id, &item_name);
+                    self.active_tab = ActiveTab::Treasury;
+                }
                 AppAction::ViewCharacterLoot {
                     char_id,
                     char_name,

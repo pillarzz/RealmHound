@@ -229,6 +229,8 @@ impl ActiveTab {
 pub enum AppAction {
     /// Switch to a different tab.
     SwitchTab(ActiveTab),
+    /// Open Treasury focused on one exact item, with its name in the search field.
+    ViewTreasuryItem { item_id: i32, item_name: String },
     /// Set exclusive loot filter for a character and switch to Loot History.
     ViewCharacterLoot {
         char_id: i32,

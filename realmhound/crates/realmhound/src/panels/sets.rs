@@ -8,7 +8,7 @@ use realmhound_core::{
 };
 use serde_json::Value;
 
-use super::{ActiveTab, AppAction, Panel, PanelContext};
+use super::{AppAction, Panel, PanelContext};
 use crate::shadcn_ui::Shadcn;
 
 const SETS: &str = include_str!("../../../../../data/rotmg-sets.json");
@@ -804,9 +804,10 @@ impl Panel for SetsPanel {
                                                 locations.join(", ")
                                             ));
                                             if ui.small_button("Browse in Treasury").clicked() {
-                                                actions.push(AppAction::SwitchTab(
-                                                    ActiveTab::Treasury,
-                                                ));
+                                                actions.push(AppAction::ViewTreasuryItem {
+                                                    item_id: id,
+                                                    item_name: piece.name.clone(),
+                                                });
                                             }
                                         }
                                     }

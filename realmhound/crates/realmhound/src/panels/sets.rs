@@ -1,5 +1,6 @@
 //! Current, account-scoped ownership of the bundled four-piece sets.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, SystemTime};
 
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
@@ -225,9 +226,15 @@ impl SetsPanel {
 
     fn rebuild_ownership(&mut self, account: &AccountData) {
         self.ownership.clear();
-        self.complete_coverage = account.last_api_update.is_some()
-            && account.regular_vault.last_updated.is_some()
-            && account.seasonal_vault.last_updated.is_some()
+        let fresh = |time: Option<SystemTime>| {
+            time.is_some_and(|t| {
+                t.elapsed()
+                    .is_ok_and(|age| age <= Duration::from_secs(24 * 60 * 60))
+            })
+        };
+        self.complete_coverage = fresh(account.last_api_update)
+            && fresh(account.regular_vault.last_updated)
+            && fresh(account.seasonal_vault.last_updated)
             && !account.regular_vault.pending_update
             && !account.seasonal_vault.pending_update;
         for ch in &account.characters.characters {
@@ -402,7 +409,7 @@ impl Panel for SetsPanel {
             age(ctx.account_data.seasonal_vault.last_updated)
         ));
         if !self.complete_coverage {
-            ui.colored_label(Color32::YELLOW, "Partial inventory: unobserved character or vault storage may contain other pieces. Unconfirmed slots are unknown.");
+            ui.colored_label(Color32::YELLOW, "Partial or stale inventory (over 24 hours): unobserved storage may contain other pieces. Unconfirmed slots are unknown.");
         }
         if !self.issues.is_empty() {
             ui.collapsing(
@@ -747,6 +754,13 @@ mod tests {
             "Unknown"
         );
         assert_eq!(panel.slot_state(&slot), "Owned");
+        account.seasonal_vault.last_updated =
+            Some(SystemTime::now() - Duration::from_secs(48 * 60 * 60));
+        panel.rebuild_ownership(&account);
+        assert_eq!(
+            panel.slot_state(&[piece(Some(999), Value::Null)]),
+            "Unknown"
+        );
     }
 
     #[test]

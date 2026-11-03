@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
-    api::character::CharacterClass, assets::get_asset_manager, vault::AccountData,
+    api::character::CharacterClass, assets::get_asset_manager, loot::class_ids, vault::AccountData,
 };
 use serde_json::Value;
 
@@ -148,28 +148,28 @@ fn classes_for(ability: &[Piece]) -> Vec<&'static str> {
     for piece in ability {
         let Some(id) = piece.id else { continue };
         let class = match assets.item_slot_type(id) {
-            4 => "Priest",
-            5 => "Knight",
-            11 => "Wizard",
-            12 => "Paladin",
-            13 => "Rogue",
-            15 => "Archer",
-            16 => "Warrior",
-            18 => "Assassin",
-            19 => "Necromancer",
-            20 => "Huntress",
-            21 => "Mystic",
-            22 => "Trickster",
-            23 => "Sorcerer",
-            25 => "Ninja",
-            27 => "Samurai",
-            28 => "Bard",
-            29 => "Summoner",
-            30 => "Kensei",
-            31 => "Druid",
+            4 => CharacterClass::Priest,
+            5 => CharacterClass::Knight,
+            11 => CharacterClass::Wizard,
+            12 => CharacterClass::Paladin,
+            13 => CharacterClass::Rogue,
+            15 => CharacterClass::Archer,
+            16 => CharacterClass::Warrior,
+            18 => CharacterClass::Assassin,
+            19 => CharacterClass::Necromancer,
+            20 => CharacterClass::Huntress,
+            21 => CharacterClass::Mystic,
+            22 => CharacterClass::Trickster,
+            23 => CharacterClass::Sorcerer,
+            25 => CharacterClass::Ninja,
+            27 => CharacterClass::Samurai,
+            28 => CharacterClass::Bard,
+            29 => CharacterClass::Summoner,
+            30 => CharacterClass::Kensei,
+            31 => CharacterClass::Druid,
             _ => continue,
         };
-        names.insert(class);
+        names.insert(class.name());
     }
     names.into_iter().collect()
 }
@@ -198,27 +198,8 @@ impl SetsPanel {
                     .width(115.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.class, String::new(), "All classes");
-                        for class in [
-                            "Rogue",
-                            "Archer",
-                            "Wizard",
-                            "Priest",
-                            "Warrior",
-                            "Knight",
-                            "Paladin",
-                            "Assassin",
-                            "Necromancer",
-                            "Huntress",
-                            "Mystic",
-                            "Trickster",
-                            "Sorcerer",
-                            "Ninja",
-                            "Samurai",
-                            "Bard",
-                            "Summoner",
-                            "Kensei",
-                            "Druid",
-                        ] {
+                        for &class_id in class_ids::ALL {
+                            let class = CharacterClass::from_id(class_id as u16).name();
                             ui.selectable_value(&mut self.class, class.into(), class);
                         }
                     });

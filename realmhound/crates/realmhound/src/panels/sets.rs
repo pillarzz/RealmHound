@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
-use eframe::egui::{self, Color32, RichText, ScrollArea};
+use eframe::egui::{self, RichText, ScrollArea};
 use realmhound_core::{
     api::character::CharacterClass, assets::get_asset_manager, loot::class_ids, vault::AccountData,
 };
@@ -314,6 +314,9 @@ impl SetsPanel {
     }
 
     fn load(&mut self) {
+        // Bundled data cannot change during a run. Keep a parse failure visible
+        // without appending the same diagnostic on every frame.
+        self.loaded = true;
         let Ok(raw_sets) = serde_json::from_str::<BTreeMap<String, Vec<String>>>(SETS) else {
             self.issues.push("Bundled set JSON is invalid".into());
             return;
@@ -400,7 +403,6 @@ impl SetsPanel {
                 classes,
             });
         }
-        self.loaded = true;
     }
 
     fn rebuild_ownership(&mut self, account: &AccountData) {
@@ -626,7 +628,7 @@ impl Panel for SetsPanel {
             age(ctx.account_data.seasonal_vault.last_updated)
         ));
         if !self.coverage_known() {
-            ui.colored_label(Color32::YELLOW, "Partial or stale inventory (over 24 hours): unobserved storage may contain other pieces. Unconfirmed slots are unknown.");
+            ui.colored_label(ui.visuals().warn_fg_color, "Partial or stale inventory (over 24 hours): unobserved storage may contain other pieces. Unconfirmed slots are unknown.");
         }
         if !self.issues.is_empty() {
             ui.collapsing(
@@ -648,11 +650,19 @@ impl Panel for SetsPanel {
         self.sort_rows(&mut rows);
         ui.label(format!("{} of {} sets", rows.len(), self.sets.len()));
         if rows.is_empty() {
-            super::empty_state(
-                ui,
-                "No matching sets",
-                Some("Try changing the search or filters."),
-            );
+            if self.sets.is_empty() && !self.issues.is_empty() {
+                super::empty_state(
+                    ui,
+                    "Set data unavailable",
+                    Some("See the diagnostics above."),
+                );
+            } else {
+                super::empty_state(
+                    ui,
+                    "No matching sets",
+                    Some("Try changing the search or filters."),
+                );
+            }
         }
         ScrollArea::both().show(ui, |ui| {
             const PIECE_WIDTH: f32 = 72.0;
@@ -733,9 +743,9 @@ impl Panel for SetsPanel {
                                     })
                                     .size(10.0)
                                     .color(match state {
-                                        "Owned" => Color32::GREEN,
-                                        "Missing" => Color32::RED,
-                                        _ => Color32::YELLOW,
+                                        "Owned" => ctx.shadcn.colors().primary,
+                                        "Missing" => ctx.shadcn.colors().destructive,
+                                        _ => ui.visuals().warn_fg_color,
                                     }),
                                 );
                             },
@@ -771,7 +781,7 @@ impl Panel for SetsPanel {
                                     }
                                     ui.label(&piece.name);
                                     if let Some(issue) = &piece.issue {
-                                        ui.colored_label(Color32::YELLOW, issue);
+                                        ui.colored_label(ui.visuals().warn_fg_color, issue);
                                     }
                                 });
                                 if let Some(id) = piece.id {
@@ -784,7 +794,11 @@ impl Panel for SetsPanel {
                                                 locations.len(),
                                                 locations.join(", ")
                                             ));
-                                            if ui.small_button("Browse in Treasury").clicked() {
+                                            if ctx
+                                                .shadcn
+                                                .btn_small(ui, "Browse in Treasury")
+                                                .clicked()
+                                            {
                                                 actions.push(AppAction::ViewTreasuryItem {
                                                     item_id: id,
                                                     item_name: piece.name.clone(),

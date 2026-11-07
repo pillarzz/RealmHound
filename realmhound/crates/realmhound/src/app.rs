@@ -1322,6 +1322,13 @@ impl RealmHoundApp {
     fn update_window_state(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
             let viewport = i.viewport();
+
+            // Windows parks a minimized window near -32000 and reports it as
+            // not maximized; persisting either would poison the next launch.
+            if viewport.minimized == Some(true) {
+                return;
+            }
+
             let mut settings = match self.settings.write() {
                 Ok(s) => s,
                 Err(_) => return,

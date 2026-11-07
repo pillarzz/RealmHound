@@ -10402,6 +10402,7 @@ impl eframe::App for RealmHoundApp {
             &self.settings,
             &mut self.sprite_renderer,
             &self.live_fights,
+            self.main_connection,
         );
 
         // Update checker (runs on startup and every 2 hours)

@@ -21,6 +21,9 @@
 //! - Never takes focus. Clicking an overlay must not pull input away from the
 //!   game; the native tweaks in [`platform`] enforce this where the windowing
 //!   layer cannot.
+//! - On Windows, hidden unless the game client that owns the tracked main
+//!   connection is the focused window, so alt-tabbing or minimizing the client
+//!   takes the overlays with it.
 //! - Position, size and chrome state round-trip through
 //!   [`realmhound_core::settings::OverlaySettings`].
 
@@ -32,10 +35,13 @@ use eframe::egui::{self, Color32, CornerRadius, RichText};
 use realmhound_core::combat::LiveFightSnapshot;
 use realmhound_core::loot::ProcessedLootDrop;
 use realmhound_core::settings::{OverlayWindowSettings, Settings};
+use realmhound_core::stream::ConnectionKey;
 
 use crate::panels::loot_filters::{LootFilters, PropertyFilters};
 use crate::rendering::SpriteRenderer;
 
+#[cfg(windows)]
+mod game;
 mod live_combat;
 mod live_loot;
 pub mod platform;
@@ -209,6 +215,8 @@ struct WindowRuntime {
     minimized: Option<bool>,
     /// Last resizable state pushed to the backend, for the same reason.
     resizable: Option<bool>,
+    /// Last native visibility pushed to the backend, for the same reason.
+    visible: Option<bool>,
     /// A pass-through or resizable change went out last frame. winit applies
     /// either by rewriting the window's whole native style, which drops the
     /// tweaks [`platform::promote`] added, so they are re-applied next frame
@@ -230,6 +238,7 @@ impl WindowRuntime {
             passthrough: None,
             minimized: None,
             resizable: None,
+            visible: None,
             restyled: false,
             hidden: false,
             last_promoted: None,
@@ -253,12 +262,17 @@ impl WindowRuntime {
         self.passthrough = None;
         self.minimized = None;
         self.resizable = None;
+        self.visible = None;
         self.restyled = false;
         self.hidden = false;
         self.last_promoted = None;
     }
 
-    fn builder_for(&mut self, cfg: &OverlayWindowSettings) -> egui::ViewportBuilder {
+    fn builder_for(
+        &mut self,
+        cfg: &OverlayWindowSettings,
+        attached: bool,
+    ) -> egui::ViewportBuilder {
         if let Some(builder) = &self.builder {
             return builder.clone();
         }
@@ -274,7 +288,11 @@ impl WindowRuntime {
         let mut builder = egui::ViewportBuilder::default()
             .with_title(&self.native_title)
             .with_decorations(false)
-            .with_transparent(true)
+            .with_visible(attached)
+            // On Windows, DWM composition is applied natively by
+            // `platform::promote`; requesting a transparent window there only
+            // trips eframe's WGL probe (see `main`).
+            .with_transparent(!cfg!(windows))
             .with_resizable(!cfg.locked)
             .with_always_on_top()
             .with_taskbar(false)
@@ -288,11 +306,22 @@ impl WindowRuntime {
                 builder = builder.with_position([x, y]);
             }
         }
+        self.visible = Some(attached);
         self.builder.insert(builder).clone()
     }
 
     /// Push a pass-through change and re-assert the native promotion on a timer.
-    fn sync_native(&mut self, ctx: &egui::Context, cfg: &OverlayWindowSettings, passthrough: bool) {
+    fn sync_native(
+        &mut self,
+        ctx: &egui::Context,
+        cfg: &OverlayWindowSettings,
+        passthrough: bool,
+        attached: bool,
+    ) {
+        if self.visible != Some(attached) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(attached));
+            self.visible = Some(attached);
+        }
         let restyled = std::mem::take(&mut self.restyled);
         if self.passthrough != Some(passthrough) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
@@ -343,6 +372,9 @@ pub struct OverlayManager {
     live_combat: live_combat::LiveCombatOverlay,
     live_loot_window: WindowRuntime,
     live_loot: live_loot::LiveLootOverlay,
+    /// Windows-only: the game client the overlays attach to.
+    #[cfg(windows)]
+    game: game::GameWindow,
     /// Mirrors "at least one overlay is open" for the packet worker, which uses
     /// it to keep waking the UI while a background tab is selected.
     active: Arc<AtomicBool>,
@@ -364,6 +396,8 @@ impl OverlayManager {
             live_combat: live_combat::LiveCombatOverlay::default(),
             live_loot_window: WindowRuntime::new(LIVE_LOOT_TITLE),
             live_loot: live_loot::LiveLootOverlay::default(),
+            #[cfg(windows)]
+            game: game::GameWindow::default(),
             active: Arc::new(AtomicBool::new(false)),
             embedded_warned: false,
         }
@@ -391,12 +425,16 @@ impl OverlayManager {
 
     /// Render whichever overlays are enabled. Call once per frame from the root
     /// `eframe::App::update`, before the main window's panels.
+    ///
+    /// On Windows the overlays are only shown while the game client that owns
+    /// `main_connection` is the focused window; elsewhere they are always shown.
     pub fn render(
         &mut self,
         ctx: &egui::Context,
         settings: &Arc<RwLock<Settings>>,
         sprites: &mut SpriteRenderer,
         live: &[Arc<LiveFightSnapshot>],
+        main_connection: Option<ConnectionKey>,
     ) {
         // The Live Loot overlay shares the Live Feed's bag and item toggles rather
         // than offering a second place to configure the same thing.
@@ -417,6 +455,17 @@ impl OverlayManager {
             return;
         }
 
+        // The overlays are in-game furniture: only draw them while the client
+        // that owns the tracked connection is the focused window. Windows-only
+        // for now; every other platform keeps its existing behaviour.
+        #[cfg(windows)]
+        let attached = self.game.poll(main_connection);
+        #[cfg(not(windows))]
+        let attached = {
+            let _ = main_connection;
+            true
+        };
+
         // Overlays are *immediate* viewports, which eframe can only paint from
         // inside the parent window's update: asking the overlay's own window to
         // redraw just bounces the request to its parent. An idle main window
@@ -430,7 +479,11 @@ impl OverlayManager {
         // drags its entire UI along.
         let animating =
             cfg.live_combat.visible && !cfg.live_combat.minimized && live.iter().any(|f| !f.ended);
-        ctx.request_repaint_after(if animating {
+        ctx.request_repaint_after(if !attached {
+            // Detached overlays are hidden, so poll quickly enough that
+            // focusing the game brings them back without a visible lag.
+            CHROME_POLL_INTERVAL
+        } else if animating {
             ACTIVE_FRAME_INTERVAL
         } else {
             IDLE_FRAME_INTERVAL
@@ -455,6 +508,7 @@ impl OverlayManager {
                 &mut self.live_combat_window,
                 &mut cfg.live_combat,
                 opacity,
+                attached,
                 sprites,
                 &mut content,
             );
@@ -474,6 +528,7 @@ impl OverlayManager {
                 &mut self.live_loot_window,
                 &mut cfg.live_loot,
                 opacity,
+                attached,
                 sprites,
                 &mut content,
             );
@@ -555,10 +610,11 @@ fn show_window(
     runtime: &mut WindowRuntime,
     cfg: &mut OverlayWindowSettings,
     opacity: f32,
+    attached: bool,
     sprites: &mut SpriteRenderer,
     content: &mut dyn OverlayContent,
 ) -> bool {
-    let builder = runtime.builder_for(cfg);
+    let builder = runtime.builder_for(cfg, attached);
     let id = runtime.id;
     let title = runtime.title;
     let mut embedded = false;
@@ -571,6 +627,12 @@ fn show_window(
 
         if ctx.input(|i| i.viewport().close_requested()) {
             cfg.visible = false;
+        }
+        if !attached {
+            // Keep the window alive but off screen while the game is not in
+            // front, so reattaching does not pay for a fresh native window.
+            runtime.sync_native(ctx, cfg, cfg.locked, attached);
+            return;
         }
         persist_geometry(ctx, cfg);
 
@@ -620,7 +682,7 @@ fn show_window(
         // Viewport commands target whichever viewport is current, so this has to
         // run inside the callback: from outside it would reconfigure the main
         // window instead. Last, so this frame's chrome clicks are included.
-        runtime.sync_native(ctx, cfg, cfg.locked && !over_chrome);
+        runtime.sync_native(ctx, cfg, cfg.locked && !over_chrome, attached);
     });
 
     if !cfg.visible {
@@ -1055,15 +1117,15 @@ mod tests {
         let cfg = OverlaySettings::default().live_combat;
         let mut runtime = WindowRuntime::new(LIVE_COMBAT_TITLE);
 
-        runtime.builder_for(&cfg);
+        runtime.builder_for(&cfg, true);
         let first = runtime.native_title.clone();
         // The same window must keep its title, or every frame would look like a
         // new generation to `dismiss_stale` and retire the live window.
-        runtime.builder_for(&cfg);
+        runtime.builder_for(&cfg, true);
         assert_eq!(runtime.native_title, first);
 
         runtime.closed();
-        runtime.builder_for(&cfg);
+        runtime.builder_for(&cfg, true);
         assert_ne!(
             runtime.native_title, first,
             "a replacement window must be distinguishable from the one it replaced"

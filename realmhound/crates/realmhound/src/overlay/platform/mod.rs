@@ -33,6 +33,9 @@ mod macos;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(windows)]
+pub(super) use windows::{game_window, game_window_active, Process};
+
 #[cfg(target_os = "linux")]
 pub use linux::{event_loop_hook, is_forced_x11_failure, relaunch_on_wayland};
 

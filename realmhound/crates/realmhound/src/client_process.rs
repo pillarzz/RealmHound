@@ -45,6 +45,13 @@ pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
     windows_impl::process_creation_unix(pid)
 }
 
+/// Resolve the process that owns `conn`, distinguishing "no such connection"
+/// from a failure to query the OS.
+#[cfg(windows)]
+pub fn connection_process_id(conn: &ConnectionKey) -> Result<Option<u32>, String> {
+    windows_impl::owning_pid_checked(conn)
+}
+
 #[cfg(target_os = "macos")]
 pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
     let pid = macos_impl::owning_pid(conn)?;
@@ -589,7 +596,8 @@ mod windows_impl {
     use realmhound_core::stream::ConnectionKey;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_ESTAB,
+        TCP_TABLE_OWNER_PID_ALL,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
     use windows_sys::Win32::System::Threading::{
@@ -647,19 +655,89 @@ mod windows_impl {
     pub(super) fn owning_pid(conn: &ConnectionKey) -> Option<u32> {
         with_tcp_rows(|rows| {
             rows.iter()
-                // Match the full 4-tuple (local addr+port and remote addr+port)
-                // so that on multihomed/VPN hosts a different process sharing
-                // the same local port to the same remote via a different local
-                // address can't resolve to the wrong process.
-                .find(|row| {
-                    decode_port(row.dwLocalPort) == conn.client_port
-                        && decode_addr(row.dwLocalAddr) == conn.client_ip
-                        && decode_port(row.dwRemotePort) == conn.server_port
-                        && decode_addr(row.dwRemoteAddr) == conn.server_ip
-                })
+                .find(|row| matches_connection(row, conn))
                 .map(|row| row.dwOwningPid)
         })
         .flatten()
+    }
+
+    fn matches_connection(row: &MIB_TCPROW_OWNER_PID, conn: &ConnectionKey) -> bool {
+        // Match the full 4-tuple (local addr+port and remote addr+port) so that
+        // on multihomed/VPN hosts a different process sharing the same local
+        // port to the same remote via a different local address can't resolve
+        // to the wrong process.
+        decode_port(row.dwLocalPort) == conn.client_port
+            && decode_addr(row.dwLocalAddr) == conn.client_ip
+            && decode_port(row.dwRemotePort) == conn.server_port
+            && decode_addr(row.dwRemoteAddr) == conn.server_ip
+    }
+
+    /// Resolve the single established owner of `conn`.
+    ///
+    /// Returns `Ok(None)` when no process owns it (the connection closed), and
+    /// an error when the OS query fails or more than one process claims it.
+    pub(super) fn owning_pid_checked(conn: &ConnectionKey) -> Result<Option<u32>, String> {
+        with_tcp_rows(|rows| {
+            let mut pids = rows
+                .iter()
+                .filter(|row| {
+                    row.dwState == MIB_TCP_STATE_ESTAB as u32
+                        && row.dwOwningPid != 0
+                        && matches_connection(row, conn)
+                })
+                .map(|row| row.dwOwningPid);
+            let first = pids.next();
+            if pids.any(|pid| Some(pid) != first) {
+                Err(
+                    "Multiple processes own the tracked connection; overlay remains hidden."
+                        .to_string(),
+                )
+            } else {
+                Ok(first)
+            }
+        })
+        .ok_or_else(|| "Windows could not query TCP connection owners.".to_string())?
+    }
+
+    #[cfg(test)]
+    mod overlay_tests {
+        use super::*;
+
+        #[test]
+        fn full_tuple_excludes_other_clients_and_local_interfaces() {
+            let conn = ConnectionKey::new([127, 0, 0, 1].into(), 40000, [1, 2, 3, 4].into(), 2050);
+            let mut row = MIB_TCPROW_OWNER_PID {
+                dwState: MIB_TCP_STATE_ESTAB as u32,
+                dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
+                dwLocalPort: 40000_u16.to_be() as u32,
+                dwRemoteAddr: u32::from_ne_bytes([1, 2, 3, 4]),
+                dwRemotePort: 2050_u16.to_be() as u32,
+                dwOwningPid: 123,
+            };
+            assert!(matches_connection(&row, &conn));
+            row.dwLocalPort = 40001_u16.to_be() as u32;
+            assert!(!matches_connection(&row, &conn));
+            row.dwLocalPort = 40000_u16.to_be() as u32;
+            row.dwLocalAddr = u32::from_ne_bytes([127, 0, 0, 2]);
+            assert!(!matches_connection(&row, &conn));
+        }
+
+        #[test]
+        fn resolves_an_actual_established_socket_to_its_owner() {
+            use std::net::{TcpListener, TcpStream};
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let server = listener.local_addr().unwrap();
+            let client = TcpStream::connect(server).unwrap();
+            let (_accepted, _) = listener.accept().unwrap();
+            let local = client.local_addr().unwrap();
+            let conn = ConnectionKey::new(
+                [127, 0, 0, 1].into(),
+                local.port(),
+                [127, 0, 0, 1].into(),
+                server.port(),
+            );
+            assert_eq!(owning_pid_checked(&conn).unwrap(), Some(std::process::id()));
+        }
     }
 
     /// Earliest process creation time (Unix seconds) among all processes that

@@ -154,7 +154,12 @@ fn main() -> Result<()> {
         // alone, so the overlay child windows can only be see-through if this one
         // asks for transparency too. The main window still looks opaque because
         // its panels paint a solid background over the whole client area.
-        .with_transparent(true)
+        //
+        // Windows is the exception: glutin still gives the context an 8-bit
+        // alpha buffer, but its WGL transparency probe reports false, so eframe
+        // logs an error and glutin strips the flag before the window exists.
+        // The platform layer applies DWM composition to each overlay instead.
+        .with_transparent(!cfg!(windows))
         .with_app_id("realmhound")
         .with_icon(window_icon());
 

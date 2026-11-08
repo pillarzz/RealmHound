@@ -1168,6 +1168,7 @@ impl Worker {
     /// fields only when their generation changed. Returns whether the scalar
     /// view state changed (so the caller can request a repaint).
     fn publish_snapshot(&mut self) -> bool {
+        let started = Instant::now();
         let view = self.processor.view_state();
         let char_gen = view.char_view_gen;
         let account_gen = view.account_generation;
@@ -1191,10 +1192,13 @@ impl Worker {
         let live_events_changed = live_event_rev != self.pub_live_event_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
+        let lock_started = Instant::now();
         let previous = match self.snapshot.lock() {
             Ok(guard) => guard.clone(),
             Err(_) => return false,
         };
+        self.health
+            .record_snapshot_lock_wait(lock_started.elapsed());
 
         // Heavy clones happen outside the lock; unchanged domains reuse their Arc.
         let account_data = account_changed.then(|| Arc::new(self.processor.account_data().clone()));
@@ -1222,10 +1226,14 @@ impl Worker {
             quests,
             live_events,
         );
+        let lock_started = Instant::now();
         let replaced = match self.snapshot.lock() {
             Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
             Err(_) => return false,
         };
+        self.health
+            .record_snapshot_lock_wait(lock_started.elapsed());
+        self.health.record_snapshot_publish(started.elapsed());
         drop(replaced);
 
         self.pub_char_gen = char_gen;

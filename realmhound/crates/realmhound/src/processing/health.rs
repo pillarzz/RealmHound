@@ -72,6 +72,10 @@ pub struct HealthSnapshot {
     pub audio_stale_drops: u64,
     /// Cumulative audio channel-full drops.
     pub audio_full_drops: u64,
+    /// Peak worker snapshot-publish duration within the window.
+    pub peak_snapshot_publish: Duration,
+    /// Peak worker snapshot-lock wait within the window.
+    pub peak_snapshot_lock_wait: Duration,
     /// Current capture source state.
     pub capture: CaptureState,
     /// Cumulative persistence failures observed by the app/worker.
@@ -90,6 +94,8 @@ pub struct HealthCounters {
     live_window_evictions: AtomicU64,
     audio_stale_drops: AtomicU64,
     audio_full_drops: AtomicU64,
+    snapshot_publish_us: AtomicU64,
+    snapshot_lock_wait_us: AtomicU64,
     capture: AtomicU8,
     persistence_failures: AtomicU64,
     last_persistence_error: Mutex<Option<String>>,
@@ -106,6 +112,8 @@ impl Default for HealthCounters {
             live_window_evictions: AtomicU64::new(0),
             audio_stale_drops: AtomicU64::new(0),
             audio_full_drops: AtomicU64::new(0),
+            snapshot_publish_us: AtomicU64::new(0),
+            snapshot_lock_wait_us: AtomicU64::new(0),
             capture: AtomicU8::new(CaptureState::Stopped as u8),
             persistence_failures: AtomicU64::new(0),
             last_persistence_error: Mutex::new(None),
@@ -155,6 +163,23 @@ impl HealthCounters {
         self.audio_full_drops.store(full, Ordering::Relaxed);
     }
 
+    /// Raise the window peak worker snapshot-publish duration.
+    pub fn record_snapshot_publish(&self, took: Duration) {
+        self.snapshot_publish_us
+            .fetch_max(took.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Raise the window peak worker snapshot-lock wait.
+    pub fn record_snapshot_lock_wait(&self, wait: Duration) {
+        self.snapshot_lock_wait_us
+            .fetch_max(wait.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn reset_snapshot_peaks(&self) {
+        self.snapshot_publish_us.store(0, Ordering::Relaxed);
+        self.snapshot_lock_wait_us.store(0, Ordering::Relaxed);
+    }
+
     /// Update the observed capture source state.
     pub fn set_capture_state(&self, state: CaptureState) {
         self.capture.store(state as u8, Ordering::Relaxed);
@@ -173,6 +198,12 @@ impl HealthCounters {
             live_window_evictions: self.live_window_evictions.load(Ordering::Relaxed),
             audio_stale_drops: self.audio_stale_drops.load(Ordering::Relaxed),
             audio_full_drops: self.audio_full_drops.load(Ordering::Relaxed),
+            peak_snapshot_publish: Duration::from_micros(
+                self.snapshot_publish_us.load(Ordering::Relaxed),
+            ),
+            peak_snapshot_lock_wait: Duration::from_micros(
+                self.snapshot_lock_wait_us.load(Ordering::Relaxed),
+            ),
             capture: CaptureState::from_u8(self.capture.load(Ordering::Relaxed)),
             persistence_failures: self.persistence_failures.load(Ordering::Relaxed),
             last_persistence_error: self
@@ -207,6 +238,10 @@ pub struct HealthSummary {
     pub audio_stale_drops: u64,
     /// Cumulative audio channel-full drops at window end.
     pub audio_full_drops: u64,
+    /// Peak worker snapshot-publish duration in the window.
+    pub peak_snapshot_publish: Duration,
+    /// Peak worker snapshot-lock wait in the window.
+    pub peak_snapshot_lock_wait: Duration,
     /// Capture state at window end.
     pub capture: CaptureState,
     /// Cumulative persistence failures at window end.
@@ -225,7 +260,8 @@ impl HealthSummary {
         if backlog && self.peak_frame_gap >= STALL_WARN_GAP {
             tracing::warn!(
                 "[HEALTH][UI] window_ms={} frames={} drained_updates={} capped_frames={} \
-                 peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} live_window_evictions={} \
+                 peak_frame_gap_ms={} peak_publish_ms={} peak_lock_wait_ms={} \
+                 peak_queue_depth={} queue_drops={} live_window_evictions={} \
                  audio_stale_drops={} audio_full_drops={} capture={} persistence_failures={} \
                  active_tab={} viewport_focused={} viewport_minimized={}",
                 self.window.as_millis(),
@@ -233,6 +269,8 @@ impl HealthSummary {
                 self.drained_updates,
                 self.capped_drain_frames,
                 self.peak_frame_gap.as_millis(),
+                self.peak_snapshot_publish.as_millis(),
+                self.peak_snapshot_lock_wait.as_millis(),
                 self.peak_queue_depth,
                 self.queue_drops_delta,
                 self.live_window_evictions,
@@ -247,7 +285,8 @@ impl HealthSummary {
         } else {
             tracing::info!(
                 "[HEALTH][UI] window_ms={} frames={} drained_updates={} capped_frames={} \
-                 peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} live_window_evictions={} \
+                 peak_frame_gap_ms={} peak_publish_ms={} peak_lock_wait_ms={} \
+                 peak_queue_depth={} queue_drops={} live_window_evictions={} \
                  audio_stale_drops={} audio_full_drops={} capture={} persistence_failures={} \
                  active_tab={} viewport_focused={} viewport_minimized={}",
                 self.window.as_millis(),
@@ -255,6 +294,8 @@ impl HealthSummary {
                 self.drained_updates,
                 self.capped_drain_frames,
                 self.peak_frame_gap.as_millis(),
+                self.peak_snapshot_publish.as_millis(),
+                self.peak_snapshot_lock_wait.as_millis(),
                 self.peak_queue_depth,
                 self.queue_drops_delta,
                 self.live_window_evictions,
@@ -354,6 +395,8 @@ impl HealthMonitor {
             live_window_evictions: counters.live_window_evictions,
             audio_stale_drops: counters.audio_stale_drops,
             audio_full_drops: counters.audio_full_drops,
+            peak_snapshot_publish: counters.peak_snapshot_publish,
+            peak_snapshot_lock_wait: counters.peak_snapshot_lock_wait,
             capture: counters.capture,
             persistence_failures: counters.persistence_failures,
         });
@@ -364,6 +407,7 @@ impl HealthMonitor {
         self.window_peak_gap = Duration::ZERO;
         self.window_peak_queue = 0;
         self.window_drops_start = queue_drops;
+        self.counters.reset_snapshot_peaks();
         summary
     }
 }
@@ -428,6 +472,17 @@ mod tests {
             snapshot.last_persistence_error.as_deref(),
             Some("account save failed")
         );
+    }
+
+    #[test]
+    fn snapshot_peaks_keep_the_window_maximum() {
+        let counters = HealthCounters::new();
+        counters.record_snapshot_publish(Duration::from_millis(4));
+        counters.record_snapshot_publish(Duration::from_millis(2));
+        counters.record_snapshot_lock_wait(Duration::from_micros(750));
+        let snapshot = counters.snapshot(0, 0);
+        assert_eq!(snapshot.peak_snapshot_publish, Duration::from_millis(4));
+        assert_eq!(snapshot.peak_snapshot_lock_wait, Duration::from_micros(750));
     }
 
     #[test]

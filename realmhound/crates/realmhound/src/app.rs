@@ -10036,6 +10036,11 @@ impl RealmHoundApp {
                     health.audio_stale_drops, health.audio_full_drops
                 ));
                 ui.label(format!(
+                    "Peak snapshot: {} ms publish, {} ms lock wait",
+                    health.peak_snapshot_publish.as_millis(),
+                    health.peak_snapshot_lock_wait.as_millis()
+                ));
+                ui.label(format!(
                     "Drain frames: {} ({} capped), {} updates",
                     health.drain_frames, health.capped_drain_frames, health.drained_updates
                 ));

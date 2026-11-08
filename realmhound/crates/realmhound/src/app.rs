@@ -579,10 +579,11 @@ pub struct RealmHoundApp {
     missions_panel: crate::panels::missions::MissionsPanel,
     /// Captured access token from HELLO packet (for API calls)
     captured_access_token: Option<String>,
-    /// Time the current access token was captured (if known). Set to now on a
-    /// fresh live capture; loaded from disk otherwise so a deferred persist keeps
-    /// the real capture time.
+    /// Time the current access token was captured (if known), from the worker's
+    /// snapshot so a stalled UI cannot renew it.
     token_captured_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Last applied token generation.
+    owned_token_gen: u64,
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
@@ -1108,6 +1109,7 @@ impl RealmHoundApp {
             missions_panel,
             captured_access_token,
             token_captured_at,
+            owned_token_gen: 0,
             worker,
             active_tab_signal,
             health,
@@ -1708,24 +1710,9 @@ impl RealmHoundApp {
             } => {
                 self.vault_panel.set_active_pet(char_id, instance_id);
             }
-            UiPayload::AccessTokenCaptured(token) => {
-                // Note: we deliberately do NOT mark the client as "seen" here.
-                // A HELLO can come from a mule/alt client, whereas the safety
-                // gate is per-account; only the verified main's live
-                // character (stamped in refresh_snapshot) may unlock refresh.
-                // Only a changed token counts as a fresh capture; a repeated HELLO
-                // with the same (aging) token must not renew its lifetime.
-                let token_changed = self.captured_access_token.as_deref() != Some(token.as_str());
-                self.captured_access_token = Some(token.clone());
-                if token_changed {
-                    self.token_captured_at = Some(chrono::Utc::now());
-                    self.characters_panel.reset_on_new_token();
-                    self.vault_panel.reset_on_new_token();
-                }
-
-                // The worker releases tokens only for the verified connection.
-                // They stay in this process and are never persisted; the worker
-                // also owns the one-shot exalt fetch.
+            UiPayload::AccessTokenCaptured(_) => {
+                // Token value, capture time and binding come from the snapshot;
+                // this update is only the wake hint. Tokens are never persisted.
             }
             UiPayload::Audio(cmd) => {
                 // The worker routes audio directly to the audio thread, so this
@@ -1780,6 +1767,14 @@ impl RealmHoundApp {
         if snap.view.mission_view_gen != self.owned_mission_gen {
             self.mission_view = (*snap.mission_view).clone();
             self.owned_mission_gen = snap.view.mission_view_gen;
+        }
+        if snap.view.token_gen != self.owned_token_gen {
+            let token = snap.token.as_ref();
+            self.captured_access_token = token.map(|t| t.token.clone());
+            self.token_captured_at = token.map(|t| t.captured_at);
+            self.characters_panel.reset_on_new_token();
+            self.vault_panel.reset_on_new_token();
+            self.owned_token_gen = snap.view.token_gen;
         }
         self.maybe_confirm_client_launch(conn_changed);
     }

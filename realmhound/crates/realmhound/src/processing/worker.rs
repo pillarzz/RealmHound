@@ -201,6 +201,7 @@ pub fn spawn(
         pub_vault_gen: u64::MAX,
         pub_view: None,
         pub_mission_gen: u64::MAX,
+        pub_token_gen: u64::MAX,
         #[cfg(feature = "latency-diagnostics")]
         latency: LatencyDiagnostics::default(),
     };
@@ -252,6 +253,7 @@ struct Worker {
     pub_vault_gen: u64,
     pub_view: Option<super::contract::ViewState>,
     pub_mission_gen: u64,
+    pub_token_gen: u64,
     #[cfg(feature = "latency-diagnostics")]
     latency: LatencyDiagnostics,
 }
@@ -1041,6 +1043,8 @@ impl Worker {
         let vault_changed = vault_gen != self.pub_vault_gen;
         let mission_gen = view.mission_view_gen;
         let mission_changed = mission_gen != self.pub_mission_gen;
+        let token_gen = view.token_gen;
+        let token_changed = token_gen != self.pub_token_gen;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
         let previous = match self.snapshot.lock() {
@@ -1052,6 +1056,9 @@ impl Worker {
         let account_data = account_changed.then(|| Arc::new(self.processor.account_data().clone()));
         let live_vault_data = vault_changed.then(|| Arc::new(self.processor.live_vault_data()));
         let mission_view = mission_changed.then(|| Arc::new(self.processor.mission_view()));
+        let token = token_changed
+            .then(|| self.processor.token_state().map(Arc::new))
+            .flatten();
         let next = previous.next(
             view.clone(),
             live_char_id,
@@ -1059,6 +1066,7 @@ impl Worker {
             account_data,
             live_vault_data,
             mission_view,
+            token,
         );
         let replaced = match self.snapshot.lock() {
             Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
@@ -1070,6 +1078,7 @@ impl Worker {
         self.pub_account_gen = account_gen;
         self.pub_vault_gen = vault_gen;
         self.pub_mission_gen = mission_gen;
+        self.pub_token_gen = token_gen;
         self.pub_view = Some(view);
         view_changed
     }

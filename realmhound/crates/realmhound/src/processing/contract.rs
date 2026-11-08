@@ -27,6 +27,7 @@ use realmhound_core::{
 use crate::panels::chat::ChatMessage;
 use crate::processing::mission_tracker::MissionView;
 use crate::sound::{EventSound, SoundType};
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 #[cfg(feature = "latency-diagnostics")]
 use std::time::Instant;
@@ -432,6 +433,8 @@ pub struct ViewState {
     pub capture_queue_drops: u64,
     /// Generation of the mission tracker (bumps on any mission-state change).
     pub mission_view_gen: u64,
+    /// Generation of the released access token (bumps on a changed token).
+    pub token_gen: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -462,6 +465,7 @@ impl ViewState {
             capture_unsync_ms: 0,
             capture_queue_drops: 0,
             mission_view_gen: 0,
+            token_gen: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -472,6 +476,18 @@ impl ViewState {
 // ---------------------------------------------------------------------------
 // ModelSnapshot (worker -> UI shared latest-value model snapshot)
 // ---------------------------------------------------------------------------
+
+/// A released access token with its original capture time and account binding.
+/// Memory only: never persisted.
+#[derive(Debug, Clone)]
+pub struct TokenState {
+    /// The token value.
+    pub token: String,
+    /// When the token was captured from the client's HELLO.
+    pub captured_at: DateTime<Utc>,
+    /// The verified account the token belongs to.
+    pub account_id: AccountId,
+}
 
 /// The immutable identity of the one selected account for the process lifetime.
 ///
@@ -528,6 +544,8 @@ pub struct ModelSnapshot {
     pub main_connection: Option<realmhound_core::stream::ConnectionKey>,
     /// Latest seasonal mission tracklist snapshot.
     pub mission_view: Arc<MissionView>,
+    /// Released access token with capture time and account binding (memory only).
+    pub token: Option<Arc<TokenState>>,
 }
 
 impl ModelSnapshot {
@@ -547,6 +565,7 @@ impl ModelSnapshot {
             live_char_id,
             main_connection: None,
             mission_view: Arc::new(MissionView::default()),
+            token: None,
         }
     }
 
@@ -560,6 +579,7 @@ impl ModelSnapshot {
         account_data: Option<Arc<AccountData>>,
         live_vault_data: Option<Arc<LiveVaultData>>,
         mission_view: Option<Arc<MissionView>>,
+        token: Option<Arc<TokenState>>,
     ) -> Self {
         Self {
             selected_identity: self.selected_identity.clone(),
@@ -569,6 +589,7 @@ impl ModelSnapshot {
             live_char_id,
             main_connection,
             mission_view: mission_view.unwrap_or_else(|| self.mission_view.clone()),
+            token: token.or_else(|| self.token.clone()),
         }
     }
 }
@@ -603,6 +624,7 @@ mod tests {
             Some(Arc::new(changed)),
             None,
             None,
+            None,
         );
 
         assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
@@ -610,6 +632,35 @@ mod tests {
         assert!(!Arc::ptr_eq(&next.account_data, &old_account));
         assert_eq!(next.account_data.generation, 7);
         assert_eq!(old_account.generation, 0, "old snapshot is immutable");
+
+        let token = Arc::new(TokenState {
+            token: "tok".to_string(),
+            captured_at: Utc::now(),
+            account_id: identity("ACCT-SNAPSHOT").account_id().clone(),
+        });
+        let with_token = next.next(
+            ViewState::new(None, None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(token.clone()),
+        );
+        assert!(Arc::ptr_eq(with_token.token.as_ref().unwrap(), &token));
+        let reused = with_token.next(
+            ViewState::new(None, None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            Arc::ptr_eq(reused.token.as_ref().unwrap(), &token),
+            "None keeps the previous token"
+        );
     }
 
     #[test]

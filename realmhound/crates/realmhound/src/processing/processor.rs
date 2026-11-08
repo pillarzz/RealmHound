@@ -35,7 +35,8 @@ use crate::processing::mission_tracker::{MissionTracker, MissionView};
 use crate::sound::SoundType;
 
 use super::contract::{
-    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, UiPayload, UiUpdate, ViewState,
+    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, TokenState, UiPayload, UiUpdate,
+    ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
@@ -411,6 +412,10 @@ pub struct PacketProcessor {
     last_account_gen: u64,
     /// Last applied generation for seasonal-mission completions.
     last_mission_gen: u64,
+    /// Released access token with original capture time and account binding.
+    token: Option<TokenState>,
+    /// Bumps when `token` changes.
+    token_gen: u64,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -425,6 +430,7 @@ struct SelectedScope {
 struct PendingCredential {
     connection: ConnectionKey,
     token: String,
+    captured_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Boss-call taunts received within this window of entering a realm are treated
@@ -541,6 +547,8 @@ impl PacketProcessor {
             current_realm: None,
             recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
+            token: None,
+            token_gen: 0,
         }
     }
 
@@ -640,6 +648,8 @@ impl PacketProcessor {
             current_realm: None,
             recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
+            token: None,
+            token_gen: 0,
         })
     }
 
@@ -691,6 +701,8 @@ impl PacketProcessor {
             current_realm: None,
             recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
+            token: None,
+            token_gen: 0,
         }
     }
 
@@ -749,6 +761,7 @@ impl PacketProcessor {
             capture_unsync_ms: metrics.total_unsync_duration_ms(),
             capture_queue_drops: metrics.queue_drops,
             mission_view_gen: self.mission_tracker.generation(),
+            token_gen: self.token_gen,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -758,6 +771,11 @@ impl PacketProcessor {
     /// Build the current seasonal mission tracklist snapshot for the UI.
     pub fn mission_view(&self) -> MissionView {
         self.mission_tracker.build_view()
+    }
+
+    /// The released token with its capture time and account binding, if any.
+    pub fn token_state(&self) -> Option<TokenState> {
+        self.token.clone()
     }
 
     /// Advance elapsed mission cooldowns before publishing or applying packets.
@@ -796,6 +814,14 @@ impl PacketProcessor {
         );
         if bound_to_main {
             if let Some(cred) = self.pending_credential.take() {
+                if let Some(scope) = &self.selected_scope {
+                    self.token = Some(TokenState {
+                        token: cred.token.clone(),
+                        captured_at: cred.captured_at,
+                        account_id: scope.account_id.clone(),
+                    });
+                    self.token_gen = self.token_gen.wrapping_add(1);
+                }
                 self.emit(UiPayload::AccessTokenCaptured(cred.token));
             }
         }
@@ -1816,6 +1842,7 @@ impl PacketProcessor {
                                         self.pending_credential = Some(PendingCredential {
                                             connection: conn_key,
                                             token: hello.access_token.clone(),
+                                            captured_at: chrono::Utc::now(),
                                         });
                                     }
                                     if self.session.connection.is_account_verified() {
@@ -1837,6 +1864,7 @@ impl PacketProcessor {
                                         self.pending_credential = Some(PendingCredential {
                                             connection: conn_key,
                                             token: hello.access_token.clone(),
+                                            captured_at: chrono::Utc::now(),
                                         });
                                         if self.session.connection.is_account_verified() {
                                             self.release_pending_credential();
@@ -5170,6 +5198,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "tok".into(),
+            captured_at: chrono::Utc::now(),
         });
         for _ in 0..PENDING_EVENT_CAP {
             p.dispatch_event(map_changed("Buffered"));
@@ -5207,6 +5236,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "tok".into(),
+            captured_at: chrono::Utc::now(),
         });
         p.dispatch_event(map_changed("Buffered"));
 
@@ -5245,6 +5275,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "mule-tok".into(),
+            captured_at: chrono::Utc::now(),
         });
 
         p.dispatch_event(identity_update(1, "MULE999", "MuleToon"));
@@ -5266,6 +5297,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "main-tok".into(),
+            captured_at: chrono::Utc::now(),
         });
 
         p.dispatch_event(map_changed("Nexus"));
@@ -5277,6 +5309,26 @@ mod isolation_gate_tests {
         p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
         assert_eq!(access_tokens(&p), vec!["main-tok".to_string()]);
         assert!(p.pending_credential.is_none());
+    }
+
+    #[test]
+    fn released_token_preserves_capture_time_and_binding() {
+        let mut p = tentative_with_saved_main("MAIN123");
+        p.set_selected_scope(AccountKey::generate(), AccountId::new("MAIN123").unwrap());
+        let captured_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        p.pending_credential = Some(PendingCredential {
+            connection: main_conn(),
+            token: "main-tok".into(),
+            captured_at,
+        });
+
+        p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
+
+        let token = p.token_state().expect("token released");
+        assert_eq!(token.token, "main-tok");
+        assert_eq!(token.captured_at, captured_at);
+        assert_eq!(token.account_id.as_str(), "MAIN123");
+        assert_eq!(p.view_state().token_gen, 1);
     }
 
     /// After a restart selecting a new main, an old (now-foreign) account that is

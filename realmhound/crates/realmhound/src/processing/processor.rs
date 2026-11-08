@@ -35,8 +35,8 @@ use crate::processing::mission_tracker::{MissionTracker, MissionView};
 use crate::sound::SoundType;
 
 use super::contract::{
-    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, TokenState, UiPayload, UiUpdate,
-    ViewState,
+    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, PartyMemberView, PartyView,
+    TokenState, UiPayload, UiUpdate, ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
@@ -416,6 +416,8 @@ pub struct PacketProcessor {
     token: Option<TokenState>,
     /// Bumps when `token` changes.
     token_gen: u64,
+    /// Authoritative party membership (watchlist/sightings stay UI-side).
+    party: PartyView,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -549,6 +551,7 @@ impl PacketProcessor {
             last_mission_gen: 0,
             token: None,
             token_gen: 0,
+            party: PartyView::default(),
         }
     }
 
@@ -650,6 +653,7 @@ impl PacketProcessor {
             last_mission_gen: 0,
             token: None,
             token_gen: 0,
+            party: PartyView::default(),
         })
     }
 
@@ -703,6 +707,7 @@ impl PacketProcessor {
             last_mission_gen: 0,
             token: None,
             token_gen: 0,
+            party: PartyView::default(),
         }
     }
 
@@ -762,6 +767,7 @@ impl PacketProcessor {
             capture_queue_drops: metrics.queue_drops,
             mission_view_gen: self.mission_tracker.generation(),
             token_gen: self.token_gen,
+            party_rev: self.party.rev,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -776,6 +782,73 @@ impl PacketProcessor {
     /// The released token with its capture time and account binding, if any.
     pub fn token_state(&self) -> Option<TokenState> {
         self.token.clone()
+    }
+
+    /// The authoritative party membership.
+    pub fn party_view(&self) -> PartyView {
+        self.party.clone()
+    }
+
+    fn bump_party(&mut self) {
+        self.party.rev = self.party.rev.wrapping_add(1);
+    }
+
+    fn set_party_members(
+        &mut self,
+        party_info: &realmhound_core::protocol::IncomingPartyMemberInfoPacket,
+    ) {
+        self.party.members = party_info
+            .party_players
+            .iter()
+            .map(|player| PartyMemberView {
+                player_id: player.id,
+                name: player.name.clone(),
+                is_leader: player.id == party_info.leader_id,
+            })
+            .collect();
+        self.bump_party();
+    }
+
+    fn add_party_member(&mut self, player_id: i16, name: &str) {
+        if self.party.members.iter().any(|member| member.name == name) {
+            return;
+        }
+        self.party.members.push(PartyMemberView {
+            player_id,
+            name: name.to_string(),
+            is_leader: false,
+        });
+        self.bump_party();
+    }
+
+    fn remove_party_member_by_id(&mut self, player_id: i16) {
+        let before = self.party.members.len();
+        self.party
+            .members
+            .retain(|member| member.player_id != player_id);
+        if self.party.members.len() != before {
+            self.bump_party();
+        }
+    }
+
+    fn remove_party_member_by_name(&mut self, name: &str) {
+        let before = self.party.members.len();
+        self.party.members.retain(|member| member.name != name);
+        if self.party.members.len() != before {
+            self.bump_party();
+        }
+    }
+
+    fn clear_party(&mut self) {
+        if !self.party.members.is_empty()
+            || self.party.is_local_leader
+            || self.party.local_player_name.is_some()
+        {
+            self.party.members.clear();
+            self.party.is_local_leader = false;
+            self.party.local_player_name = None;
+            self.bump_party();
+        }
     }
 
     /// Advance elapsed mission cooldowns before publishing or applying packets.
@@ -2293,6 +2366,7 @@ impl PacketProcessor {
                 // A rejected alt/mule may have tentatively populated the party
                 // panel before its identity was known; wipe it so a mule's party
                 // never lingers on the main's UI.
+                self.clear_party();
                 self.emit(UiPayload::PartyCleared);
             }
             AccountVerifyResult::Verified => {
@@ -2382,9 +2456,7 @@ impl PacketProcessor {
         match event {
             GameEvent::QuestsReceived(_)
             | GameEvent::RealmScoreChanged { .. }
-            | GameEvent::PartyMemberJoined(_)
             | GameEvent::PartyJoinRequestResponse(_)
-            | GameEvent::PartyActionReceived { .. }
             | GameEvent::PortalUsed { .. }
             | GameEvent::QuestRedeemAttempted { .. }
             | GameEvent::QuestRedeemResult { .. }
@@ -2393,7 +2465,20 @@ impl PacketProcessor {
             GameEvent::ActivePetChanged { instance_id } => {
                 self.apply_active_pet(instance_id);
             }
+            GameEvent::PartyMemberJoined(ref member) => {
+                self.add_party_member(member.player_id, &member.name);
+            }
+            GameEvent::PartyActionReceived {
+                player_id,
+                action_id,
+            } => {
+                // action 2 = Kicked, 6 = LeftParty
+                if action_id == 2 || action_id == 6 {
+                    self.remove_party_member_by_id(player_id);
+                }
+            }
             GameEvent::PartyListReceived(ref party_info) => {
+                self.set_party_members(party_info);
                 let local_name = self.session.connection.detected_account_name.clone();
                 let leader_name = party_info
                     .party_players
@@ -2404,6 +2489,9 @@ impl PacketProcessor {
                     (Some(me), Some(leader)) => me.eq_ignore_ascii_case(leader),
                     _ => false,
                 };
+                self.party.is_local_leader = is_leader;
+                self.party.local_player_name = local_name.clone();
+                self.bump_party();
                 self.emit(UiPayload::PartyLocalLeaderStatus(is_leader));
                 self.emit(UiPayload::PartyLocalPlayerName(local_name));
             }
@@ -3018,6 +3106,7 @@ impl PacketProcessor {
 
                 // Party leave messages.
                 if let Some(player_name) = text.text.strip_suffix(" has left the party") {
+                    self.remove_party_member_by_name(player_name);
                     self.emit(UiPayload::PartyMemberLeft(player_name.to_string()));
                 }
 
@@ -5309,6 +5398,75 @@ mod isolation_gate_tests {
         p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
         assert_eq!(access_tokens(&p), vec!["main-tok".to_string()]);
         assert!(p.pending_credential.is_none());
+    }
+
+    #[test]
+    fn party_view_tracks_join_leave_and_clear() {
+        use realmhound_core::protocol::data::PartyPlayerData;
+        use realmhound_core::protocol::{
+            IncomingPartyMemberInfoPacket, PartyMemberAddedPacket, TextPacket,
+        };
+
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(GameEvent::PartyListReceived(
+            IncomingPartyMemberInfoPacket {
+                party_id: 1,
+                leader_id: 10,
+                max_size: 6,
+                party_players: vec![
+                    PartyPlayerData {
+                        id: 10,
+                        name: "Leader".to_string(),
+                        object_id: 0,
+                        unknown: 0,
+                    },
+                    PartyPlayerData {
+                        id: 11,
+                        name: "Member".to_string(),
+                        object_id: 0,
+                        unknown: 0,
+                    },
+                ],
+                description: "Party".to_string(),
+            },
+        ));
+        let listed = p.party_view();
+        assert_eq!(listed.members.len(), 2);
+        assert!(listed
+            .members
+            .iter()
+            .find(|member| member.name == "Leader")
+            .is_some_and(|member| member.is_leader));
+
+        p.dispatch_event(GameEvent::PartyMemberJoined(PartyMemberAddedPacket {
+            player_id: 12,
+            name: "Joined".to_string(),
+            class_id: 0,
+            skin_id: 0,
+        }));
+        assert_eq!(p.party_view().members.len(), 3);
+
+        p.dispatch_event(GameEvent::PartyActionReceived {
+            player_id: 11,
+            action_id: 6,
+        });
+        assert_eq!(p.party_view().members.len(), 2);
+
+        p.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: "Joined".to_string(),
+            object_id: 0,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: String::new(),
+            text: "Joined has left the party".to_string(),
+            clean_text: String::new(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+        assert_eq!(p.party_view().members.len(), 1);
+
+        p.clear_party();
+        assert!(p.party_view().members.is_empty());
     }
 
     #[test]

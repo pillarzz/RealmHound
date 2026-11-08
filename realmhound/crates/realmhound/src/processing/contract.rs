@@ -435,6 +435,8 @@ pub struct ViewState {
     pub mission_view_gen: u64,
     /// Generation of the released access token (bumps on a changed token).
     pub token_gen: u64,
+    /// Generation of worker-owned party membership.
+    pub party_rev: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -466,6 +468,7 @@ impl ViewState {
             capture_queue_drops: 0,
             mission_view_gen: 0,
             token_gen: 0,
+            party_rev: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -476,6 +479,31 @@ impl ViewState {
 // ---------------------------------------------------------------------------
 // ModelSnapshot (worker -> UI shared latest-value model snapshot)
 // ---------------------------------------------------------------------------
+
+/// Worker-owned party membership. Watchlist status and world sightings stay in
+/// the UI panel; this is the authoritative member list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartyView {
+    /// Current members.
+    pub members: Vec<PartyMemberView>,
+    /// Whether the local player is the party leader.
+    pub is_local_leader: bool,
+    /// The local (main) player's name, if known.
+    pub local_player_name: Option<String>,
+    /// Bumps on every membership change.
+    pub rev: u64,
+}
+
+/// One party member as owned by the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartyMemberView {
+    /// Internal player id.
+    pub player_id: i16,
+    /// Player name.
+    pub name: String,
+    /// Whether this member is the party leader.
+    pub is_leader: bool,
+}
 
 /// A released access token with its original capture time and account binding.
 /// Memory only: never persisted.
@@ -546,6 +574,8 @@ pub struct ModelSnapshot {
     pub mission_view: Arc<MissionView>,
     /// Released access token with capture time and account binding (memory only).
     pub token: Option<Arc<TokenState>>,
+    /// Worker-owned party membership.
+    pub party: Arc<PartyView>,
 }
 
 impl ModelSnapshot {
@@ -566,6 +596,7 @@ impl ModelSnapshot {
             main_connection: None,
             mission_view: Arc::new(MissionView::default()),
             token: None,
+            party: Arc::new(PartyView::default()),
         }
     }
 
@@ -580,6 +611,7 @@ impl ModelSnapshot {
         live_vault_data: Option<Arc<LiveVaultData>>,
         mission_view: Option<Arc<MissionView>>,
         token: Option<Arc<TokenState>>,
+        party: Option<Arc<PartyView>>,
     ) -> Self {
         Self {
             selected_identity: self.selected_identity.clone(),
@@ -590,6 +622,7 @@ impl ModelSnapshot {
             main_connection,
             mission_view: mission_view.unwrap_or_else(|| self.mission_view.clone()),
             token: token.or_else(|| self.token.clone()),
+            party: party.unwrap_or_else(|| self.party.clone()),
         }
     }
 }
@@ -625,6 +658,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
@@ -646,10 +680,12 @@ mod tests {
             None,
             None,
             Some(token.clone()),
+            None,
         );
         assert!(Arc::ptr_eq(with_token.token.as_ref().unwrap(), &token));
         let reused = with_token.next(
             ViewState::new(None, None),
+            None,
             None,
             None,
             None,

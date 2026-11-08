@@ -584,6 +584,8 @@ pub struct RealmHoundApp {
     token_captured_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Last applied token generation.
     owned_token_gen: u64,
+    /// Last applied worker-owned party revision.
+    owned_party_rev: u64,
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
@@ -1110,6 +1112,7 @@ impl RealmHoundApp {
             captured_access_token,
             token_captured_at,
             owned_token_gen: 0,
+            owned_party_rev: 0,
             worker,
             active_tab_signal,
             health,
@@ -1775,6 +1778,10 @@ impl RealmHoundApp {
             self.characters_panel.reset_on_new_token();
             self.vault_panel.reset_on_new_token();
             self.owned_token_gen = snap.view.token_gen;
+        }
+        if snap.view.party_rev != self.owned_party_rev {
+            self.party_panel.apply_party_view(&snap.party);
+            self.owned_party_rev = snap.view.party_rev;
         }
         self.maybe_confirm_client_launch(conn_changed);
     }

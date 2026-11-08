@@ -333,6 +333,42 @@ impl PartyPanel {
         self.is_local_leader = false;
     }
 
+    /// Rebuild membership from the worker-owned snapshot, preserving watchlist
+    /// status and world sightings for members already known.
+    pub fn apply_party_view(&mut self, view: &crate::processing::contract::PartyView) {
+        let mut rebuilt = Vec::with_capacity(view.members.len());
+        for source in &view.members {
+            match self.members.iter().find(|m| m.name == source.name).cloned() {
+                Some(mut member) => {
+                    member.player_id = source.player_id;
+                    member.is_leader = source.is_leader;
+                    member.update_status(&self.watchlist);
+                    rebuilt.push(member);
+                }
+                None => {
+                    let mut member = PartyMember::with_player_id(
+                        source.player_id,
+                        source.name.clone(),
+                        &self.watchlist,
+                        source.is_leader,
+                    );
+                    self.apply_known_sighting(&mut member);
+                    rebuilt.push(member);
+                }
+            }
+        }
+        rebuilt.sort_by(|a, b| match (a.is_leader, b.is_leader) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        self.members = rebuilt;
+        self.is_local_leader = view.is_local_leader;
+        if view.local_player_name.is_some() {
+            self.local_player_name = view.local_player_name.clone();
+        }
+    }
+
     /// Returns whether the local player is the party leader.
     pub fn is_local_leader(&self) -> bool {
         self.is_local_leader
@@ -1005,5 +1041,41 @@ impl Panel for PartyPanel {
             }
             _ => vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processing::contract::{PartyMemberView, PartyView};
+
+    fn member(id: i16, name: &str, is_leader: bool) -> PartyMemberView {
+        PartyMemberView {
+            player_id: id,
+            name: name.to_string(),
+            is_leader,
+        }
+    }
+
+    #[test]
+    fn apply_party_view_rebuilds_membership() {
+        let mut panel = PartyPanel::default();
+        panel.apply_party_view(&PartyView {
+            members: vec![member(10, "Leader", true), member(11, "Member", false)],
+            is_local_leader: true,
+            local_player_name: Some("Me".to_string()),
+            rev: 1,
+        });
+        assert_eq!(panel.member_count(), 2);
+        assert!(panel.is_local_leader());
+
+        panel.apply_party_view(&PartyView {
+            members: vec![member(10, "Leader", true)],
+            is_local_leader: false,
+            local_player_name: None,
+            rev: 2,
+        });
+        assert_eq!(panel.member_count(), 1);
+        assert!(!panel.is_local_leader());
     }
 }

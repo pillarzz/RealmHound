@@ -202,6 +202,7 @@ pub fn spawn(
         pub_view: None,
         pub_mission_gen: u64::MAX,
         pub_token_gen: u64::MAX,
+        pub_party_rev: u64::MAX,
         #[cfg(feature = "latency-diagnostics")]
         latency: LatencyDiagnostics::default(),
     };
@@ -254,6 +255,7 @@ struct Worker {
     pub_view: Option<super::contract::ViewState>,
     pub_mission_gen: u64,
     pub_token_gen: u64,
+    pub_party_rev: u64,
     #[cfg(feature = "latency-diagnostics")]
     latency: LatencyDiagnostics,
 }
@@ -1045,6 +1047,8 @@ impl Worker {
         let mission_changed = mission_gen != self.pub_mission_gen;
         let token_gen = view.token_gen;
         let token_changed = token_gen != self.pub_token_gen;
+        let party_rev = view.party_rev;
+        let party_changed = party_rev != self.pub_party_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
         let previous = match self.snapshot.lock() {
@@ -1059,6 +1063,7 @@ impl Worker {
         let token = token_changed
             .then(|| self.processor.token_state().map(Arc::new))
             .flatten();
+        let party = party_changed.then(|| Arc::new(self.processor.party_view()));
         let next = previous.next(
             view.clone(),
             live_char_id,
@@ -1067,6 +1072,7 @@ impl Worker {
             live_vault_data,
             mission_view,
             token,
+            party,
         );
         let replaced = match self.snapshot.lock() {
             Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
@@ -1079,6 +1085,7 @@ impl Worker {
         self.pub_vault_gen = vault_gen;
         self.pub_mission_gen = mission_gen;
         self.pub_token_gen = token_gen;
+        self.pub_party_rev = party_rev;
         self.pub_view = Some(view);
         view_changed
     }

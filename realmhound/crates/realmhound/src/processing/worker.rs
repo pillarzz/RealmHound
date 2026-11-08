@@ -236,6 +236,7 @@ pub fn spawn(
         pub_token_gen: u64::MAX,
         pub_party_rev: u64::MAX,
         pub_encounter_rev: u64::MAX,
+        pub_quest_rev: u64::MAX,
         #[cfg(feature = "latency-diagnostics")]
         latency: LatencyDiagnostics::default(),
     };
@@ -292,6 +293,7 @@ struct Worker {
     pub_token_gen: u64,
     pub_party_rev: u64,
     pub_encounter_rev: u64,
+    pub_quest_rev: u64,
     #[cfg(feature = "latency-diagnostics")]
     latency: LatencyDiagnostics,
 }
@@ -1087,6 +1089,8 @@ impl Worker {
         let party_changed = party_rev != self.pub_party_rev;
         let encounter_rev = view.encounter_rev;
         let encounters_changed = encounter_rev != self.pub_encounter_rev;
+        let quest_rev = view.quest_rev;
+        let quests_changed = quest_rev != self.pub_quest_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
         let previous = match self.snapshot.lock() {
@@ -1103,6 +1107,9 @@ impl Worker {
             .flatten();
         let party = party_changed.then(|| Arc::new(self.processor.party_view()));
         let encounters = encounters_changed.then(|| Arc::new(self.processor.encounter_set()));
+        let quests = quests_changed
+            .then(|| self.processor.quest_view().map(Arc::new))
+            .flatten();
         let next = previous.next(
             view.clone(),
             live_char_id,
@@ -1113,6 +1120,7 @@ impl Worker {
             token,
             party,
             encounters,
+            quests,
         );
         let replaced = match self.snapshot.lock() {
             Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
@@ -1127,6 +1135,7 @@ impl Worker {
         self.pub_token_gen = token_gen;
         self.pub_party_rev = party_rev;
         self.pub_encounter_rev = encounter_rev;
+        self.pub_quest_rev = quest_rev;
         self.pub_view = Some(view);
         view_changed
     }

@@ -36,7 +36,7 @@ use crate::sound::SoundType;
 
 use super::contract::{
     AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, EncounterSet, EncounterView,
-    PartyMemberView, PartyView, TokenState, UiPayload, UiUpdate, ViewState,
+    PartyMemberView, PartyView, QuestView, TokenState, UiPayload, UiUpdate, ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
@@ -420,6 +420,12 @@ pub struct PacketProcessor {
     party: PartyView,
     /// Authoritative set of currently visible encounters.
     encounters: EncounterSet,
+    /// Latest quest fetch, including local redeem completions.
+    quests: Option<realmhound_core::protocol::QuestFetchResponsePacket>,
+    /// Bumps on quest fetch and redeem completion.
+    quest_rev: u64,
+    /// Quest most recently redeemed, awaiting its result.
+    pending_redeem_quest_id: Option<String>,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -555,6 +561,9 @@ impl PacketProcessor {
             token_gen: 0,
             party: PartyView::default(),
             encounters: EncounterSet::default(),
+            quests: None,
+            quest_rev: 0,
+            pending_redeem_quest_id: None,
         }
     }
 
@@ -658,6 +667,9 @@ impl PacketProcessor {
             token_gen: 0,
             party: PartyView::default(),
             encounters: EncounterSet::default(),
+            quests: None,
+            quest_rev: 0,
+            pending_redeem_quest_id: None,
         })
     }
 
@@ -713,6 +725,9 @@ impl PacketProcessor {
             token_gen: 0,
             party: PartyView::default(),
             encounters: EncounterSet::default(),
+            quests: None,
+            quest_rev: 0,
+            pending_redeem_quest_id: None,
         }
     }
 
@@ -774,6 +789,7 @@ impl PacketProcessor {
             token_gen: self.token_gen,
             party_rev: self.party.rev,
             encounter_rev: self.encounters.rev,
+            quest_rev: self.quest_rev,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -860,6 +876,14 @@ impl PacketProcessor {
     /// The authoritative current encounter set.
     pub fn encounter_set(&self) -> EncounterSet {
         self.encounters.clone()
+    }
+
+    /// The latest quest state, if a fetch has been seen.
+    pub fn quest_view(&self) -> Option<QuestView> {
+        self.quests.as_ref().map(|packet| QuestView {
+            packet: packet.clone(),
+            rev: self.quest_rev,
+        })
     }
 
     fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
@@ -2499,13 +2523,33 @@ impl PacketProcessor {
 
         // --- Phase 2: model-side orchestration ---
         match event {
-            GameEvent::QuestsReceived(_)
-            | GameEvent::RealmScoreChanged { .. }
+            GameEvent::RealmScoreChanged { .. }
             | GameEvent::PartyJoinRequestResponse(_)
             | GameEvent::PortalUsed { .. }
-            | GameEvent::QuestRedeemAttempted { .. }
-            | GameEvent::QuestRedeemResult { .. }
             | GameEvent::ReconnectReceived { .. } => {}
+
+            GameEvent::QuestsReceived(ref response) => {
+                self.quests = Some(response.clone());
+                self.pending_redeem_quest_id = None;
+                self.quest_rev = self.quest_rev.wrapping_add(1);
+            }
+            GameEvent::QuestRedeemAttempted { ref quest_id } => {
+                self.pending_redeem_quest_id = Some(quest_id.clone());
+            }
+            GameEvent::QuestRedeemResult { ok } => {
+                if ok {
+                    if let Some(quest_id) = self.pending_redeem_quest_id.take() {
+                        if let Some(quest) = self
+                            .quests
+                            .as_mut()
+                            .and_then(|packet| packet.quests.iter_mut().find(|q| q.id == quest_id))
+                        {
+                            quest.completed = true;
+                            self.quest_rev = self.quest_rev.wrapping_add(1);
+                        }
+                    }
+                }
+            }
 
             GameEvent::ActivePetChanged { instance_id } => {
                 self.apply_active_pet(instance_id);
@@ -5451,6 +5495,42 @@ mod isolation_gate_tests {
         p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
         assert_eq!(access_tokens(&p), vec!["main-tok".to_string()]);
         assert!(p.pending_credential.is_none());
+    }
+
+    #[test]
+    fn quest_view_tracks_fetch_and_redeem() {
+        use realmhound_core::protocol::data::QuestData;
+        use realmhound_core::protocol::QuestFetchResponsePacket;
+
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(GameEvent::QuestsReceived(QuestFetchResponsePacket {
+            quests: vec![QuestData {
+                id: "q1".to_string(),
+                name: "Quest".to_string(),
+                description: String::new(),
+                expiration: String::new(),
+                category: 0,
+                unknown_int: 0,
+                requirements: Vec::new(),
+                rewards: Vec::new(),
+                completed: false,
+                item_of_choice: false,
+                repeatable: false,
+            }],
+            next_refresh_price: 50,
+            unknown: 0,
+        }));
+        assert!(p.quest_view().is_some());
+        let rev = p.view_state().quest_rev;
+
+        p.dispatch_event(GameEvent::QuestRedeemAttempted {
+            quest_id: "q1".to_string(),
+        });
+        p.dispatch_event(GameEvent::QuestRedeemResult { ok: true });
+
+        let view = p.quest_view().expect("quests published");
+        assert!(view.packet.quests[0].completed);
+        assert!(view.rev > rev);
     }
 
     #[test]

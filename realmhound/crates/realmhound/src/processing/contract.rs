@@ -17,6 +17,7 @@ use realmhound_core::{
     api::{ClientSeasons, PlayerMissions},
     capture::PacketReceiver,
     loot::{LootBagType, ProcessedLootDrop},
+    protocol::QuestFetchResponsePacket,
     session::MainAccountStatus,
     settings::{CombatHistorySettings, LootTrackingSettings},
     stream::CaptureHealth,
@@ -439,6 +440,8 @@ pub struct ViewState {
     pub party_rev: u64,
     /// Generation of worker-owned current encounters.
     pub encounter_rev: u64,
+    /// Generation of worker-owned quest state.
+    pub quest_rev: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -472,6 +475,7 @@ impl ViewState {
             token_gen: 0,
             party_rev: 0,
             encounter_rev: 0,
+            quest_rev: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -525,6 +529,15 @@ pub struct EncounterSet {
     /// Current encounters.
     pub encounters: Vec<EncounterView>,
     /// Bumps on every set change.
+    pub rev: u64,
+}
+
+/// Worker-owned quest state: the last fetched quests plus local completion.
+#[derive(Debug, Clone)]
+pub struct QuestView {
+    /// Latest quest fetch response.
+    pub packet: QuestFetchResponsePacket,
+    /// Bumps on fetch and redeem completion.
     pub rev: u64,
 }
 
@@ -601,6 +614,8 @@ pub struct ModelSnapshot {
     pub party: Arc<PartyView>,
     /// Worker-owned current encounters.
     pub encounters: Arc<EncounterSet>,
+    /// Worker-owned quest state.
+    pub quests: Option<Arc<QuestView>>,
 }
 
 impl ModelSnapshot {
@@ -623,6 +638,7 @@ impl ModelSnapshot {
             token: None,
             party: Arc::new(PartyView::default()),
             encounters: Arc::new(EncounterSet::default()),
+            quests: None,
         }
     }
 
@@ -639,6 +655,7 @@ impl ModelSnapshot {
         token: Option<Arc<TokenState>>,
         party: Option<Arc<PartyView>>,
         encounters: Option<Arc<EncounterSet>>,
+        quests: Option<Arc<QuestView>>,
     ) -> Self {
         Self {
             selected_identity: self.selected_identity.clone(),
@@ -651,6 +668,7 @@ impl ModelSnapshot {
             token: token.or_else(|| self.token.clone()),
             party: party.unwrap_or_else(|| self.party.clone()),
             encounters: encounters.unwrap_or_else(|| self.encounters.clone()),
+            quests: quests.or_else(|| self.quests.clone()),
         }
     }
 }
@@ -688,6 +706,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
@@ -711,10 +730,12 @@ mod tests {
             Some(token.clone()),
             None,
             None,
+            None,
         );
         assert!(Arc::ptr_eq(with_token.token.as_ref().unwrap(), &token));
         let reused = with_token.next(
             ViewState::new(None, None),
+            None,
             None,
             None,
             None,

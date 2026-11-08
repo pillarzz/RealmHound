@@ -588,6 +588,8 @@ pub struct RealmHoundApp {
     owned_party_rev: u64,
     /// Last applied worker-owned encounter revision.
     owned_encounter_rev: u64,
+    /// Last applied worker-owned quest revision.
+    owned_quest_rev: u64,
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
@@ -1116,6 +1118,7 @@ impl RealmHoundApp {
             owned_token_gen: 0,
             owned_party_rev: 0,
             owned_encounter_rev: 0,
+            owned_quest_rev: 0,
             worker,
             active_tab_signal,
             health,
@@ -1789,6 +1792,12 @@ impl RealmHoundApp {
         if snap.view.encounter_rev != self.owned_encounter_rev {
             self.live_feed_panel.apply_encounter_view(&snap.encounters);
             self.owned_encounter_rev = snap.view.encounter_rev;
+        }
+        if snap.view.quest_rev != self.owned_quest_rev {
+            if let Some(quests) = &snap.quests {
+                self.quest_panel.update_quests(&quests.packet);
+            }
+            self.owned_quest_rev = snap.view.quest_rev;
         }
         self.maybe_confirm_client_launch(conn_changed);
     }

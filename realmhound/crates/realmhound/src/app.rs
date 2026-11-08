@@ -1701,6 +1701,9 @@ impl RealmHoundApp {
                 self.owned_live_event_rev = snap.view.live_event_rev;
             }
             if feed_new {
+                // Reconcile with the durable state last: the bounded history may
+                // have lost the transition that produced it.
+                self.live_feed_panel.apply_feed_current(&snap.feed.current);
                 self.owned_feed_rev = snap.view.feed_rev;
             }
         }

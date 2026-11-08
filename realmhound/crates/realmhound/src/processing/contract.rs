@@ -627,9 +627,54 @@ pub struct FeedContextEntry {
     pub event: FeedContextEvent,
 }
 
-/// Worker-owned Live Feed context (whole session).
+/// Authoritative current feed context, kept outside the bounded event history.
+#[derive(Debug, Clone, Default)]
+pub struct FeedCurrent {
+    /// Connected server display name.
+    pub server_name: Option<String>,
+    /// Current map context from the last transition.
+    pub location: Option<FeedLocation>,
+    /// Latest realm score.
+    pub realm_score: Option<i32>,
+    /// Whether the realm has closed.
+    pub realm_closed: bool,
+    /// Current character's seasonal flag.
+    pub is_seasonal: Option<bool>,
+    /// Latest dust amounts.
+    pub dust: Option<(realmhound_core::dust::DustAmounts, bool)>,
+    /// Current discovery lifecycle per object.
+    pub discoveries: Vec<DiscoveryState>,
+    /// Origin flags for the next callout, so an evicted transition cannot
+    /// leave them stale.
+    pub map_is_realm: bool,
+    pub left_from_realm: bool,
+    pub map_is_hub: bool,
+    pub left_from_hub: bool,
+}
+
+/// One tracked discovery object's durable state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryState {
+    pub object_id: i32,
+    pub object_type: i32,
+    pub present: bool,
+    pub defeated: bool,
+}
+
+/// Map context carried by [`FeedCurrent`].
+#[derive(Debug, Clone)]
+pub struct FeedLocation {
+    pub display_name: String,
+    pub realm_name: String,
+    pub current_realm_score: i32,
+    pub max_realm_score: i32,
+    pub is_dungeon: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FeedContext {
+    /// Current state, always available even when the history is evicted.
+    pub current: FeedCurrent,
     /// Updates oldest to newest (bounded).
     pub events: Vec<FeedContextEntry>,
     /// Highest sequence dropped from the front.

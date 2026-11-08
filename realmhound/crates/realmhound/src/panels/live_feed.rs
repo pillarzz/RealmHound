@@ -730,7 +730,7 @@ pub(crate) fn select_learned_mods(
 /// Realm entries reached from a hub are not hub maps: they report their own
 /// names (Meridian, Hearth, ...) plus a realm score, so a realm portal used in
 /// the Nexus never produces a Nexus marker.
-fn is_hub_map(display_name: &str) -> bool {
+pub(crate) fn is_hub_map(display_name: &str) -> bool {
     const HUB_MARKERS: &[&str] = &["nexus", "vault", "guildhall", "guild hall", "bazaar"];
     let name = display_name.trim().to_ascii_lowercase();
     HUB_MARKERS.iter().any(|hub| name.contains(hub))
@@ -2030,6 +2030,66 @@ impl LiveFeedPanel {
     // === End Realm Status Bar Methods ===
 
     /// Apply a realm-entity discovery to the feed.
+    /// Restore durable state that the bounded event history may have evicted.
+    pub fn apply_feed_current(&mut self, current: &crate::processing::contract::FeedCurrent) {
+        if let Some(server) = &current.server_name {
+            self.set_server_name(server.clone());
+        }
+        if let Some(location) = &current.location {
+            // Display fields only: the transition flags stay event-driven.
+            self.location_name = format_dungeon_name(&location.display_name);
+            self.realm_name = Some(location.realm_name.clone()).filter(|r| !r.is_empty());
+            self.map_is_realm = location.max_realm_score > 0;
+            self.currently_in_dungeon = location.is_dungeon;
+            self.realm_score = (location.max_realm_score > 0)
+                .then_some((location.current_realm_score, location.max_realm_score));
+        }
+        if let Some(score) = current.realm_score {
+            if let Some((_, max)) = self.realm_score {
+                self.realm_score = Some((score, max));
+            }
+        }
+        if current.realm_closed {
+            self.force_realm_closed_at(std::time::Instant::now());
+        }
+        if let Some((amounts, is_seasonal)) = &current.dust {
+            self.update_dust(amounts.clone(), *is_seasonal);
+        }
+        if let Some(is_seasonal) = current.is_seasonal {
+            self.set_seasonal(is_seasonal);
+        }
+        self.map_is_realm = current.map_is_realm;
+        self.left_from_realm = current.left_from_realm;
+        self.map_is_hub = current.map_is_hub;
+        self.left_from_hub = current.left_from_hub;
+        self.apply_discovery_state(&current.discoveries);
+    }
+
+    /// Reconcile discovery rows with the durable per-object state, so an
+    /// evicted lifecycle event cannot leave stale flags behind.
+    fn apply_discovery_state(&mut self, states: &[crate::processing::contract::DiscoveryState]) {
+        for entry in &mut self.entries {
+            let FeedEntry::BossCall(boss) = entry else {
+                continue;
+            };
+            let Some(discovery) = boss.discovery.as_mut() else {
+                continue;
+            };
+            let Some(object_id) = discovery.object_id else {
+                continue;
+            };
+            let Some(state) = states.iter().find(|state| state.object_id == object_id) else {
+                continue;
+            };
+            discovery.defeated = state.defeated;
+            if state.present {
+                discovery.absent_since = None;
+            } else if discovery.absent_since.is_none() {
+                discovery.absent_since = Some(std::time::Instant::now());
+            }
+        }
+    }
+
     /// Apply one authoritative context update from the worker snapshot.
     pub fn apply_context_event(
         &mut self,
@@ -2569,11 +2629,14 @@ impl LiveFeedPanel {
         // the join window can't belong to the portal we just entered (it lives
         // only 30s), so treat it as unknown. Without a real spawn anchor the
         // window is only estimated (e.g. joined via a party call).
+        // Freshness and the deadline use the entry time, not the repaint time, so
+        // recovering an old dungeon cannot mint a new join window.
+        let now = self.event_instant.unwrap_or_else(std::time::Instant::now);
         let fresh_spawn = self
             .pending_portal_spawn
-            .filter(|spawn| spawn.elapsed() < DUNGEON_JOIN_WINDOW);
+            .filter(|spawn| now.saturating_duration_since(*spawn) < DUNGEON_JOIN_WINDOW);
         let estimated = fresh_spawn.is_none();
-        let anchor = fresh_spawn.unwrap_or_else(std::time::Instant::now);
+        let anchor = fresh_spawn.unwrap_or(now);
         // Realm status is only called for dungeons entered through a portal from
         // a realm: a party-call join (estimated window) belongs to no realm of
         // its own, and a dungeon keyed open in the Nexus, inside another dungeon
@@ -2685,10 +2748,12 @@ impl LiveFeedPanel {
     /// any entry that has not already been frozen by the authoritative
     /// CombatManager freeze (e.g. non-groupable dungeons it does not track).
     fn deactivate_active_dungeons(&mut self) {
-        let now = std::time::Instant::now();
+        // Use the leave event's time, or a recovered run would count the time
+        // the window spent unpainted.
+        let now = self.event_instant.unwrap_or_else(std::time::Instant::now);
         for entry in self.entries.iter_mut() {
             if let FeedEntry::Dungeon(d) = entry {
-                d.deactivate();
+                d.expires_at = now;
                 if d.frozen_elapsed_ms.is_none() {
                     d.frozen_elapsed_ms = Some(now.duration_since(d.entered_at).as_millis() as i64);
                 }
@@ -6766,6 +6831,58 @@ mod tests {
         panel.apply_dungeon_freeze(11, 4_000);
         match panel.entries.front().unwrap() {
             FeedEntry::Dungeon(d) => assert_eq!(d.frozen_elapsed_ms, Some(4_000)),
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn feed_current_restores_the_map_context() {
+        use crate::processing::contract::{FeedCurrent, FeedLocation};
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_feed_current(&FeedCurrent {
+            server_name: Some("EUWest".to_string()),
+            location: Some(FeedLocation {
+                display_name: "Snake Pit".to_string(),
+                realm_name: "Medusa".to_string(),
+                current_realm_score: 40,
+                max_realm_score: 100,
+                is_dungeon: true,
+            }),
+            realm_score: Some(41),
+            realm_closed: false,
+            is_seasonal: Some(true),
+            dust: None,
+            discoveries: Vec::new(),
+            map_is_realm: false,
+            left_from_realm: false,
+            map_is_hub: false,
+            left_from_hub: false,
+        });
+        assert_eq!(panel.server_name.as_deref(), Some("EUWest"));
+        assert_eq!(panel.realm_name.as_deref(), Some("Medusa"));
+        assert_eq!(panel.realm_score, Some((41, 100)));
+        assert!(panel.currently_in_dungeon);
+    }
+
+    #[test]
+    fn recovered_dungeon_keeps_its_original_deadline() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView};
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_event(&LiveEventEntry {
+            seq: 1,
+            at: chrono::Utc::now() - chrono::Duration::seconds(60),
+            event: LiveEventView::Dungeon {
+                fp: 3,
+                display_name: "Snake Pit".to_string(),
+                modifiers: Vec::new(),
+                grade: None,
+            },
+        });
+        match panel.entries.front().unwrap() {
+            FeedEntry::Dungeon(entry) => assert!(
+                entry.remaining(std::time::Instant::now()).is_zero(),
+                "a dungeon recovered after its window must stay closed"
+            ),
             other => panic!("Expected Dungeon entry, got {:?}", other),
         }
     }

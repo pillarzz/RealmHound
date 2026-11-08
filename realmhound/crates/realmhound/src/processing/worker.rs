@@ -1157,6 +1157,7 @@ impl Worker {
                 *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
             ) as usize,
         );
+        let (left_from_realm, left_from_hub, score_percent) = self.processor.callout_origin();
         let Some((text, expires_at)) = build_auto_callout(
             &settings,
             self.processor.server_name(),
@@ -1165,6 +1166,9 @@ impl Worker {
             is_dungeon,
             current_realm_score,
             max_realm_score,
+            left_from_realm,
+            left_from_hub,
+            score_percent,
             modifiers,
             grade,
             &learned,
@@ -1368,6 +1372,9 @@ fn build_auto_callout(
     is_dungeon: bool,
     current_realm_score: i32,
     max_realm_score: i32,
+    left_from_realm: bool,
+    left_from_hub: bool,
+    score_percent: Option<i32>,
     modifiers: &[String],
     grade: &Option<String>,
     learned: &[String],
@@ -1376,27 +1383,27 @@ fn build_auto_callout(
     if !is_dungeon || !settings.live_feed.auto_clipboard_dungeon_calls {
         return None;
     }
+    let estimated = anchor.is_none();
     let score =
         (max_realm_score > 0).then(|| (current_realm_score * 100 / max_realm_score).clamp(0, 100));
     if score.is_some_and(|percent| percent >= 100) {
         return None;
     }
-    let origin = {
-        use realmhound_core::settings::LiveFeedSettings;
-        fn origin_status(live: &LiveFeedSettings, score: Option<i32>) -> Option<String> {
-            if let Some(status) = crate::panels::dungeon_callout::realm_status_suffix(
-                live.realm_status,
-                live.realm_status_threshold,
-                score,
-            ) {
-                return Some(status);
-            }
-            score
-                .is_none()
-                .then(|| live.nexus_marker.text().map(str::to_string))
-                .flatten()
-        }
-        origin_status(&settings.live_feed, score)
+    // Same origin rule as the panel: a realm is named only for a portal entry
+    // from a realm; a hub entry names the Nexus marker instead.
+    let origin_score = if estimated || !left_from_realm {
+        None
+    } else {
+        score_percent
+    };
+    let origin = match crate::panels::dungeon_callout::realm_status_suffix(
+        settings.live_feed.realm_status,
+        settings.live_feed.realm_status_threshold,
+        origin_score,
+    ) {
+        Some(status) => Some(status),
+        None if left_from_hub => settings.live_feed.nexus_marker.text().map(str::to_string),
+        None => None,
     };
     let params = crate::panels::dungeon_callout::DungeonCalloutParams {
         name_style: settings.live_feed.dungeon_name_style,
@@ -1502,6 +1509,9 @@ mod tests {
             true,
             50,
             100,
+            false,
+            false,
+            None,
             &[],
             &None,
             &[],
@@ -1522,6 +1532,9 @@ mod tests {
             true,
             0,
             0,
+            false,
+            false,
+            None,
             &[],
             &None,
             &[],
@@ -1538,6 +1551,9 @@ mod tests {
             false,
             0,
             0,
+            false,
+            false,
+            None,
             &[],
             &None,
             &[],

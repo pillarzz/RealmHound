@@ -55,6 +55,14 @@ pub struct RealmDiscovery {
 }
 
 impl RealmDiscovery {
+    /// Durable per-object state, published outside the bounded event history.
+    pub fn state(&self) -> Vec<(i32, i32, bool, bool)> {
+        self.objects
+            .iter()
+            .map(|(id, object)| (*id, object.object_type, object.present, object.defeated))
+            .collect()
+    }
+
     pub fn reset(&mut self, active: bool) -> DiscoveryEvent {
         *self = Self {
             active,

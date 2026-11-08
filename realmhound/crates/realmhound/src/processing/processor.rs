@@ -459,6 +459,11 @@ pub struct PacketProcessor {
     last_learned_fp: Option<i32>,
     portal_spawns: std::collections::HashMap<i32, std::time::Instant>,
     known_appearance: std::collections::HashMap<String, PartyAppearance>,
+    map_is_realm: bool,
+    left_from_realm: bool,
+    map_is_hub: bool,
+    left_from_hub: bool,
+    realm_score: Option<(i32, i32)>,
     /// Monotonic id for `live_events`.
     live_event_seq: u64,
     /// Number of events evicted from the bounded live-event window.
@@ -615,6 +620,11 @@ impl PacketProcessor {
             last_learned_fp: None,
             portal_spawns: std::collections::HashMap::new(),
             known_appearance: std::collections::HashMap::new(),
+            map_is_realm: false,
+            left_from_realm: false,
+            map_is_hub: false,
+            left_from_hub: false,
+            realm_score: None,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -734,6 +744,11 @@ impl PacketProcessor {
             last_learned_fp: None,
             portal_spawns: std::collections::HashMap::new(),
             known_appearance: std::collections::HashMap::new(),
+            map_is_realm: false,
+            left_from_realm: false,
+            map_is_hub: false,
+            left_from_hub: false,
+            realm_score: None,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -805,6 +820,11 @@ impl PacketProcessor {
             last_learned_fp: None,
             portal_spawns: std::collections::HashMap::new(),
             known_appearance: std::collections::HashMap::new(),
+            map_is_realm: false,
+            left_from_realm: false,
+            map_is_hub: false,
+            left_from_hub: false,
+            realm_score: None,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -1017,6 +1037,49 @@ impl PacketProcessor {
 
     /// Record an authoritative Live Feed context update.
     pub(crate) fn record_feed_event(&mut self, event: FeedContextEvent) {
+        match &event {
+            FeedContextEvent::ServerName(name) => {
+                self.feed.current.server_name = Some(name.clone());
+            }
+            FeedContextEvent::ServerCommand { server, .. } => {
+                self.feed.current.server_name = Some(server.clone());
+            }
+            FeedContextEvent::Location {
+                display_name,
+                realm_name,
+                current_realm_score,
+                max_realm_score,
+                is_dungeon,
+            } => {
+                self.feed.current.location = Some(super::contract::FeedLocation {
+                    display_name: display_name.clone(),
+                    realm_name: realm_name.clone(),
+                    current_realm_score: *current_realm_score,
+                    max_realm_score: *max_realm_score,
+                    is_dungeon: *is_dungeon,
+                });
+                self.feed.current.realm_closed = false;
+            }
+            FeedContextEvent::RealmScore(score) => {
+                self.feed.current.realm_score = Some(*score);
+            }
+            FeedContextEvent::RealmClosed => {
+                self.feed.current.realm_closed = true;
+            }
+            FeedContextEvent::DustUpdated {
+                amounts,
+                is_seasonal,
+            } => {
+                self.feed.current.dust = Some((amounts.clone(), *is_seasonal));
+            }
+            FeedContextEvent::Seasonal(is_seasonal) => {
+                self.feed.current.is_seasonal = Some(*is_seasonal);
+            }
+            FeedContextEvent::Discovery(_)
+            | FeedContextEvent::PortalSpawned { .. }
+            | FeedContextEvent::PortalUsed { .. }
+            | FeedContextEvent::DungeonTimerFrozen { .. } => {}
+        }
         // One monotonic sequence for both streams; callers merge by it.
         self.live_event_seq = self.live_event_seq.wrapping_add(1);
         self.feed.events.push(FeedContextEntry {
@@ -1038,6 +1101,23 @@ impl PacketProcessor {
     pub fn feed_context(&self) -> FeedContext {
         let mut feed = self.feed.clone();
         feed.learned_mod_sets = self.learned_mod_sets.clone();
+        feed.current.map_is_realm = self.map_is_realm;
+        feed.current.left_from_realm = self.left_from_realm;
+        feed.current.map_is_hub = self.map_is_hub;
+        feed.current.left_from_hub = self.left_from_hub;
+        feed.current.discoveries = self
+            .realm_discovery
+            .state()
+            .into_iter()
+            .map(
+                |(object_id, object_type, present, defeated)| super::contract::DiscoveryState {
+                    object_id,
+                    object_type,
+                    present,
+                    defeated,
+                },
+            )
+            .collect();
         feed
     }
 
@@ -1110,6 +1190,15 @@ impl PacketProcessor {
             tokens,
         );
         self.feed.rev = self.feed.rev.wrapping_add(1);
+    }
+
+    /// Origin inputs shared with the displayed dungeon callout:
+    /// `(left_from_realm, left_from_hub, realm_score_percent)`.
+    pub fn callout_origin(&self) -> (bool, bool, Option<i32>) {
+        let score = self
+            .realm_score
+            .map(|(current, max)| ((current * 100) / max.max(1)).clamp(0, 100));
+        (self.left_from_realm, self.left_from_hub, score)
     }
 
     /// Event-added modifier tokens learned for `dungeon`.
@@ -2806,12 +2895,8 @@ impl PacketProcessor {
             GameEvent::PortalUsed { object_id } => {
                 self.record_feed_event(FeedContextEvent::PortalUsed { object_id });
                 // Anchor to the portal's spawn, matching the displayed callout.
-                self.portal_anchor = Some(
-                    self.portal_spawns
-                        .get(&object_id)
-                        .copied()
-                        .unwrap_or_else(std::time::Instant::now),
-                );
+                // Unknown spawn stays unknown: never pretend `now` is the anchor.
+                self.portal_anchor = self.portal_spawns.get(&object_id).copied();
             }
             GameEvent::PartyJoinRequestResponse(_) | GameEvent::ReconnectReceived { .. } => {}
 
@@ -3173,6 +3258,16 @@ impl PacketProcessor {
                 ref dungeon_grade,
                 ..
             } => {
+                // Track the same origin flags the panel uses so the automatic
+                // callout resolves its origin from identical inputs.
+                let in_realm = max_realm_score > 0;
+                self.left_from_realm = self.map_is_realm;
+                self.left_from_hub = self.map_is_hub;
+                self.map_is_realm = in_realm;
+                self.map_is_hub = crate::panels::live_feed::is_hub_map(display_name);
+                if in_realm {
+                    self.realm_score = Some((current_realm_score, max_realm_score));
+                }
                 // The UI must see the same transition context the worker saw,
                 // even if it paints much later.
                 self.record_feed_event(FeedContextEvent::Location {
@@ -3193,6 +3288,8 @@ impl PacketProcessor {
                     self.portal_spawns.clear();
                     self.last_learned_fp = None;
                 }
+                // Portal observations belong to the map they were seen on.
+                self.portal_spawns.clear();
                 self.in_dungeon = is_dungeon;
                 if is_dungeon {
                     let key = crate::panels::live_feed::format_dungeon_name(display_name);
@@ -5116,6 +5213,57 @@ mod keyper_tests {
         assert_eq!(window.events.first().map(|entry| entry.seq), Some(1));
         assert_eq!(window.events.last().map(|entry| entry.seq), Some(250));
         assert_eq!(processor.live_event_evictions(), 0);
+    }
+
+    #[test]
+    fn callout_origin_tracks_the_last_transition() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        p.dispatch_event(GameEvent::MapChanged {
+            name: "Snake Pit".to_string(),
+            display_name: "Snake Pit".to_string(),
+            realm_name: "NexusPortal.Mesa".to_string(),
+            fp: 7,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: true,
+            dungeon_modifiers: Vec::new(),
+            dungeon_grade: None,
+        });
+        let (left_from_realm, left_from_hub, score) = p.callout_origin();
+        assert!(left_from_realm, "dungeon entered from a realm");
+        assert!(!left_from_hub);
+        assert_eq!(score, Some(0), "realm score is remembered from the realm");
+
+        // A hub entry names the Nexus instead.
+        p.dispatch_event(GameEvent::MapChanged {
+            name: "Nexus".to_string(),
+            display_name: "Nexus".to_string(),
+            realm_name: String::new(),
+            fp: 8,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: false,
+            dungeon_modifiers: Vec::new(),
+            dungeon_grade: None,
+        });
+        p.dispatch_event(GameEvent::MapChanged {
+            name: "Snake Pit".to_string(),
+            display_name: "Snake Pit".to_string(),
+            realm_name: String::new(),
+            fp: 9,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: true,
+            dungeon_modifiers: Vec::new(),
+            dungeon_grade: None,
+        });
+        let (left_from_realm, left_from_hub, _) = p.callout_origin();
+        assert!(!left_from_realm);
+        assert!(left_from_hub, "dungeon opened in a hub");
     }
 
     #[test]

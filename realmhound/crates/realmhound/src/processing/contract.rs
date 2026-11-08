@@ -553,6 +553,15 @@ pub enum LiveEventView {
         contributions: Vec<(i32, String)>,
         callout: String,
     },
+    Warning {
+        text: String,
+        severity: crate::panels::live_feed::WarningSeverity,
+        copyable: bool,
+    },
+    Dm {
+        sender: String,
+        text: String,
+    },
 }
 
 /// A sequenced Live Feed event.

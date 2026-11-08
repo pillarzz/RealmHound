@@ -1549,16 +1549,8 @@ impl RealmHoundApp {
                 }
                 self.process_actions(actions);
             }
-            UiPayload::Chat(msg) => {
-                if msg.chat_type == crate::panels::chat::ChatType::Whisper
-                    && !msg.is_outgoing
-                    && self.live_feed_panel.dm_display_enabled()
-                {
-                    if !msg.sender.is_empty() {
-                        self.live_feed_panel
-                            .push_dm(msg.sender.clone(), msg.text.clone());
-                    }
-                }
+            UiPayload::Chat(_) => {
+                // Chat is written worker-side; DMs come from the live-event window.
             }
             UiPayload::BossCall { .. } | UiPayload::KeyperEvent { .. } => {
                 // The worker's live-event window drives these feed entries.
@@ -1567,23 +1559,12 @@ impl RealmHoundApp {
                 self.live_feed_panel.apply_realm_discovery(event);
             }
             UiPayload::RealmClosed => {
-                use crate::panels::live_feed::WarningSeverity;
+                // The warning entry comes from the live-event window; only the
+                // realm score state is UI-local.
                 self.live_feed_panel.force_realm_closed();
-                self.live_feed_panel.push_warning(
-                    "Realm closed!".to_string(),
-                    WarningSeverity::Orange,
-                    false,
-                );
             }
             UiPayload::OryxLagWarning => {
-                use crate::panels::live_feed::WarningSeverity;
-                if self.live_feed_panel.is_in_dungeon() {
-                    self.live_feed_panel.push_warning(
-                        "Oryx lag incoming, careful!".to_string(),
-                        WarningSeverity::Red,
-                        true,
-                    );
-                }
+                // The worker's live-event window drives the warning entry.
             }
             UiPayload::SetServerName(name) => {
                 self.live_feed_panel.set_server_name(name);

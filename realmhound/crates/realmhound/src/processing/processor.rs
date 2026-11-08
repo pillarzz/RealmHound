@@ -431,6 +431,8 @@ pub struct PacketProcessor {
     live_events: LiveEventWindow,
     /// Monotonic id for `live_events`.
     live_event_seq: u64,
+    /// Whether the current map is a dungeon (for Oryx-lag warnings).
+    in_dungeon: bool,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -571,6 +573,7 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            in_dungeon: false,
         }
     }
 
@@ -679,6 +682,7 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            in_dungeon: false,
         })
     }
 
@@ -739,6 +743,7 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            in_dungeon: false,
         }
     }
 
@@ -1037,6 +1042,7 @@ impl PacketProcessor {
     /// Reset session + reassembler state for a fresh capture.
     pub fn on_capture_start(&mut self) {
         self.current_realm = None;
+        self.in_dungeon = false;
         let reset = self.realm_discovery.reset(false);
         self.emit_realm_discovery(reset);
         self.session.reset_for_capture();
@@ -1047,6 +1053,7 @@ impl PacketProcessor {
     /// Forget realm instances when capture stops.
     pub fn on_capture_stop(&mut self) {
         self.current_realm = None;
+        self.in_dungeon = false;
         let reset = self.realm_discovery.reset(false);
         self.emit_realm_discovery(reset);
     }
@@ -2912,6 +2919,7 @@ impl PacketProcessor {
                 // The Live Feed clears its own location state; the worker clears
                 // its authoritative encounter set here.
                 self.clear_encounters();
+                self.in_dungeon = is_dungeon;
                 // Remaining: notify loot tracker of new map.
                 self.loot_tracker.on_map_info(display_name, fp);
                 self.combat
@@ -3045,8 +3053,20 @@ impl PacketProcessor {
                 if text.name.contains("Oryx the Mad God") {
                     let raw = &text.text;
                     if raw.contains("s.oryx_closed_realm") {
+                        self.record_live_event(LiveEventView::Warning {
+                            text: "Realm closed!".to_string(),
+                            severity: crate::panels::live_feed::WarningSeverity::Orange,
+                            copyable: false,
+                        });
                         self.emit(UiPayload::RealmClosed);
                     } else if raw.contains("s.oryx_minions_failed") {
+                        if self.in_dungeon {
+                            self.record_live_event(LiveEventView::Warning {
+                                text: "Oryx lag incoming, careful!".to_string(),
+                                severity: crate::panels::live_feed::WarningSeverity::Red,
+                                copyable: true,
+                            });
+                        }
                         self.emit(UiPayload::OryxLagWarning);
                     }
                 }
@@ -3227,6 +3247,12 @@ impl PacketProcessor {
                                     }));
                                 }
                             }
+                        }
+                        if chat_msg.chat_type == ChatType::Whisper && !chat_msg.is_outgoing {
+                            self.record_live_event(LiveEventView::Dm {
+                                sender: chat_msg.sender.clone(),
+                                text: chat_msg.text.clone(),
+                            });
                         }
                         self.emit(UiPayload::Chat(chat_msg));
                     }
@@ -4756,6 +4782,46 @@ mod keyper_tests {
             other => panic!("expected a boss call, got {other:?}"),
         }
         assert_eq!(processor.view_state().live_event_rev, window.rev);
+    }
+
+    #[test]
+    fn live_event_window_records_warnings_and_dms() {
+        use realmhound_core::protocol::TextPacket;
+
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: "Oryx the Mad God".to_string(),
+            object_id: 0,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: String::new(),
+            text: "s.oryx_closed_realm".to_string(),
+            clean_text: String::new(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+        processor.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: "Sender".to_string(),
+            object_id: -1,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: "Me".to_string(),
+            text: "hello".to_string(),
+            clean_text: "hello".to_string(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+
+        let window = processor.live_event_window();
+        assert_eq!(window.events.len(), 2);
+        assert!(matches!(
+            window.events[0].event,
+            crate::processing::contract::LiveEventView::Warning { .. }
+        ));
+        assert!(matches!(
+            window.events[1].event,
+            crate::processing::contract::LiveEventView::Dm { .. }
+        ));
     }
 
     #[test]

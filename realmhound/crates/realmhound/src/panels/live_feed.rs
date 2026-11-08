@@ -2452,10 +2452,6 @@ impl LiveFeedPanel {
         }
     }
 
-    pub fn is_in_dungeon(&self) -> bool {
-        self.currently_in_dungeon
-    }
-
     /// Whether the DM-in-live-feed feature is enabled (mirrors setting).
     pub fn dm_display_enabled(&self) -> bool {
         self.show_dms
@@ -2772,6 +2768,18 @@ impl LiveFeedPanel {
                     callout,
                 } => {
                     self.push_area_unlock(title.clone(), contributions.clone(), callout.clone());
+                }
+                LiveEventView::Warning {
+                    text,
+                    severity,
+                    copyable,
+                } => {
+                    self.push_warning(text.clone(), *severity, *copyable);
+                }
+                LiveEventView::Dm { sender, text } => {
+                    if self.dm_display_enabled() {
+                        self.push_dm(sender.clone(), text.clone());
+                    }
                 }
             }
         }

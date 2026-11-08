@@ -893,6 +893,11 @@ impl PacketProcessor {
                 player_id: player.id,
                 name: player.name.clone(),
                 is_leader: player.id == party_info.leader_id,
+                class_id: None,
+                skin_id: 0,
+                tex1: 0,
+                tex2: 0,
+                guild: None,
             })
             .collect();
         self.bump_party();
@@ -906,6 +911,11 @@ impl PacketProcessor {
             player_id,
             name: name.to_string(),
             is_leader: false,
+            class_id: None,
+            skin_id: 0,
+            tex1: 0,
+            tex2: 0,
+            guild: None,
         });
         self.bump_party();
     }
@@ -992,6 +1002,58 @@ impl PacketProcessor {
     /// When the local player last took a portal (callout countdown anchor).
     pub fn portal_anchor(&self) -> Option<std::time::Instant> {
         self.portal_anchor
+    }
+
+    /// Copy world-update appearance onto the authoritative party members, so the
+    /// party panel never needs queued events for their skins or guild.
+    fn observe_party_appearance(
+        &mut self,
+        update: &realmhound_core::protocol::packets::UpdatePacket,
+    ) {
+        use realmhound_core::loot::class_ids;
+        use realmhound_core::protocol::data::StatType;
+
+        let mut changed = false;
+        for obj in &update.new_objects {
+            let class_id = obj.object_type as i32;
+            if !class_ids::is_player_class(class_id) {
+                continue;
+            }
+            let stat = |kind: StatType| obj.status.stats.iter().find(|s| s.stat_type == kind);
+            let Some(name) = stat(StatType::Name).and_then(|s| s.string_stat_value.clone()) else {
+                continue;
+            };
+            let Some(member) = self.party.members.iter_mut().find(|m| m.name == name) else {
+                continue;
+            };
+            let skin_id = stat(StatType::SkinId).map(|s| s.stat_value).unwrap_or(0);
+            let tex1 = stat(StatType::Texture1)
+                .map(|s| s.stat_value as u32)
+                .unwrap_or(0);
+            let tex2 = stat(StatType::Texture2)
+                .map(|s| s.stat_value as u32)
+                .unwrap_or(0);
+            let guild = stat(StatType::GuildName)
+                .and_then(|s| s.string_stat_value.clone())
+                .filter(|g| !g.is_empty());
+            let next = PartyMemberView {
+                player_id: member.player_id,
+                name: member.name.clone(),
+                is_leader: member.is_leader,
+                class_id: Some(class_id),
+                skin_id,
+                tex1,
+                tex2,
+                guild,
+            };
+            if *member != next {
+                *member = next;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump_party();
+        }
     }
 
     /// Record a dungeon entry's modifier set for learned event mods.
@@ -3510,6 +3572,7 @@ impl PacketProcessor {
                 }
             }
             GameEvent::UpdateReceived(ref update, time_ms) => {
+                self.observe_party_appearance(update);
                 // Player stats + loot tracker
                 if let Some(player_id) = self.session.player.object_id {
                     if let Some(obj) = update.find_object(player_id) {
@@ -5572,6 +5635,55 @@ mod isolation_gate_tests {
             },
             0,
         )
+    }
+
+    #[test]
+    fn party_member_cosmetics_come_from_world_updates() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.party
+            .members
+            .push(crate::processing::contract::PartyMemberView {
+                player_id: 5,
+                name: "Ally".to_string(),
+                is_leader: false,
+                class_id: None,
+                skin_id: 0,
+                tex1: 0,
+                tex2: 0,
+                guild: None,
+            });
+        let obj = ObjectData {
+            object_type: 768,
+            status: ObjectStatusData {
+                object_id: 1,
+                pos: WorldPosData { x: 0.0, y: 0.0 },
+                stats: vec![
+                    string_stat(StatType::Name, "Ally"),
+                    string_stat(StatType::GuildName, "Guild"),
+                    StatData {
+                        stat_type_id: 0,
+                        stat_type: StatType::SkinId,
+                        stat_value: 42,
+                        stat_value_two: 0,
+                        string_stat_value: None,
+                    },
+                ],
+            },
+        };
+        p.dispatch_event(GameEvent::UpdateReceived(
+            UpdatePacket {
+                pos: WorldPosData { x: 0.0, y: 0.0 },
+                level_type: 0,
+                tiles: Vec::new(),
+                new_objects: vec![obj],
+                drops: Vec::new(),
+            },
+            0,
+        ));
+        let member = &p.party_view().members[0];
+        assert_eq!(member.class_id, Some(768));
+        assert_eq!(member.skin_id, 42);
+        assert_eq!(member.guild.as_deref(), Some("Guild"));
     }
 
     fn map_changed(name: &str) -> GameEvent {

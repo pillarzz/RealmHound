@@ -228,6 +228,11 @@ impl PartyPanel {
                 Some(mut member) => {
                     member.player_id = source.player_id;
                     member.is_leader = source.is_leader;
+                    member.class_id = source.class_id;
+                    member.skin_id = source.skin_id;
+                    member.tex1 = source.tex1;
+                    member.tex2 = source.tex2;
+                    member.guild = source.guild.clone();
                     member.update_status(&self.watchlist);
                     rebuilt.push(member);
                 }
@@ -239,6 +244,11 @@ impl PartyPanel {
                         source.is_leader,
                     );
                     self.apply_known_sighting(&mut member);
+                    member.class_id = source.class_id;
+                    member.skin_id = source.skin_id;
+                    member.tex1 = source.tex1;
+                    member.tex2 = source.tex2;
+                    member.guild = source.guild.clone();
                     rebuilt.push(member);
                 }
             }
@@ -893,6 +903,11 @@ mod tests {
             player_id: id,
             name: name.to_string(),
             is_leader,
+            class_id: None,
+            skin_id: 0,
+            tex1: 0,
+            tex2: 0,
+            guild: None,
         }
     }
 

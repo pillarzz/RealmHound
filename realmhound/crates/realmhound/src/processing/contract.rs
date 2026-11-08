@@ -491,6 +491,16 @@ pub struct PartyMemberView {
     pub name: String,
     /// Whether this member is the party leader.
     pub is_leader: bool,
+    /// Player class id from the last world update.
+    pub class_id: Option<i32>,
+    /// Skin, texture and guild from the last world update.
+    pub skin_id: i32,
+    /// Texture 1.
+    pub tex1: u32,
+    /// Texture 2.
+    pub tex2: u32,
+    /// Guild name, if any.
+    pub guild: Option<String>,
 }
 
 /// An encounter currently visible in the world.

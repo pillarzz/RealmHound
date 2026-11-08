@@ -583,8 +583,6 @@ pub struct RealmHoundApp {
     /// fresh live capture; loaded from disk otherwise so a deferred persist keeps
     /// the real capture time.
     token_captured_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Whether we've already fetched exalt stats (only do once per app session)
-    exalts_fetched: bool,
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
@@ -1110,7 +1108,6 @@ impl RealmHoundApp {
             missions_panel,
             captured_access_token,
             token_captured_at,
-            exalts_fetched: false,
             worker,
             active_tab_signal,
             health,
@@ -1732,23 +1729,8 @@ impl RealmHoundApp {
                 }
 
                 // The worker releases tokens only for the verified connection.
-                // They stay in this process and are never persisted.
-
-                // Fetch exalt stats once per app session
-                if !self.exalts_fetched {
-                    self.exalts_fetched = true;
-                    let token_for_exalts = token.clone();
-                    std::thread::spawn(move || {
-                        tracing::debug!("[API] Fetching exalt stats...");
-                        let client = realmhound_core::api::RotmgApiClient::new(token_for_exalts);
-                        match client.get_power_up_stats() {
-                            Ok(xml) => {
-                                tracing::info!("[EXALTS] Loaded exalt stats ({} bytes)", xml.len())
-                            }
-                            Err(e) => tracing::warn!("[EXALTS] Failed to load: {}", e),
-                        }
-                    });
-                }
+                // They stay in this process and are never persisted; the worker
+                // also owns the one-shot exalt fetch.
             }
             UiPayload::Audio(cmd) => {
                 // The worker routes audio directly to the audio thread, so this

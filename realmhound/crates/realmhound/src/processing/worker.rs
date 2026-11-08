@@ -185,6 +185,7 @@ pub fn spawn(
         snapshot: snapshot.clone(),
         health: health.clone(),
         chat_log,
+        exalts_fetched: false,
         ctx,
         active_tab,
         account,
@@ -228,6 +229,8 @@ struct Worker {
     health: Arc<HealthCounters>,
     /// Worker-owned chat persistence (independent of UI frames).
     chat_log: ChatLogWriter,
+    /// One-shot exalt stats fetch, triggered by the first released token.
+    exalts_fetched: bool,
     ctx: egui::Context,
     /// Shared active-tab signal written by the UI thread; read to decide whether
     /// an update is worth waking the UI for (relevance-gated repaints).
@@ -522,6 +525,9 @@ impl Worker {
                                     self.health
                                         .record_persistence_failure(format!("chat log: {error}"));
                                 }
+                            }
+                            if let UiPayload::AccessTokenCaptured(token) = &payload {
+                                self.fetch_exalts_once(token);
                             }
                             if payload_relevant(&payload, active) {
                                 wake = true;
@@ -986,6 +992,23 @@ impl Worker {
             }
         }
         false
+    }
+
+    /// Fetch exalt stats once per worker session, off the UI drain path.
+    fn fetch_exalts_once(&mut self, token: &str) {
+        if self.exalts_fetched {
+            return;
+        }
+        self.exalts_fetched = true;
+        let token = token.to_string();
+        std::thread::spawn(move || {
+            tracing::debug!("[API] Fetching exalt stats...");
+            let client = realmhound_core::api::RotmgApiClient::new(token);
+            match client.get_power_up_stats() {
+                Ok(xml) => tracing::info!("[EXALTS] Loaded exalt stats ({} bytes)", xml.len()),
+                Err(error) => tracing::warn!("[EXALTS] Failed to load: {}", error),
+            }
+        });
     }
 
     /// Periodic account save, mirroring the App's prior 60s/dirty policy.

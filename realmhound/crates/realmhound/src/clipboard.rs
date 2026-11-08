@@ -73,17 +73,19 @@ unsafe fn text_while_open() -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+extern "system" {
+    /// Declared directly: windows-sys 0.52 does not export `GlobalFree`.
+    fn GlobalFree(hmem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
 /// Release a moveable block the clipboard did not take ownership of.
-///
-/// `GlobalFree` is not exported by windows-sys; a zero-length reallocation of a
-/// moveable block is the documented way to free it.
 ///
 /// # Safety
 /// `handle` must be a block from `GlobalAlloc` that nobody else owns.
 #[cfg(windows)]
 unsafe fn free_block(handle: *mut std::ffi::c_void) {
-    use windows_sys::Win32::System::Memory::{GlobalReAlloc, GMEM_MOVEABLE};
-    GlobalReAlloc(handle, 0, GMEM_MOVEABLE);
+    GlobalFree(handle);
 }
 
 /// Put `text` on the clipboard from a worker thread. Returns whether the write

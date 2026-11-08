@@ -3790,6 +3790,7 @@ impl PacketProcessor {
                             .map(|item| item.item_id)
                             .collect::<Vec<i32>>(),
                     );
+                    self.record_live_event(LiveEventView::Loot(drop.clone()));
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
                     // Shiny-loot notification keyed off the shiny item's own bag

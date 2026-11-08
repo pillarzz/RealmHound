@@ -536,7 +536,7 @@ pub struct EncounterSet {
 }
 
 /// One recoverable Live Feed event emitted by the worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum LiveEventView {
     BossCall {
         boss_id: i32,
@@ -562,10 +562,11 @@ pub enum LiveEventView {
         sender: String,
         text: String,
     },
+    Loot(ProcessedLootDrop),
 }
 
 /// A sequenced Live Feed event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LiveEventEntry {
     /// Monotonic event id used by the UI to recover only missed entries.
     pub seq: u64,
@@ -574,7 +575,7 @@ pub struct LiveEventEntry {
 }
 
 /// Bounded worker-owned window of recent recoverable Live Feed events.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct LiveEventWindow {
     /// Events oldest to newest.
     pub events: Vec<LiveEventEntry>,

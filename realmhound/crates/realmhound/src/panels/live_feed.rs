@@ -2781,6 +2781,9 @@ impl LiveFeedPanel {
                         self.push_dm(sender.clone(), text.clone());
                     }
                 }
+                LiveEventView::Loot(drop) => {
+                    self.push_loot(drop);
+                }
             }
         }
         if let Some(last) = window.events.last() {

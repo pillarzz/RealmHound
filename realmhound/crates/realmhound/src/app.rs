@@ -1579,9 +1579,9 @@ impl RealmHoundApp {
             UiPayload::CombatHistoryChanged => {
                 self.combat_panel.invalidate_cards();
             }
-            UiPayload::PushLoot(drop) => {
-                self.live_feed_panel.push_loot(&drop);
-                // A new drop was recorded by the worker; refresh the history view.
+            UiPayload::PushLoot(_) => {
+                // The worker's live-event window drives the feed entry; the loot
+                // history view still needs a refresh.
                 self.loot_panel.mark_history_dirty();
             }
             UiPayload::LootBatchAdded => {

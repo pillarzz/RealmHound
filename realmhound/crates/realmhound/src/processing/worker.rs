@@ -516,10 +516,13 @@ impl Worker {
                     #[cfg(feature = "latency-diagnostics")]
                     let wait_started = Instant::now();
                     let result = rx.recv_timeout(MAX_PACKETS_PER_BATCH, RECV_TIMEOUT);
+                    // Read the counter before borrowing self mutably below.
+                    #[cfg(feature = "latency-diagnostics")]
+                    let dropped_now = rx.dropped();
                     #[cfg(feature = "latency-diagnostics")]
                     {
                         wait_time += wait_started.elapsed();
-                        capture_queue_drops = self.capture_drops.observe(rx.dropped());
+                        capture_queue_drops = self.capture_drops.observe(dropped_now);
                     }
                     if result.closed {
                         tracing::warn!("[WORKER] capture source closed; awaiting restart");
@@ -528,7 +531,7 @@ impl Worker {
                         capture_closed = true;
                         #[cfg(feature = "latency-diagnostics")]
                         {
-                            capture_queue_drops = self.capture_drops.finish_source(rx.dropped());
+                            capture_queue_drops = self.capture_drops.finish_source(dropped_now);
                         }
                         self.receiver = None;
                     }

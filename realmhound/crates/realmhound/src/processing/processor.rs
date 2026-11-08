@@ -1517,6 +1517,11 @@ impl PacketProcessor {
         !self.updates.is_empty()
     }
 
+    /// Take loot insert failures since the last call for health reporting.
+    pub fn drain_loot_persistence_errors(&mut self) -> Vec<String> {
+        self.loot_tracker.drain_persistence_errors()
+    }
+
     /// Test-only: queue a chat update so worker-side persistence can be tested
     /// without crafting an encrypted chat packet.
     #[cfg(test)]

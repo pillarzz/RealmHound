@@ -611,6 +611,10 @@ impl Worker {
             #[cfg(feature = "latency-diagnostics")]
             let save_started = Instant::now();
             self.maybe_periodic_save();
+            for error in self.processor.drain_loot_persistence_errors() {
+                self.health
+                    .record_persistence_failure(format!("loot insert: {error}"));
+            }
             #[cfg(feature = "latency-diagnostics")]
             {
                 segments.save = save_started.elapsed();
@@ -635,6 +639,10 @@ impl Worker {
         // Shutdown: drain combat/loot, flush account data, close databases,
         // publish a final snapshot, then report the outcome.
         self.processor.final_drain();
+        for error in self.processor.drain_loot_persistence_errors() {
+            self.health
+                .record_persistence_failure(format!("loot insert: {error}"));
+        }
         let persistence = self.processor.save_account_on_exit();
         let db_close = self.processor.close_databases();
         let report = ShutdownReport::from_results(persistence, db_close);

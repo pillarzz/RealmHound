@@ -142,6 +142,9 @@ impl CaptureManager {
     /// but can also be called explicitly if needed.
     #[allow(dead_code)]
     pub fn mark_stopped(&mut self) {
+        if let Some(handle) = &self.capture_handle {
+            handle.stop();
+        }
         self.capturing = false;
         self.capture_handle = None;
         self.packet_rx = None;

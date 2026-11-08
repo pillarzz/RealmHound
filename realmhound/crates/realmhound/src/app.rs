@@ -26,6 +26,7 @@ use crate::panels::update::UpdatePanel;
 use crate::panels::vault::VaultPanel;
 use crate::panels::{ActiveTab, AppAction, Panel, PanelContext};
 use crate::processing::contract::relaunch_preflight;
+use crate::processing::health::CaptureState;
 use crate::processing::{
     spawn_worker, AccountOperationScope, AudioCommand, ControlMsg, HealthMonitor, PacketProcessor,
     UiPayload, UiUpdate, ViewState, WorkerHandle,
@@ -10106,7 +10107,7 @@ impl RealmHoundApp {
     }
 
     /// Render the status bar.
-    fn render_status_bar(&self, ui: &mut egui::Ui) {
+    fn render_status_bar(&mut self, ui: &mut egui::Ui) {
         let health = self
             .health
             .counters()
@@ -10255,6 +10256,17 @@ impl RealmHoundApp {
                     ))
                     .color(egui::Color32::from_rgb(255, 100, 100)),
                 );
+            }
+            if health.capture == CaptureState::Closed {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("[!] Capture stopped")
+                        .color(egui::Color32::from_rgb(255, 100, 100)),
+                );
+                if ui.button("Retry").clicked() {
+                    self.capture.mark_stopped();
+                    self.start_capture();
+                }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

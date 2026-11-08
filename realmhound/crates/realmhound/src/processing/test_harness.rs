@@ -148,6 +148,16 @@ mod tests {
         let health = harness.health();
         assert_eq!(health.drain_frames, 0, "no UI frames may be implied");
         assert_eq!(health.drained_updates, 0);
+
+        // Retry: attaching a fresh source must return the worker to Active.
+        let (retry_sender, retry_receiver) = packet_channel(8);
+        harness.start_capture(retry_receiver);
+        assert!(
+            harness.wait_for_capture(CaptureState::Active),
+            "worker did not attach the retried capture source"
+        );
+        drop(retry_sender);
+
         assert!(
             harness.shutdown().is_success(),
             "clean shutdown must still succeed"

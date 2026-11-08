@@ -328,7 +328,7 @@ impl ChatMessage {
 
             // Crystal callouts carry no resolvable boss_id, so synthesize the
             // Mysterious Crystal sprite + name. This routes them to the Live Feed
-            // (via PushBossCall) like other encounter callouts, instead of leaving
+            // like other encounter callouts, instead of leaving
             // them as a plain chat announcement.
             if is_crystal && boss_id.is_none() {
                 let asset_manager = get_asset_manager();
@@ -2056,38 +2056,6 @@ impl Panel for ChatPanel {
         } else {
             vec![]
         }
-    }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        if let realmhound_core::GameEvent::TextReceived(ref text) = event {
-            if let Some(mut chat_msg) = ChatMessage::from_text_packet(text) {
-                let mut actions = Vec::new();
-                if let Some(boss_id) = chat_msg.boss_id {
-                    // Encounter callouts are surfaced in the Live Feed only, not the chat list.
-                    actions.push(AppAction::PushBossCall {
-                        boss_id,
-                        text: chat_msg.text.clone(),
-                    });
-                    return actions;
-                }
-                // Whispers always involve the local player. Both directions render
-                // the full "sender → recipient: text"; we only tag outgoing whispers
-                // (sender == me) so click-to-filter targets the conversation partner.
-                if chat_msg.chat_type == ChatType::Whisper {
-                    if let Some(me) = session.connection.detected_account_name.as_deref() {
-                        if chat_msg.sender.eq_ignore_ascii_case(me) {
-                            chat_msg.is_outgoing = true;
-                        }
-                    }
-                }
-                return actions;
-            }
-        }
-        vec![]
     }
 }
 

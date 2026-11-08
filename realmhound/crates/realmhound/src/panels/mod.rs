@@ -1,8 +1,7 @@
 //! Panel trait and shared types for the tab-based UI.
 //!
 //! Provides a common interface for all tab panels, enabling standardized
-//! rendering, event handling, lifecycle hooks, and cross-panel communication
-//! via `AppAction`.
+//! rendering and cross-panel communication via `AppAction`.
 
 pub mod character_card;
 pub mod characters;
@@ -29,9 +28,7 @@ pub mod update;
 pub mod vault;
 
 use eframe::egui;
-use realmhound_core::{
-    combat::CombatDatabase, loot::LootDatabase, vault::AccountData, GameEvent, GameSession,
-};
+use realmhound_core::{combat::CombatDatabase, loot::LootDatabase, vault::AccountData};
 use std::collections::HashMap;
 
 use crate::rendering::SpriteRenderer;
@@ -197,7 +194,7 @@ impl ActiveTab {
 
 /// Actions that panels can request from the app.
 ///
-/// Panels return these from `show()` and `handle_event()` instead of directly
+/// Panels return these from `show()` instead of directly
 /// mutating app state. The app processes them in a single loop, keeping
 /// cross-panel wiring in one place.
 #[derive(Debug)]
@@ -233,8 +230,6 @@ pub enum AppAction {
     SaveLiveFeedFilterSettings(realmhound_core::settings::LiveFeedFilterSettings),
     /// Custom quick-clipboard buttons changed -- app should persist them.
     SaveQuickClipButtons(Vec<realmhound_core::settings::QuickClipButton>),
-    /// Push a boss call to the live feed.
-    PushBossCall { boss_id: i32, text: String },
     /// Character cache was modified -- app should sync and mark AccountData dirty.
     CharacterCacheChanged,
     /// UI-origin: set a custom label for a character (routed to the processor).
@@ -326,17 +321,8 @@ pub struct PanelContext<'a> {
 ///
 /// Each tab panel implements this trait so the app can:
 /// - Render panels through a uniform `show()` signature
-/// - Forward game events via `handle_event()`
 /// - Process cross-panel actions returned by panels
 pub trait Panel {
     /// Render the panel UI. Returns actions for the app to process.
     fn show(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) -> Vec<AppAction>;
-
-    /// Handle a game event. Returns actions for the app to process.
-    ///
-    /// Default implementation ignores all events. Override for events
-    /// the panel cares about.
-    fn handle_event(&mut self, _event: &GameEvent, _session: &GameSession) -> Vec<AppAction> {
-        Vec::new()
-    }
 }

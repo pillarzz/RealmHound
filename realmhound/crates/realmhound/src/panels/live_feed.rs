@@ -2392,7 +2392,8 @@ impl LiveFeedPanel {
     /// For every other boss, repeated callouts for the same boss in the
     /// same realm within `BOSS_CALL_DEDUP_WINDOW` are suppressed (one Live Feed
     /// entry, one sound).
-    pub fn push_boss_call(&mut self, boss_id: i32, boss_name: String) -> bool {
+    #[cfg(test)]
+    fn push_boss_call(&mut self, boss_id: i32, boss_name: String) -> bool {
         self.push_boss_call_with_origin(
             boss_id,
             boss_name,

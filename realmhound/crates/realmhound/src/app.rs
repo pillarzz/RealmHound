@@ -9884,9 +9884,6 @@ impl RealmHoundApp {
                         s.save();
                     }
                 }
-                AppAction::PushBossCall { boss_id, text } => {
-                    self.live_feed_panel.push_boss_call(boss_id, text);
-                }
                 AppAction::CharacterCacheChanged => {
                     // The processor owns the canonical character cache now; this
                     // action is retained for compatibility but is a no-op.

@@ -2073,15 +2073,6 @@ impl Panel for QuestPanel {
             (ctx.client_launch_unix > 0).then_some(ctx.client_launch_unix),
         )
     }
-
-    fn handle_event(
-        &mut self,
-        _event: &realmhound_core::GameEvent,
-        _session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        // Quest state is driven from the worker snapshot.
-        vec![]
-    }
 }
 
 #[cfg(test)]

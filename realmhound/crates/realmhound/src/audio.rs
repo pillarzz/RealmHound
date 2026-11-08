@@ -232,7 +232,7 @@ impl AudioSender {
             Err(TrySendError::Full(timed)) => {
                 #[cfg(feature = "latency-diagnostics")]
                 record_audio_channel_full();
-                let total = FULL_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                let _total = FULL_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
                 #[cfg(feature = "latency-diagnostics")]
                 {
                     let now = Instant::now();
@@ -243,7 +243,7 @@ impl AudioSender {
                             "[LATENCY][AUDIO] stage=channel_full command_kind={} \
                              dropped_total={}",
                             timed.command_kind(),
-                            total
+                            _total
                         );
                     }
                 }

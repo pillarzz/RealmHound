@@ -3134,6 +3134,10 @@ impl PacketProcessor {
                     }
                 }
 
+                if let Some(names) = crate::panels::live_feed::parse_who_roster(&text.text) {
+                    self.record_live_event(LiveEventView::WhoRoster { names });
+                }
+
                 // Chat message + boss call (resolved here using our own session).
                 if let Some(mut chat_msg) = ChatMessage::from_text_packet(text) {
                     if let Some(boss_id) = chat_msg.boss_id {
@@ -4791,6 +4795,29 @@ mod keyper_tests {
             other => panic!("expected a boss call, got {other:?}"),
         }
         assert_eq!(processor.view_state().live_event_rev, window.rev);
+    }
+
+    #[test]
+    fn live_event_window_records_who_roster() {
+        use realmhound_core::protocol::TextPacket;
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: String::new(),
+            object_id: -1,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: String::new(),
+            text: "Players online (2): A, B".to_string(),
+            clean_text: String::new(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+
+        let window = processor.live_event_window();
+        assert!(matches!(
+            window.events.last().map(|entry| &entry.event),
+            Some(crate::processing::contract::LiveEventView::WhoRoster { .. })
+        ));
     }
 
     #[test]

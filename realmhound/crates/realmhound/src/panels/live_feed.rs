@@ -449,7 +449,7 @@ impl AreaUnlockEntry {
 /// `None` for any text that is not a `/who` reply. A reply with an empty roster
 /// (`Players online (0): `) yields `Some(vec![])`. Names are sorted
 /// case-insensitively.
-fn parse_who_roster(text: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_who_roster(text: &str) -> Option<Vec<String>> {
     let trimmed = text.trim();
     if !trimmed.starts_with("Players online (") {
         return None;
@@ -2791,6 +2791,11 @@ impl LiveFeedPanel {
                     grade,
                 } => {
                     self.push_dungeon(*fp, display_name, modifiers, grade.clone());
+                }
+                LiveEventView::WhoRoster { names } => {
+                    if self.show_who_roster {
+                        self.push_who_roster(names.clone());
+                    }
                 }
             }
         }
@@ -5480,11 +5485,6 @@ impl Panel for LiveFeedPanel {
                 self.set_seasonal(*is_seasonal);
             }
             realmhound_core::GameEvent::TextReceived(ref text) => {
-                if self.show_who_roster {
-                    if let Some(names) = parse_who_roster(&text.text) {
-                        self.push_who_roster(names);
-                    }
-                }
                 // `/server` reply: authoritatively override the header server +
                 // realm. Gated to system messages so player chat can't spoof it.
                 if let Some((server, realm)) = parse_server_command_packet(text) {

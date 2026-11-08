@@ -569,6 +569,9 @@ pub enum LiveEventView {
         modifiers: Vec<String>,
         grade: Option<String>,
     },
+    WhoRoster {
+        names: Vec<String>,
+    },
 }
 
 /// A sequenced Live Feed event.

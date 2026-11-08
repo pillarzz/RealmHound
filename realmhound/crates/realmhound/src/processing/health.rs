@@ -248,9 +248,32 @@ pub struct HealthSummary {
     pub persistence_failures: u64,
 }
 
+/// Whether the periodic `[HEALTH][*]` and pipeline trace lines are emitted.
+///
+/// Counters and the status bar always run; the log output is opt-in for
+/// investigations via `REALMHOUND_PIPELINE_LOGS=1` (anything but 0/false/off).
+pub fn pipeline_logs_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("REALMHOUND_PIPELINE_LOGS")
+            .map(|value| parse_flag(&value))
+            .unwrap_or(false)
+    })
+}
+
+fn parse_flag(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "off" | "no"
+    )
+}
+
 impl HealthSummary {
-    /// Emit the window as a throttled, always-compiled log line.
+    /// Emit the window as a throttled log line, when pipeline logging is on.
     pub fn emit(&self, active_tab: &str, focused: bool, minimized: Option<bool>) {
+        if !pipeline_logs_enabled() {
+            return;
+        }
         let minimized = minimized
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string());
@@ -483,6 +506,16 @@ mod tests {
         let snapshot = counters.snapshot(0, 0);
         assert_eq!(snapshot.peak_snapshot_publish, Duration::from_millis(4));
         assert_eq!(snapshot.peak_snapshot_lock_wait, Duration::from_micros(750));
+    }
+
+    #[test]
+    fn pipeline_log_flag_is_opt_in() {
+        for off in ["", "0", "false", "off", "no", " FALSE "] {
+            assert!(!parse_flag(off), "{off:?} must keep logging off");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            assert!(parse_flag(on), "{on:?} enables pipeline logging");
+        }
     }
 
     #[test]

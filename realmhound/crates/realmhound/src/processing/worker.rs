@@ -1195,7 +1195,9 @@ impl Worker {
     /// Frame measurements stay in the UI-side monitor; this line covers the
     /// worker-owned numbers so a stalled or minimized window is still visible.
     fn maybe_log_health(&mut self) {
-        if self.last_health_log.elapsed() < HEALTH_LOG_INTERVAL {
+        if !super::health::pipeline_logs_enabled()
+            || self.last_health_log.elapsed() < HEALTH_LOG_INTERVAL
+        {
             return;
         }
         self.last_health_log = Instant::now();

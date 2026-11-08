@@ -1763,7 +1763,7 @@ impl LiveFeedPanel {
         // name. It is read whatever we came from (a realm, or another dungeon).
         self.nexus_parent_dungeon =
             !in_realm && !self.map_is_hub && realm_field_is_hub(realm_name_field);
-        if !in_realm && !self.map_is_hub {
+        if !in_realm && !self.map_is_hub && crate::processing::health::pipeline_logs_enabled() {
             tracing::info!(
                 "[LIVE_FEED] entering '{display_name}': realm field '{realm_name_field}' \
                  (came from realm={}, hub={})",

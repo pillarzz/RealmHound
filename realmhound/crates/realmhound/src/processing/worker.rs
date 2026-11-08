@@ -13,7 +13,6 @@
 //! - worker -> audio: an [`AudioSender`] (audio commands are routed here, never
 //!   forwarded to the UI).
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -22,10 +21,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use realmhound_core::account::AccountContext;
 use realmhound_core::capture::PacketReceiver;
-use realmhound_core::GameEvent;
 
 use crate::audio::AudioSender;
-use crate::panels::ActiveTab;
 
 use super::chat_log::ChatLogWriter;
 use super::contract::{
@@ -42,11 +39,6 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_PACKETS_PER_BATCH: usize = 256;
 /// Periodic account-data save interval (interim S2 persistence).
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
-/// Bounded-staleness fallback: when a batch produced only updates irrelevant to
-/// the active tab, drain the queue (and refresh background tabs) at ~1 Hz rather
-/// than waking every frame. True idle (no traffic) arms nothing, so static tabs
-/// still sleep fully while connected.
-const SUPPRESSED_DRAIN_INTERVAL: Duration = Duration::from_millis(1000);
 /// Target maximum repaint rate from worker traffic (~10 Hz). The trailing
 /// `request_repaint_after` guarantees the last update is still painted.
 const WAKE_INTERVAL: Duration = Duration::from_millis(100);
@@ -187,7 +179,6 @@ pub fn spawn(
     mut processor: PacketProcessor,
     ctx: egui::Context,
     audio_tx: AudioSender,
-    active_tab: Arc<AtomicU8>,
     account: Arc<AccountContext>,
 ) -> std::io::Result<WorkerHandle> {
     processor.set_selected_scope(account.account_key(), account.account_id().clone());
@@ -219,7 +210,6 @@ pub fn spawn(
         exalts_fetched: false,
         wake: WakeThrottle::default(),
         ctx,
-        active_tab,
         account,
         receiver: None,
         #[cfg(feature = "latency-diagnostics")]
@@ -270,9 +260,6 @@ struct Worker {
     /// Coalesced repaint requests from worker traffic.
     wake: WakeThrottle,
     ctx: egui::Context,
-    /// Shared active-tab signal written by the UI thread; read to decide whether
-    /// an update is worth waking the UI for (relevance-gated repaints).
-    active_tab: Arc<AtomicU8>,
     /// Shared immutable account context. Held so the exclusive profile lock
     /// inside it lives as long as the worker (including after a detached
     /// shutdown), keeping the selected profile owned by this process.
@@ -549,12 +536,9 @@ impl Worker {
                 {
                     segments.process = process_started.elapsed();
                 }
-                let active = ActiveTab::from_u8(self.active_tab.load(Ordering::Relaxed));
-                // Wake the UI only for updates the active tab (or a global widget)
-                // actually displays; `suppressed` tracks irrelevant traffic so a
-                // slow fallback still drains the queue and covers background tabs.
-                let mut wake = false;
-                let mut suppressed = false;
+                // Wake hints are paint-only: every UI update wakes the throttled
+                // UI, regardless of the active tab.
+                let mut had_ui_updates = false;
                 #[cfg(feature = "latency-diagnostics")]
                 let dispatch_started = Instant::now();
                 for update in updates {
@@ -571,11 +555,7 @@ impl Worker {
                             if let UiPayload::AccessTokenCaptured(token) = &payload {
                                 self.fetch_exalts_once(token);
                             }
-                            if payload_relevant(&payload, active) {
-                                wake = true;
-                            } else {
-                                suppressed = true;
-                            }
+                            had_ui_updates = true;
                             if self
                                 .ui_tx
                                 .send(UiUpdate {
@@ -605,10 +585,8 @@ impl Worker {
                 {
                     segments.snapshot = snapshot_started.elapsed();
                 }
-                if wake || view_changed {
+                if had_ui_updates || view_changed {
                     self.wake.request(&self.ctx);
-                } else if suppressed {
-                    self.ctx.request_repaint_after(SUPPRESSED_DRAIN_INTERVAL);
                 }
             } else if missions_changed || identity_changed {
                 #[cfg(feature = "latency-diagnostics")]
@@ -1141,68 +1119,6 @@ impl Worker {
     }
 }
 
-/// Whether a produced [`UiPayload`] should wake the UI given the current
-/// `active` tab. Payloads that feed always-visible global widgets (the party
-/// status bar) or carry side effects return `true` regardless of tab; the rest
-/// wake only the tabs whose panels render them. `Audio` is routed to the audio
-/// thread before this decision and never reaches here.
-fn payload_relevant(payload: &UiPayload, active: ActiveTab) -> bool {
-    use ActiveTab::*;
-    match payload {
-        // Global: drive the always-visible status bar or have deferred-unsafe
-        // side effects (token persistence + one-time exalt fetch).
-        UiPayload::PartyMemberLeft(_)
-        | UiPayload::PartyLocalLeaderStatus(_)
-        | UiPayload::PartyLocalPlayerName(_)
-        | UiPayload::PartyCleared
-        | UiPayload::AccessTokenCaptured(_) => true,
-
-        // Every GameEvent is broadcast here. Party-membership variants also feed
-        // the global status bar, so they always wake; the rest wake only the
-        // tabs that render live game events.
-        UiPayload::Broadcast(event) => {
-            is_global_event(event)
-                || matches!(active, LiveFeed | Quests | Party | Vault | CombatHistory)
-        }
-
-        UiPayload::Chat(_) => matches!(active, Chat | LiveFeed),
-        UiPayload::PushLoot(_) => matches!(active, LiveFeed | LootHistory | TrophyHall),
-        UiPayload::LootBatchAdded => matches!(active, LootHistory | TrophyHall),
-        UiPayload::UpdateVaultPetSlot { .. } => matches!(active, Vault | PetYard),
-        UiPayload::SetVaultActivePet { .. } => matches!(active, Vault | PetYard),
-
-        UiPayload::BossCall { .. }
-        | UiPayload::RealmDiscovery(_)
-        | UiPayload::KeyperEvent { .. }
-        | UiPayload::SetServerName(_)
-        | UiPayload::AddEncounter { .. }
-        | UiPayload::RemoveEncounter(_)
-        | UiPayload::RealmClosed
-        | UiPayload::KeyPop { .. }
-        | UiPayload::AreaUnlock { .. }
-        | UiPayload::DungeonTimerFrozen { .. }
-        | UiPayload::OryxLagWarning => matches!(active, LiveFeed),
-
-        // Only the Combat History panel shows stored fight cards.
-        UiPayload::CombatHistoryChanged => matches!(active, CombatHistory),
-
-        // Handled by the audio thread before this point.
-        UiPayload::Audio(_) => false,
-    }
-}
-
-/// Broadcast events that mutate the always-visible party status bar (leader
-/// crown + member/watchlist counts), so they must wake any active tab.
-fn is_global_event(event: &GameEvent) -> bool {
-    matches!(
-        event,
-        GameEvent::PartyListReceived(_)
-            | GameEvent::PartyMemberJoined(_)
-            | GameEvent::PartyJoinRequestResponse(_)
-            | GameEvent::PartyActionReceived { .. }
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,124 +1137,6 @@ mod tests {
             Some(Duration::from_millis(1))
         );
         assert_eq!(wake.next_delay(t0 + Duration::from_millis(100)), None);
-    }
-
-    fn non_party_broadcast() -> UiPayload {
-        UiPayload::Broadcast(GameEvent::EntityHit { target_id: 1 })
-    }
-
-    fn party_broadcast() -> UiPayload {
-        UiPayload::Broadcast(GameEvent::PartyActionReceived {
-            player_id: 0,
-            action_id: 0,
-        })
-    }
-
-    #[test]
-    fn broadcast_wakes_only_dynamic_game_tabs() {
-        let p = non_party_broadcast();
-        for tab in [
-            ActiveTab::LiveFeed,
-            ActiveTab::Quests,
-            ActiveTab::Party,
-            ActiveTab::Vault,
-            ActiveTab::CombatHistory,
-        ] {
-            assert!(
-                payload_relevant(&p, tab),
-                "{:?} should wake on broadcast",
-                tab
-            );
-        }
-        // Expensive static tabs must sleep through unrelated broadcast traffic.
-        for tab in [
-            ActiveTab::Treasury,
-            ActiveTab::TrophyHall,
-            ActiveTab::Characters,
-            ActiveTab::Exaltations,
-            ActiveTab::LootHistory,
-            ActiveTab::Chat,
-        ] {
-            assert!(
-                !payload_relevant(&p, tab),
-                "{:?} should sleep on broadcast",
-                tab
-            );
-        }
-    }
-
-    #[test]
-    fn party_membership_broadcast_is_global() {
-        // Feeds the always-visible status bar, so it wakes even a static tab.
-        assert!(payload_relevant(&party_broadcast(), ActiveTab::Treasury));
-        assert!(payload_relevant(&party_broadcast(), ActiveTab::Characters));
-    }
-
-    #[test]
-    fn party_status_payloads_are_global() {
-        for p in [
-            UiPayload::PartyMemberLeft("x".into()),
-            UiPayload::PartyLocalLeaderStatus(true),
-        ] {
-            assert!(payload_relevant(&p, ActiveTab::Treasury));
-            assert!(payload_relevant(&p, ActiveTab::TrophyHall));
-        }
-    }
-
-    #[test]
-    fn access_token_capture_is_global() {
-        let p = UiPayload::AccessTokenCaptured("tok".into());
-        assert!(payload_relevant(&p, ActiveTab::Treasury));
-    }
-
-    #[test]
-    fn loot_payloads_wake_loot_and_trophy_tabs() {
-        let p = UiPayload::LootBatchAdded;
-        assert!(payload_relevant(&p, ActiveTab::LootHistory));
-        assert!(payload_relevant(&p, ActiveTab::TrophyHall));
-        assert!(!payload_relevant(&p, ActiveTab::Treasury));
-        assert!(!payload_relevant(&p, ActiveTab::LiveFeed));
-    }
-
-    #[test]
-    fn live_feed_only_payloads_scope_to_live_feed() {
-        for p in [
-            UiPayload::RealmClosed,
-            UiPayload::OryxLagWarning,
-            UiPayload::RemoveEncounter(1),
-            UiPayload::SetServerName("s".into()),
-        ] {
-            assert!(payload_relevant(&p, ActiveTab::LiveFeed));
-            assert!(!payload_relevant(&p, ActiveTab::Treasury));
-            assert!(!payload_relevant(&p, ActiveTab::Party));
-        }
-    }
-
-    #[test]
-    fn combat_history_change_scopes_to_combat_history() {
-        let p = UiPayload::CombatHistoryChanged;
-        assert!(payload_relevant(&p, ActiveTab::CombatHistory));
-        for tab in [
-            ActiveTab::LiveFeed,
-            ActiveTab::Party,
-            ActiveTab::Treasury,
-            ActiveTab::TrophyHall,
-        ] {
-            assert!(!payload_relevant(&p, tab), "{tab:?} should sleep");
-        }
-    }
-
-    #[test]
-    fn vault_pet_slot_scopes_to_vault() {
-        let p = UiPayload::UpdateVaultPetSlot {
-            pet_instance_id: 1,
-            seasonal: false,
-            slot: 0,
-            item_id: 2,
-            stack_count: 1,
-        };
-        assert!(payload_relevant(&p, ActiveTab::Vault));
-        assert!(!payload_relevant(&p, ActiveTab::LiveFeed));
     }
 
     #[cfg(feature = "latency-diagnostics")]
@@ -1668,7 +1466,6 @@ mod staging_tests {
             processor(&account),
             egui::Context::default(),
             AudioSender::disconnected(),
-            Arc::new(AtomicU8::new(0)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1690,7 +1487,6 @@ mod staging_tests {
             processor(&account),
             egui::Context::default(),
             AudioSender::disconnected(),
-            Arc::new(AtomicU8::new(0)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1717,7 +1513,6 @@ mod staging_tests {
             processor,
             egui::Context::default(),
             AudioSender::disconnected(),
-            Arc::new(AtomicU8::new(0)),
             account,
         )
         .unwrap();

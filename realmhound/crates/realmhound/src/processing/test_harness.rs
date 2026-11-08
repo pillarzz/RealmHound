@@ -4,7 +4,6 @@
 //! against a temporary selected profile and deliberately never drains the
 //! worker -> UI queue, so tests observe the no-UI path directly.
 
-use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -83,7 +82,6 @@ impl NoUiWorker {
             processor,
             egui::Context::default(),
             AudioSender::disconnected(),
-            Arc::new(AtomicU8::new(0)),
             account.clone(),
         )
         .expect("worker thread spawns");

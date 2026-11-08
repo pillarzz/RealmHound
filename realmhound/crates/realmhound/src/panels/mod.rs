@@ -171,27 +171,6 @@ pub enum ActiveTab {
 }
 
 impl ActiveTab {
-    /// Recover a tab from its `#[repr(u8)]` discriminant (the shared worker
-    /// signal); unknown values fall back to `LiveFeed`.
-    pub fn from_u8(value: u8) -> ActiveTab {
-        match value {
-            0 => ActiveTab::LiveFeed,
-            1 => ActiveTab::Quests,
-            2 => ActiveTab::LootHistory,
-            3 => ActiveTab::TrophyHall,
-            4 => ActiveTab::Treasury,
-            5 => ActiveTab::Vault,
-            6 => ActiveTab::Characters,
-            7 => ActiveTab::Exaltations,
-            8 => ActiveTab::Party,
-            9 => ActiveTab::Chat,
-            10 => ActiveTab::CombatHistory,
-            11 => ActiveTab::PetYard,
-            12 => ActiveTab::Missions,
-            _ => ActiveTab::LiveFeed,
-        }
-    }
-
     /// Short, stable label used in logs/profiling output.
     pub fn name(self) -> &'static str {
         match self {

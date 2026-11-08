@@ -53,7 +53,6 @@ use realmhound_core::{
     GameSession, Settings,
 };
 use std::fs;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 #[cfg(feature = "latency-diagnostics")]
 use std::time::Duration;
@@ -593,10 +592,6 @@ pub struct RealmHoundApp {
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
-    /// Active-tab signal shared with the worker so it only wakes the UI for
-    /// updates the current tab (or a global widget) displays. Written at the end
-    /// of each frame to reflect the tab actually rendered.
-    active_tab_signal: Arc<AtomicU8>,
     /// Audio thread handle (owns the `!Send` `SoundEngine`). Kept alive so the
     /// thread isn't torn down; dropped on app exit.
     audio: AudioHandle,
@@ -1029,12 +1024,10 @@ impl RealmHoundApp {
         // context (and its lock) but processes and persists nothing until it is
         // activated. Creating the thread must succeed before any launch metadata
         // is recorded, so a spawn failure counts no launch.
-        let active_tab_signal = Arc::new(AtomicU8::new(ActiveTab::LiveFeed as u8));
         let worker = spawn_worker(
             processor,
             egui_ctx.clone(),
             audio_tx.clone(),
-            active_tab_signal.clone(),
             account.clone(),
         )
         .map_err(|e| AppStartError::Worker(e.to_string()))?;
@@ -1120,7 +1113,6 @@ impl RealmHoundApp {
             owned_encounter_rev: 0,
             owned_quest_rev: 0,
             worker,
-            active_tab_signal,
             health,
             audio,
             audio_tx,
@@ -10401,11 +10393,6 @@ impl eframe::App for RealmHoundApp {
         // of burning CPU re-rendering unchanged frames.
 
         // Publish the tab that was actually rendered this frame so the worker
-        // gates repaints on the current view (relevance-gated wakes). Done at
-        // frame end so any in-frame tab switch (SwitchTab actions) is reflected.
-        self.active_tab_signal
-            .store(self.active_tab as u8, Ordering::Relaxed);
-
         #[cfg(feature = "profiling")]
         {
             let (glow, dye, char_dye, bytes) = self.sprite_renderer.cache_stats();

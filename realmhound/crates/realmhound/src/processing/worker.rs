@@ -27,6 +27,7 @@ use realmhound_core::GameEvent;
 use crate::audio::AudioSender;
 use crate::panels::ActiveTab;
 
+use super::chat_log::ChatLogWriter;
 use super::contract::{
     ControlMsg, ModelSnapshot, SelectedIdentity, ShutdownReport, UiPayload, UiUpdate,
 };
@@ -165,6 +166,7 @@ pub fn spawn(
     let (ui_tx, ui_rx) = ui_channel::channel(ui_channel::DEFAULT_BOUND);
     let (done_tx, done_rx) = channel::<ShutdownReport>();
     let health = Arc::new(HealthCounters::new());
+    let chat_log = ChatLogWriter::new(account.persistence().chat_logs().to_path_buf());
 
     let selected_identity =
         SelectedIdentity::new(account.account_key(), account.account_id().clone());
@@ -182,6 +184,7 @@ pub fn spawn(
         audio_tx,
         snapshot: snapshot.clone(),
         health: health.clone(),
+        chat_log,
         ctx,
         active_tab,
         account,
@@ -223,6 +226,8 @@ struct Worker {
     snapshot: Arc<Mutex<ModelSnapshot>>,
     /// Always-on health counters shared with the UI.
     health: Arc<HealthCounters>,
+    /// Worker-owned chat persistence (independent of UI frames).
+    chat_log: ChatLogWriter,
     ctx: egui::Context,
     /// Shared active-tab signal written by the UI thread; read to decide whether
     /// an update is worth waking the UI for (relevance-gated repaints).
@@ -511,6 +516,13 @@ impl Worker {
                     match update.payload {
                         UiPayload::Audio(cmd) => self.audio_tx.send(cmd),
                         payload => {
+                            if let UiPayload::Chat(message) = &payload {
+                                if let Err(error) = self.chat_log.append(message) {
+                                    tracing::warn!("[CHAT] failed to write log: {error}");
+                                    self.health
+                                        .record_persistence_failure(format!("chat log: {error}"));
+                                }
+                            }
                             if payload_relevant(&payload, active) {
                                 wake = true;
                             } else {

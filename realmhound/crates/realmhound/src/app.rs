@@ -1556,7 +1556,6 @@ impl RealmHoundApp {
                             .push_dm(msg.sender.clone(), msg.text.clone());
                     }
                 }
-                self.chat_panel.add_message(msg);
             }
             UiPayload::BossCall { boss_id, text } => {
                 let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());

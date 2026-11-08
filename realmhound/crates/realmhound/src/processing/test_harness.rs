@@ -38,6 +38,15 @@ pub(crate) struct NoUiWorker {
 impl NoUiWorker {
     /// Spawn a staged worker over a seeded empty profile.
     pub(crate) fn start() -> Self {
+        Self::start_with(|_| {})
+    }
+
+    /// Spawn a staged worker with a pending chat update.
+    pub(crate) fn start_with_chat(message: crate::panels::chat::ChatMessage) -> Self {
+        Self::start_with(|processor| processor.queue_chat_for_test(message))
+    }
+
+    fn start_with(seed: impl FnOnce(&mut PacketProcessor)) -> Self {
         let root = tempfile::tempdir().unwrap();
         let storage = StorageRoot::from_path(root.path()).unwrap();
         std::fs::write(
@@ -58,7 +67,7 @@ impl NoUiWorker {
         };
 
         let persistence = account.persistence();
-        let processor = PacketProcessor::new_selected(
+        let mut processor = PacketProcessor::new_selected(
             Arc::new(RwLock::new(Settings::default())),
             AccountData::new(),
             persistence.account_data_repository(),
@@ -68,6 +77,7 @@ impl NoUiWorker {
             None,
         )
         .expect("writers open for the selected profile");
+        seed(&mut processor);
 
         let handle = spawn(
             processor,
@@ -125,6 +135,8 @@ impl NoUiWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panels::chat::{ChatMessage, ChatType};
+    use chrono::{Local, TimeZone};
     use realmhound_core::capture::packet_channel;
 
     #[test]
@@ -162,5 +174,37 @@ mod tests {
             harness.shutdown().is_success(),
             "clean shutdown must still succeed"
         );
+    }
+
+    #[test]
+    fn chat_is_persisted_without_a_ui_receiver() {
+        let message = ChatMessage {
+            timestamp: Local.with_ymd_and_hms(2026, 2, 3, 0, 0, 5).unwrap(),
+            sender: "Pillar".to_string(),
+            text: "hello".to_string(),
+            chat_type: ChatType::Normal,
+            recipient: None,
+            stars: 0,
+            is_supporter: false,
+            boss_id: None,
+            is_outgoing: false,
+        };
+        let mut harness = NoUiWorker::start_with_chat(message);
+        harness.handle.activate();
+
+        let path = harness
+            .account
+            .persistence()
+            .chat_logs()
+            .join("chat_2026-02-03.log");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let contents =
+            std::fs::read_to_string(&path).expect("chat line written without a UI drain");
+        assert!(contents.contains("00:00:05 [PUBLIC] Pillar: hello"));
+        assert_eq!(harness.health().drain_frames, 0, "no UI frames observed");
+        assert!(harness.shutdown().is_success());
     }
 }

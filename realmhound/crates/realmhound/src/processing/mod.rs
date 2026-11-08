@@ -6,6 +6,7 @@
 //! updates and reads the snapshot. Session 1 drives this synchronously; the
 //! contract types are shaped for a Session 2 worker-thread move.
 
+pub mod chat_log;
 pub mod contract;
 pub mod health;
 pub mod mission_tracker;

@@ -1517,6 +1517,13 @@ impl PacketProcessor {
         !self.updates.is_empty()
     }
 
+    /// Test-only: queue a chat update so worker-side persistence can be tested
+    /// without crafting an encrypted chat packet.
+    #[cfg(test)]
+    pub(crate) fn queue_chat_for_test(&mut self, message: ChatMessage) {
+        self.emit(UiPayload::Chat(message));
+    }
+
     pub fn historical_maintenance_batch(&mut self) -> Result<(bool, bool), String> {
         if !self
             .combat

@@ -3009,13 +3009,6 @@ impl PacketProcessor {
                     } else if raw.contains("s.oryx_minions_failed") {
                         self.emit(UiPayload::OryxLagWarning);
                     }
-                    // Discovery capture: Oryx's per-encounter death / "still alive"
-                    // taunts arrive under stringlist keys the spawn parser ignores
-                    // (only `.new.` is understood). Log the non-spawn ones so their
-                    // key format can be identified for the dedup-reset-on-kill work.
-                    if !raw.contains(".new.") {
-                        crate::event_log::capture_oryx_taunt(&text.name, raw);
-                    }
                 }
 
                 // Special "area unlock" broadcasts (Wine Cellar Incantation, Lost

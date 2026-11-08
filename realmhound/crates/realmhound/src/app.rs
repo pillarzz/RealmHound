@@ -1558,39 +1558,10 @@ impl RealmHoundApp {
                 }
             }
             UiPayload::BossCall { boss_id, text } => {
-                let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                self.log_realm_event(boss_id, &text, should_sound);
+                self.live_feed_panel.push_boss_call(boss_id, text);
             }
             UiPayload::RealmDiscovery(event) => {
-                use crate::processing::realm_discovery::{
-                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE,
-                };
-
-                let notification = match &event {
-                    DiscoveryEvent::Discovered {
-                        object_type: JAILER_TYPE,
-                        notify,
-                        ..
-                    } => Some((JAILER_TYPE, "Spectral Jailer", *notify)),
-                    DiscoveryEvent::Discovered {
-                        object_type: CRYSTAL_TYPE,
-                        notify,
-                        ..
-                    }
-                    | DiscoveryEvent::CrystalMessage { notify, .. } => {
-                        Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify))
-                    }
-                    DiscoveryEvent::Discovered {
-                        object_type: TOTALIA_TYPE,
-                        notify,
-                        ..
-                    } => Some((TOTALIA_TYPE, "Totalia the Malevolent", *notify)),
-                    _ => None,
-                };
                 self.live_feed_panel.apply_realm_discovery(event);
-                if let Some((boss_id, name, notify)) = notification {
-                    self.log_realm_event(boss_id, name, notify);
-                }
             }
             UiPayload::KeyperEvent { towers } => {
                 use realmhound_core::keyper::{KEYPER_BOSS_ID, KEYPER_TOWER_SPRITE_ID};
@@ -1599,13 +1570,10 @@ impl RealmHoundApp {
                 } else {
                     (KEYPER_BOSS_ID, "The Keyper")
                 };
-                // Route through the shared realm-event notification path so the
-                // "Seasonal and special bosses" section (The Keyper / Keyper
-                // Towers rows) drives the sound, exactly like any other boss call.
-                let should_sound = self
-                    .live_feed_panel
+                // Route through the shared realm-event path so the "Seasonal and
+                // special bosses" section drives the visible callout.
+                self.live_feed_panel
                     .push_boss_call(boss_id, name.to_string());
-                self.log_realm_event(boss_id, name, should_sound);
             }
             UiPayload::RealmClosed => {
                 use crate::panels::live_feed::WarningSeverity;
@@ -5245,10 +5213,7 @@ impl RealmHoundApp {
 
         // Get current settings
         let mut settings_changed = false;
-        let (mut current_settings, mut log_event_notifications) = {
-            let s = self.settings.read().unwrap();
-            (s.sound.clone(), s.live_feed.log_event_notifications)
-        };
+        let mut current_settings = { self.settings.read().unwrap().sound.clone() };
 
         // Sub-tab selection is driven by the nested sidebar nav items; render
         // only the active section's content here.
@@ -5260,12 +5225,8 @@ impl RealmHoundApp {
                 settings_changed |= self.render_sound_loot_bags(ui, shadcn, &mut current_settings);
             }
             SoundSubTab::RealmBosses => {
-                settings_changed |= self.render_realm_event_sounds(
-                    ui,
-                    shadcn,
-                    &mut current_settings,
-                    &mut log_event_notifications,
-                );
+                settings_changed |=
+                    self.render_realm_event_sounds(ui, shadcn, &mut current_settings);
             }
             SoundSubTab::Enchantments => {
                 settings_changed |=
@@ -5277,7 +5238,6 @@ impl RealmHoundApp {
         if settings_changed {
             if let Ok(mut s) = self.settings.write() {
                 s.sound = current_settings;
-                s.live_feed.log_event_notifications = log_event_notifications;
                 s.save();
             }
         }
@@ -6369,7 +6329,6 @@ impl RealmHoundApp {
         ui: &mut egui::Ui,
         shadcn: &crate::shadcn_ui::Shadcn,
         current: &mut realmhound_core::settings::SoundSettings,
-        log_event_notifications: &mut bool,
     ) -> bool {
         use crate::realm_event_sound::SectionKind;
 
@@ -6395,19 +6354,6 @@ impl RealmHoundApp {
         }
         changed |= self.render_alien_section_card(ui, shadcn, current, label_w);
         ui.add_space(12.0);
-        shadcn.card(ui, "realm_event_history", "Diagnostic History", |ui| {
-            if shadcn
-                .switch(
-                    ui,
-                    log_event_notifications,
-                    "Write event notification history",
-                )
-                .hover_tip("Store boss-call diagnostics for the selected account. Off by default.")
-                .changed()
-            {
-                changed = true;
-            }
-        });
         changed
     }
 
@@ -6985,41 +6931,6 @@ impl RealmHoundApp {
         });
 
         changed
-    }
-
-    /// Log a Live Feed boss call for the diagnostic notification history. The
-    /// sound itself is dispatched worker-side so hidden windows still alert.
-    fn log_realm_event(&self, boss_id: i32, text: &str, should_sound: bool) {
-        let (events, custom_sounds, log_events) = match self.settings.read() {
-            Ok(s) => (
-                s.sound.realm_events.clone(),
-                s.sound.custom_sounds.clone(),
-                s.live_feed.log_event_notifications,
-            ),
-            Err(_) => return,
-        };
-        let sets = crate::realm_event_sound::EventSets::from_assets();
-
-        // Diagnostic log: record every boss call (including silent ones) so
-        // missing / mis-mapped notification sounds can be traced later. Written
-        // only when the global opt-in toggle is enabled, to the per-account log.
-        let display_name = realmhound_core::assets::get_asset_manager()
-            .get_object(boss_id)
-            .map(|o| o.name().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| text.to_string());
-        let history_path = (log_events && self.view_state.account_verified)
-            .then(|| self.persistence.event_notifications());
-        crate::event_log::log_boss_call(
-            history_path,
-            boss_id,
-            &display_name,
-            text,
-            should_sound,
-            &events,
-            &custom_sounds,
-            &sets,
-        );
     }
 
     /// Render a custom sound file picker button for a given sound type.
@@ -10031,8 +9942,7 @@ impl RealmHoundApp {
                     self.live_feed_panel.push_join_request_alert(name);
                 }
                 AppAction::PushBossCall { boss_id, text } => {
-                    let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                    self.log_realm_event(boss_id, &text, should_sound);
+                    self.live_feed_panel.push_boss_call(boss_id, text);
                 }
                 AppAction::CharacterCacheChanged => {
                     // The processor owns the canonical character cache now; this

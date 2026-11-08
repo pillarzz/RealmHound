@@ -31,7 +31,6 @@ mod discovery;
 #[cfg(target_os = "macos")]
 mod dock_icon;
 mod enchant_sound;
-mod event_log;
 mod memo;
 mod modals;
 mod panels;

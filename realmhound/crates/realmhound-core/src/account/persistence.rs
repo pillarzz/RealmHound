@@ -27,7 +27,6 @@ pub struct AccountPersistencePaths {
     combat_database: PathBuf,
     realmshark_import: PathBuf,
     chat_logs: PathBuf,
-    event_notifications: PathBuf,
     watchlist_detections: PathBuf,
     api_diagnostics: Option<PathBuf>,
 }
@@ -54,7 +53,6 @@ impl AccountPersistencePaths {
             combat_database: root.ensure_no_links("combat_history.db")?,
             realmshark_import: root.ensure_no_links(Path::new("imports").join("dungeon.stats"))?,
             chat_logs: root.ensure_no_links(Path::new("logs").join("chat"))?,
-            event_notifications: root.ensure_no_links("event_notification_log.csv")?,
             watchlist_detections: root.ensure_no_links("watchlist_detections.log")?,
             api_diagnostics: None,
         })
@@ -75,7 +73,6 @@ impl AccountPersistencePaths {
             combat_database: paths.combat_database()?,
             realmshark_import: paths.realmshark_import()?,
             chat_logs: paths.chat_logs()?,
-            event_notifications: paths.event_notifications()?,
             watchlist_detections: paths.watchlist_detections()?,
             api_diagnostics: Some(paths.api_diagnostics()?),
         })
@@ -126,11 +123,6 @@ impl AccountPersistencePaths {
         &self.chat_logs
     }
 
-    /// Path to the opt-in event-notification diagnostic log.
-    pub fn event_notifications(&self) -> &Path {
-        &self.event_notifications
-    }
-
     /// Path to the per-account watchlist detection log.
     pub fn watchlist_detections(&self) -> &Path {
         &self.watchlist_detections
@@ -174,10 +166,6 @@ mod tests {
             base.join("imports").join("dungeon.stats")
         );
         assert_eq!(paths.chat_logs(), base.join("logs").join("chat"));
-        assert_eq!(
-            paths.event_notifications(),
-            base.join("event_notification_log.csv")
-        );
         assert_eq!(
             paths.watchlist_detections(),
             base.join("watchlist_detections.log")

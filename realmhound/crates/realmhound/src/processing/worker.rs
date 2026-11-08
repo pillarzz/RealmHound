@@ -1159,6 +1159,7 @@ impl Worker {
             max_realm_score,
             modifiers,
             grade,
+            self.processor.portal_anchor(),
         ) else {
             return;
         };
@@ -1360,6 +1361,7 @@ fn build_auto_callout(
     max_realm_score: i32,
     modifiers: &[String],
     grade: &Option<String>,
+    anchor: Option<Instant>,
 ) -> Option<(String, Instant)> {
     if !is_dungeon || !settings.live_feed.auto_clipboard_dungeon_calls {
         return None;
@@ -1402,6 +1404,10 @@ fn build_auto_callout(
         learned_event_mods: &learned,
         origin_status: origin.as_deref(),
     };
+    // Anchor the countdown to the portal the player used, not to the moment
+    // this batch happened to be processed.
+    let anchor_known = anchor.is_some();
+    let anchor = anchor.unwrap_or_else(Instant::now);
     let entry = crate::panels::live_feed::DungeonEntry::new(
         display_name.to_string(),
         None,
@@ -1411,8 +1417,8 @@ fn build_auto_callout(
         server.map(str::to_string),
         Some(realm_name.to_string()),
         score,
-        Instant::now(),
-        false,
+        anchor,
+        anchor_known,
     );
     let body = entry.callout.as_deref()?;
     if entry.remaining(Instant::now()).is_zero() {
@@ -1488,6 +1494,7 @@ mod tests {
             100,
             &[],
             &None,
+            None,
         )
         .expect("joinable dungeon produces a callout");
         assert!(text.contains("snake"), "unexpected callout: {text}");
@@ -1496,10 +1503,19 @@ mod tests {
     #[test]
     fn auto_callout_requires_dungeon_and_setting() {
         let mut settings = Settings::default();
-        assert!(
-            build_auto_callout(&settings, None, "Snake Pit", "Mesa", true, 0, 0, &[], &None)
-                .is_none()
-        );
+        assert!(build_auto_callout(
+            &settings,
+            None,
+            "Snake Pit",
+            "Mesa",
+            true,
+            0,
+            0,
+            &[],
+            &None,
+            None
+        )
+        .is_none());
 
         settings.live_feed.auto_clipboard_dungeon_calls = true;
         assert!(build_auto_callout(
@@ -1511,7 +1527,8 @@ mod tests {
             0,
             0,
             &[],
-            &None
+            &None,
+            None
         )
         .is_none());
     }

@@ -435,6 +435,7 @@ pub struct PacketProcessor {
     feed: FeedContext,
     feed_seq: u64,
     realm_close_pending: bool,
+    portal_anchor: Option<std::time::Instant>,
     /// Monotonic id for `live_events`.
     live_event_seq: u64,
     /// Number of events evicted from the bounded live-event window.
@@ -587,6 +588,7 @@ impl PacketProcessor {
             feed: FeedContext::default(),
             feed_seq: 0,
             realm_close_pending: false,
+            portal_anchor: None,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -702,6 +704,7 @@ impl PacketProcessor {
             feed: FeedContext::default(),
             feed_seq: 0,
             realm_close_pending: false,
+            portal_anchor: None,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -769,6 +772,7 @@ impl PacketProcessor {
             feed: FeedContext::default(),
             feed_seq: 0,
             realm_close_pending: false,
+            portal_anchor: None,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -977,6 +981,11 @@ impl PacketProcessor {
     /// Take the "realm just closed" edge (clears the automatic callout).
     pub fn take_realm_close(&mut self) -> bool {
         std::mem::take(&mut self.realm_close_pending)
+    }
+
+    /// When the local player last took a portal (callout countdown anchor).
+    pub fn portal_anchor(&self) -> Option<std::time::Instant> {
+        self.portal_anchor
     }
 
     pub(crate) fn record_live_event(&mut self, event: LiveEventView) {
@@ -2655,6 +2664,7 @@ impl PacketProcessor {
             }
             GameEvent::PortalUsed { object_id } => {
                 self.record_feed_event(FeedContextEvent::PortalUsed { object_id });
+                self.portal_anchor = Some(std::time::Instant::now());
             }
             GameEvent::PartyJoinRequestResponse(_) | GameEvent::ReconnectReceived { .. } => {}
 
@@ -3027,6 +3037,7 @@ impl PacketProcessor {
                     // Same ordered window as the entry, so a dungeon entered and
                     // left between paints cannot reappear as joinable.
                     self.record_live_event(LiveEventView::DungeonLeft);
+                    self.portal_anchor = None;
                 }
                 self.in_dungeon = is_dungeon;
                 if is_dungeon {

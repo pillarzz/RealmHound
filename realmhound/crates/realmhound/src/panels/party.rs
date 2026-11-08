@@ -2,9 +2,6 @@
 
 use crate::ui_ext::HoverTooltipExt;
 use eframe::egui::{self, Color32, RichText, ScrollArea, Sense, TextEdit, Ui, Vec2};
-use realmhound_core::loot::class_ids;
-use realmhound_core::party_cache::{PartySightingCache, PlayerSighting};
-use realmhound_core::protocol::data::StatType;
 use realmhound_core::settings::{PartyListLayout, PartyViewMode};
 use realmhound_core::watchlist::{PlayerStatus, Watchlist};
 
@@ -81,7 +78,6 @@ pub struct PartyPanel {
     view_mode: PartyViewMode,
     list_layout: PartyListLayout,
     /// Populated from Update packets as players become visible in the game world.
-    seen_players: PartySightingCache,
     /// The local (main) account's player name, used to render the local player
     /// with their real skin/dyes while others use a plain class icon.
     local_player_name: Option<String>,
@@ -103,7 +99,6 @@ impl Default for PartyPanel {
             mod_tools: false,
             view_mode: PartyViewMode::Advanced,
             list_layout: PartyListLayout::SingleColumn,
-            seen_players: PartySightingCache::new(),
             local_player_name: None,
         }
     }
@@ -126,87 +121,6 @@ impl PartyPanel {
         self.mod_tools = settings.mod_tools;
         self.view_mode = settings.view_mode;
         self.list_layout = settings.list_layout;
-    }
-
-    /// Look up a cached sighting and apply it to a member, if known.
-    fn apply_known_sighting(&self, member: &mut PartyMember) {
-        if let Some(sighting) = self.seen_players.get(&member.name) {
-            member.class_id = Some(sighting.class_id);
-            member.skin_id = sighting.skin_id;
-            member.tex1 = sighting.tex1;
-            member.tex2 = sighting.tex2;
-            member.guild = sighting.guild.clone();
-        }
-    }
-
-    fn record_sighting(&mut self, name: &str, sighting: PlayerSighting) {
-        let key = name.to_lowercase();
-        self.seen_players.insert(name, sighting.clone());
-        if let Some(member) = self
-            .members
-            .iter_mut()
-            .find(|m| m.name.to_lowercase() == key)
-        {
-            member.class_id = Some(sighting.class_id);
-            member.skin_id = sighting.skin_id;
-            member.tex1 = sighting.tex1;
-            member.tex2 = sighting.tex2;
-            member.guild = sighting.guild;
-        }
-    }
-
-    fn observe_update(&mut self, update: &realmhound_core::protocol::packets::UpdatePacket) {
-        for obj in &update.new_objects {
-            let object_type = obj.object_type as i32;
-            if !class_ids::is_player_class(object_type) {
-                continue;
-            }
-            let name = obj
-                .status
-                .stats
-                .iter()
-                .find(|s| s.stat_type == StatType::Name)
-                .and_then(|s| s.string_stat_value.clone());
-            let Some(name) = name else { continue };
-            let guild = obj
-                .status
-                .stats
-                .iter()
-                .find(|s| s.stat_type == StatType::GuildName)
-                .and_then(|s| s.string_stat_value.clone())
-                .filter(|g| !g.is_empty());
-            let skin_id = obj
-                .status
-                .stats
-                .iter()
-                .find(|s| s.stat_type == StatType::SkinId)
-                .map(|s| s.stat_value)
-                .unwrap_or(0);
-            let tex1 = obj
-                .status
-                .stats
-                .iter()
-                .find(|s| s.stat_type == StatType::Texture1)
-                .map(|s| s.stat_value as u32)
-                .unwrap_or(0);
-            let tex2 = obj
-                .status
-                .stats
-                .iter()
-                .find(|s| s.stat_type == StatType::Texture2)
-                .map(|s| s.stat_value as u32)
-                .unwrap_or(0);
-            self.record_sighting(
-                &name,
-                PlayerSighting {
-                    class_id: object_type,
-                    skin_id,
-                    tex1,
-                    tex2,
-                    guild,
-                },
-            );
-        }
     }
 
     /// Take a pending watchlist edit so the app can push it to the worker.
@@ -243,7 +157,6 @@ impl PartyPanel {
                         &self.watchlist,
                         source.is_leader,
                     );
-                    self.apply_known_sighting(&mut member);
                     member.class_id = source.class_id;
                     member.skin_id = source.skin_id;
                     member.tex1 = source.tex1;
@@ -877,19 +790,6 @@ impl PartyPanel {
 impl Panel for PartyPanel {
     fn show(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) -> Vec<AppAction> {
         self.ui(ui, ctx)
-    }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        _session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        // Membership and leader state come from the worker snapshot. Only the
-        // cosmetic details of already-listed members are enriched here.
-        if let realmhound_core::GameEvent::UpdateReceived(update, _time_ms) = event {
-            self.observe_update(update);
-        }
-        vec![]
     }
 }
 

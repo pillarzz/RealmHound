@@ -650,7 +650,6 @@ pub struct RealmHoundApp {
     client_launch_unix: i64,
     /// A default session passed to transient panels' `handle_event` (they ignore
     /// it; the worker owns the real session).
-    event_session: GameSession,
     /// Sprite renderer for item icons (shared across panels)
     sprite_renderer: SpriteRenderer,
     /// Per-section autocomplete state for the realm-event boss picker,
@@ -1146,7 +1145,6 @@ impl RealmHoundApp {
             account,
             account_op_generations: OperationGenerations::default(),
             client_launch_unix,
-            event_session: GameSession::new(),
             sprite_renderer: SpriteRenderer::new(),
             event_pickers: std::collections::HashMap::new(),
             expanded_chat_alert: None,
@@ -1521,17 +1519,8 @@ impl RealmHoundApp {
     /// Apply a single processor [`UiUpdate`] to the UI panels.
     fn apply_update(&mut self, update: UiUpdate) {
         match update.payload {
-            UiPayload::Broadcast(event) => {
-                // Re-broadcast to the session-independent transient panels. These
-                // panels ignore the session arg (the worker owns the real one);
-                // chat/characters are resolved by the worker as their own updates.
-                let mut actions = Vec::new();
-                {
-                    let session = &self.event_session;
-                    actions.extend(self.quest_panel.handle_event(&event, session));
-                    actions.extend(self.party_panel.handle_event(&event, session));
-                }
-                self.process_actions(actions);
+            UiPayload::Broadcast(_) => {
+                // Every state-bearing panel is driven by the snapshot.
             }
             UiPayload::Chat(_) => {
                 // Chat is written worker-side; DMs come from the live-event window.

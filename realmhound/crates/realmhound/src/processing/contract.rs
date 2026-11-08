@@ -55,9 +55,9 @@ pub struct UiUpdate {
 
 /// The payload of a [`UiUpdate`].
 pub enum UiPayload {
-    /// Re-broadcast a domain event to the session-independent transient panels
-    /// (quest / party / live feed / vault). The processor has already applied
-    /// any model-side effects; this reproduces the panels' `handle_event`.
+    /// Re-broadcast a domain event. No panel consumes it any more; every panel
+    /// that matters is driven by the snapshot. Kept as the replay signal the
+    /// processor's buffering tests assert on.
     Broadcast(GameEvent),
 
     /// A resolved chat message to append (whisper direction already tagged).

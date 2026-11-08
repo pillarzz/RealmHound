@@ -47,9 +47,9 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 /// than waking every frame. True idle (no traffic) arms nothing, so static tabs
 /// still sleep fully while connected.
 const SUPPRESSED_DRAIN_INTERVAL: Duration = Duration::from_millis(1000);
-/// Target maximum repaint rate from worker traffic (~30 Hz). The trailing
+/// Target maximum repaint rate from worker traffic (~10 Hz). The trailing
 /// `request_repaint_after` guarantees the last update is still painted.
-const WAKE_INTERVAL: Duration = Duration::from_millis(33);
+const WAKE_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(feature = "latency-diagnostics")]
 const PIPELINE_WARN_AGE: Duration = Duration::from_millis(500);
 #[cfg(feature = "latency-diagnostics")]
@@ -1198,13 +1198,13 @@ mod tests {
         assert_eq!(wake.next_delay(t0), None);
         assert_eq!(
             wake.next_delay(t0 + Duration::from_millis(10)),
-            Some(Duration::from_millis(23))
+            Some(Duration::from_millis(90))
         );
         assert_eq!(
-            wake.next_delay(t0 + Duration::from_millis(32)),
+            wake.next_delay(t0 + Duration::from_millis(99)),
             Some(Duration::from_millis(1))
         );
-        assert_eq!(wake.next_delay(t0 + Duration::from_millis(33)), None);
+        assert_eq!(wake.next_delay(t0 + Duration::from_millis(100)), None);
     }
 
     fn non_party_broadcast() -> UiPayload {

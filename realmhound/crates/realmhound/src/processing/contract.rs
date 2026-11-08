@@ -442,6 +442,8 @@ pub struct ViewState {
     pub encounter_rev: u64,
     /// Generation of worker-owned quest state.
     pub quest_rev: u64,
+    /// Generation of the worker-owned boss-call window.
+    pub boss_call_rev: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -476,6 +478,7 @@ impl ViewState {
             party_rev: 0,
             encounter_rev: 0,
             quest_rev: 0,
+            boss_call_rev: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -529,6 +532,26 @@ pub struct EncounterSet {
     /// Current encounters.
     pub encounters: Vec<EncounterView>,
     /// Bumps on every set change.
+    pub rev: u64,
+}
+
+/// One recent boss-call callout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BossCallView {
+    /// Monotonic event id used by the UI to recover only missed entries.
+    pub seq: u64,
+    /// Boss object id.
+    pub boss_id: i32,
+    /// Display name.
+    pub name: String,
+}
+
+/// Bounded worker-owned window of recent boss calls and Keyper cues.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BossCallWindow {
+    /// Events oldest to newest.
+    pub events: Vec<BossCallView>,
+    /// Bumps on every append.
     pub rev: u64,
 }
 
@@ -616,6 +639,8 @@ pub struct ModelSnapshot {
     pub encounters: Arc<EncounterSet>,
     /// Worker-owned quest state.
     pub quests: Option<Arc<QuestView>>,
+    /// Worker-owned recent boss-call window.
+    pub boss_calls: Arc<BossCallWindow>,
 }
 
 impl ModelSnapshot {
@@ -639,6 +664,7 @@ impl ModelSnapshot {
             party: Arc::new(PartyView::default()),
             encounters: Arc::new(EncounterSet::default()),
             quests: None,
+            boss_calls: Arc::new(BossCallWindow::default()),
         }
     }
 
@@ -656,6 +682,7 @@ impl ModelSnapshot {
         party: Option<Arc<PartyView>>,
         encounters: Option<Arc<EncounterSet>>,
         quests: Option<Arc<QuestView>>,
+        boss_calls: Option<Arc<BossCallWindow>>,
     ) -> Self {
         Self {
             selected_identity: self.selected_identity.clone(),
@@ -669,6 +696,7 @@ impl ModelSnapshot {
             party: party.unwrap_or_else(|| self.party.clone()),
             encounters: encounters.unwrap_or_else(|| self.encounters.clone()),
             quests: quests.or_else(|| self.quests.clone()),
+            boss_calls: boss_calls.unwrap_or_else(|| self.boss_calls.clone()),
         }
     }
 }
@@ -707,6 +735,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
@@ -731,10 +760,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(Arc::ptr_eq(with_token.token.as_ref().unwrap(), &token));
         let reused = with_token.next(
             ViewState::new(None, None),
+            None,
             None,
             None,
             None,

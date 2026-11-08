@@ -881,6 +881,8 @@ pub struct LiveFeedPanel {
     /// Active encounters (realm bosses/events currently in view)
     /// Key is object_id (instance ID)
     active_encounters: HashMap<i32, ActiveEncounter>,
+    /// Highest recovered boss-call event id from the worker window.
+    recovered_boss_seq: u64,
 
     // === Realm Status Bar State ===
     /// Current server name (e.g., "EUWest")
@@ -1132,6 +1134,7 @@ impl LiveFeedPanel {
             awaiting_first_map: true,
             has_captured_connection: false,
             active_encounters: HashMap::new(),
+            recovered_boss_seq: 0,
             // Realm status bar state
             server_name: None,
             realm_name: None,
@@ -2741,6 +2744,19 @@ impl LiveFeedPanel {
     /// Clear all active encounters (on map change).
     pub fn clear_encounters(&mut self) {
         self.active_encounters.clear();
+    }
+
+    /// Recover boss calls the UI missed while it was not painting. Existing
+    /// entries are left alone; the window only fills gaps.
+    pub fn recover_boss_calls(&mut self, window: &crate::processing::contract::BossCallWindow) {
+        for event in &window.events {
+            if event.seq > self.recovered_boss_seq {
+                self.push_boss_call(event.boss_id, event.name.clone());
+            }
+        }
+        if let Some(last) = window.events.last() {
+            self.recovered_boss_seq = self.recovered_boss_seq.max(last.seq);
+        }
     }
 
     /// Rebuild the encounter set from the worker snapshot, preserving each
@@ -8244,5 +8260,38 @@ mod tests {
         // Whisper/party/guild directed messages carry a recipient.
         let whisper = text_packet("", -1, "Me", "EUWest Nexus");
         assert!(parse_server_command_packet(&whisper).is_none());
+    }
+
+    #[test]
+    fn recover_boss_calls_adds_only_new_events() {
+        use crate::processing::contract::{BossCallView, BossCallWindow};
+
+        let mut panel = LiveFeedPanel::default();
+        panel.recover_boss_calls(&BossCallWindow {
+            events: vec![BossCallView {
+                seq: 1,
+                boss_id: 10,
+                name: "First".to_string(),
+            }],
+            rev: 1,
+        });
+        assert_eq!(panel.entries.len(), 1);
+
+        panel.recover_boss_calls(&BossCallWindow {
+            events: vec![
+                BossCallView {
+                    seq: 1,
+                    boss_id: 10,
+                    name: "First".to_string(),
+                },
+                BossCallView {
+                    seq: 2,
+                    boss_id: 11,
+                    name: "Second".to_string(),
+                },
+            ],
+            rev: 2,
+        });
+        assert_eq!(panel.entries.len(), 2, "seq 1 is not replayed");
     }
 }

@@ -35,8 +35,9 @@ use crate::processing::mission_tracker::{MissionTracker, MissionView};
 use crate::sound::SoundType;
 
 use super::contract::{
-    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, EncounterSet, EncounterView,
-    PartyMemberView, PartyView, QuestView, TokenState, UiPayload, UiUpdate, ViewState,
+    AccountOperationScope, AudioCommand, BossCallView, BossCallWindow, ControlMsg, DbCloseError,
+    EncounterSet, EncounterView, PartyMemberView, PartyView, QuestView, TokenState, UiPayload,
+    UiUpdate, ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
@@ -426,6 +427,10 @@ pub struct PacketProcessor {
     quest_rev: u64,
     /// Quest most recently redeemed, awaiting its result.
     pending_redeem_quest_id: Option<String>,
+    /// Recent boss calls/Keyper cues the UI can recover after missing a wake.
+    boss_calls: BossCallWindow,
+    /// Monotonic id for `boss_calls`.
+    boss_call_seq: u64,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -564,6 +569,8 @@ impl PacketProcessor {
             quests: None,
             quest_rev: 0,
             pending_redeem_quest_id: None,
+            boss_calls: BossCallWindow::default(),
+            boss_call_seq: 0,
         }
     }
 
@@ -670,6 +677,8 @@ impl PacketProcessor {
             quests: None,
             quest_rev: 0,
             pending_redeem_quest_id: None,
+            boss_calls: BossCallWindow::default(),
+            boss_call_seq: 0,
         })
     }
 
@@ -728,6 +737,8 @@ impl PacketProcessor {
             quests: None,
             quest_rev: 0,
             pending_redeem_quest_id: None,
+            boss_calls: BossCallWindow::default(),
+            boss_call_seq: 0,
         }
     }
 
@@ -790,6 +801,7 @@ impl PacketProcessor {
             party_rev: self.party.rev,
             encounter_rev: self.encounters.rev,
             quest_rev: self.quest_rev,
+            boss_call_rev: self.boss_calls.rev,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -884,6 +896,25 @@ impl PacketProcessor {
             packet: packet.clone(),
             rev: self.quest_rev,
         })
+    }
+
+    /// Recent boss calls/Keyper cues for UI recovery.
+    pub fn boss_call_window(&self) -> BossCallWindow {
+        self.boss_calls.clone()
+    }
+
+    fn record_boss_call(&mut self, boss_id: i32, name: &str) {
+        const WINDOW: usize = 100;
+        self.boss_call_seq = self.boss_call_seq.wrapping_add(1);
+        self.boss_calls.events.push(BossCallView {
+            seq: self.boss_call_seq,
+            boss_id,
+            name: name.to_string(),
+        });
+        if self.boss_calls.events.len() > WINDOW {
+            self.boss_calls.events.remove(0);
+        }
+        self.boss_calls.rev = self.boss_calls.rev.wrapping_add(1);
     }
 
     fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
@@ -3081,6 +3112,7 @@ impl PacketProcessor {
                             if self.should_play_boss_call(boss_id, &chat_msg.text) {
                                 self.play_realm_event_sound(boss_id, &chat_msg.text, None);
                             }
+                            self.record_boss_call(boss_id, &chat_msg.text);
                             self.emit(UiPayload::BossCall {
                                 boss_id,
                                 text: chat_msg.text.clone(),
@@ -3892,6 +3924,7 @@ impl PacketProcessor {
                 if self.should_play_boss_call(KEYPER_BOSS_ID, "The Keyper") {
                     self.play_realm_event_sound(KEYPER_BOSS_ID, "The Keyper", None);
                 }
+                self.record_boss_call(KEYPER_BOSS_ID, "The Keyper");
                 self.emit(UiPayload::KeyperEvent { towers: false });
             }
             KeyperCue::TowersAppeared => {
@@ -3905,6 +3938,7 @@ impl PacketProcessor {
                 if self.should_play_boss_call(KEYPER_TOWER_SPRITE_ID, "Keyper Towers") {
                     self.play_realm_event_sound(KEYPER_TOWER_SPRITE_ID, "Keyper Towers", None);
                 }
+                self.record_boss_call(KEYPER_TOWER_SPRITE_ID, "Keyper Towers");
                 self.emit(UiPayload::KeyperEvent { towers: true });
             }
         }
@@ -4680,6 +4714,22 @@ mod keyper_tests {
         assert_eq!(processor.current_realm.as_deref(), Some("Mesa"));
         processor.dispatch_event(map_changed_realm(0, "Nexus"));
         assert_eq!(processor.current_realm, None);
+    }
+
+    #[test]
+    fn boss_call_window_records_keyper_cues() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        enter_realm_settled(&mut processor);
+        processor.dispatch_event(keyper_taunt("Wha- Again? REALLY?!"));
+
+        let window = processor.boss_call_window();
+        assert_eq!(window.events.len(), 1);
+        assert_eq!(
+            window.events[0].boss_id,
+            realmhound_core::keyper::KEYPER_BOSS_ID
+        );
+        assert_eq!(window.events[0].name, "The Keyper");
+        assert_eq!(processor.view_state().boss_call_rev, window.rev);
     }
 
     #[test]

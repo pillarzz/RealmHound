@@ -41,6 +41,8 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_PACKETS_PER_BATCH: usize = 256;
 /// Periodic account-data save interval (interim S2 persistence).
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Background health summary interval, independent of UI painting.
+const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Target maximum repaint rate from worker traffic (~10 Hz). The trailing
 /// `request_repaint_after` guarantees the last update is still painted.
 const WAKE_INTERVAL: Duration = Duration::from_millis(100);
@@ -253,6 +255,7 @@ pub fn spawn(
         #[cfg(feature = "latency-diagnostics")]
         capture_drops: CaptureDropTotals::default(),
         last_save: Instant::now(),
+        last_health_log: Instant::now(),
         next_maintenance: None,
         maintenance_history_dirty: false,
         next_maintenance_refresh: Instant::now(),
@@ -314,6 +317,7 @@ struct Worker {
     #[cfg(feature = "latency-diagnostics")]
     capture_drops: CaptureDropTotals,
     last_save: Instant,
+    last_health_log: Instant,
     next_maintenance: Option<Instant>,
     maintenance_history_dirty: bool,
     next_maintenance_refresh: Instant,
@@ -717,6 +721,7 @@ impl Worker {
             #[cfg(feature = "latency-diagnostics")]
             let save_started = Instant::now();
             self.maybe_periodic_save();
+            self.maybe_log_health();
             for error in self.processor.drain_loot_persistence_errors() {
                 self.health
                     .record_persistence_failure(format!("loot insert: {error}"));
@@ -1190,6 +1195,31 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Throttled health summary that does not depend on the UI painting.
+    ///
+    /// Frame measurements stay in the UI-side monitor; this line covers the
+    /// worker-owned numbers so a stalled or minimized window is still visible.
+    fn maybe_log_health(&mut self) {
+        if self.last_health_log.elapsed() < HEALTH_LOG_INTERVAL {
+            return;
+        }
+        self.last_health_log = Instant::now();
+        let counters = self.health.snapshot(0, 0);
+        tracing::info!(
+            "[HEALTH][WORKER] ui_backlog={} ui_drops={} capture={} persistence_failures={} \
+             live_window_events={} live_window_evictions={} audio_stale_drops={} \
+             audio_full_drops={}",
+            self.ui_tx.len(),
+            self.ui_tx.dropped(),
+            counters.capture.label(),
+            counters.persistence_failures,
+            self.processor.live_event_window().events.len(),
+            counters.live_window_evictions,
+            counters.audio_stale_drops,
+            counters.audio_full_drops
+        );
     }
 
     /// Publish the latest model state into the shared snapshot, cloning heavy

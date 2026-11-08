@@ -58,22 +58,6 @@ impl PartyMember {
         }
     }
 
-    /// Create a new party member with class and skin info.
-    pub fn new_with_class(name: String, watchlist: &Watchlist) -> Self {
-        let status = watchlist.check_and_log(&name);
-        Self {
-            player_id: 0,
-            name,
-            status,
-            is_leader: false,
-            class_id: None,
-            skin_id: 0,
-            tex1: 0,
-            tex2: 0,
-            guild: None,
-        }
-    }
-
     /// Update watchlist status for this member.
     pub fn update_status(&mut self, watchlist: &Watchlist) {
         self.status = watchlist.check_player(&self.name);
@@ -225,117 +209,6 @@ impl PartyPanel {
         }
     }
 
-    /// Set the full party from an IncomingPartyMemberInfoPacket.
-    /// Returns a list of banned player names for kick alert notifications.
-    pub fn set_party(
-        &mut self,
-        party_info: &realmhound_core::protocol::IncomingPartyMemberInfoPacket,
-    ) -> Vec<String> {
-        self.party_id = party_info.party_id;
-        self.max_size = party_info.max_size;
-        self.party_name = party_info.description.clone();
-
-        // Clear existing members and repopulate
-        self.members.clear();
-        let mut banned_names = Vec::new();
-
-        for player in party_info.party_players.iter() {
-            let is_leader = player.id == party_info.leader_id;
-            let mut member = PartyMember::with_player_id(
-                player.id,
-                player.name.clone(),
-                &self.watchlist,
-                is_leader,
-            );
-            self.apply_known_sighting(&mut member);
-
-            // Track banned members for kick alerts
-            if member.status == PlayerStatus::Banned {
-                banned_names.push(player.name.clone());
-            }
-
-            self.members.push(member);
-        }
-
-        // Sort: leader first, then alphabetically
-        self.members
-            .sort_by(|a, b| match (a.is_leader, b.is_leader) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            });
-
-        banned_names
-    }
-
-    /// Add a single member from a PartyMemberAddedPacket.
-    /// Returns the player's watchlist status (for kick alert notifications).
-    pub fn add_member(
-        &mut self,
-        member_added: &realmhound_core::protocol::PartyMemberAddedPacket,
-    ) -> PlayerStatus {
-        // Check if member already exists (by name)
-        if self.members.iter().any(|m| m.name == member_added.name) {
-            return PlayerStatus::Normal;
-        }
-
-        let mut member = PartyMember::new_with_class(member_added.name.clone(), &self.watchlist);
-        member.player_id = member_added.player_id;
-        self.apply_known_sighting(&mut member);
-        let status = member.status;
-        self.members.push(member);
-
-        // Re-sort: leader first, then alphabetically
-        self.members
-            .sort_by(|a, b| match (a.is_leader, b.is_leader) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            });
-
-        status
-    }
-
-    /// Remove a member by name (e.g., when they leave the party).
-    /// Returns true if the member was found and removed.
-    pub fn remove_member_by_name(&mut self, name: &str) -> bool {
-        let initial_len = self.members.len();
-        self.members.retain(|m| m.name != name);
-        self.members.len() < initial_len
-    }
-
-    /// Remove a member by player_id (from inbound PartyAction packet).
-    /// Returns the removed member's name, if found.
-    pub fn remove_member_by_id(&mut self, player_id: i16) -> Option<String> {
-        if let Some(pos) = self.members.iter().position(|m| m.player_id == player_id) {
-            let name = self.members.remove(pos).name;
-            Some(name)
-        } else {
-            None
-        }
-    }
-
-    /// Set whether the local player is currently the party leader.
-    pub fn set_local_leader(&mut self, is_leader: bool) {
-        self.is_local_leader = is_leader;
-    }
-
-    /// Set the local (main) account's player name, used to render the local
-    /// player with their real skin/dyes.
-    pub fn set_local_player_name(&mut self, name: Option<String>) {
-        self.local_player_name = name;
-    }
-
-    /// Wipe all party state (members, identity, leader status). Used when a
-    /// rejected mule/alt connection had tentatively populated the panel.
-    pub fn clear(&mut self) {
-        self.party_name.clear();
-        self.party_id = 0;
-        self.max_size = 0;
-        self.members.clear();
-        self.is_local_leader = false;
-    }
-
     /// Take a pending watchlist edit so the app can push it to the worker.
     pub fn take_watchlist_update(&mut self) -> Option<Watchlist> {
         if self.watchlist_dirty {
@@ -376,6 +249,9 @@ impl PartyPanel {
             _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         });
         self.members = rebuilt;
+        self.party_id = view.party_id;
+        self.party_name = view.party_name.clone();
+        self.max_size = view.max_size;
         self.is_local_leader = view.is_local_leader;
         if view.local_player_name.is_some() {
             self.local_player_name = view.local_player_name.clone();
@@ -998,35 +874,12 @@ impl Panel for PartyPanel {
         event: &realmhound_core::GameEvent,
         _session: &realmhound_core::GameSession,
     ) -> Vec<AppAction> {
-        match event {
-            realmhound_core::GameEvent::PartyListReceived(ref party_info) => {
-                let _ = self.set_party(party_info);
-                vec![]
-            }
-            realmhound_core::GameEvent::PartyMemberJoined(ref member_added) => {
-                let _ = self.add_member(member_added);
-                vec![]
-            }
-            realmhound_core::GameEvent::PartyJoinRequestResponse(_) => {
-                // The worker's watchlist drives kick/join alerts.
-                vec![]
-            }
-            realmhound_core::GameEvent::PartyActionReceived {
-                player_id,
-                action_id,
-            } => {
-                // action 2 = Kicked, 6 = LeftParty
-                if *action_id == 2 || *action_id == 6 {
-                    self.remove_member_by_id(*player_id);
-                }
-                vec![]
-            }
-            realmhound_core::GameEvent::UpdateReceived(ref update, _time_ms) => {
-                self.observe_update(update);
-                vec![]
-            }
-            _ => vec![],
+        // Membership and leader state come from the worker snapshot. Only the
+        // cosmetic details of already-listed members are enriched here.
+        if let realmhound_core::GameEvent::UpdateReceived(update, _time_ms) = event {
+            self.observe_update(update);
         }
+        vec![]
     }
 }
 
@@ -1047,6 +900,9 @@ mod tests {
     fn apply_party_view_rebuilds_membership() {
         let mut panel = PartyPanel::default();
         panel.apply_party_view(&PartyView {
+            party_id: 7,
+            party_name: "Party".to_string(),
+            max_size: 6,
             members: vec![member(10, "Leader", true), member(11, "Member", false)],
             is_local_leader: true,
             local_player_name: Some("Me".to_string()),
@@ -1056,6 +912,9 @@ mod tests {
         assert!(panel.is_local_leader());
 
         panel.apply_party_view(&PartyView {
+            party_id: 7,
+            party_name: "Party".to_string(),
+            max_size: 6,
             members: vec![member(10, "Leader", true)],
             is_local_leader: false,
             local_player_name: None,

@@ -80,18 +80,6 @@ pub enum UiPayload {
     /// At least one loot drop was recorded this batch (refresh autocomplete).
     LootBatchAdded,
 
-    /// An encounter spawned (forward to the live feed).
-    AddEncounter {
-        object_id: i32,
-        object_type: u16,
-        name: String,
-    },
-    /// An encounter was removed.
-    RemoveEncounter(i32),
-
-    /// A party member left (parsed from a chat "has left the party" message).
-    PartyMemberLeft(String),
-
     /// A dungeon key was popped nearby (public portal open). Carries the opener
     /// name, the dungeon key's object id (for the sprite), and the resolved
     /// dungeon name. Drives the key-open Live Feed entry.
@@ -112,16 +100,6 @@ pub enum UiPayload {
         contributions: Vec<(i32, String)>,
         callout: String,
     },
-
-    /// Whether the local player is currently the party leader.
-    PartyLocalLeaderStatus(bool),
-
-    /// The local (main) account's player name, forwarded to the party panel so
-    /// it can render the local player with their real skin/dyes.
-    PartyLocalPlayerName(Option<String>),
-
-    /// The party panel should be cleared (e.g. a rejected mule/alt connection).
-    PartyCleared,
 
     /// A pet inventory slot changed (forward to the vault panel's API copy).
     UpdateVaultPetSlot {
@@ -498,6 +476,12 @@ impl ViewState {
 /// the UI panel; this is the authoritative member list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartyView {
+    /// Party id from the party list packet.
+    pub party_id: i32,
+    /// Party description shown in the header.
+    pub party_name: String,
+    /// Maximum party size.
+    pub max_size: u8,
     /// Current members.
     pub members: Vec<PartyMemberView>,
     /// Whether the local player is the party leader.
@@ -593,6 +577,8 @@ pub enum LiveEventView {
 pub struct LiveEventEntry {
     /// Monotonic event id used by the UI to recover only missed entries.
     pub seq: u64,
+    /// When the worker observed the event (the UI must not re-date it).
+    pub at: chrono::DateTime<chrono::Utc>,
     /// Event payload.
     pub event: LiveEventView,
 }

@@ -85,6 +85,24 @@ pub enum FeedEntry {
     AreaUnlock(AreaUnlockEntry),
 }
 
+impl FeedEntry {
+    /// Replace the row's display time (recovered rows keep the worker's time).
+    fn set_timestamp(&mut self, timestamp: DateTime<Local>) {
+        match self {
+            FeedEntry::Loot(entry) => entry.timestamp = timestamp,
+            FeedEntry::BossCall(entry) => entry.timestamp = timestamp,
+            FeedEntry::KickAlert(entry) => entry.timestamp = timestamp,
+            FeedEntry::Dungeon(entry) => entry.timestamp = timestamp,
+            FeedEntry::DustFull(entry) => entry.timestamp = timestamp,
+            FeedEntry::DirectMessage(entry) => entry.timestamp = timestamp,
+            FeedEntry::WhoRoster(entry) => entry.timestamp = timestamp,
+            FeedEntry::Warning(entry) => entry.timestamp = timestamp,
+            FeedEntry::KeyPop(entry) => entry.timestamp = timestamp,
+            FeedEntry::AreaUnlock(entry) => entry.timestamp = timestamp,
+        }
+    }
+}
+
 /// Loot drop entry data.
 #[derive(Debug, Clone)]
 pub struct LootEntry {
@@ -872,6 +890,10 @@ pub struct LiveFeedPanel {
     active_encounters: HashMap<i32, ActiveEncounter>,
     /// Highest recovered Live Feed event id from the worker window.
     recovered_event_seq: u64,
+    /// Whether older entries were trimmed from the displayed window.
+    trimmed_history: bool,
+    /// Timer freezes that arrived before their dungeon row (keyed by map seed).
+    pending_freezes: HashMap<i32, i64>,
 
     // === Realm Status Bar State ===
     /// Current server name (e.g., "EUWest")
@@ -1103,6 +1125,8 @@ impl LiveFeedPanel {
     pub fn new() -> Self {
         Self {
             entries: VecDeque::with_capacity(MAX_FEED_ENTRIES),
+            trimmed_history: false,
+            pending_freezes: HashMap::new(),
             auto_scroll: true,
             needs_scroll_to_top: false,
             status_message: None,
@@ -2104,14 +2128,22 @@ impl LiveFeedPanel {
         // Add to front (newest first)
         self.entries.push_front(entry);
 
-        // Evict oldest if over capacity
+        // Evict oldest if over capacity; the worker still keeps the full session.
         while self.entries.len() > MAX_FEED_ENTRIES {
             self.entries.pop_back();
+            self.trimmed_history = true;
         }
 
         // Trigger scroll to top if auto-scroll is enabled
         if self.auto_scroll {
             self.needs_scroll_to_top = true;
+        }
+    }
+
+    /// Overwrite the newest row's display time (recovery keeps the original).
+    fn set_newest_timestamp(&mut self, timestamp: DateTime<Local>) {
+        if let Some(entry) = self.entries.front_mut() {
+            entry.set_timestamp(timestamp);
         }
     }
 
@@ -2525,6 +2557,10 @@ impl LiveFeedPanel {
         if !self.realm_closed && self.get_score_percent().map_or(false, |p| p >= 100) {
             entry.deactivate();
         }
+        // The run may have ended before this row was recovered.
+        if let Some(elapsed) = self.pending_freezes.remove(&fp) {
+            entry.frozen_elapsed_ms = Some(elapsed);
+        }
         self.push_entry(FeedEntry::Dungeon(entry));
     }
 
@@ -2557,6 +2593,8 @@ impl LiveFeedPanel {
                 }
             }
         }
+        // The row may not exist yet (recovery); apply it when the row arrives.
+        self.pending_freezes.insert(map_seed, elapsed_ms.max(0));
     }
 
     /// Forget the last dungeon signature (call when leaving a dungeon) so that
@@ -2570,31 +2608,6 @@ impl LiveFeedPanel {
         self.entries.clear();
     }
 
-    /// Add an active encounter (realm boss/event in view).
-    pub fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
-        if !ENABLE_ACTIVE_ENCOUNTERS {
-            return;
-        }
-        // Only insert if not already present (preserve original timestamp)
-        self.active_encounters
-            .entry(object_id)
-            .or_insert(ActiveEncounter {
-                object_type,
-                name,
-                added_at: std::time::Instant::now(),
-            });
-    }
-
-    /// Remove an encounter when it leaves view (drops).
-    pub fn remove_encounter(&mut self, object_id: i32) {
-        self.active_encounters.remove(&object_id);
-    }
-
-    /// Clear all active encounters (on map change).
-    pub fn clear_encounters(&mut self) {
-        self.active_encounters.clear();
-    }
-
     /// Recover Live Feed events the UI missed while it was not painting. The
     /// worker window is the authority for these entry types.
     pub fn recover_live_events(&mut self, window: &crate::processing::contract::LiveEventWindow) {
@@ -2603,6 +2616,7 @@ impl LiveFeedPanel {
             if entry.seq <= self.recovered_event_seq {
                 continue;
             }
+            let rows_before = self.entries.len();
             match &entry.event {
                 LiveEventView::BossCall { boss_id, name } => {
                     self.push_boss_call(*boss_id, name.clone());
@@ -2665,6 +2679,10 @@ impl LiveFeedPanel {
                 LiveEventView::JoinRequestAlert { name } => {
                     self.push_join_request_alert(name.clone());
                 }
+            }
+            // Recovered rows keep the worker's timestamp, not the repaint time.
+            if self.entries.len() > rows_before {
+                self.set_newest_timestamp(entry.at.with_timezone(&chrono::Local));
             }
         }
         if let Some(last) = window.events.last() {
@@ -3312,6 +3330,15 @@ impl LiveFeedPanel {
                         }
                     }
                 }
+            }
+
+            if self.trimmed_history {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Older session entries are not shown")
+                        .small()
+                        .weak(),
+                );
             }
 
             // Handle copy after iteration to avoid borrow issues
@@ -5309,7 +5336,6 @@ impl Panel for LiveFeedPanel {
                     *current_realm_score,
                     *max_realm_score,
                 );
-                self.clear_encounters();
                 self.left_from_dungeon = self.currently_in_dungeon;
                 self.currently_in_dungeon = *is_dungeon;
 
@@ -6689,6 +6715,18 @@ mod tests {
     }
 
     #[test]
+    fn freeze_before_the_row_is_applied_when_it_arrives() {
+        let mut panel = LiveFeedPanel::new();
+        // The run ended before the row was recovered from the worker window.
+        panel.apply_dungeon_freeze(42, 12_000);
+        panel.push_dungeon(42, "Snake Pit", &[], None);
+        match panel.entries.front().unwrap() {
+            FeedEntry::Dungeon(d) => assert_eq!(d.frozen_elapsed_ms, Some(12_000)),
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn format_run_timer_uses_mmss_then_hhmmss() {
         use std::time::Duration;
         assert_eq!(format_run_timer(Duration::from_secs(5)), "0:05");
@@ -7972,6 +8010,7 @@ mod tests {
         panel.recover_live_events(&LiveEventWindow {
             events: vec![LiveEventEntry {
                 seq: 1,
+                at: chrono::Utc::now(),
                 event: LiveEventView::BossCall {
                     boss_id: 10,
                     name: "First".to_string(),
@@ -7985,6 +8024,7 @@ mod tests {
             events: vec![
                 LiveEventEntry {
                     seq: 1,
+                    at: chrono::Utc::now(),
                     event: LiveEventView::BossCall {
                         boss_id: 10,
                         name: "First".to_string(),
@@ -7992,6 +8032,7 @@ mod tests {
                 },
                 LiveEventEntry {
                     seq: 2,
+                    at: chrono::Utc::now(),
                     event: LiveEventView::BossCall {
                         boss_id: 11,
                         name: "Second".to_string(),
@@ -7999,6 +8040,7 @@ mod tests {
                 },
                 LiveEventEntry {
                     seq: 3,
+                    at: chrono::Utc::now(),
                     event: LiveEventView::KeyPop {
                         opener: "Popper".to_string(),
                         key_id: 7,
@@ -8008,6 +8050,7 @@ mod tests {
                 },
                 LiveEventEntry {
                     seq: 4,
+                    at: chrono::Utc::now(),
                     event: LiveEventView::Dungeon {
                         fp: 1,
                         display_name: "Spider Den".to_string(),

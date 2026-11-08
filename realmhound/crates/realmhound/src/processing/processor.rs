@@ -861,6 +861,9 @@ impl PacketProcessor {
         &mut self,
         party_info: &realmhound_core::protocol::IncomingPartyMemberInfoPacket,
     ) {
+        self.party.party_id = party_info.party_id;
+        self.party.party_name = party_info.description.clone();
+        self.party.max_size = party_info.max_size;
         self.party.members = party_info
             .party_players
             .iter()
@@ -909,6 +912,9 @@ impl PacketProcessor {
             || self.party.local_player_name.is_some()
         {
             self.party.members.clear();
+            self.party.party_id = 0;
+            self.party.party_name.clear();
+            self.party.max_size = 0;
             self.party.is_local_leader = false;
             self.party.local_player_name = None;
             self.bump_party();
@@ -939,16 +945,14 @@ impl PacketProcessor {
     }
 
     pub(crate) fn record_live_event(&mut self, event: LiveEventView) {
-        const WINDOW: usize = 100;
+        // The whole session is kept so the UI can always rebuild its rows.
+        // `live_event_evictions` exists as a must-stay-zero signal.
         self.live_event_seq = self.live_event_seq.wrapping_add(1);
         self.live_events.events.push(LiveEventEntry {
             seq: self.live_event_seq,
+            at: chrono::Utc::now(),
             event,
         });
-        if self.live_events.events.len() > WINDOW {
-            self.live_events.events.remove(0);
-            self.live_event_evictions = self.live_event_evictions.wrapping_add(1);
-        }
         self.live_events.rev = self.live_events.rev.wrapping_add(1);
     }
 
@@ -1023,12 +1027,20 @@ impl PacketProcessor {
         if bound_to_main {
             if let Some(cred) = self.pending_credential.take() {
                 if let Some(scope) = &self.selected_scope {
-                    self.token = Some(TokenState {
-                        token: cred.token.clone(),
-                        captured_at: cred.captured_at,
-                        account_id: scope.account_id.clone(),
+                    // A re-captured identical token keeps its original capture
+                    // time and generation: a map change must not make the token
+                    // look freshly issued.
+                    let unchanged = self.token.as_ref().is_some_and(|t| {
+                        t.token == cred.token && &t.account_id == &scope.account_id
                     });
-                    self.token_gen = self.token_gen.wrapping_add(1);
+                    if !unchanged {
+                        self.token = Some(TokenState {
+                            token: cred.token.clone(),
+                            captured_at: cred.captured_at,
+                            account_id: scope.account_id.clone(),
+                        });
+                        self.token_gen = self.token_gen.wrapping_add(1);
+                    }
                 }
                 self.emit(UiPayload::AccessTokenCaptured(cred.token));
             }
@@ -2517,7 +2529,6 @@ impl PacketProcessor {
                 // panel before its identity was known; wipe it so a mule's party
                 // never lingers on the main's UI.
                 self.clear_party();
-                self.emit(UiPayload::PartyCleared);
             }
             AccountVerifyResult::Verified => {
                 tracing::info!(
@@ -2662,8 +2673,6 @@ impl PacketProcessor {
                 self.party.is_local_leader = is_leader;
                 self.party.local_player_name = local_name.clone();
                 self.bump_party();
-                self.emit(UiPayload::PartyLocalLeaderStatus(is_leader));
-                self.emit(UiPayload::PartyLocalPlayerName(local_name));
             }
 
             // Character cache events (previously handled by CharactersPanel).
@@ -3320,7 +3329,6 @@ impl PacketProcessor {
                 // Party leave messages.
                 if let Some(player_name) = text.text.strip_suffix(" has left the party") {
                     self.remove_party_member_by_name(player_name);
-                    self.emit(UiPayload::PartyMemberLeft(player_name.to_string()));
                 }
 
                 // Notify loot tracker (for delayed drop triggers).
@@ -3525,11 +3533,6 @@ impl PacketProcessor {
                         encounter.sprite_id,
                         encounter.name.clone(),
                     );
-                    self.emit(UiPayload::AddEncounter {
-                        object_id: encounter.object_id,
-                        object_type: encounter.sprite_id,
-                        name: encounter.name,
-                    });
                 }
 
                 // Keyper crystal-tower wave: the first wave (~33% realm score)
@@ -3558,7 +3561,6 @@ impl PacketProcessor {
                     self.loot_tracker.on_entity_removed(object_id);
                     self.combat.on_object_removed(object_id, time_ms as i64);
                     self.remove_encounter(object_id);
-                    self.emit(UiPayload::RemoveEncounter(object_id));
                     self.pet_object_buffer.remove(&object_id);
                 }
             }
@@ -4845,16 +4847,19 @@ mod keyper_tests {
     }
 
     #[test]
-    fn live_event_window_counts_evictions() {
+    fn live_event_window_keeps_the_whole_session() {
         let mut processor = PacketProcessor::new_for_test(AccountData::new());
-        for i in 0..101 {
+        for i in 0..250 {
             processor.record_live_event(crate::processing::contract::LiveEventView::BossCall {
                 boss_id: i,
                 name: "Boss".to_string(),
             });
         }
-        assert_eq!(processor.live_event_window().events.len(), 100);
-        assert_eq!(processor.live_event_evictions(), 1);
+        let window = processor.live_event_window();
+        assert_eq!(window.events.len(), 250);
+        assert_eq!(window.events.first().map(|entry| entry.seq), Some(1));
+        assert_eq!(window.events.last().map(|entry| entry.seq), Some(250));
+        assert_eq!(processor.live_event_evictions(), 0);
     }
 
     #[test]
@@ -5619,13 +5624,6 @@ mod isolation_gate_tests {
             .collect()
     }
 
-    fn party_cleared_count(p: &PacketProcessor) -> usize {
-        p.updates
-            .iter()
-            .filter(|u| matches!(u.payload, UiPayload::PartyCleared))
-            .count()
-    }
-
     fn scope(key: AccountKey, id: &AccountId, generation: u64) -> AccountOperationScope {
         AccountOperationScope {
             account_key: key,
@@ -5687,9 +5685,8 @@ mod isolation_gate_tests {
             p.session.connection.main_account_status,
             MainAccountStatus::WaitingForConnection
         );
-        assert_eq!(
-            party_cleared_count(&p),
-            0,
+        assert!(
+            p.party_view().members.is_empty(),
             "overflow is not a positive mismatch"
         );
         assert!(access_tokens(&p).is_empty(), "no token leaked");
@@ -5917,6 +5914,33 @@ mod isolation_gate_tests {
         assert_eq!(token.token, "main-tok");
         assert_eq!(token.captured_at, captured_at);
         assert_eq!(token.account_id.as_str(), "MAIN123");
+        assert_eq!(p.view_state().token_gen, 1);
+    }
+
+    #[test]
+    fn recaptured_identical_token_keeps_its_original_age() {
+        let mut p = tentative_with_saved_main("MAIN123");
+        p.set_selected_scope(AccountKey::generate(), AccountId::new("MAIN123").unwrap());
+        let captured_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        p.pending_credential = Some(PendingCredential {
+            connection: main_conn(),
+            token: "main-tok".into(),
+            captured_at,
+        });
+        p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
+        assert_eq!(p.view_state().token_gen, 1);
+
+        // The same token on a later HELLO (map change): a fresh capture time must
+        // not make the token look newly issued.
+        p.pending_credential = Some(PendingCredential {
+            connection: main_conn(),
+            token: "main-tok".into(),
+            captured_at: chrono::Utc::now(),
+        });
+        p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
+
+        let token = p.token_state().expect("token kept");
+        assert_eq!(token.captured_at, captured_at);
         assert_eq!(p.view_state().token_gen, 1);
     }
 

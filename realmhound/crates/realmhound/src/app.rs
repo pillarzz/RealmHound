@@ -1570,33 +1570,8 @@ impl RealmHoundApp {
                 self.loot_panel.invalidate_autocomplete_cache();
                 self.loot_panel.mark_history_dirty();
             }
-            UiPayload::AddEncounter {
-                object_id,
-                object_type,
-                name,
-            } => {
-                self.live_feed_panel
-                    .add_encounter(object_id, object_type, name);
-            }
-            UiPayload::RemoveEncounter(object_id) => {
-                self.live_feed_panel.remove_encounter(object_id);
-            }
-            UiPayload::PartyMemberLeft(name) => {
-                if self.party_panel.remove_member_by_name(&name) {
-                    tracing::debug!("[PARTY] Member left (via chat): {}", name);
-                }
-            }
             UiPayload::KeyPop { .. } | UiPayload::AreaUnlock { .. } => {
                 // The worker's live-event window drives these feed entries.
-            }
-            UiPayload::PartyLocalLeaderStatus(is_leader) => {
-                self.party_panel.set_local_leader(is_leader);
-            }
-            UiPayload::PartyLocalPlayerName(name) => {
-                self.party_panel.set_local_player_name(name);
-            }
-            UiPayload::PartyCleared => {
-                self.party_panel.clear();
             }
             UiPayload::UpdateVaultPetSlot {
                 pet_instance_id,

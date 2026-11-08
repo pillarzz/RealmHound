@@ -2393,6 +2393,21 @@ impl LiveFeedPanel {
     /// same realm within `BOSS_CALL_DEDUP_WINDOW` are suppressed (one Live Feed
     /// entry, one sound).
     pub fn push_boss_call(&mut self, boss_id: i32, boss_name: String) -> bool {
+        self.push_boss_call_with_origin(
+            boss_id,
+            boss_name,
+            self.server_name.clone(),
+            self.realm_name.clone(),
+        )
+    }
+
+    fn push_boss_call_with_origin(
+        &mut self,
+        boss_id: i32,
+        boss_name: String,
+        server: Option<String>,
+        realm: Option<String>,
+    ) -> bool {
         if boss_id == CRYSTAL_TYPE || boss_name.contains("Mysterious Crystal") {
             return self.push_discovery_entry(
                 None,
@@ -2403,7 +2418,7 @@ impl LiveFeedPanel {
                 None,
             );
         }
-        let now = Local::now();
+        let now = self.event_time.unwrap_or_else(Local::now);
         for entry in &self.entries {
             if let FeedEntry::BossCall(existing) = entry {
                 // Queued discoveries can predate neighboring UI-created rows.
@@ -2414,14 +2429,12 @@ impl LiveFeedPanel {
                 // different realm entered within the window still notifies.
                 if existing.boss_id == boss_id
                     && existing.boss_name == boss_name
-                    && existing.realm_name == self.realm_name
+                    && existing.realm_name == realm
                 {
                     return false;
                 }
             }
         }
-        let server = self.server_name.clone();
-        let realm = self.realm_name.clone();
         // When a new Alien Invasion wave spawns, the previous wave(s) in the
         // same realm are superseded: fade them out and make them non-copyable.
         if Self::is_alien_wave(&boss_name) {
@@ -2896,8 +2909,18 @@ impl LiveFeedPanel {
                 }),
             );
             match &entry.event {
-                LiveEventView::BossCall { boss_id, name } => {
-                    self.push_boss_call(*boss_id, name.clone());
+                LiveEventView::BossCall {
+                    boss_id,
+                    name,
+                    server_name,
+                    realm_name,
+                } => {
+                    self.push_boss_call_with_origin(
+                        *boss_id,
+                        name.clone(),
+                        server_name.clone(),
+                        realm_name.clone(),
+                    );
                 }
                 LiveEventView::KeyPop {
                     opener,
@@ -6612,6 +6635,50 @@ mod tests {
     }
 
     #[test]
+    fn recovered_boss_calls_use_original_context_for_rows_and_deduplication() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView};
+        let mut panel = LiveFeedPanel::new();
+        panel.server_name = Some("Server A".into());
+        panel.realm_name = Some("Realm A".into());
+        panel.push_boss_call(22128, "Beer God".into());
+        let at = Utc::now();
+        for (seq, realm) in [(1, "Realm B"), (2, "Realm C"), (3, "Realm B")] {
+            panel.apply_live_event(&LiveEventEntry {
+                seq,
+                at,
+                event: LiveEventView::BossCall {
+                    boss_id: 22128,
+                    name: "Beer God".into(),
+                    server_name: Some("Server B".into()),
+                    realm_name: Some(realm.into()),
+                },
+            });
+        }
+        assert_eq!(boss_call_count(&panel), 3);
+        let origins: Vec<_> = panel
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if let FeedEntry::BossCall(boss) = entry {
+                    Some((boss.server_name.as_deref(), boss.realm_name.as_deref()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            origins,
+            vec![
+                (Some("Server B"), Some("Realm C")),
+                (Some("Server B"), Some("Realm B")),
+                (Some("Server A"), Some("Realm A")),
+            ]
+        );
+        assert_eq!(panel.server_name.as_deref(), Some("Server A"));
+        assert_eq!(panel.realm_name.as_deref(), Some("Realm A"));
+    }
+
+    #[test]
     fn new_alien_wave_expires_previous_waves_in_same_realm() {
         let mut panel = LiveFeedPanel::new();
         panel.realm_name = Some("Mesa".to_string());
@@ -8425,6 +8492,8 @@ mod tests {
                 event: LiveEventView::BossCall {
                     boss_id: 10,
                     name: "First".to_string(),
+                    server_name: None,
+                    realm_name: None,
                 },
             }],
             dropped_before_seq: 0,
@@ -8440,6 +8509,8 @@ mod tests {
                     event: LiveEventView::BossCall {
                         boss_id: 10,
                         name: "First".to_string(),
+                        server_name: None,
+                        realm_name: None,
                     },
                 },
                 LiveEventEntry {
@@ -8448,6 +8519,8 @@ mod tests {
                     event: LiveEventView::BossCall {
                         boss_id: 11,
                         name: "Second".to_string(),
+                        server_name: None,
+                        realm_name: None,
                     },
                 },
                 LiveEventEntry {

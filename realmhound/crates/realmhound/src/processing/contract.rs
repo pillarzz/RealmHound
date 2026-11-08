@@ -537,6 +537,8 @@ pub enum LiveEventView {
     BossCall {
         boss_id: i32,
         name: String,
+        server_name: Option<String>,
+        realm_name: Option<String>,
     },
     KeyPop {
         opener: String,

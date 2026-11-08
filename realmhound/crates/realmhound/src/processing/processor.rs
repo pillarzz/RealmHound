@@ -3635,6 +3635,8 @@ impl PacketProcessor {
                             self.record_live_event(LiveEventView::BossCall {
                                 boss_id,
                                 name: chat_msg.text.clone(),
+                                server_name: self.feed.current.server_name.clone(),
+                                realm_name: self.feed.current.realm_name.clone(),
                             });
                             self.emit(UiPayload::BossCall {
                                 boss_id,
@@ -4469,6 +4471,8 @@ impl PacketProcessor {
                 self.record_live_event(LiveEventView::BossCall {
                     boss_id: KEYPER_BOSS_ID,
                     name: "The Keyper".to_string(),
+                    server_name: self.feed.current.server_name.clone(),
+                    realm_name: self.feed.current.realm_name.clone(),
                 });
                 self.emit(UiPayload::KeyperEvent { towers: false });
             }
@@ -4486,6 +4490,8 @@ impl PacketProcessor {
                 self.record_live_event(LiveEventView::BossCall {
                     boss_id: KEYPER_TOWER_SPRITE_ID,
                     name: "Keyper Towers".to_string(),
+                    server_name: self.feed.current.server_name.clone(),
+                    realm_name: self.feed.current.realm_name.clone(),
                 });
                 self.emit(UiPayload::KeyperEvent { towers: true });
             }
@@ -5286,7 +5292,7 @@ mod keyper_tests {
             .collect();
         assert_eq!(calls.len(), 1);
         match &calls[0].event {
-            crate::processing::contract::LiveEventView::BossCall { boss_id, name } => {
+            crate::processing::contract::LiveEventView::BossCall { boss_id, name, .. } => {
                 assert_eq!(*boss_id, realmhound_core::keyper::KEYPER_BOSS_ID);
                 assert_eq!(name, "The Keyper");
             }
@@ -5296,12 +5302,46 @@ mod keyper_tests {
     }
 
     #[test]
+    fn boss_origin_survives_eviction_of_its_location_context() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.record_feed_event(FeedContextEvent::ServerName("EUWest".into()));
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        p.realm_entered_at =
+            Some(std::time::Instant::now() - REALM_JOIN_SETTLE - std::time::Duration::from_secs(1));
+        p.dispatch_event(keyper_taunt("Wha- Again? REALLY?!"));
+        for _ in 0..501 {
+            p.dispatch_event(GameEvent::RealmScoreChanged { score: 50 });
+        }
+        assert!(!p
+            .feed_context()
+            .events
+            .iter()
+            .any(|entry| matches!(entry.event, FeedContextEvent::Location { .. })));
+        let window = p.live_event_window();
+        let call = window.events.iter().find_map(|entry| {
+            if let crate::processing::contract::LiveEventView::BossCall {
+                server_name,
+                realm_name,
+                ..
+            } = &entry.event
+            {
+                Some((server_name.as_deref(), realm_name.as_deref()))
+            } else {
+                None
+            }
+        });
+        assert_eq!(call, Some((Some("EUWest"), Some("Mesa"))));
+    }
+
+    #[test]
     fn live_event_window_keeps_the_whole_session() {
         let mut processor = PacketProcessor::new_for_test(AccountData::new());
         for i in 0..250 {
             processor.record_live_event(crate::processing::contract::LiveEventView::BossCall {
                 boss_id: i,
                 name: "Boss".to_string(),
+                server_name: None,
+                realm_name: None,
             });
         }
         let window = processor.live_event_window();

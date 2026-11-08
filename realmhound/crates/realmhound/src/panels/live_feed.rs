@@ -2023,6 +2023,7 @@ impl LiveFeedPanel {
                 }
                 self.portal_spawns.clear();
             }
+            FeedContextEvent::ServerName(name) => self.set_server_name(name.clone()),
             FeedContextEvent::RealmScore(score) => self.update_realm_score(*score),
             FeedContextEvent::RealmClosed => self.force_realm_closed(),
             FeedContextEvent::Discovery(event) => self.apply_realm_discovery(event.clone()),

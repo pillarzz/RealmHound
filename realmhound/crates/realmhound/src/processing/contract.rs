@@ -587,6 +587,8 @@ pub enum FeedContextEvent {
     RealmClosed,
     /// Crystal/Jailer/Totalia lifecycle update.
     Discovery(super::realm_discovery::DiscoveryEvent),
+    /// Connected server display name (from the server-IP mapping).
+    ServerName(String),
     /// A portal object appeared on the current map (anchor for callout timing).
     PortalSpawned { object_id: i32 },
     /// The local player used a portal object.

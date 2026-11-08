@@ -2025,7 +2025,7 @@ impl PacketProcessor {
                         if let Some(name) = ip_to_server_name(new_ip) {
                             tracing::info!("[SERVER] Connected to {} ({})", name, new_ip);
                             self.server_name = Some(name.to_string());
-                            self.emit(UiPayload::SetServerName(name.to_string()));
+                            self.record_feed_event(FeedContextEvent::ServerName(name.to_string()));
                         } else {
                             tracing::info!("[SERVER] Unknown server IP: {} (int={}) - not in the server-name table", new_ip, u32::from_be_bytes(new_ip.octets()) as i32);
                         }

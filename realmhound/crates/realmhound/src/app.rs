@@ -1544,8 +1544,8 @@ impl RealmHoundApp {
             UiPayload::OryxLagWarning => {
                 // The worker's live-event window drives the warning entry.
             }
-            UiPayload::SetServerName(name) => {
-                self.live_feed_panel.set_server_name(name);
+            UiPayload::SetServerName(_) => {
+                // Carried by the worker's feed context in the snapshot.
             }
             UiPayload::CombatHistoryChanged => {
                 self.combat_panel.invalidate_cards();

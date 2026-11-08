@@ -376,6 +376,8 @@ pub struct PacketProcessor {
     /// Current realm key for worker-side alert dedup. Mirrors the Live Feed's
     /// parsed realm name; `None` outside a realm.
     current_realm: Option<String>,
+    /// Last resolved server name (for worker-side callout assembly).
+    server_name: Option<String>,
 
     /// Recent boss-call alerts, for the same 5s per-realm suppression the Live
     /// Feed applies to visible entries.
@@ -566,6 +568,7 @@ impl PacketProcessor {
             pending_credential: None,
             last_account_gen: 0,
             current_realm: None,
+            server_name: None,
             recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
             token: None,
@@ -677,6 +680,7 @@ impl PacketProcessor {
             pending_credential: None,
             last_account_gen: 0,
             current_realm: None,
+            server_name: None,
             recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
             token: None,
@@ -740,6 +744,7 @@ impl PacketProcessor {
             pending_credential: None,
             last_account_gen: 0,
             current_realm: None,
+            server_name: None,
             recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
             token: None,
@@ -836,6 +841,16 @@ impl PacketProcessor {
     /// The authoritative party membership.
     pub fn party_view(&self) -> PartyView {
         self.party.clone()
+    }
+
+    /// The last resolved server name.
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    /// Shared settings handle for worker-side side effects.
+    pub fn settings_handle(&self) -> Arc<std::sync::RwLock<Settings>> {
+        self.settings.clone()
     }
 
     fn bump_party(&mut self) {
@@ -1951,6 +1966,7 @@ impl PacketProcessor {
                         self.session.connection.server_ip = Some(new_ip);
                         if let Some(name) = ip_to_server_name(new_ip) {
                             tracing::info!("[SERVER] Connected to {} ({})", name, new_ip);
+                            self.server_name = Some(name.to_string());
                             self.emit(UiPayload::SetServerName(name.to_string()));
                         } else {
                             tracing::info!("[SERVER] Unknown server IP: {} (int={}) - not in the server-name table", new_ip, u32::from_be_bytes(new_ip.octets()) as i32);

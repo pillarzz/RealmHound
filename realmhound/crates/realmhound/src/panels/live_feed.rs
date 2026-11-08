@@ -850,17 +850,6 @@ pub struct ActiveEncounter {
     pub added_at: std::time::Instant,
 }
 
-/// A clipboard write the Live Feed panel asks the app to perform.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClipboardWrite {
-    /// Put this callout on the clipboard.
-    Copy(String),
-    /// Empty the clipboard, but only while it still holds exactly this callout.
-    /// The user may have copied something else in the meantime, and that content
-    /// is theirs to keep.
-    ClearIfUnchanged(String),
-}
-
 /// Live feed panel state and UI.
 pub struct LiveFeedPanel {
     /// Feed entries (newest at front)
@@ -1034,20 +1023,6 @@ pub struct LiveFeedPanel {
     /// Whether callout reward values include a `%` sign.
     /// Mirrors `Settings.live_feed.callout_percent`.
     callout_percent: bool,
-    /// Whether entering a joinable dungeon copies its callout to the clipboard
-    /// by itself. Mirrors `Settings.live_feed.auto_clipboard_dungeon_calls`.
-    auto_clipboard_calls: bool,
-    /// `map_seed` of the dungeon whose callout this panel put on the clipboard
-    /// automatically and has not released yet.
-    auto_clipboard_seed: Option<i32>,
-    /// Exact text this panel put on the clipboard for `auto_clipboard_seed`, so
-    /// the automatic release can tell our callout from anything the user copied
-    /// afterwards.
-    auto_clipboard_text: Option<String>,
-    /// Clipboard write the app still has to perform for this panel. The panel
-    /// is only rendered while its tab is open, so it hands the write to the
-    /// app, which has the egui context every frame.
-    pending_clipboard: Option<ClipboardWrite>,
     /// Editable reward-modifier callout tags. Mirrors `Settings.live_feed.reward_mods`.
     reward_mods: Vec<realmhound_core::settings::RewardModEntry>,
     /// Dungeon short-name overrides. Mirrors `Settings.live_feed.dungeon_name_overrides`.
@@ -1179,10 +1154,6 @@ impl LiveFeedPanel {
             realm_status_threshold: 33,
             nexus_marker: realmhound_core::settings::NexusMarker::None,
             callout_percent: false,
-            auto_clipboard_calls: false,
-            auto_clipboard_seed: None,
-            auto_clipboard_text: None,
-            pending_clipboard: None,
             reward_mods: realmhound_core::settings::default_reward_mods(),
             dungeon_name_overrides: std::collections::BTreeMap::new(),
             event_name_overrides: std::collections::BTreeMap::new(),
@@ -1268,11 +1239,6 @@ impl LiveFeedPanel {
         self.realm_status_threshold = settings.realm_status_threshold;
         self.nexus_marker = settings.nexus_marker;
         self.callout_percent = settings.callout_percent;
-        self.auto_clipboard_calls = settings.auto_clipboard_dungeon_calls;
-        // Turning the feature off releases any callout it is holding.
-        if !self.auto_clipboard_calls {
-            self.release_auto_clipboard();
-        }
         self.reward_mods = settings.reward_mods.clone();
         self.dungeon_name_overrides = settings.dungeon_name_overrides.clone();
         self.event_name_overrides = settings.event_name_overrides.clone();
@@ -1508,32 +1474,15 @@ impl LiveFeedPanel {
         realm: Option<&str>,
         join: realmhound_core::settings::JoinPosition,
     ) -> String {
-        use realmhound_core::settings::JoinPosition;
-        // Assembled from parts so an empty body (a name-less call with no tag to
-        // name) still reads as `/p j` rather than carrying a stray double space.
-        let mut parts: Vec<String> = Vec::new();
-        if self.call_for_party {
-            parts.push("/p".to_string());
-        }
-        if join == JoinPosition::Beginning {
-            parts.push("j".to_string());
-        }
-        if self.include_server_name {
-            if let Some(server) = server {
-                parts.push(realmhound_core::protocol::short_server_name(server).to_string());
-            }
-        }
-        if self.include_realm_name {
-            if let Some(realm) = realm {
-                parts.push(realm.to_string());
-            }
-        }
-        parts.push(body.to_string());
-        if join == JoinPosition::End {
-            parts.push("j".to_string());
-        }
-        parts.retain(|part| !part.is_empty());
-        parts.join(" ")
+        crate::panels::dungeon_callout::assemble_callout(
+            body,
+            server,
+            realm,
+            join,
+            self.call_for_party,
+            self.include_server_name,
+            self.include_realm_name,
+        )
     }
 
     /// Initialize dust state from cached account data.
@@ -2329,8 +2278,6 @@ impl LiveFeedPanel {
         // The realm is closing and the Oryx endgame begins; dungeons opened with
         // a key inside the castle areas from here on stay callable.
         self.realm_closed = true;
-        // A realm close makes the dungeon we may have auto-copied unjoinable.
-        self.release_auto_clipboard();
         // Start the castle teleport countdown; ignore repeated
         // realm-close messages so the window isn't reset each time.
         if self.castle_timer_expires_at.is_none() {
@@ -2579,7 +2526,6 @@ impl LiveFeedPanel {
             entry.deactivate();
         }
         self.push_entry(FeedEntry::Dungeon(entry));
-        self.queue_auto_clipboard();
     }
 
     /// Force-expire every still-active dungeon entry in the feed. Called when the
@@ -2597,84 +2543,6 @@ impl LiveFeedPanel {
                 }
             }
         }
-        // The dungeon we may have auto-copied can no longer be joined.
-        self.release_auto_clipboard();
-    }
-
-    /// Queue the newly entered dungeon's callout for the clipboard, when the
-    /// "Auto clipboard dungeon calls" setting is on and the dungeon can actually
-    /// be joined from the outside. Instances that start out unjoinable -
-    /// non-callable ones (Cultist Hideout, The Void, Crystal Cavern, which carry
-    /// no callout at all) and dungeons entered from a realm that is already full
-    /// - are skipped.
-    fn queue_auto_clipboard(&mut self) {
-        if !self.auto_clipboard_calls {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let queued = match self.entries.front() {
-            Some(FeedEntry::Dungeon(entry))
-                if entry.callout.is_some() && !entry.remaining(now).is_zero() =>
-            {
-                Some((
-                    entry.map_seed,
-                    self.assemble_callout(
-                        entry.callout.as_deref().unwrap_or_default(),
-                        entry.server_name.as_deref(),
-                        entry.realm_name.as_deref(),
-                        self.dungeon_join_position,
-                    ),
-                ))
-            }
-            _ => None,
-        };
-        if let Some((seed, text)) = queued {
-            self.auto_clipboard_seed = Some(seed);
-            self.auto_clipboard_text = Some(text.clone());
-            self.pending_clipboard = Some(ClipboardWrite::Copy(text));
-        }
-    }
-
-    /// Stop holding the automatic callout copy and queue a clipboard clear.
-    /// Does nothing when this panel never put a callout there, and the clear it
-    /// queues only fires while the clipboard still holds that callout, so
-    /// anything the user copied since is left alone.
-    fn release_auto_clipboard(&mut self) {
-        if self.auto_clipboard_seed.take().is_some() {
-            self.pending_clipboard = Some(ClipboardWrite::ClearIfUnchanged(
-                self.auto_clipboard_text.take().unwrap_or_default(),
-            ));
-        }
-    }
-
-    /// The clipboard write the app should perform this frame, if any: a queued
-    /// copy/clear, or the clear that follows the auto-copied callout becoming
-    /// uncallable (its join window elapsed, or the player moved on).
-    ///
-    /// The panel is only rendered while its tab is open, so the app polls this
-    /// every frame and does the actual clipboard access.
-    pub fn poll_clipboard(&mut self) -> Option<ClipboardWrite> {
-        if let Some(write) = self.pending_clipboard.take() {
-            return Some(write);
-        }
-        let seed = self.auto_clipboard_seed?;
-        let now = std::time::Instant::now();
-        let live = self.auto_clipboard_calls
-            && self.entries.iter().any(|entry| match entry {
-                FeedEntry::Dungeon(dungeon) => {
-                    dungeon.map_seed == seed
-                        && dungeon.callout.is_some()
-                        && !dungeon.remaining(now).is_zero()
-                }
-                _ => false,
-            });
-        if live {
-            return None;
-        }
-        self.auto_clipboard_seed = None;
-        Some(ClipboardWrite::ClearIfUnchanged(
-            self.auto_clipboard_text.take().unwrap_or_default(),
-        ))
     }
 
     /// Settle the live dungeon run timer for the row matching `map_seed` to the
@@ -7766,137 +7634,6 @@ mod tests {
             }
             other => panic!("Expected Dungeon entry, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn auto_clipboard_copies_joinable_dungeon_callout() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(7, "Snake Pit", &["LOOTING".to_string()], None);
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::Copy("/p snake 50 lb j".to_string()))
-        );
-        // The copy is handed over once; afterwards the panel only tracks the
-        // entry so it can release the clipboard later.
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    // With names off, a dungeon whose modifiers clear no threshold still has a
-    // callout -- the join marker alone -- so the auto-clipboard must copy it.
-    #[test]
-    fn auto_clipboard_copies_name_less_callout_with_no_tags() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            dungeon_name_style: realmhound_core::settings::DungeonNameStyle::None,
-            ..Default::default()
-        });
-        // Snake Pit with no modifiers: no name, and no tag above its threshold.
-        panel.push_dungeon(7, "Snake Pit", &[], None);
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::Copy("/p j".to_string()))
-        );
-    }
-
-    #[test]
-    fn auto_clipboard_is_off_by_default() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    #[test]
-    fn auto_clipboard_skips_dungeons_that_cannot_be_called() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        // The Void is reachable only from inside another instance.
-        panel.push_dungeon(1, "The Void", &["DIMITUS".to_string()], None);
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    #[test]
-    fn auto_clipboard_clears_on_portal_switch() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        let copied = match panel.poll_clipboard() {
-            Some(ClipboardWrite::Copy(text)) => text,
-            other => panic!("expected a copy, got {other:?}"),
-        };
-
-        // Leaving the dungeon (any non-dungeon map change) releases the copy.
-        panel.deactivate_active_dungeons();
-        // The clear carries the exact callout, so the app can tell it apart from
-        // anything the user copied since.
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::ClearIfUnchanged(copied))
-        );
-        // Nothing is held any more, so no further clear is queued.
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    #[test]
-    fn auto_clipboard_clears_on_realm_close() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        let copied = match panel.poll_clipboard() {
-            Some(ClipboardWrite::Copy(text)) => text,
-            other => panic!("expected a copy, got {other:?}"),
-        };
-
-        panel.force_realm_closed();
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::ClearIfUnchanged(copied))
-        );
-    }
-
-    #[test]
-    fn auto_clipboard_clears_when_the_join_window_elapses() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        let copied = match panel.poll_clipboard() {
-            Some(ClipboardWrite::Copy(text)) => text,
-            other => panic!("expected a copy, got {other:?}"),
-        };
-
-        // The countdown runs out on its own, with no map change.
-        for entry in panel.entries.iter_mut() {
-            if let FeedEntry::Dungeon(dungeon) = entry {
-                dungeon.deactivate();
-            }
-        }
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::ClearIfUnchanged(copied))
-        );
     }
 
     #[test]

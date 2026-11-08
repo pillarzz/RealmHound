@@ -14,13 +14,14 @@
 //!   forwarded to the UI).
 
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use realmhound_core::account::AccountContext;
 use realmhound_core::capture::PacketReceiver;
+use realmhound_core::{GameEvent, Settings};
 
 use crate::audio::AudioSender;
 
@@ -54,6 +55,12 @@ const PIPELINE_EXTREME_WORK: Duration = Duration::from_secs(1);
 const PIPELINE_WARN_THROTTLE: Duration = Duration::from_secs(2);
 #[cfg(feature = "latency-diagnostics")]
 const HEALTH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Automatic dungeon callout currently on the clipboard.
+struct AutoCallout {
+    text: String,
+    expires_at: Instant,
+}
 
 #[derive(Default)]
 struct WakeThrottle {
@@ -188,6 +195,7 @@ pub fn spawn(
     let (ui_tx, ui_rx) = ui_channel::channel(ui_channel::DEFAULT_BOUND);
     let (done_tx, done_rx) = channel::<ShutdownReport>();
     let health = Arc::new(HealthCounters::new());
+    let settings = processor.settings_handle();
     let chat_log = ChatLogWriter::new(account.persistence().chat_logs().to_path_buf());
 
     let selected_identity =
@@ -207,6 +215,8 @@ pub fn spawn(
         snapshot: snapshot.clone(),
         health: health.clone(),
         chat_log,
+        settings,
+        auto_callout: None,
         exalts_fetched: false,
         wake: WakeThrottle::default(),
         ctx,
@@ -256,6 +266,10 @@ struct Worker {
     health: Arc<HealthCounters>,
     /// Worker-owned chat persistence (independent of UI frames).
     chat_log: ChatLogWriter,
+    /// Shared settings for worker-side side effects.
+    settings: Arc<RwLock<Settings>>,
+    /// Automatic dungeon callout currently on the clipboard.
+    auto_callout: Option<AutoCallout>,
     /// One-shot exalt stats fetch, triggered by the first released token.
     exalts_fetched: bool,
     /// Coalesced repaint requests from worker traffic.
@@ -480,6 +494,7 @@ impl Worker {
                     if result.closed {
                         tracing::warn!("[WORKER] capture source closed; awaiting restart");
                         self.health.set_capture_state(CaptureState::Closed);
+                        self.release_auto_callout();
                         capture_closed = true;
                         #[cfg(feature = "latency-diagnostics")]
                         {
@@ -556,6 +571,30 @@ impl Worker {
                             }
                             if let UiPayload::AccessTokenCaptured(token) = &payload {
                                 self.fetch_exalts_once(token);
+                            }
+                            if matches!(&payload, UiPayload::RealmClosed) {
+                                self.release_auto_callout();
+                            }
+                            if let UiPayload::Broadcast(GameEvent::MapChanged {
+                                ref display_name,
+                                ref realm_name,
+                                is_dungeon,
+                                current_realm_score,
+                                max_realm_score,
+                                ref dungeon_modifiers,
+                                ref dungeon_grade,
+                                ..
+                            }) = &payload
+                            {
+                                self.refresh_auto_callout(
+                                    display_name,
+                                    realm_name,
+                                    *is_dungeon,
+                                    *current_realm_score,
+                                    *max_realm_score,
+                                    dungeon_modifiers,
+                                    dungeon_grade,
+                                );
                             }
                             had_ui_updates = true;
                             if self
@@ -645,6 +684,7 @@ impl Worker {
             }
             self.health
                 .set_live_window_evictions(self.processor.live_event_evictions());
+            self.expire_auto_callout();
             #[cfg(feature = "latency-diagnostics")]
             {
                 segments.save = save_started.elapsed();
@@ -668,6 +708,7 @@ impl Worker {
 
         // Shutdown: drain combat/loot, flush account data, close databases,
         // publish a final snapshot, then report the outcome.
+        self.release_auto_callout();
         self.processor.final_drain();
         for error in self.processor.drain_loot_persistence_errors() {
             self.health
@@ -1005,6 +1046,7 @@ impl Worker {
                 {
                     self.receiver = None;
                 }
+                self.release_auto_callout();
                 self.health.set_capture_state(CaptureState::Stopped);
             }
             other => {
@@ -1016,6 +1058,59 @@ impl Worker {
             }
         }
         false
+    }
+
+    /// Release any automatic callout this worker put on the clipboard.
+    fn release_auto_callout(&mut self) {
+        if let Some(auto) = self.auto_callout.take() {
+            crate::clipboard::clear_if_ours(&auto.text);
+        }
+    }
+
+    /// Clear the automatic callout once its join window elapses.
+    fn expire_auto_callout(&mut self) {
+        if self
+            .auto_callout
+            .as_ref()
+            .is_some_and(|auto| Instant::now() >= auto.expires_at)
+        {
+            self.release_auto_callout();
+        }
+    }
+
+    /// Copy the new dungeon's callout worker-side when auto-clipboard is enabled.
+    #[allow(clippy::too_many_arguments)]
+    fn refresh_auto_callout(
+        &mut self,
+        display_name: &str,
+        realm_name: &str,
+        is_dungeon: bool,
+        current_realm_score: i32,
+        max_realm_score: i32,
+        modifiers: &[String],
+        grade: &Option<String>,
+    ) {
+        self.release_auto_callout();
+        let settings = match self.settings.read() {
+            Ok(settings) => settings.clone(),
+            Err(_) => return,
+        };
+        let Some((text, expires_at)) = build_auto_callout(
+            &settings,
+            self.processor.server_name(),
+            display_name,
+            realm_name,
+            is_dungeon,
+            current_realm_score,
+            max_realm_score,
+            modifiers,
+            grade,
+        ) else {
+            return;
+        };
+        if crate::clipboard::set_text(&text) {
+            self.auto_callout = Some(AutoCallout { text, expires_at });
+        }
     }
 
     /// Fetch exalt stats once per worker session, off the UI drain path.
@@ -1128,9 +1223,134 @@ impl Worker {
     }
 }
 
+/// Build the automatic dungeon callout, if one should be copied.
+#[allow(clippy::too_many_arguments)]
+fn build_auto_callout(
+    settings: &Settings,
+    server: Option<&str>,
+    display_name: &str,
+    realm_name: &str,
+    is_dungeon: bool,
+    current_realm_score: i32,
+    max_realm_score: i32,
+    modifiers: &[String],
+    grade: &Option<String>,
+) -> Option<(String, Instant)> {
+    if !is_dungeon || !settings.live_feed.auto_clipboard_dungeon_calls {
+        return None;
+    }
+    let score =
+        (max_realm_score > 0).then(|| (current_realm_score * 100 / max_realm_score).clamp(0, 100));
+    if score.is_some_and(|percent| percent >= 100) {
+        return None;
+    }
+    let origin = {
+        use realmhound_core::settings::LiveFeedSettings;
+        fn origin_status(live: &LiveFeedSettings, score: Option<i32>) -> Option<String> {
+            if let Some(status) = crate::panels::dungeon_callout::realm_status_suffix(
+                live.realm_status,
+                live.realm_status_threshold,
+                score,
+            ) {
+                return Some(status);
+            }
+            score
+                .is_none()
+                .then(|| live.nexus_marker.text().map(str::to_string))
+                .flatten()
+        }
+        origin_status(&settings.live_feed, score)
+    };
+    let learned: Vec<String> = Vec::new();
+    let params = crate::panels::dungeon_callout::DungeonCalloutParams {
+        name_style: settings.live_feed.dungeon_name_style,
+        name_overrides: &settings.live_feed.dungeon_name_overrides,
+        loot_label: settings.live_feed.loot_label,
+        dust_label: settings.live_feed.dust_label,
+        xp_label: settings.live_feed.xp_label,
+        loot_threshold: settings.live_feed.loot_threshold,
+        dust_threshold: settings.live_feed.dust_threshold,
+        xp_threshold: settings.live_feed.xp_threshold,
+        call_event_mods: settings.live_feed.call_event_mods,
+        percent: settings.live_feed.callout_percent,
+        reward_mods: &settings.live_feed.reward_mods,
+        learned_event_mods: &learned,
+        origin_status: origin.as_deref(),
+    };
+    let entry = crate::panels::live_feed::DungeonEntry::new(
+        display_name.to_string(),
+        None,
+        modifiers,
+        grade.clone(),
+        &params,
+        server.map(str::to_string),
+        Some(realm_name.to_string()),
+        score,
+        Instant::now(),
+        false,
+    );
+    let body = entry.callout.as_deref()?;
+    if entry.remaining(Instant::now()).is_zero() {
+        return None;
+    }
+    let text = crate::panels::dungeon_callout::assemble_callout(
+        body,
+        entry.server_name.as_deref(),
+        entry.realm_name.as_deref(),
+        settings.live_feed.dungeon_join_position,
+        settings.live_feed.call_for_party,
+        settings.live_feed.include_server_name,
+        settings.live_feed.include_realm_name,
+    );
+    Some((text, entry.expires_at))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_callout_builds_joinable_callout() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut settings = Settings::default();
+        settings.live_feed.auto_clipboard_dungeon_calls = true;
+        let (text, _) = build_auto_callout(
+            &settings,
+            Some("EUWest"),
+            "Snake Pit",
+            "NexusPortal.Mesa",
+            true,
+            50,
+            100,
+            &[],
+            &None,
+        )
+        .expect("joinable dungeon produces a callout");
+        assert!(text.contains("snake"), "unexpected callout: {text}");
+    }
+
+    #[test]
+    fn auto_callout_requires_dungeon_and_setting() {
+        let mut settings = Settings::default();
+        assert!(
+            build_auto_callout(&settings, None, "Snake Pit", "Mesa", true, 0, 0, &[], &None)
+                .is_none()
+        );
+
+        settings.live_feed.auto_clipboard_dungeon_calls = true;
+        assert!(build_auto_callout(
+            &settings,
+            None,
+            "Snake Pit",
+            "Mesa",
+            false,
+            0,
+            0,
+            &[],
+            &None
+        )
+        .is_none());
+    }
 
     #[test]
     fn wake_throttle_coalesces_and_keeps_a_trailing_repaint() {

@@ -1508,27 +1508,6 @@ impl RealmHoundApp {
             });
             summary.emit(self.active_tab.name(), focused, minimized);
         }
-        // The Live Feed panel decides when its automatic dungeon callout has to
-        // be copied or cleared, but it only runs while its tab is open. The
-        // clipboard write therefore happens here, every frame.
-        if let Some(write) = self.live_feed_panel.poll_clipboard() {
-            match write {
-                crate::panels::live_feed::ClipboardWrite::Copy(text) => {
-                    #[cfg(target_os = "linux")]
-                    if !crate::clipboard::set_text(&text) {
-                        _ctx.copy_text(text);
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    _ctx.copy_text(text);
-                }
-                crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
-                    // Checked and cleared in one clipboard session, so anything
-                    // the user copies meanwhile cannot be caught in between.
-                    crate::clipboard::clear_if_ours(&copied);
-                }
-            }
-        }
-
         applied == 4096
     }
 

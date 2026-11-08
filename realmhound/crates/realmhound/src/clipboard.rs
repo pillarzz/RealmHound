@@ -73,6 +73,49 @@ unsafe fn text_while_open() -> Option<String> {
     }
 }
 
+/// Put `text` on the clipboard from a worker thread. Returns whether the write
+/// succeeded; a busy clipboard is left untouched.
+#[cfg(windows)]
+pub fn set_text(text: &str) -> bool {
+    use windows_sys::Win32::Foundation::HGLOBAL;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    unsafe {
+        if OpenClipboard(0) == 0 {
+            return false;
+        }
+        let ok = (|| {
+            if EmptyClipboard() == 0 {
+                return false;
+            }
+            let bytes = units.len() * std::mem::size_of::<u16>();
+            let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if handle.is_null() {
+                return false;
+            }
+            let ptr = GlobalLock(handle as HGLOBAL) as *mut u16;
+            if ptr.is_null() {
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(units.as_ptr(), ptr, units.len());
+            GlobalUnlock(handle as HGLOBAL);
+            if SetClipboardData(CF_UNICODETEXT, handle as isize) == 0 {
+                return false;
+            }
+            true
+        })();
+        CloseClipboard();
+        ok
+    }
+}
+
 /// Empty the clipboard, but only while it still holds exactly `copied` -- the
 /// callout this app put there. Returns whether it was cleared.
 ///
@@ -107,9 +150,6 @@ pub fn clear_if_ours(copied: &str) -> bool {
 /// is exactly when an automatic callout fires. X11 keeps using egui's path.
 #[cfg(target_os = "linux")]
 pub fn set_text(text: &str) -> bool {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return false;
-    }
     match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
         Ok(()) => true,
         Err(error) => {

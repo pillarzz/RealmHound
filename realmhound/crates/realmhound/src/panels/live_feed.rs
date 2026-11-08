@@ -2784,6 +2784,14 @@ impl LiveFeedPanel {
                 LiveEventView::Loot(drop) => {
                     self.push_loot(drop);
                 }
+                LiveEventView::Dungeon {
+                    fp,
+                    display_name,
+                    modifiers,
+                    grade,
+                } => {
+                    self.push_dungeon(*fp, display_name, modifiers, grade.clone());
+                }
             }
         }
         if let Some(last) = window.events.last() {
@@ -5417,12 +5425,9 @@ impl Panel for LiveFeedPanel {
             realmhound_core::GameEvent::MapChanged {
                 ref display_name,
                 ref realm_name,
-                fp,
                 current_realm_score,
                 max_realm_score,
                 is_dungeon,
-                ref dungeon_modifiers,
-                ref dungeon_grade,
                 ..
             } => {
                 self.update_location(
@@ -5436,7 +5441,7 @@ impl Panel for LiveFeedPanel {
                 self.currently_in_dungeon = *is_dungeon;
 
                 if *is_dungeon {
-                    self.push_dungeon(*fp, display_name, dungeon_modifiers, dungeon_grade.clone());
+                    // The worker's live-event window drives the dungeon entry.
                 } else {
                     // Left the dungeon (hub/realm): you can no longer call it, so
                     // expire any still-active dungeon entries and allow a fresh
@@ -8336,9 +8341,18 @@ mod tests {
                         thankable: true,
                     },
                 },
+                LiveEventEntry {
+                    seq: 4,
+                    event: LiveEventView::Dungeon {
+                        fp: 1,
+                        display_name: "Spider Den".to_string(),
+                        modifiers: Vec::new(),
+                        grade: None,
+                    },
+                },
             ],
             rev: 2,
         });
-        assert_eq!(panel.entries.len(), 3, "seq 1 is not replayed");
+        assert_eq!(panel.entries.len(), 4, "seq 1 is not replayed");
     }
 }

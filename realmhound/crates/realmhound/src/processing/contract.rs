@@ -563,6 +563,12 @@ pub enum LiveEventView {
         text: String,
     },
     Loot(ProcessedLootDrop),
+    Dungeon {
+        fp: i32,
+        display_name: String,
+        modifiers: Vec<String>,
+        grade: Option<String>,
+    },
 }
 
 /// A sequenced Live Feed event.

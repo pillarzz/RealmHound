@@ -2920,6 +2920,14 @@ impl PacketProcessor {
                 // its authoritative encounter set here.
                 self.clear_encounters();
                 self.in_dungeon = is_dungeon;
+                if is_dungeon {
+                    self.record_live_event(LiveEventView::Dungeon {
+                        fp,
+                        display_name: display_name.clone(),
+                        modifiers: dungeon_modifiers.clone(),
+                        grade: dungeon_grade.clone(),
+                    });
+                }
                 // Remaining: notify loot tracker of new map.
                 self.loot_tracker.on_map_info(display_name, fp);
                 self.combat
@@ -4783,6 +4791,29 @@ mod keyper_tests {
             other => panic!("expected a boss call, got {other:?}"),
         }
         assert_eq!(processor.view_state().live_event_rev, window.rev);
+    }
+
+    #[test]
+    fn live_event_window_records_dungeon_entries() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::MapChanged {
+            name: "Spider Den".to_string(),
+            display_name: "Spider Den".to_string(),
+            realm_name: "NexusPortal.Mesa".to_string(),
+            fp: 123,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: true,
+            dungeon_modifiers: vec!["CHEF".to_string()],
+            dungeon_grade: Some("S".to_string()),
+        });
+
+        let window = processor.live_event_window();
+        assert!(matches!(
+            window.events.last().map(|entry| &entry.event),
+            Some(crate::processing::contract::LiveEventView::Dungeon { .. })
+        ));
     }
 
     #[test]

@@ -698,6 +698,8 @@ impl Worker {
             }
             self.health
                 .set_live_window_evictions(self.processor.live_event_evictions());
+            let (audio_stale, audio_full) = crate::audio::drop_counts();
+            self.health.set_audio_drops(audio_stale, audio_full);
             self.expire_auto_callout();
             #[cfg(feature = "latency-diagnostics")]
             {

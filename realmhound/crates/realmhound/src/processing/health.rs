@@ -68,6 +68,10 @@ pub struct HealthSnapshot {
     pub queue_drops: u64,
     /// Cumulative Live Feed window evictions.
     pub live_window_evictions: u64,
+    /// Cumulative stale audio command drops.
+    pub audio_stale_drops: u64,
+    /// Cumulative audio channel-full drops.
+    pub audio_full_drops: u64,
     /// Current capture source state.
     pub capture: CaptureState,
     /// Cumulative persistence failures observed by the app/worker.
@@ -84,6 +88,8 @@ pub struct HealthCounters {
     drained_updates: AtomicU64,
     capped_drain_frames: AtomicU64,
     live_window_evictions: AtomicU64,
+    audio_stale_drops: AtomicU64,
+    audio_full_drops: AtomicU64,
     capture: AtomicU8,
     persistence_failures: AtomicU64,
     last_persistence_error: Mutex<Option<String>>,
@@ -98,6 +104,8 @@ impl Default for HealthCounters {
             drained_updates: AtomicU64::new(0),
             capped_drain_frames: AtomicU64::new(0),
             live_window_evictions: AtomicU64::new(0),
+            audio_stale_drops: AtomicU64::new(0),
+            audio_full_drops: AtomicU64::new(0),
             capture: AtomicU8::new(CaptureState::Stopped as u8),
             persistence_failures: AtomicU64::new(0),
             last_persistence_error: Mutex::new(None),
@@ -141,6 +149,12 @@ impl HealthCounters {
         self.live_window_evictions.store(count, Ordering::Relaxed);
     }
 
+    /// Set the cumulative audio `(stale, full)` drop counts.
+    pub fn set_audio_drops(&self, stale: u64, full: u64) {
+        self.audio_stale_drops.store(stale, Ordering::Relaxed);
+        self.audio_full_drops.store(full, Ordering::Relaxed);
+    }
+
     /// Update the observed capture source state.
     pub fn set_capture_state(&self, state: CaptureState) {
         self.capture.store(state as u8, Ordering::Relaxed);
@@ -157,6 +171,8 @@ impl HealthCounters {
             queue_depth,
             queue_drops,
             live_window_evictions: self.live_window_evictions.load(Ordering::Relaxed),
+            audio_stale_drops: self.audio_stale_drops.load(Ordering::Relaxed),
+            audio_full_drops: self.audio_full_drops.load(Ordering::Relaxed),
             capture: CaptureState::from_u8(self.capture.load(Ordering::Relaxed)),
             persistence_failures: self.persistence_failures.load(Ordering::Relaxed),
             last_persistence_error: self
@@ -187,6 +203,10 @@ pub struct HealthSummary {
     pub queue_drops_delta: u64,
     /// Cumulative Live Feed window evictions at window end.
     pub live_window_evictions: u64,
+    /// Cumulative audio stale drops at window end.
+    pub audio_stale_drops: u64,
+    /// Cumulative audio channel-full drops at window end.
+    pub audio_full_drops: u64,
     /// Capture state at window end.
     pub capture: CaptureState,
     /// Cumulative persistence failures at window end.
@@ -206,8 +226,8 @@ impl HealthSummary {
             tracing::warn!(
                 "[HEALTH][UI] window_ms={} frames={} drained_updates={} capped_frames={} \
                  peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} live_window_evictions={} \
-                 capture={} persistence_failures={} active_tab={} viewport_focused={} \
-                 viewport_minimized={}",
+                 audio_stale_drops={} audio_full_drops={} capture={} persistence_failures={} \
+                 active_tab={} viewport_focused={} viewport_minimized={}",
                 self.window.as_millis(),
                 self.frames,
                 self.drained_updates,
@@ -216,6 +236,8 @@ impl HealthSummary {
                 self.peak_queue_depth,
                 self.queue_drops_delta,
                 self.live_window_evictions,
+                self.audio_stale_drops,
+                self.audio_full_drops,
                 self.capture.label(),
                 self.persistence_failures,
                 active_tab,
@@ -226,8 +248,8 @@ impl HealthSummary {
             tracing::info!(
                 "[HEALTH][UI] window_ms={} frames={} drained_updates={} capped_frames={} \
                  peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} live_window_evictions={} \
-                 capture={} persistence_failures={} active_tab={} viewport_focused={} \
-                 viewport_minimized={}",
+                 audio_stale_drops={} audio_full_drops={} capture={} persistence_failures={} \
+                 active_tab={} viewport_focused={} viewport_minimized={}",
                 self.window.as_millis(),
                 self.frames,
                 self.drained_updates,
@@ -236,6 +258,8 @@ impl HealthSummary {
                 self.peak_queue_depth,
                 self.queue_drops_delta,
                 self.live_window_evictions,
+                self.audio_stale_drops,
+                self.audio_full_drops,
                 self.capture.label(),
                 self.persistence_failures,
                 active_tab,
@@ -328,6 +352,8 @@ impl HealthMonitor {
             peak_queue_depth: self.window_peak_queue,
             queue_drops_delta: drops_delta,
             live_window_evictions: counters.live_window_evictions,
+            audio_stale_drops: counters.audio_stale_drops,
+            audio_full_drops: counters.audio_full_drops,
             capture: counters.capture,
             persistence_failures: counters.persistence_failures,
         });

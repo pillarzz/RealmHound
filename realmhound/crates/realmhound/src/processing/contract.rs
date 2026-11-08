@@ -442,8 +442,8 @@ pub struct ViewState {
     pub encounter_rev: u64,
     /// Generation of worker-owned quest state.
     pub quest_rev: u64,
-    /// Generation of the worker-owned boss-call window.
-    pub boss_call_rev: u64,
+    /// Generation of the worker-owned recoverable Live Feed window.
+    pub live_event_rev: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -478,7 +478,7 @@ impl ViewState {
             party_rev: 0,
             encounter_rev: 0,
             quest_rev: 0,
-            boss_call_rev: 0,
+            live_event_rev: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -535,22 +535,40 @@ pub struct EncounterSet {
     pub rev: u64,
 }
 
-/// One recent boss-call callout.
+/// One recoverable Live Feed event emitted by the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BossCallView {
-    /// Monotonic event id used by the UI to recover only missed entries.
-    pub seq: u64,
-    /// Boss object id.
-    pub boss_id: i32,
-    /// Display name.
-    pub name: String,
+pub enum LiveEventView {
+    BossCall {
+        boss_id: i32,
+        name: String,
+    },
+    KeyPop {
+        opener: String,
+        key_id: i32,
+        dungeon_name: String,
+        thankable: bool,
+    },
+    AreaUnlock {
+        title: String,
+        contributions: Vec<(i32, String)>,
+        callout: String,
+    },
 }
 
-/// Bounded worker-owned window of recent boss calls and Keyper cues.
+/// A sequenced Live Feed event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEventEntry {
+    /// Monotonic event id used by the UI to recover only missed entries.
+    pub seq: u64,
+    /// Event payload.
+    pub event: LiveEventView,
+}
+
+/// Bounded worker-owned window of recent recoverable Live Feed events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BossCallWindow {
+pub struct LiveEventWindow {
     /// Events oldest to newest.
-    pub events: Vec<BossCallView>,
+    pub events: Vec<LiveEventEntry>,
     /// Bumps on every append.
     pub rev: u64,
 }
@@ -639,8 +657,8 @@ pub struct ModelSnapshot {
     pub encounters: Arc<EncounterSet>,
     /// Worker-owned quest state.
     pub quests: Option<Arc<QuestView>>,
-    /// Worker-owned recent boss-call window.
-    pub boss_calls: Arc<BossCallWindow>,
+    /// Worker-owned recent recoverable Live Feed window.
+    pub live_events: Arc<LiveEventWindow>,
 }
 
 impl ModelSnapshot {
@@ -664,7 +682,7 @@ impl ModelSnapshot {
             party: Arc::new(PartyView::default()),
             encounters: Arc::new(EncounterSet::default()),
             quests: None,
-            boss_calls: Arc::new(BossCallWindow::default()),
+            live_events: Arc::new(LiveEventWindow::default()),
         }
     }
 
@@ -682,7 +700,7 @@ impl ModelSnapshot {
         party: Option<Arc<PartyView>>,
         encounters: Option<Arc<EncounterSet>>,
         quests: Option<Arc<QuestView>>,
-        boss_calls: Option<Arc<BossCallWindow>>,
+        live_events: Option<Arc<LiveEventWindow>>,
     ) -> Self {
         Self {
             selected_identity: self.selected_identity.clone(),
@@ -696,7 +714,7 @@ impl ModelSnapshot {
             party: party.unwrap_or_else(|| self.party.clone()),
             encounters: encounters.unwrap_or_else(|| self.encounters.clone()),
             quests: quests.or_else(|| self.quests.clone()),
-            boss_calls: boss_calls.unwrap_or_else(|| self.boss_calls.clone()),
+            live_events: live_events.unwrap_or_else(|| self.live_events.clone()),
         }
     }
 }

@@ -589,8 +589,8 @@ pub struct RealmHoundApp {
     owned_encounter_rev: u64,
     /// Last applied worker-owned quest revision.
     owned_quest_rev: u64,
-    /// Last applied worker-owned boss-call revision.
-    owned_boss_call_rev: u64,
+    /// Last applied worker-owned recoverable Live Feed revision.
+    owned_live_event_rev: u64,
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
@@ -1114,7 +1114,7 @@ impl RealmHoundApp {
             owned_party_rev: 0,
             owned_encounter_rev: 0,
             owned_quest_rev: 0,
-            owned_boss_call_rev: 0,
+            owned_live_event_rev: 0,
             worker,
             health,
             audio,
@@ -1560,23 +1560,11 @@ impl RealmHoundApp {
                     }
                 }
             }
-            UiPayload::BossCall { boss_id, text } => {
-                self.live_feed_panel.push_boss_call(boss_id, text);
+            UiPayload::BossCall { .. } | UiPayload::KeyperEvent { .. } => {
+                // The worker's live-event window drives these feed entries.
             }
             UiPayload::RealmDiscovery(event) => {
                 self.live_feed_panel.apply_realm_discovery(event);
-            }
-            UiPayload::KeyperEvent { towers } => {
-                use realmhound_core::keyper::{KEYPER_BOSS_ID, KEYPER_TOWER_SPRITE_ID};
-                let (boss_id, name) = if towers {
-                    (KEYPER_TOWER_SPRITE_ID, "Keyper Towers")
-                } else {
-                    (KEYPER_BOSS_ID, "The Keyper")
-                };
-                // Route through the shared realm-event path so the "Seasonal and
-                // special bosses" section drives the visible callout.
-                self.live_feed_panel
-                    .push_boss_call(boss_id, name.to_string());
             }
             UiPayload::RealmClosed => {
                 use crate::panels::live_feed::WarningSeverity;
@@ -1635,22 +1623,8 @@ impl RealmHoundApp {
                     tracing::debug!("[PARTY] Member left (via chat): {}", name);
                 }
             }
-            UiPayload::KeyPop {
-                opener,
-                key_id,
-                dungeon_name,
-                thankable,
-            } => {
-                self.live_feed_panel
-                    .push_key_pop(key_id, dungeon_name, opener, thankable);
-            }
-            UiPayload::AreaUnlock {
-                title,
-                contributions,
-                callout,
-            } => {
-                self.live_feed_panel
-                    .push_area_unlock(title, contributions, callout);
+            UiPayload::KeyPop { .. } | UiPayload::AreaUnlock { .. } => {
+                // The worker's live-event window drives these feed entries.
             }
             UiPayload::PartyLocalLeaderStatus(is_leader) => {
                 self.party_panel.set_local_leader(is_leader);
@@ -1762,9 +1736,9 @@ impl RealmHoundApp {
             }
             self.owned_quest_rev = snap.view.quest_rev;
         }
-        if snap.view.boss_call_rev != self.owned_boss_call_rev {
-            self.live_feed_panel.recover_boss_calls(&snap.boss_calls);
-            self.owned_boss_call_rev = snap.view.boss_call_rev;
+        if snap.view.live_event_rev != self.owned_live_event_rev {
+            self.live_feed_panel.recover_live_events(&snap.live_events);
+            self.owned_live_event_rev = snap.view.live_event_rev;
         }
         self.maybe_confirm_client_launch(conn_changed);
     }

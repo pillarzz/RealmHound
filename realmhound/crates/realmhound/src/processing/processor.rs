@@ -35,9 +35,9 @@ use crate::processing::mission_tracker::{MissionTracker, MissionView};
 use crate::sound::SoundType;
 
 use super::contract::{
-    AccountOperationScope, AudioCommand, BossCallView, BossCallWindow, ControlMsg, DbCloseError,
-    EncounterSet, EncounterView, PartyMemberView, PartyView, QuestView, TokenState, UiPayload,
-    UiUpdate, ViewState,
+    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, EncounterSet, EncounterView,
+    LiveEventEntry, LiveEventView, LiveEventWindow, PartyMemberView, PartyView, QuestView,
+    TokenState, UiPayload, UiUpdate, ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
@@ -427,10 +427,10 @@ pub struct PacketProcessor {
     quest_rev: u64,
     /// Quest most recently redeemed, awaiting its result.
     pending_redeem_quest_id: Option<String>,
-    /// Recent boss calls/Keyper cues the UI can recover after missing a wake.
-    boss_calls: BossCallWindow,
-    /// Monotonic id for `boss_calls`.
-    boss_call_seq: u64,
+    /// Recent recoverable Live Feed events the UI can recover after missing a wake.
+    live_events: LiveEventWindow,
+    /// Monotonic id for `live_events`.
+    live_event_seq: u64,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -569,8 +569,8 @@ impl PacketProcessor {
             quests: None,
             quest_rev: 0,
             pending_redeem_quest_id: None,
-            boss_calls: BossCallWindow::default(),
-            boss_call_seq: 0,
+            live_events: LiveEventWindow::default(),
+            live_event_seq: 0,
         }
     }
 
@@ -677,8 +677,8 @@ impl PacketProcessor {
             quests: None,
             quest_rev: 0,
             pending_redeem_quest_id: None,
-            boss_calls: BossCallWindow::default(),
-            boss_call_seq: 0,
+            live_events: LiveEventWindow::default(),
+            live_event_seq: 0,
         })
     }
 
@@ -737,8 +737,8 @@ impl PacketProcessor {
             quests: None,
             quest_rev: 0,
             pending_redeem_quest_id: None,
-            boss_calls: BossCallWindow::default(),
-            boss_call_seq: 0,
+            live_events: LiveEventWindow::default(),
+            live_event_seq: 0,
         }
     }
 
@@ -801,7 +801,7 @@ impl PacketProcessor {
             party_rev: self.party.rev,
             encounter_rev: self.encounters.rev,
             quest_rev: self.quest_rev,
-            boss_call_rev: self.boss_calls.rev,
+            live_event_rev: self.live_events.rev,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -898,23 +898,22 @@ impl PacketProcessor {
         })
     }
 
-    /// Recent boss calls/Keyper cues for UI recovery.
-    pub fn boss_call_window(&self) -> BossCallWindow {
-        self.boss_calls.clone()
+    /// Recent recoverable Live Feed events for UI recovery.
+    pub fn live_event_window(&self) -> LiveEventWindow {
+        self.live_events.clone()
     }
 
-    fn record_boss_call(&mut self, boss_id: i32, name: &str) {
+    fn record_live_event(&mut self, event: LiveEventView) {
         const WINDOW: usize = 100;
-        self.boss_call_seq = self.boss_call_seq.wrapping_add(1);
-        self.boss_calls.events.push(BossCallView {
-            seq: self.boss_call_seq,
-            boss_id,
-            name: name.to_string(),
+        self.live_event_seq = self.live_event_seq.wrapping_add(1);
+        self.live_events.events.push(LiveEventEntry {
+            seq: self.live_event_seq,
+            event,
         });
-        if self.boss_calls.events.len() > WINDOW {
-            self.boss_calls.events.remove(0);
+        if self.live_events.events.len() > WINDOW {
+            self.live_events.events.remove(0);
         }
-        self.boss_calls.rev = self.boss_calls.rev.wrapping_add(1);
+        self.live_events.rev = self.live_events.rev.wrapping_add(1);
     }
 
     fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
@@ -2185,6 +2184,11 @@ impl PacketProcessor {
             return;
         }
         let callout = Self::monument_callout(&eligible);
+        self.record_live_event(LiveEventView::AreaUnlock {
+            title: "Sanctuary runes".to_string(),
+            contributions: contributions.clone(),
+            callout: callout.clone(),
+        });
         self.emit(UiPayload::AreaUnlock {
             title: "Sanctuary runes".to_string(),
             contributions,
@@ -2403,6 +2407,11 @@ impl PacketProcessor {
                     } else {
                         format!("Thanks {} for the {}!", popper, short)
                     };
+                    self.record_live_event(LiveEventView::AreaUnlock {
+                        title: title.to_string(),
+                        contributions: vec![(item_id, popper.clone())],
+                        callout: callout.clone(),
+                    });
                     self.emit(UiPayload::AreaUnlock {
                         title: title.to_string(),
                         contributions: vec![(item_id, popper)],
@@ -3112,7 +3121,10 @@ impl PacketProcessor {
                             if self.should_play_boss_call(boss_id, &chat_msg.text) {
                                 self.play_realm_event_sound(boss_id, &chat_msg.text, None);
                             }
-                            self.record_boss_call(boss_id, &chat_msg.text);
+                            self.record_live_event(LiveEventView::BossCall {
+                                boss_id,
+                                name: chat_msg.text.clone(),
+                            });
                             self.emit(UiPayload::BossCall {
                                 boss_id,
                                 text: chat_msg.text.clone(),
@@ -3274,6 +3286,12 @@ impl PacketProcessor {
                                 .key_id_for_dungeon(&dungeon_name)
                                 .unwrap_or(picture_type);
                             let thankable = !self.is_local_player(&opener);
+                            self.record_live_event(LiveEventView::KeyPop {
+                                opener: opener.clone(),
+                                key_id,
+                                dungeon_name: dungeon_name.clone(),
+                                thankable,
+                            });
                             self.emit(UiPayload::KeyPop {
                                 opener,
                                 key_id,
@@ -3924,7 +3942,10 @@ impl PacketProcessor {
                 if self.should_play_boss_call(KEYPER_BOSS_ID, "The Keyper") {
                     self.play_realm_event_sound(KEYPER_BOSS_ID, "The Keyper", None);
                 }
-                self.record_boss_call(KEYPER_BOSS_ID, "The Keyper");
+                self.record_live_event(LiveEventView::BossCall {
+                    boss_id: KEYPER_BOSS_ID,
+                    name: "The Keyper".to_string(),
+                });
                 self.emit(UiPayload::KeyperEvent { towers: false });
             }
             KeyperCue::TowersAppeared => {
@@ -3938,7 +3959,10 @@ impl PacketProcessor {
                 if self.should_play_boss_call(KEYPER_TOWER_SPRITE_ID, "Keyper Towers") {
                     self.play_realm_event_sound(KEYPER_TOWER_SPRITE_ID, "Keyper Towers", None);
                 }
-                self.record_boss_call(KEYPER_TOWER_SPRITE_ID, "Keyper Towers");
+                self.record_live_event(LiveEventView::BossCall {
+                    boss_id: KEYPER_TOWER_SPRITE_ID,
+                    name: "Keyper Towers".to_string(),
+                });
                 self.emit(UiPayload::KeyperEvent { towers: true });
             }
         }
@@ -4717,19 +4741,21 @@ mod keyper_tests {
     }
 
     #[test]
-    fn boss_call_window_records_keyper_cues() {
+    fn live_event_window_records_keyper_cues() {
         let mut processor = PacketProcessor::new_for_test(AccountData::new());
         enter_realm_settled(&mut processor);
         processor.dispatch_event(keyper_taunt("Wha- Again? REALLY?!"));
 
-        let window = processor.boss_call_window();
+        let window = processor.live_event_window();
         assert_eq!(window.events.len(), 1);
-        assert_eq!(
-            window.events[0].boss_id,
-            realmhound_core::keyper::KEYPER_BOSS_ID
-        );
-        assert_eq!(window.events[0].name, "The Keyper");
-        assert_eq!(processor.view_state().boss_call_rev, window.rev);
+        match &window.events[0].event {
+            crate::processing::contract::LiveEventView::BossCall { boss_id, name } => {
+                assert_eq!(*boss_id, realmhound_core::keyper::KEYPER_BOSS_ID);
+                assert_eq!(name, "The Keyper");
+            }
+            other => panic!("expected a boss call, got {other:?}"),
+        }
+        assert_eq!(processor.view_state().live_event_rev, window.rev);
     }
 
     #[test]

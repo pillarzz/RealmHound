@@ -881,8 +881,8 @@ pub struct LiveFeedPanel {
     /// Active encounters (realm bosses/events currently in view)
     /// Key is object_id (instance ID)
     active_encounters: HashMap<i32, ActiveEncounter>,
-    /// Highest recovered boss-call event id from the worker window.
-    recovered_boss_seq: u64,
+    /// Highest recovered Live Feed event id from the worker window.
+    recovered_event_seq: u64,
 
     // === Realm Status Bar State ===
     /// Current server name (e.g., "EUWest")
@@ -1134,7 +1134,7 @@ impl LiveFeedPanel {
             awaiting_first_map: true,
             has_captured_connection: false,
             active_encounters: HashMap::new(),
-            recovered_boss_seq: 0,
+            recovered_event_seq: 0,
             // Realm status bar state
             server_name: None,
             realm_name: None,
@@ -2746,16 +2746,37 @@ impl LiveFeedPanel {
         self.active_encounters.clear();
     }
 
-    /// Recover boss calls the UI missed while it was not painting. Existing
-    /// entries are left alone; the window only fills gaps.
-    pub fn recover_boss_calls(&mut self, window: &crate::processing::contract::BossCallWindow) {
-        for event in &window.events {
-            if event.seq > self.recovered_boss_seq {
-                self.push_boss_call(event.boss_id, event.name.clone());
+    /// Recover Live Feed events the UI missed while it was not painting. The
+    /// worker window is the authority for these entry types.
+    pub fn recover_live_events(&mut self, window: &crate::processing::contract::LiveEventWindow) {
+        use crate::processing::contract::LiveEventView;
+        for entry in &window.events {
+            if entry.seq <= self.recovered_event_seq {
+                continue;
+            }
+            match &entry.event {
+                LiveEventView::BossCall { boss_id, name } => {
+                    self.push_boss_call(*boss_id, name.clone());
+                }
+                LiveEventView::KeyPop {
+                    opener,
+                    key_id,
+                    dungeon_name,
+                    thankable,
+                } => {
+                    self.push_key_pop(*key_id, dungeon_name.clone(), opener.clone(), *thankable);
+                }
+                LiveEventView::AreaUnlock {
+                    title,
+                    contributions,
+                    callout,
+                } => {
+                    self.push_area_unlock(title.clone(), contributions.clone(), callout.clone());
+                }
             }
         }
         if let Some(last) = window.events.last() {
-            self.recovered_boss_seq = self.recovered_boss_seq.max(last.seq);
+            self.recovered_event_seq = self.recovered_event_seq.max(last.seq);
         }
     }
 
@@ -8263,35 +8284,50 @@ mod tests {
     }
 
     #[test]
-    fn recover_boss_calls_adds_only_new_events() {
-        use crate::processing::contract::{BossCallView, BossCallWindow};
+    fn recover_live_events_adds_only_new_events() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView, LiveEventWindow};
 
         let mut panel = LiveFeedPanel::default();
-        panel.recover_boss_calls(&BossCallWindow {
-            events: vec![BossCallView {
+        panel.recover_live_events(&LiveEventWindow {
+            events: vec![LiveEventEntry {
                 seq: 1,
-                boss_id: 10,
-                name: "First".to_string(),
+                event: LiveEventView::BossCall {
+                    boss_id: 10,
+                    name: "First".to_string(),
+                },
             }],
             rev: 1,
         });
         assert_eq!(panel.entries.len(), 1);
 
-        panel.recover_boss_calls(&BossCallWindow {
+        panel.recover_live_events(&LiveEventWindow {
             events: vec![
-                BossCallView {
+                LiveEventEntry {
                     seq: 1,
-                    boss_id: 10,
-                    name: "First".to_string(),
+                    event: LiveEventView::BossCall {
+                        boss_id: 10,
+                        name: "First".to_string(),
+                    },
                 },
-                BossCallView {
+                LiveEventEntry {
                     seq: 2,
-                    boss_id: 11,
-                    name: "Second".to_string(),
+                    event: LiveEventView::BossCall {
+                        boss_id: 11,
+                        name: "Second".to_string(),
+                    },
+                },
+                LiveEventEntry {
+                    seq: 3,
+                    event: LiveEventView::KeyPop {
+                        opener: "Popper".to_string(),
+                        key_id: 7,
+                        dungeon_name: "Dungeon".to_string(),
+                        thankable: true,
+                    },
                 },
             ],
             rev: 2,
         });
-        assert_eq!(panel.entries.len(), 2, "seq 1 is not replayed");
+        assert_eq!(panel.entries.len(), 3, "seq 1 is not replayed");
     }
 }

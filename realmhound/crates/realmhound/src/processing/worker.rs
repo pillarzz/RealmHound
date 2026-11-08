@@ -227,7 +227,7 @@ pub fn spawn(
         pub_party_rev: u64::MAX,
         pub_encounter_rev: u64::MAX,
         pub_quest_rev: u64::MAX,
-        pub_boss_call_rev: u64::MAX,
+        pub_live_event_rev: u64::MAX,
         #[cfg(feature = "latency-diagnostics")]
         latency: LatencyDiagnostics::default(),
     };
@@ -282,7 +282,7 @@ struct Worker {
     pub_party_rev: u64,
     pub_encounter_rev: u64,
     pub_quest_rev: u64,
-    pub_boss_call_rev: u64,
+    pub_live_event_rev: u64,
     #[cfg(feature = "latency-diagnostics")]
     latency: LatencyDiagnostics,
 }
@@ -1071,8 +1071,8 @@ impl Worker {
         let encounters_changed = encounter_rev != self.pub_encounter_rev;
         let quest_rev = view.quest_rev;
         let quests_changed = quest_rev != self.pub_quest_rev;
-        let boss_call_rev = view.boss_call_rev;
-        let boss_calls_changed = boss_call_rev != self.pub_boss_call_rev;
+        let live_event_rev = view.live_event_rev;
+        let live_events_changed = live_event_rev != self.pub_live_event_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
         let previous = match self.snapshot.lock() {
@@ -1092,7 +1092,7 @@ impl Worker {
         let quests = quests_changed
             .then(|| self.processor.quest_view().map(Arc::new))
             .flatten();
-        let boss_calls = boss_calls_changed.then(|| Arc::new(self.processor.boss_call_window()));
+        let live_events = live_events_changed.then(|| Arc::new(self.processor.live_event_window()));
         let next = previous.next(
             view.clone(),
             live_char_id,
@@ -1104,7 +1104,7 @@ impl Worker {
             party,
             encounters,
             quests,
-            boss_calls,
+            live_events,
         );
         let replaced = match self.snapshot.lock() {
             Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
@@ -1120,7 +1120,7 @@ impl Worker {
         self.pub_party_rev = party_rev;
         self.pub_encounter_rev = encounter_rev;
         self.pub_quest_rev = quest_rev;
-        self.pub_boss_call_rev = boss_call_rev;
+        self.pub_live_event_rev = live_event_rev;
         self.pub_view = Some(view);
         view_changed
     }

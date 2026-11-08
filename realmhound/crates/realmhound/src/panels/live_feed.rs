@@ -6888,6 +6888,39 @@ mod tests {
     }
 
     #[test]
+    fn recovered_leave_freezes_the_run_at_the_leave_time() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView};
+        let mut panel = LiveFeedPanel::new();
+        let entered = chrono::Utc::now() - chrono::Duration::seconds(3_600);
+        panel.apply_live_event(&LiveEventEntry {
+            seq: 1,
+            at: entered,
+            event: LiveEventView::Dungeon {
+                fp: 5,
+                display_name: "Snake Pit".to_string(),
+                modifiers: Vec::new(),
+                grade: None,
+            },
+        });
+        panel.apply_live_event(&LiveEventEntry {
+            seq: 2,
+            at: entered + chrono::Duration::seconds(10),
+            event: LiveEventView::DungeonLeft,
+        });
+        match panel.entries.front().unwrap() {
+            FeedEntry::Dungeon(entry) => {
+                let frozen = entry.frozen_elapsed_ms.expect("run is settled");
+                assert!(
+                    (9_900..=10_100).contains(&frozen),
+                    "the fallback duration ends at the leave event, not at paint time: {frozen}ms"
+                );
+                assert!(entry.remaining(std::time::Instant::now()).is_zero());
+            }
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn freeze_before_the_row_is_applied_when_it_arrives() {
         let mut panel = LiveFeedPanel::new();
         // The run ended before the row was recovered from the worker window.

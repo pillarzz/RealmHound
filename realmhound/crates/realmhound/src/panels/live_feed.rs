@@ -1554,23 +1554,8 @@ impl LiveFeedPanel {
     /// observation of an account only seeds state, so an account already at cap
     /// on login does not spam notifications.
     pub fn update_dust(&mut self, amounts: DustAmounts, is_seasonal: bool) {
-        let previous = self.dust_state.get(is_seasonal).cloned();
-        self.dust_state.update(amounts.clone(), is_seasonal);
+        self.dust_state.update(amounts, is_seasonal);
         self.is_seasonal = is_seasonal;
-
-        let Some(previous) = previous else {
-            return;
-        };
-
-        let previously_full = previous.full_types();
-        for dust_type in amounts.full_types() {
-            if !previously_full.contains(&dust_type) {
-                self.push_entry(FeedEntry::DustFull(DustFullEntry::new(
-                    is_seasonal,
-                    dust_type,
-                )));
-            }
-        }
     }
 
     /// Set the current character's seasonal status (for display emphasis).
@@ -2796,6 +2781,15 @@ impl LiveFeedPanel {
                     if self.show_who_roster {
                         self.push_who_roster(names.clone());
                     }
+                }
+                LiveEventView::DustFull {
+                    is_seasonal,
+                    dust_type,
+                } => {
+                    self.push_entry(FeedEntry::DustFull(DustFullEntry::new(
+                        *is_seasonal,
+                        *dust_type,
+                    )));
                 }
             }
         }
@@ -6230,14 +6224,6 @@ mod tests {
             .count()
     }
 
-    fn dust_full_count(panel: &LiveFeedPanel) -> usize {
-        panel
-            .entries
-            .iter()
-            .filter(|e| matches!(e, FeedEntry::DustFull(_)))
-            .count()
-    }
-
     fn sample_dungeon_entry() -> FeedEntry {
         let (mods, ov) = test_callout_inputs();
         let params = test_params(&mods, &ov);
@@ -6316,70 +6302,6 @@ mod tests {
             entry.callout(),
             Some("Thanks Alice for the key!".to_string())
         );
-    }
-
-    #[test]
-    fn dust_full_notifies_once_on_transition() {
-        let mut panel = LiveFeedPanel::new();
-
-        // Green below cap: no notification.
-        let mut amounts = DustAmounts::new();
-        amounts.green = (1900, 2000);
-        amounts.red = (500, 2000);
-        amounts.purple = (500, 2000);
-        panel.update_dust(amounts.clone(), false);
-        assert_eq!(dust_full_count(&panel), 0);
-
-        // Green reaches cap: one notification.
-        amounts.green = (2000, 2000);
-        panel.update_dust(amounts.clone(), false);
-        assert_eq!(dust_full_count(&panel), 1);
-
-        // Still full on the next update: no new notification.
-        panel.update_dust(amounts.clone(), false);
-        assert_eq!(dust_full_count(&panel), 1);
-
-        // A different type fills: a second notification.
-        amounts.red = (2000, 2000);
-        panel.update_dust(amounts, false);
-        assert_eq!(dust_full_count(&panel), 2);
-    }
-
-    #[test]
-    fn dust_full_separate_per_account() {
-        let mut panel = LiveFeedPanel::new();
-
-        // Seed both accounts below cap (first observation does not notify).
-        let mut below = DustAmounts::new();
-        below.green = (0, 2000);
-        below.red = (0, 2000);
-        below.purple = (0, 2000);
-        panel.update_dust(below.clone(), false);
-        panel.update_dust(below, true);
-        assert_eq!(dust_full_count(&panel), 0);
-
-        // Fill green on each account: one notification per account.
-        let mut full_green = DustAmounts::new();
-        full_green.green = (2000, 2000);
-        full_green.red = (0, 2000);
-        full_green.purple = (0, 2000);
-        panel.update_dust(full_green.clone(), false);
-        panel.update_dust(full_green, true);
-        assert_eq!(dust_full_count(&panel), 2);
-    }
-
-    #[test]
-    fn dust_full_first_observation_already_full_does_not_notify() {
-        let mut panel = LiveFeedPanel::new();
-
-        let mut full_green = DustAmounts::new();
-        full_green.green = (2000, 2000);
-        full_green.red = (0, 2000);
-        full_green.purple = (0, 2000);
-
-        // First-ever update for the account already at cap: seed only.
-        panel.update_dust(full_green, false);
-        assert_eq!(dust_full_count(&panel), 0);
     }
 
     #[test]

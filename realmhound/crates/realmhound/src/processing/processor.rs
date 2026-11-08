@@ -433,6 +433,8 @@ pub struct PacketProcessor {
     live_event_seq: u64,
     /// Whether the current map is a dungeon (for Oryx-lag warnings).
     in_dungeon: bool,
+    /// Dust amounts used to detect full transitions.
+    dust_state: realmhound_core::dust::DustState,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -574,6 +576,7 @@ impl PacketProcessor {
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
             in_dungeon: false,
+            dust_state: realmhound_core::dust::DustState::new(),
         }
     }
 
@@ -683,6 +686,7 @@ impl PacketProcessor {
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
             in_dungeon: false,
+            dust_state: realmhound_core::dust::DustState::new(),
         })
     }
 
@@ -744,6 +748,7 @@ impl PacketProcessor {
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
             in_dungeon: false,
+            dust_state: realmhound_core::dust::DustState::new(),
         }
     }
 
@@ -2766,6 +2771,19 @@ impl PacketProcessor {
                     is_seasonal,
                     &self.account_repository,
                 );
+                let previous = self.dust_state.get(is_seasonal).cloned();
+                self.dust_state.update(amounts.clone(), is_seasonal);
+                if let Some(previous) = previous {
+                    let previously_full = previous.full_types();
+                    for dust_type in amounts.full_types() {
+                        if !previously_full.contains(&dust_type) {
+                            self.record_live_event(LiveEventView::DustFull {
+                                is_seasonal,
+                                dust_type,
+                            });
+                        }
+                    }
+                }
             }
 
             // Account-level Widget Bar stats (stars, fame, gold, forge fire, materials).
@@ -4795,6 +4813,33 @@ mod keyper_tests {
             other => panic!("expected a boss call, got {other:?}"),
         }
         assert_eq!(processor.view_state().live_event_rev, window.rev);
+    }
+
+    #[test]
+    fn live_event_window_records_dust_full_transition() {
+        use realmhound_core::dust::{DustAmounts, DustType};
+
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::DustUpdated {
+            amounts: DustAmounts::new(),
+            is_seasonal: false,
+        });
+        assert!(processor.live_event_window().events.is_empty());
+
+        let mut full = DustAmounts::new();
+        full.set(DustType::Green, 100, 100);
+        processor.dispatch_event(GameEvent::DustUpdated {
+            amounts: full,
+            is_seasonal: false,
+        });
+        assert!(matches!(
+            processor
+                .live_event_window()
+                .events
+                .last()
+                .map(|entry| &entry.event),
+            Some(crate::processing::contract::LiveEventView::DustFull { .. })
+        ));
     }
 
     #[test]

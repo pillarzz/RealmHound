@@ -572,6 +572,10 @@ pub enum LiveEventView {
     WhoRoster {
         names: Vec<String>,
     },
+    DustFull {
+        is_seasonal: bool,
+        dust_type: realmhound_core::dust::DustType,
+    },
 }
 
 /// A sequenced Live Feed event.

@@ -593,6 +593,8 @@ pub struct RealmHoundApp {
     owned_quest_rev: u64,
     /// Last applied worker-owned recoverable Live Feed revision.
     owned_live_event_rev: u64,
+    owned_feed_rev: u64,
+    owned_feed_seq: u64,
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
@@ -1118,6 +1120,8 @@ impl RealmHoundApp {
             owned_encounter_rev: 0,
             owned_quest_rev: 0,
             owned_live_event_rev: 0,
+            owned_feed_rev: 0,
+            owned_feed_seq: 0,
             worker,
             health,
             audio,
@@ -1537,26 +1541,11 @@ impl RealmHoundApp {
             UiPayload::BossCall { .. } | UiPayload::KeyperEvent { .. } => {
                 // The worker's live-event window drives these feed entries.
             }
-            UiPayload::RealmDiscovery(event) => {
-                self.live_feed_panel.apply_realm_discovery(event);
-            }
-            UiPayload::RealmClosed => {
-                // The warning entry comes from the live-event window; only the
-                // realm score state is UI-local.
-                self.live_feed_panel.force_realm_closed();
-            }
             UiPayload::OryxLagWarning => {
                 // The worker's live-event window drives the warning entry.
             }
             UiPayload::SetServerName(name) => {
                 self.live_feed_panel.set_server_name(name);
-            }
-            UiPayload::DungeonTimerFrozen {
-                map_seed,
-                elapsed_ms,
-            } => {
-                self.live_feed_panel
-                    .apply_dungeon_freeze(map_seed, elapsed_ms);
             }
             UiPayload::CombatHistoryChanged => {
                 self.combat_panel.invalidate_cards();
@@ -1677,6 +1666,16 @@ impl RealmHoundApp {
         if snap.view.live_event_rev != self.owned_live_event_rev {
             self.live_feed_panel.recover_live_events(&snap.live_events);
             self.owned_live_event_rev = snap.view.live_event_rev;
+        }
+        if snap.view.feed_rev != self.owned_feed_rev {
+            for entry in &snap.feed.events {
+                if entry.seq > self.owned_feed_seq {
+                    self.live_feed_panel
+                        .apply_context_event(&entry.event, entry.at);
+                    self.owned_feed_seq = entry.seq;
+                }
+            }
+            self.owned_feed_rev = snap.view.feed_rev;
         }
         self.maybe_confirm_client_launch(conn_changed);
     }

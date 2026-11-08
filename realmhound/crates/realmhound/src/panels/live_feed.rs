@@ -1987,6 +1987,58 @@ impl LiveFeedPanel {
     // === End Realm Status Bar Methods ===
 
     /// Apply a realm-entity discovery to the feed.
+    /// Apply one authoritative context update from the worker snapshot.
+    pub fn apply_context_event(
+        &mut self,
+        event: &crate::processing::contract::FeedContextEvent,
+        at: DateTime<Utc>,
+    ) {
+        use crate::processing::contract::FeedContextEvent;
+        // Anchor times carried by the snapshot must not shift with the repaint.
+        let observed = std::time::Instant::now()
+            - chrono::Utc::now()
+                .signed_duration_since(at)
+                .to_std()
+                .unwrap_or_default();
+        match event {
+            FeedContextEvent::Location {
+                display_name,
+                realm_name,
+                current_realm_score,
+                max_realm_score,
+                is_dungeon,
+            } => {
+                self.update_location(
+                    display_name,
+                    realm_name,
+                    *current_realm_score,
+                    *max_realm_score,
+                );
+                self.left_from_dungeon = self.currently_in_dungeon;
+                self.currently_in_dungeon = *is_dungeon;
+                if !*is_dungeon {
+                    self.deactivate_active_dungeons();
+                    self.clear_dungeon_signature();
+                    self.pending_portal_spawn = None;
+                }
+                self.portal_spawns.clear();
+            }
+            FeedContextEvent::RealmScore(score) => self.update_realm_score(*score),
+            FeedContextEvent::RealmClosed => self.force_realm_closed(),
+            FeedContextEvent::Discovery(event) => self.apply_realm_discovery(event.clone()),
+            FeedContextEvent::PortalSpawned { object_id } => {
+                self.portal_spawns.entry(*object_id).or_insert(observed);
+            }
+            FeedContextEvent::PortalUsed { object_id } => {
+                self.pending_portal_spawn = self.portal_spawns.get(object_id).copied();
+            }
+            FeedContextEvent::DungeonTimerFrozen {
+                map_seed,
+                elapsed_ms,
+            } => self.apply_dungeon_freeze(*map_seed, *elapsed_ms),
+        }
+    }
+
     pub fn apply_realm_discovery(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Reset { at } => {
@@ -5319,56 +5371,8 @@ impl Panel for LiveFeedPanel {
         _session: &realmhound_core::GameSession,
     ) -> Vec<AppAction> {
         match event {
-            realmhound_core::GameEvent::RealmScoreChanged { score } => {
-                self.update_realm_score(*score);
-            }
-            realmhound_core::GameEvent::MapChanged {
-                ref display_name,
-                ref realm_name,
-                current_realm_score,
-                max_realm_score,
-                is_dungeon,
-                ..
-            } => {
-                self.update_location(
-                    display_name,
-                    realm_name,
-                    *current_realm_score,
-                    *max_realm_score,
-                );
-                self.left_from_dungeon = self.currently_in_dungeon;
-                self.currently_in_dungeon = *is_dungeon;
-
-                if *is_dungeon {
-                    // The worker's live-event window drives the dungeon entry.
-                } else {
-                    // Left the dungeon (hub/realm): you can no longer call it, so
-                    // expire any still-active dungeon entries and allow a fresh
-                    // entry on re-entry. A non-dungeon transition also voids any
-                    // pending portal anchor (e.g. a realm/nexus portal we used).
-                    self.deactivate_active_dungeons();
-                    self.clear_dungeon_signature();
-                    self.pending_portal_spawn = None;
-                }
-                // Portal spawn times are map-local; drop them when the map changes.
-                self.portal_spawns.clear();
-            }
-            realmhound_core::GameEvent::UpdateReceived(update, _) => {
-                let am = realmhound_core::assets::get_asset_manager();
-                for obj in &update.new_objects {
-                    if am.is_portal_object(obj.object_type as i32) {
-                        // Keep the first-seen spawn time; re-seeing the same
-                        // portal must not reset its countdown. Drops are not
-                        // pruned (map change clears the whole map).
-                        self.portal_spawns
-                            .entry(obj.object_id())
-                            .or_insert_with(std::time::Instant::now);
-                    }
-                }
-            }
-            realmhound_core::GameEvent::PortalUsed { object_id } => {
-                self.pending_portal_spawn = self.portal_spawns.get(object_id).copied();
-            }
+            // Location, realm score, discovery and portal anchors arrive from
+            // the worker snapshot (`apply_context_event`).
             realmhound_core::GameEvent::DustUpdated {
                 amounts,
                 is_seasonal,

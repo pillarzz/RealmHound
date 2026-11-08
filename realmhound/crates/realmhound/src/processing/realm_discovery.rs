@@ -11,6 +11,7 @@ pub const JAILER_TYPE: i32 = 0xAD31;
 pub const TOTALIA_TYPE: i32 = 0x3CCF;
 pub const ABSENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
     Reset {
         at: Instant,

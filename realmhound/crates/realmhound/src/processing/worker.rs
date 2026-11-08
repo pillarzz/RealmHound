@@ -269,6 +269,7 @@ pub fn spawn(
         pub_encounter_rev: u64::MAX,
         pub_quest_rev: u64::MAX,
         pub_live_event_rev: u64::MAX,
+        pub_feed_rev: u64::MAX,
         #[cfg(feature = "latency-diagnostics")]
         latency: LatencyDiagnostics::default(),
     };
@@ -331,6 +332,7 @@ struct Worker {
     pub_encounter_rev: u64,
     pub_quest_rev: u64,
     pub_live_event_rev: u64,
+    pub_feed_rev: u64,
     #[cfg(feature = "latency-diagnostics")]
     latency: LatencyDiagnostics,
 }
@@ -615,9 +617,6 @@ impl Worker {
                                     self.processor.record_live_event(alert);
                                 }
                             }
-                            if matches!(&payload, UiPayload::RealmClosed) {
-                                self.release_auto_callout();
-                            }
                             if let UiPayload::Broadcast(GameEvent::MapChanged {
                                 ref display_name,
                                 ref realm_name,
@@ -731,6 +730,9 @@ impl Worker {
             let (audio_stale, audio_full) = crate::audio::drop_counts();
             self.health.set_audio_drops(audio_stale, audio_full);
             self.expire_auto_callout();
+            if self.processor.take_realm_close() {
+                self.release_auto_callout();
+            }
             #[cfg(feature = "latency-diagnostics")]
             {
                 segments.save = save_started.elapsed();
@@ -1248,6 +1250,8 @@ impl Worker {
         let quests_changed = quest_rev != self.pub_quest_rev;
         let live_event_rev = view.live_event_rev;
         let live_events_changed = live_event_rev != self.pub_live_event_rev;
+        let feed_rev = view.feed_rev;
+        let feed_changed = feed_rev != self.pub_feed_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
         let lock_started = Instant::now();
@@ -1271,6 +1275,7 @@ impl Worker {
             .then(|| self.processor.quest_view().map(Arc::new))
             .flatten();
         let live_events = live_events_changed.then(|| Arc::new(self.processor.live_event_window()));
+        let feed = feed_changed.then(|| Arc::new(self.processor.feed_context()));
         let next = previous.next(
             view.clone(),
             live_char_id,
@@ -1283,6 +1288,7 @@ impl Worker {
             encounters,
             quests,
             live_events,
+            feed,
         );
         let lock_started = Instant::now();
         let replaced = match self.snapshot.lock() {
@@ -1303,6 +1309,7 @@ impl Worker {
         self.pub_encounter_rev = encounter_rev;
         self.pub_quest_rev = quest_rev;
         self.pub_live_event_rev = live_event_rev;
+        self.pub_feed_rev = feed_rev;
         self.pub_view = Some(view);
         view_changed
     }

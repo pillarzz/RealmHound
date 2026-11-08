@@ -64,8 +64,6 @@ pub enum UiPayload {
     Chat(ChatMessage),
     /// An encounter/boss callout for the live feed.
     BossCall { boss_id: i32, text: String },
-    /// Instance-scoped Crystal/Jailer discovery updates.
-    RealmDiscovery(super::realm_discovery::DiscoveryEvent),
 
     /// A Keyper seasonal-event cue for the live feed. `towers` = true when a
     /// crystal-tower wave appeared, false when The Keyper boss spawned. Carries
@@ -120,16 +118,8 @@ pub enum UiPayload {
     /// A sound should be played (App owns the `SoundEngine` this session).
     Audio(AudioCommand),
 
-    /// Oryx realm-close announcement detected.
-    RealmClosed,
-
     /// Oryx "MY MINIONS HAVE FAILED ME" detected while in dungeon.
     OryxLagWarning,
-
-    /// The current dungeon run's timer has settled to its committed per-run
-    /// value (fired when the run ends: leave/nexus, death, disconnect). Carries
-    /// the map seed of the run so the Live Feed can target the matching row.
-    DungeonTimerFrozen { map_seed: i32, elapsed_ms: i64 },
 
     /// A stored Combat History card changed without a new fight being recorded
     /// (a loot bag completing an escaped fight or an encounter run), which the
@@ -426,6 +416,8 @@ pub struct ViewState {
     pub quest_rev: u64,
     /// Generation of the worker-owned recoverable Live Feed window.
     pub live_event_rev: u64,
+    /// Bumps when the worker-side Live Feed context changes.
+    pub feed_rev: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -461,6 +453,7 @@ impl ViewState {
             encounter_rev: 0,
             quest_rev: 0,
             live_event_rev: 0,
+            feed_rev: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -572,6 +565,54 @@ pub enum LiveEventView {
     },
 }
 
+/// One authoritative Live Feed context update produced by the worker.
+///
+/// These used to travel as UI payloads, which let a stale queued event undo a
+/// newer snapshot. They now live in the snapshot and are replayed in order.
+#[derive(Debug, Clone)]
+pub enum FeedContextEvent {
+    /// Map transition with the realm context it was observed in.
+    Location {
+        display_name: String,
+        realm_name: String,
+        current_realm_score: i32,
+        max_realm_score: i32,
+        is_dungeon: bool,
+    },
+    /// Realm score tick.
+    RealmScore(i32),
+    /// Realm close detected; starts the castle countdown.
+    RealmClosed,
+    /// Crystal/Jailer/Totalia lifecycle update.
+    Discovery(super::realm_discovery::DiscoveryEvent),
+    /// A portal object appeared on the current map (anchor for callout timing).
+    PortalSpawned { object_id: i32 },
+    /// The local player used a portal object.
+    PortalUsed { object_id: i32 },
+    /// A dungeon run's timer settled, keyed by map seed.
+    DungeonTimerFrozen { map_seed: i32, elapsed_ms: i64 },
+}
+
+/// A sequenced, timestamped context update.
+#[derive(Debug, Clone)]
+pub struct FeedContextEntry {
+    /// Monotonic id used by the UI to apply only new updates.
+    pub seq: u64,
+    /// When the worker observed it.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// The update.
+    pub event: FeedContextEvent,
+}
+
+/// Worker-owned Live Feed context (whole session).
+#[derive(Debug, Clone, Default)]
+pub struct FeedContext {
+    /// Updates oldest to newest.
+    pub events: Vec<FeedContextEntry>,
+    /// Bumps on every append.
+    pub rev: u64,
+}
+
 /// A sequenced Live Feed event.
 #[derive(Debug, Clone)]
 pub struct LiveEventEntry {
@@ -678,6 +719,8 @@ pub struct ModelSnapshot {
     pub quests: Option<Arc<QuestView>>,
     /// Worker-owned recent recoverable Live Feed window.
     pub live_events: Arc<LiveEventWindow>,
+    /// Worker-owned Live Feed context (location, score, discovery, anchors).
+    pub feed: Arc<FeedContext>,
 }
 
 impl ModelSnapshot {
@@ -702,6 +745,7 @@ impl ModelSnapshot {
             encounters: Arc::new(EncounterSet::default()),
             quests: None,
             live_events: Arc::new(LiveEventWindow::default()),
+            feed: Arc::new(FeedContext::default()),
         }
     }
 
@@ -720,6 +764,7 @@ impl ModelSnapshot {
         encounters: Option<Arc<EncounterSet>>,
         quests: Option<Arc<QuestView>>,
         live_events: Option<Arc<LiveEventWindow>>,
+        feed: Option<Arc<FeedContext>>,
     ) -> Self {
         Self {
             selected_identity: self.selected_identity.clone(),
@@ -734,6 +779,7 @@ impl ModelSnapshot {
             encounters: encounters.unwrap_or_else(|| self.encounters.clone()),
             quests: quests.or_else(|| self.quests.clone()),
             live_events: live_events.unwrap_or_else(|| self.live_events.clone()),
+            feed: feed.unwrap_or_else(|| self.feed.clone()),
         }
     }
 }
@@ -773,6 +819,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
@@ -798,10 +845,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(Arc::ptr_eq(with_token.token.as_ref().unwrap(), &token));
         let reused = with_token.next(
             ViewState::new(None, None),
+            None,
             None,
             None,
             None,

@@ -36,8 +36,9 @@ use crate::sound::SoundType;
 
 use super::contract::{
     AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, EncounterSet, EncounterView,
-    LiveEventEntry, LiveEventView, LiveEventWindow, PartyMemberView, PartyView, QuestView,
-    TokenState, UiPayload, UiUpdate, ViewState,
+    FeedContext, FeedContextEntry, FeedContextEvent, LiveEventEntry, LiveEventView,
+    LiveEventWindow, PartyMemberView, PartyView, QuestView, TokenState, UiPayload, UiUpdate,
+    ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
@@ -431,6 +432,9 @@ pub struct PacketProcessor {
     pending_redeem_quest_id: Option<String>,
     /// Recent recoverable Live Feed events the UI can recover after missing a wake.
     live_events: LiveEventWindow,
+    feed: FeedContext,
+    feed_seq: u64,
+    realm_close_pending: bool,
     /// Monotonic id for `live_events`.
     live_event_seq: u64,
     /// Number of events evicted from the bounded live-event window.
@@ -580,6 +584,9 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            feed: FeedContext::default(),
+            feed_seq: 0,
+            realm_close_pending: false,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -692,6 +699,9 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            feed: FeedContext::default(),
+            feed_seq: 0,
+            realm_close_pending: false,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -756,6 +766,9 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            feed: FeedContext::default(),
+            feed_seq: 0,
+            realm_close_pending: false,
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -822,6 +835,7 @@ impl PacketProcessor {
             encounter_rev: self.encounters.rev,
             quest_rev: self.quest_rev,
             live_event_rev: self.live_events.rev,
+            feed_rev: self.feed.rev,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -942,6 +956,27 @@ impl PacketProcessor {
     /// Cumulative evictions from the bounded live-event window.
     pub fn live_event_evictions(&self) -> u64 {
         self.live_event_evictions
+    }
+
+    /// Record an authoritative Live Feed context update.
+    pub(crate) fn record_feed_event(&mut self, event: FeedContextEvent) {
+        self.feed_seq = self.feed_seq.wrapping_add(1);
+        self.feed.events.push(FeedContextEntry {
+            seq: self.feed_seq,
+            at: chrono::Utc::now(),
+            event,
+        });
+        self.feed.rev = self.feed.rev.wrapping_add(1);
+    }
+
+    /// The worker-owned Live Feed context.
+    pub fn feed_context(&self) -> FeedContext {
+        self.feed.clone()
+    }
+
+    /// Take the "realm just closed" edge (clears the automatic callout).
+    pub fn take_realm_close(&mut self) -> bool {
+        std::mem::take(&mut self.realm_close_pending)
     }
 
     pub(crate) fn record_live_event(&mut self, event: LiveEventView) {
@@ -1130,7 +1165,7 @@ impl PacketProcessor {
         if let Some((boss_id, name, instance_id)) = trigger {
             self.play_realm_event_sound(boss_id, name, instance_id);
         }
-        self.emit(UiPayload::RealmDiscovery(update));
+        self.record_feed_event(FeedContextEvent::Discovery(update));
     }
 
     /// Play a realm-event sound for a boss call when its section is enabled.
@@ -2615,10 +2650,13 @@ impl PacketProcessor {
 
         // --- Phase 2: model-side orchestration ---
         match event {
-            GameEvent::RealmScoreChanged { .. }
-            | GameEvent::PartyJoinRequestResponse(_)
-            | GameEvent::PortalUsed { .. }
-            | GameEvent::ReconnectReceived { .. } => {}
+            GameEvent::RealmScoreChanged { score } => {
+                self.record_feed_event(FeedContextEvent::RealmScore(score));
+            }
+            GameEvent::PortalUsed { object_id } => {
+                self.record_feed_event(FeedContextEvent::PortalUsed { object_id });
+            }
+            GameEvent::PartyJoinRequestResponse(_) | GameEvent::ReconnectReceived { .. } => {}
 
             GameEvent::QuestsReceived(ref response) => {
                 self.quests = Some(response.clone());
@@ -2967,11 +3005,21 @@ impl PacketProcessor {
                 ref realm_name,
                 fp,
                 is_dungeon,
+                current_realm_score,
                 max_realm_score,
                 ref dungeon_modifiers,
                 ref dungeon_grade,
                 ..
             } => {
+                // The UI must see the same transition context the worker saw,
+                // even if it paints much later.
+                self.record_feed_event(FeedContextEvent::Location {
+                    display_name: display_name.clone(),
+                    realm_name: realm_name.clone(),
+                    current_realm_score,
+                    max_realm_score,
+                    is_dungeon,
+                });
                 // The Live Feed clears its own location state; the worker clears
                 // its authoritative encounter set here.
                 self.clear_encounters();
@@ -3122,7 +3170,8 @@ impl PacketProcessor {
                             severity: crate::panels::live_feed::WarningSeverity::Orange,
                             copyable: false,
                         });
-                        self.emit(UiPayload::RealmClosed);
+                        self.record_feed_event(FeedContextEvent::RealmClosed);
+                        self.realm_close_pending = true;
                     } else if raw.contains("s.oryx_minions_failed") {
                         if self.in_dungeon {
                             self.record_live_event(LiveEventView::Warning {
@@ -3525,6 +3574,16 @@ impl PacketProcessor {
                     self.apply_active_pet(active_pet_id);
                 }
                 self.enrich_detected_pet();
+
+                // Portal spawn times anchor the callout countdowns.
+                let assets = realmhound_core::assets::get_asset_manager();
+                for object in &update.new_objects {
+                    if assets.is_portal_object(object.object_type as i32) {
+                        self.record_feed_event(FeedContextEvent::PortalSpawned {
+                            object_id: object.object_id(),
+                        });
+                    }
+                }
 
                 // Forward encounter spawns to live feed
                 for encounter in extract_encounter_spawns(&update.new_objects) {
@@ -4001,7 +4060,7 @@ impl PacketProcessor {
     /// to the Live Feed so its run timer settles to the committed per-run value.
     fn forward_dungeon_freeze(&mut self) {
         if let Some((map_seed, elapsed_ms)) = self.combat.take_dungeon_freeze() {
-            self.emit(UiPayload::DungeonTimerFrozen {
+            self.record_feed_event(FeedContextEvent::DungeonTimerFrozen {
                 map_seed,
                 elapsed_ms,
             });
@@ -4672,12 +4731,13 @@ mod join_gate_tests {
         processor.dispatch_event(crystal.clone());
         processor.dispatch_event(crystal);
         let notifications: Vec<bool> = processor
-            .updates
+            .feed_context()
+            .events
             .iter()
-            .filter_map(|update| match &update.payload {
-                UiPayload::RealmDiscovery(DiscoveryEvent::CrystalMessage { notify, .. }) => {
-                    Some(*notify)
-                }
+            .filter_map(|entry| match &entry.event {
+                crate::processing::contract::FeedContextEvent::Discovery(
+                    DiscoveryEvent::CrystalMessage { notify, .. },
+                ) => Some(*notify),
                 _ => None,
             })
             .collect();
@@ -4860,6 +4920,26 @@ mod keyper_tests {
         assert_eq!(window.events.first().map(|entry| entry.seq), Some(1));
         assert_eq!(window.events.last().map(|entry| entry.seq), Some(250));
         assert_eq!(processor.live_event_evictions(), 0);
+    }
+
+    #[test]
+    fn feed_context_keeps_every_map_transition() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(map_changed(1));
+        p.dispatch_event(map_changed(2));
+        let locations: Vec<(u64, String)> = p
+            .feed_context()
+            .events
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                crate::processing::contract::FeedContextEvent::Location {
+                    display_name, ..
+                } => Some((entry.seq, display_name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(locations.len(), 2, "both transitions are kept");
+        assert!(locations[0].0 < locations[1].0, "applied in observed order");
     }
 
     #[test]

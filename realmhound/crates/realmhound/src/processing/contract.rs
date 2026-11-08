@@ -27,6 +27,7 @@ use realmhound_core::{
 use crate::panels::chat::ChatMessage;
 use crate::processing::mission_tracker::MissionView;
 use crate::sound::{EventSound, SoundType};
+use std::sync::Arc;
 #[cfg(feature = "latency-diagnostics")]
 use std::time::Instant;
 
@@ -503,12 +504,10 @@ impl SelectedIdentity {
     }
 }
 
-/// Heavy model state published by the worker into a shared `Arc<Mutex<..>>`.
+/// Immutable model state published by the worker as an `Arc`.
 ///
-/// The worker overwrites the latest value (coalescing); the App reads it each
-/// frame and refreshes its owned copies + dependent panels only when the
-/// matching generation in `view` bumps. Cloning the heavy fields is gated on the
-/// generations so it happens only on actual change.
+/// Publishing builds the next snapshot outside the lock and swaps the pointer;
+/// unchanged domains reuse their `Arc`, so the lock only protects the pointer.
 #[derive(Debug, Clone)]
 pub struct ModelSnapshot {
     /// The immutable selected-account identity. Set once at construction and
@@ -518,9 +517,9 @@ pub struct ModelSnapshot {
     /// Coalesced scalar view state (connection fields + generations).
     pub view: ViewState,
     /// Latest account data (characters + vaults). Single source of truth.
-    pub account_data: AccountData,
+    pub account_data: Arc<AccountData>,
     /// Latest live vault data.
-    pub live_vault_data: LiveVaultData,
+    pub live_vault_data: Arc<LiveVaultData>,
     /// Currently playing character id.
     pub live_char_id: Option<i32>,
     /// Socket of the verified main game-client connection, if tracked. Lets the
@@ -528,7 +527,7 @@ pub struct ModelSnapshot {
     /// relaunch safeguard.
     pub main_connection: Option<realmhound_core::stream::ConnectionKey>,
     /// Latest seasonal mission tracklist snapshot.
-    pub mission_view: MissionView,
+    pub mission_view: Arc<MissionView>,
 }
 
 impl ModelSnapshot {
@@ -543,11 +542,33 @@ impl ModelSnapshot {
         Self {
             selected_identity,
             view,
-            account_data,
-            live_vault_data,
+            account_data: Arc::new(account_data),
+            live_vault_data: Arc::new(live_vault_data),
             live_char_id,
             main_connection: None,
-            mission_view: MissionView::default(),
+            mission_view: Arc::new(MissionView::default()),
+        }
+    }
+
+    /// Build the next immutable snapshot, reusing unchanged domain `Arc`s.
+    /// `None` means "unchanged", so the previous `Arc` is cloned cheaply.
+    pub fn next(
+        &self,
+        view: ViewState,
+        live_char_id: Option<i32>,
+        main_connection: Option<realmhound_core::stream::ConnectionKey>,
+        account_data: Option<Arc<AccountData>>,
+        live_vault_data: Option<Arc<LiveVaultData>>,
+        mission_view: Option<Arc<MissionView>>,
+    ) -> Self {
+        Self {
+            selected_identity: self.selected_identity.clone(),
+            view,
+            account_data: account_data.unwrap_or_else(|| self.account_data.clone()),
+            live_vault_data: live_vault_data.unwrap_or_else(|| self.live_vault_data.clone()),
+            live_char_id,
+            main_connection,
+            mission_view: mission_view.unwrap_or_else(|| self.mission_view.clone()),
         }
     }
 }
@@ -559,6 +580,36 @@ mod tests {
 
     fn identity(account_id: &str) -> SelectedIdentity {
         SelectedIdentity::new(AccountKey::generate(), AccountId::new(account_id).unwrap())
+    }
+
+    #[test]
+    fn next_snapshot_reuses_unchanged_domains() {
+        let snap = ModelSnapshot::new(
+            identity("ACCT-SNAPSHOT"),
+            ViewState::new(None, None),
+            AccountData::new(),
+            LiveVaultData::default(),
+            None,
+        );
+        let old_account = snap.account_data.clone();
+        let old_vault = snap.live_vault_data.clone();
+
+        let mut changed = AccountData::new();
+        changed.generation = 7;
+        let next = snap.next(
+            ViewState::new(None, None),
+            None,
+            None,
+            Some(Arc::new(changed)),
+            None,
+            None,
+        );
+
+        assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
+        assert!(Arc::ptr_eq(&next.mission_view, &snap.mission_view));
+        assert!(!Arc::ptr_eq(&next.account_data, &old_account));
+        assert_eq!(next.account_data.generation, 7);
+        assert_eq!(old_account.generation, 0, "old snapshot is immutable");
     }
 
     #[test]

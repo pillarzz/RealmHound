@@ -1058,8 +1058,8 @@ impl RealmHoundApp {
             let snap = worker.snapshot.lock().unwrap();
             (
                 snap.view.clone(),
-                snap.account_data.clone(),
-                snap.live_vault_data.clone(),
+                (*snap.account_data).clone(),
+                (*snap.live_vault_data).clone(),
                 snap.live_char_id,
             )
         };
@@ -1741,7 +1741,7 @@ impl RealmHoundApp {
     /// cloned only when their generation changed.
     fn refresh_snapshot(&mut self) {
         let snap = match self.worker.snapshot.lock() {
-            Ok(s) => s,
+            Ok(guard) => Arc::clone(&guard),
             Err(_) => return,
         };
         self.view_state = snap.view.clone();
@@ -1769,19 +1769,18 @@ impl RealmHoundApp {
 
         let epoch = (snap.view.char_view_gen, snap.view.account_generation);
         if epoch != self.owned_account_epoch {
-            self.account_data = snap.account_data.clone();
+            self.account_data = (*snap.account_data).clone();
             self.owned_account_epoch = epoch;
             self.account_data_revision = self.account_data_revision.wrapping_add(1);
         }
         if snap.view.vault_view_gen != self.owned_vault_gen {
-            self.live_vault_data = snap.live_vault_data.clone();
+            self.live_vault_data = (*snap.live_vault_data).clone();
             self.owned_vault_gen = snap.view.vault_view_gen;
         }
         if snap.view.mission_view_gen != self.owned_mission_gen {
-            self.mission_view = snap.mission_view.clone();
+            self.mission_view = (*snap.mission_view).clone();
             self.owned_mission_gen = snap.view.mission_view_gen;
         }
-        drop(snap);
         self.maybe_confirm_client_launch(conn_changed);
     }
 

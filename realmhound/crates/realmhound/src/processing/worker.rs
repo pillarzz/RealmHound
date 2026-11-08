@@ -77,8 +77,8 @@ pub struct WorkerHandle {
     start_tx: Sender<StartSignal>,
     /// Worker -> UI ordered update stream (bounded, drop-oldest on overflow).
     pub ui_rx: UiReceiver,
-    /// Shared latest-value model snapshot.
-    pub snapshot: Arc<Mutex<ModelSnapshot>>,
+    /// Shared latest-value model snapshot (pointer swap, immutable).
+    pub snapshot: Arc<Mutex<Arc<ModelSnapshot>>>,
     /// Always-on health counters shared with the UI.
     pub health: Arc<HealthCounters>,
     /// Signalled by the worker once its final flush is done, carrying the outcome.
@@ -170,13 +170,13 @@ pub fn spawn(
 
     let selected_identity =
         SelectedIdentity::new(account.account_key(), account.account_id().clone());
-    let snapshot = Arc::new(Mutex::new(ModelSnapshot::new(
+    let snapshot = Arc::new(Mutex::new(Arc::new(ModelSnapshot::new(
         selected_identity,
         processor.view_state(),
         processor.account_data().clone(),
         processor.live_vault_data(),
         processor.live_char_id(),
-    )));
+    ))));
 
     let worker = Worker {
         processor,
@@ -224,7 +224,7 @@ struct Worker {
     processor: PacketProcessor,
     ui_tx: UiSender,
     audio_tx: AudioSender,
-    snapshot: Arc<Mutex<ModelSnapshot>>,
+    snapshot: Arc<Mutex<Arc<ModelSnapshot>>>,
     /// Always-on health counters shared with the UI.
     health: Arc<HealthCounters>,
     /// Worker-owned chat persistence (independent of UI frames).
@@ -1043,20 +1043,28 @@ impl Worker {
         let mission_changed = mission_gen != self.pub_mission_gen;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
-        if let Ok(mut snap) = self.snapshot.lock() {
-            snap.view = view.clone();
-            snap.live_char_id = live_char_id;
-            snap.main_connection = main_connection;
-            if account_changed {
-                snap.account_data = self.processor.account_data().clone();
-            }
-            if vault_changed {
-                snap.live_vault_data = self.processor.live_vault_data();
-            }
-            if mission_changed {
-                snap.mission_view = self.processor.mission_view();
-            }
-        }
+        let previous = match self.snapshot.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return false,
+        };
+
+        // Heavy clones happen outside the lock; unchanged domains reuse their Arc.
+        let account_data = account_changed.then(|| Arc::new(self.processor.account_data().clone()));
+        let live_vault_data = vault_changed.then(|| Arc::new(self.processor.live_vault_data()));
+        let mission_view = mission_changed.then(|| Arc::new(self.processor.mission_view()));
+        let next = previous.next(
+            view.clone(),
+            live_char_id,
+            main_connection,
+            account_data,
+            live_vault_data,
+            mission_view,
+        );
+        let replaced = match self.snapshot.lock() {
+            Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
+            Err(_) => return false,
+        };
+        drop(replaced);
 
         self.pub_char_gen = char_gen;
         self.pub_account_gen = account_gen;

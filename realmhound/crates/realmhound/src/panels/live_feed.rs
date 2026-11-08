@@ -527,7 +527,7 @@ fn parse_server_command(text: &str) -> Option<(String, Option<String>)> {
 /// whereas player whisper/party/guild chat has a recipient or `#`-prefixed name
 /// and public chat has a non-negative object id. Gating this way means ordinary
 /// chat that happens to read like `<Server> Nexus` can never spoof the header.
-fn parse_server_command_packet(
+pub(crate) fn parse_server_command_packet(
     packet: &realmhound_core::protocol::TextPacket,
 ) -> Option<(String, Option<String>)> {
     let is_system = packet.recipient.is_empty() && (packet.object_id < 0 || packet.name.is_empty());
@@ -2045,6 +2045,14 @@ impl LiveFeedPanel {
                 self.portal_spawns.clear();
             }
             FeedContextEvent::ServerName(name) => self.set_server_name(name.clone()),
+            FeedContextEvent::ServerCommand { server, realm } => {
+                self.apply_server_command(server.clone(), realm.clone())
+            }
+            FeedContextEvent::DustUpdated {
+                amounts,
+                is_seasonal,
+            } => self.update_dust(amounts.clone(), *is_seasonal),
+            FeedContextEvent::Seasonal(is_seasonal) => self.set_seasonal(*is_seasonal),
             FeedContextEvent::RealmScore(score) => self.update_realm_score(*score),
             FeedContextEvent::RealmClosed => self.force_realm_closed(),
             FeedContextEvent::Discovery(event) => self.apply_realm_discovery(event.clone()),
@@ -5397,35 +5405,6 @@ impl Panel for LiveFeedPanel {
         }
         actions.append(&mut self.pending_actions);
         actions
-    }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        _session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        match event {
-            // Location, realm score, discovery and portal anchors arrive from
-            // the worker snapshot (`apply_context_event`).
-            realmhound_core::GameEvent::DustUpdated {
-                amounts,
-                is_seasonal,
-            } => {
-                self.update_dust(amounts.clone(), *is_seasonal);
-            }
-            realmhound_core::GameEvent::SeasonalStatusReceived { is_seasonal, .. } => {
-                self.set_seasonal(*is_seasonal);
-            }
-            realmhound_core::GameEvent::TextReceived(ref text) => {
-                // `/server` reply: authoritatively override the header server +
-                // realm. Gated to system messages so player chat can't spoof it.
-                if let Some((server, realm)) = parse_server_command_packet(text) {
-                    self.apply_server_command(server, realm);
-                }
-            }
-            _ => {}
-        }
-        vec![]
     }
 }
 

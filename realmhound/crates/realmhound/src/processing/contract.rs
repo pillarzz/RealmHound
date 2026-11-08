@@ -70,9 +70,6 @@ pub enum UiPayload {
     /// its own Live Feed entry + sound (independent of the realm-event system).
     KeyperEvent { towers: bool },
 
-    /// Display name for the connected server (from server-IP mapping).
-    SetServerName(String),
-
     /// A processed loot drop (already recorded to the DB by the processor).
     PushLoot(ProcessedLootDrop),
     /// At least one loot drop was recorded this batch (refresh autocomplete).
@@ -589,6 +586,18 @@ pub enum FeedContextEvent {
     Discovery(super::realm_discovery::DiscoveryEvent),
     /// Connected server display name (from the server-IP mapping).
     ServerName(String),
+    /// `/server` reply: authoritative server + realm header override.
+    ServerCommand {
+        server: String,
+        realm: Option<String>,
+    },
+    /// Forge dust amounts changed.
+    DustUpdated {
+        amounts: realmhound_core::dust::DustAmounts,
+        is_seasonal: bool,
+    },
+    /// Seasonal status of the current character.
+    Seasonal(bool),
     /// A portal object appeared on the current map (anchor for callout timing).
     PortalSpawned { object_id: i32 },
     /// The local player used a portal object.

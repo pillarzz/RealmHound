@@ -1530,7 +1530,6 @@ impl RealmHoundApp {
                     let session = &self.event_session;
                     actions.extend(self.quest_panel.handle_event(&event, session));
                     actions.extend(self.party_panel.handle_event(&event, session));
-                    actions.extend(self.live_feed_panel.handle_event(&event, session));
                     actions.extend(self.vault_panel.handle_event(&event, session));
                 }
                 self.process_actions(actions);
@@ -1543,9 +1542,6 @@ impl RealmHoundApp {
             }
             UiPayload::OryxLagWarning => {
                 // The worker's live-event window drives the warning entry.
-            }
-            UiPayload::SetServerName(_) => {
-                // Carried by the worker's feed context in the snapshot.
             }
             UiPayload::CombatHistoryChanged => {
                 self.combat_panel.invalidate_cards();

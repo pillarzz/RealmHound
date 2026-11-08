@@ -2799,6 +2799,7 @@ impl PacketProcessor {
                 char_id,
                 is_seasonal,
             } => {
+                self.record_feed_event(FeedContextEvent::Seasonal(is_seasonal));
                 self.account_data
                     .characters
                     .update_seasonal_status(char_id, is_seasonal);
@@ -2880,6 +2881,10 @@ impl PacketProcessor {
                     is_seasonal,
                     &self.account_repository,
                 );
+                self.record_feed_event(FeedContextEvent::DustUpdated {
+                    amounts: amounts.clone(),
+                    is_seasonal,
+                });
                 let previous = self.dust_state.get(is_seasonal).cloned();
                 self.dust_state.update(amounts.clone(), is_seasonal);
                 if let Some(previous) = previous {
@@ -3195,6 +3200,11 @@ impl PacketProcessor {
                 }
             }
             GameEvent::TextReceived(ref text) => {
+                if let Some((server, realm)) =
+                    crate::panels::live_feed::parse_server_command_packet(text)
+                {
+                    self.record_feed_event(FeedContextEvent::ServerCommand { server, realm });
+                }
                 let is_crystal =
                     text.recipient.is_empty() && text.name.contains("Mysterious Crystal");
                 if is_crystal {

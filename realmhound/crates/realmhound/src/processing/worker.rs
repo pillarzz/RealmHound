@@ -47,6 +47,9 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 /// than waking every frame. True idle (no traffic) arms nothing, so static tabs
 /// still sleep fully while connected.
 const SUPPRESSED_DRAIN_INTERVAL: Duration = Duration::from_millis(1000);
+/// Target maximum repaint rate from worker traffic (~30 Hz). The trailing
+/// `request_repaint_after` guarantees the last update is still painted.
+const WAKE_INTERVAL: Duration = Duration::from_millis(33);
 #[cfg(feature = "latency-diagnostics")]
 const PIPELINE_WARN_AGE: Duration = Duration::from_millis(500);
 #[cfg(feature = "latency-diagnostics")]
@@ -59,6 +62,34 @@ const PIPELINE_EXTREME_WORK: Duration = Duration::from_secs(1);
 const PIPELINE_WARN_THROTTLE: Duration = Duration::from_secs(2);
 #[cfg(feature = "latency-diagnostics")]
 const HEALTH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct WakeThrottle {
+    last: Option<Instant>,
+}
+
+impl WakeThrottle {
+    /// Coalesce worker wake-ups to [`WAKE_INTERVAL`], scheduling the trailing
+    /// repaint instead of dropping it.
+    fn request(&mut self, ctx: &egui::Context) {
+        match self.next_delay(Instant::now()) {
+            Some(delay) => ctx.request_repaint_after(delay),
+            None => ctx.request_repaint(),
+        }
+    }
+
+    fn next_delay(&mut self, now: Instant) -> Option<Duration> {
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < WAKE_INTERVAL => {
+                Some(WAKE_INTERVAL - now.saturating_duration_since(last))
+            }
+            _ => {
+                self.last = Some(now);
+                None
+            }
+        }
+    }
+}
 
 /// Signal delivered to a freshly spawned, still-inactive worker deciding
 /// whether it begins processing or exits without ever persisting.
@@ -186,6 +217,7 @@ pub fn spawn(
         health: health.clone(),
         chat_log,
         exalts_fetched: false,
+        wake: WakeThrottle::default(),
         ctx,
         active_tab,
         account,
@@ -233,6 +265,8 @@ struct Worker {
     chat_log: ChatLogWriter,
     /// One-shot exalt stats fetch, triggered by the first released token.
     exalts_fetched: bool,
+    /// Coalesced repaint requests from worker traffic.
+    wake: WakeThrottle,
     ctx: egui::Context,
     /// Shared active-tab signal written by the UI thread; read to decide whether
     /// an update is worth waking the UI for (relevance-gated repaints).
@@ -568,7 +602,7 @@ impl Worker {
                     segments.snapshot = snapshot_started.elapsed();
                 }
                 if wake || view_changed {
-                    self.ctx.request_repaint();
+                    self.wake.request(&self.ctx);
                 } else if suppressed {
                     self.ctx.request_repaint_after(SUPPRESSED_DRAIN_INTERVAL);
                 }
@@ -580,7 +614,7 @@ impl Worker {
                 {
                     segments.snapshot = snapshot_started.elapsed();
                 }
-                self.ctx.request_repaint();
+                self.wake.request(&self.ctx);
             }
 
             if queue_remaining == 0
@@ -613,7 +647,7 @@ impl Worker {
                 };
                 self.next_maintenance = Some(Instant::now() + delay);
                 if self.publish_snapshot() {
-                    self.ctx.request_repaint();
+                    self.wake.request(&self.ctx);
                 }
             }
 
@@ -973,7 +1007,7 @@ impl Worker {
                 self.health.set_capture_state(CaptureState::Active);
                 // Reset publishes so the UI re-syncs after a capture restart.
                 self.publish_snapshot();
-                self.ctx.request_repaint();
+                self.wake.request(&self.ctx);
             }
             ControlMsg::StopCapture => {
                 self.processor.on_capture_stop();
@@ -991,7 +1025,7 @@ impl Worker {
                 self.processor.apply_control(other);
                 let view_changed = self.publish_snapshot();
                 if view_changed {
-                    self.ctx.request_repaint();
+                    self.wake.request(&self.ctx);
                 }
             }
         }
@@ -1156,6 +1190,22 @@ fn is_global_event(event: &GameEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_throttle_coalesces_and_keeps_a_trailing_repaint() {
+        let t0 = Instant::now();
+        let mut wake = WakeThrottle::default();
+        assert_eq!(wake.next_delay(t0), None);
+        assert_eq!(
+            wake.next_delay(t0 + Duration::from_millis(10)),
+            Some(Duration::from_millis(23))
+        );
+        assert_eq!(
+            wake.next_delay(t0 + Duration::from_millis(32)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(wake.next_delay(t0 + Duration::from_millis(33)), None);
+    }
 
     fn non_party_broadcast() -> UiPayload {
         UiPayload::Broadcast(GameEvent::EntityHit { target_id: 1 })

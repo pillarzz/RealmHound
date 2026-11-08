@@ -1091,23 +1091,23 @@ impl PacketProcessor {
     }
 
     /// Periodic save: persists `account_data` if dirty. Returns whether a save
-    /// was attempted (so the caller can reset its timer).
-    pub fn save_account_if_dirty(&mut self) -> bool {
-        if self.account_data.is_dirty() {
-            #[cfg(feature = "latency-diagnostics")]
-            let started = std::time::Instant::now();
-            if let Err(e) = self
-                .account_data
-                .save_and_clear_dirty(&self.account_repository)
-            {
-                tracing::warn!("[ACCOUNT] Periodic save failed: {}", e);
-            }
-            #[cfg(feature = "latency-diagnostics")]
-            self.log_account_storage_latency("account_periodic_save", started.elapsed());
-            true
-        } else {
-            false
+    /// was attempted (so the caller can reset its timer) and surfaces the error
+    /// so the caller can record it in health; the save itself is unchanged.
+    pub fn save_account_if_dirty(&mut self) -> Result<bool, String> {
+        if !self.account_data.is_dirty() {
+            return Ok(false);
         }
+        #[cfg(feature = "latency-diagnostics")]
+        let started = std::time::Instant::now();
+        let result = self
+            .account_data
+            .save_and_clear_dirty(&self.account_repository);
+        if let Err(e) = &result {
+            tracing::warn!("[ACCOUNT] Periodic save failed: {}", e);
+        }
+        #[cfg(feature = "latency-diagnostics")]
+        self.log_account_storage_latency("account_periodic_save", started.elapsed());
+        result.map(|()| true).map_err(|e| e.to_string())
     }
 
     /// Save `account_data` on exit, surfacing the error so a relaunch can abort.

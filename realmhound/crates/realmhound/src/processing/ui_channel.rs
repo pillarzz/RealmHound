@@ -139,8 +139,7 @@ impl UiReceiver {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
-    /// Number of updates currently waiting for the UI.
-    #[cfg(feature = "latency-diagnostics")]
+    /// Number of updates currently waiting for the UI (always-on health).
     pub fn len(&self) -> usize {
         self.shared
             .queue

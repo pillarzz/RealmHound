@@ -30,6 +30,7 @@ use crate::panels::ActiveTab;
 use super::contract::{
     ControlMsg, ModelSnapshot, SelectedIdentity, ShutdownReport, UiPayload, UiUpdate,
 };
+use super::health::{CaptureState, HealthCounters};
 use super::processor::PacketProcessor;
 use super::ui_channel::{self, UiReceiver, UiSender};
 
@@ -77,6 +78,8 @@ pub struct WorkerHandle {
     pub ui_rx: UiReceiver,
     /// Shared latest-value model snapshot.
     pub snapshot: Arc<Mutex<ModelSnapshot>>,
+    /// Always-on health counters shared with the UI.
+    pub health: Arc<HealthCounters>,
     /// Signalled by the worker once its final flush is done, carrying the outcome.
     shutdown_done: Receiver<ShutdownReport>,
     /// Join handle for the worker thread.
@@ -161,6 +164,7 @@ pub fn spawn(
     let (start_tx, start_rx) = channel::<StartSignal>();
     let (ui_tx, ui_rx) = ui_channel::channel(ui_channel::DEFAULT_BOUND);
     let (done_tx, done_rx) = channel::<ShutdownReport>();
+    let health = Arc::new(HealthCounters::new());
 
     let selected_identity =
         SelectedIdentity::new(account.account_key(), account.account_id().clone());
@@ -177,6 +181,7 @@ pub fn spawn(
         ui_tx,
         audio_tx,
         snapshot: snapshot.clone(),
+        health: health.clone(),
         ctx,
         active_tab,
         account,
@@ -205,6 +210,7 @@ pub fn spawn(
         start_tx,
         ui_rx,
         snapshot,
+        health,
         shutdown_done: done_rx,
         join: Some(join),
     })
@@ -215,6 +221,8 @@ struct Worker {
     ui_tx: UiSender,
     audio_tx: AudioSender,
     snapshot: Arc<Mutex<ModelSnapshot>>,
+    /// Always-on health counters shared with the UI.
+    health: Arc<HealthCounters>,
     ctx: egui::Context,
     /// Shared active-tab signal written by the UI thread; read to decide whether
     /// an update is worth waking the UI for (relevance-gated repaints).
@@ -432,6 +440,7 @@ impl Worker {
                     }
                     if result.closed {
                         tracing::warn!("[WORKER] capture source closed; awaiting restart");
+                        self.health.set_capture_state(CaptureState::Closed);
                         capture_closed = true;
                         #[cfg(feature = "latency-diagnostics")]
                         {
@@ -617,6 +626,18 @@ impl Worker {
         let persistence = self.processor.save_account_on_exit();
         let db_close = self.processor.close_databases();
         let report = ShutdownReport::from_results(persistence, db_close);
+        match &report {
+            ShutdownReport::PersistenceFailed(error) => {
+                self.health
+                    .record_persistence_failure(format!("account save: {error}"));
+            }
+            ShutdownReport::DatabaseCloseFailed(error) => {
+                self.health
+                    .record_persistence_failure(format!("database close: {error}"));
+            }
+            ShutdownReport::Success | ShutdownReport::TimedOut => {}
+        }
+        self.health.set_capture_state(CaptureState::Stopped);
         self.publish_snapshot();
         tracing::info!("[WORKER] processing thread stopped: {:?}", report);
         let _ = done_tx.send(report);
@@ -919,6 +940,7 @@ impl Worker {
                     self.capture_drops.finish_source(previous.dropped());
                 }
                 self.receiver = Some(receiver);
+                self.health.set_capture_state(CaptureState::Active);
                 // Reset publishes so the UI re-syncs after a capture restart.
                 self.publish_snapshot();
                 self.ctx.request_repaint();
@@ -933,6 +955,7 @@ impl Worker {
                 {
                     self.receiver = None;
                 }
+                self.health.set_capture_state(CaptureState::Stopped);
             }
             other => {
                 self.processor.apply_control(other);
@@ -948,8 +971,14 @@ impl Worker {
     /// Periodic account save, mirroring the App's prior 60s/dirty policy.
     fn maybe_periodic_save(&mut self) {
         if self.last_save.elapsed() >= SAVE_INTERVAL {
-            if self.processor.save_account_if_dirty() {
-                self.last_save = Instant::now();
+            match self.processor.save_account_if_dirty() {
+                Ok(true) => self.last_save = Instant::now(),
+                Ok(false) => {}
+                Err(error) => {
+                    self.health
+                        .record_persistence_failure(format!("periodic account save: {error}"));
+                    self.last_save = Instant::now();
+                }
             }
         }
     }

@@ -27,8 +27,8 @@ use crate::panels::vault::VaultPanel;
 use crate::panels::{ActiveTab, AppAction, Panel, PanelContext};
 use crate::processing::contract::relaunch_preflight;
 use crate::processing::{
-    spawn_worker, AccountOperationScope, AudioCommand, ControlMsg, PacketProcessor, UiPayload,
-    UiUpdate, ViewState, WorkerHandle,
+    spawn_worker, AccountOperationScope, AudioCommand, ControlMsg, HealthMonitor, PacketProcessor,
+    UiPayload, UiUpdate, ViewState, WorkerHandle,
 };
 use crate::rendering::{EmbeddedIcon, SpriteRenderer};
 use crate::sound::{custom_sounds_dir, SoundType};
@@ -55,7 +55,8 @@ use std::fs;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 #[cfg(feature = "latency-diagnostics")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 // MainAccountStatus is now in realmhound_core::session
 
@@ -531,104 +532,6 @@ impl OperationGenerations {
     }
 }
 
-#[cfg(feature = "latency-diagnostics")]
-#[derive(Default)]
-struct UiHealth {
-    started: Option<Instant>,
-    updates: u64,
-    capped_drain_frames: u64,
-    peak_oldest_wait: Duration,
-    peak_remaining: usize,
-    peak_frame_gap: Duration,
-}
-
-#[cfg(feature = "latency-diagnostics")]
-struct UiHealthSummary {
-    window: Duration,
-    updates: u64,
-    capped_drain_frames: u64,
-    peak_oldest_wait: Duration,
-    peak_remaining: usize,
-    peak_frame_gap: Duration,
-}
-
-#[cfg(feature = "latency-diagnostics")]
-impl UiHealth {
-    fn record(
-        &mut self,
-        now: Instant,
-        updates: usize,
-        capped: bool,
-        oldest_wait: Duration,
-        remaining: usize,
-        frame_gap: Duration,
-    ) -> Option<UiHealthSummary> {
-        if updates == 0 {
-            return None;
-        }
-        let started = *self.started.get_or_insert(now);
-        self.updates = self.updates.saturating_add(updates as u64);
-        self.capped_drain_frames = self.capped_drain_frames.saturating_add(u64::from(capped));
-        self.peak_oldest_wait = self.peak_oldest_wait.max(oldest_wait);
-        self.peak_remaining = self.peak_remaining.max(remaining);
-        self.peak_frame_gap = self.peak_frame_gap.max(frame_gap);
-        let window = now.duration_since(started);
-        if window < Duration::from_secs(30) {
-            return None;
-        }
-        let summary = UiHealthSummary {
-            window,
-            updates: self.updates,
-            capped_drain_frames: self.capped_drain_frames,
-            peak_oldest_wait: self.peak_oldest_wait,
-            peak_remaining: self.peak_remaining,
-            peak_frame_gap: self.peak_frame_gap,
-        };
-        *self = Self::default();
-        Some(summary)
-    }
-}
-
-#[cfg(all(test, feature = "latency-diagnostics"))]
-mod ui_health_tests {
-    use super::*;
-
-    #[test]
-    fn ui_health_requires_updates_and_resets_after_actual_window() {
-        let now = Instant::now();
-        let mut health = UiHealth::default();
-        assert!(health
-            .record(now, 0, false, Duration::ZERO, 0, Duration::ZERO)
-            .is_none());
-        assert!(health
-            .record(
-                now,
-                3,
-                false,
-                Duration::from_millis(20),
-                2,
-                Duration::from_millis(16),
-            )
-            .is_none());
-        let summary = health
-            .record(
-                now + Duration::from_secs(34),
-                4,
-                true,
-                Duration::from_millis(40),
-                5,
-                Duration::from_millis(80),
-            )
-            .unwrap();
-        assert_eq!(summary.window, Duration::from_secs(34));
-        assert_eq!(summary.updates, 7);
-        assert_eq!(summary.capped_drain_frames, 1);
-        assert_eq!(summary.peak_remaining, 5);
-        assert_eq!(summary.peak_frame_gap, Duration::from_millis(80));
-        assert!(health.started.is_none());
-    }
-}
-
 /// Main application state.
 pub struct RealmHoundApp {
     /// Packet capture lifecycle manager
@@ -693,12 +596,10 @@ pub struct RealmHoundApp {
     audio: AudioHandle,
     /// Sender for audio commands (volume slider, test button).
     audio_tx: AudioSender,
-    #[cfg(feature = "latency-diagnostics")]
-    latency_last_frame: Instant,
+    /// Always-on UI pipeline health (frame gap, drains, queue, capture).
+    health: HealthMonitor,
     #[cfg(feature = "latency-diagnostics")]
     latency_last_ui_warn: Option<Instant>,
-    #[cfg(feature = "latency-diagnostics")]
-    latency_ui_health: UiHealth,
     /// Owned snapshot of the worker model, refreshed each frame from the shared
     /// snapshot. Panels read from these (the worker is the source of truth).
     account_data: AccountData,
@@ -1166,6 +1067,7 @@ impl RealmHoundApp {
 
         let captured_access_token = None;
         let token_captured_at = None;
+        let health = HealthMonitor::new(worker.health.clone());
 
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
@@ -1210,14 +1112,11 @@ impl RealmHoundApp {
             exalts_fetched: false,
             worker,
             active_tab_signal,
+            health,
             audio,
             audio_tx,
             #[cfg(feature = "latency-diagnostics")]
-            latency_last_frame: Instant::now(),
-            #[cfg(feature = "latency-diagnostics")]
             latency_last_ui_warn: None,
-            #[cfg(feature = "latency-diagnostics")]
-            latency_ui_health: UiHealth::default(),
             account_data: init_account,
             live_vault_data: init_vault,
             live_char_id: init_live_char,
@@ -1540,14 +1439,7 @@ impl RealmHoundApp {
     /// Returns `true` if the per-frame cap was hit (more may remain), so the
     /// caller can request another repaint to keep draining.
     fn drain_ui_updates(&mut self, _ctx: &egui::Context) -> bool {
-        #[cfg(feature = "latency-diagnostics")]
         let frame_started = Instant::now();
-        #[cfg(feature = "latency-diagnostics")]
-        let frame_gap = frame_started.duration_since(self.latency_last_frame);
-        #[cfg(feature = "latency-diagnostics")]
-        {
-            self.latency_last_frame = frame_started;
-        }
         #[cfg(feature = "latency-diagnostics")]
         let mut oldest_wait = Duration::ZERO;
 
@@ -1567,8 +1459,15 @@ impl RealmHoundApp {
                 None => break,
             }
         }
-        #[cfg(feature = "latency-diagnostics")]
-        let remaining = self.worker.ui_rx.len();
+        let queue_depth = self.worker.ui_rx.len();
+        let queue_drops = self.worker.ui_rx.dropped();
+        let summary = self.health.record_frame(
+            frame_started,
+            applied,
+            applied == 4096,
+            queue_depth,
+            queue_drops,
+        );
         #[cfg(feature = "latency-diagnostics")]
         if oldest_wait >= Duration::from_millis(500)
             && self
@@ -1589,45 +1488,21 @@ impl RealmHoundApp {
                 "[LATENCY][UI] oldest_queued_ms={} queue_remaining={} frame_gap_ms={} \
                  active_tab={} viewport_focused={} viewport_minimized={}",
                 oldest_wait.as_millis(),
-                remaining,
-                frame_gap.as_millis(),
+                queue_depth,
+                self.health.last_frame_gap().as_millis(),
                 self.active_tab.name(),
                 focused,
                 minimized
             );
         }
-        #[cfg(feature = "latency-diagnostics")]
-        if let Some(health) = self.latency_ui_health.record(
-            frame_started,
-            applied,
-            applied == 4096,
-            oldest_wait,
-            remaining,
-            frame_gap,
-        ) {
+        if let Some(summary) = summary {
             let (focused, minimized) = _ctx.input(|input| {
                 (
                     input.viewport().focused.unwrap_or(false),
                     input.viewport().minimized,
                 )
             });
-            let minimized = minimized
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            tracing::info!(
-                "[LATENCY][UI] health window_ms={} updates={} capped_drain_frames={} \
-                 peak_oldest_queued_ms={} peak_queue_remaining={} peak_frame_gap_ms={} \
-                 active_tab_at_emit={} viewport_focused={} viewport_minimized={}",
-                health.window.as_millis(),
-                health.updates,
-                health.capped_drain_frames,
-                health.peak_oldest_wait.as_millis(),
-                health.peak_remaining,
-                health.peak_frame_gap.as_millis(),
-                self.active_tab.name(),
-                focused,
-                minimized
-            );
+            summary.emit(self.active_tab.name(), focused, minimized);
         }
         // The Live Feed panel decides when its automatic dungeon callout has to
         // be copied or cleared, but it only runs while its tab is open. The
@@ -10232,6 +10107,10 @@ impl RealmHoundApp {
 
     /// Render the status bar.
     fn render_status_bar(&self, ui: &mut egui::Ui) {
+        let health = self
+            .health
+            .counters()
+            .snapshot(self.worker.ui_rx.len(), self.worker.ui_rx.dropped());
         ui.horizontal(|ui| {
             // The party leader crown and party status indicator are part of the
             // moderation tools, so they only appear when those are enabled.
@@ -10332,6 +10211,30 @@ impl RealmHoundApp {
                     ui.label(format!("Queue drops: {}", vs.capture_queue_drops));
                     ui.label(format!("Time unsynced: {}ms", vs.capture_unsync_ms));
                 }
+                ui.separator();
+                ui.label(format!("Capture source: {}", health.capture.label()));
+                ui.label(format!(
+                    "UI frame gap: {} ms (peak {} ms)",
+                    self.health.last_frame_gap().as_millis(),
+                    health.peak_frame_gap.as_millis()
+                ));
+                ui.label(format!(
+                    "UI queue: {} pending, {} dropped",
+                    health.queue_depth, health.queue_drops
+                ));
+                ui.label(format!(
+                    "Drain frames: {} ({} capped), {} updates",
+                    health.drain_frames, health.capped_drain_frames, health.drained_updates
+                ));
+                if health.persistence_failures > 0 {
+                    ui.label(format!(
+                        "Persistence failures: {}",
+                        health.persistence_failures
+                    ));
+                    if let Some(error) = &health.last_persistence_error {
+                        ui.label(error);
+                    }
+                }
             });
 
             // Surface UI-update-channel overflow as an anomaly
@@ -10341,6 +10244,16 @@ impl RealmHoundApp {
                 ui.label(
                     egui::RichText::new(format!("[!] Dropped {} updates", dropped))
                         .color(egui::Color32::from_rgb(255, 100, 100)),
+                );
+            }
+            if health.persistence_failures > 0 {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "[!] Persistence failures: {}",
+                        health.persistence_failures
+                    ))
+                    .color(egui::Color32::from_rgb(255, 100, 100)),
                 );
             }
 

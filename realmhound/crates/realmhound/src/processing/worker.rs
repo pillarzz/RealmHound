@@ -63,19 +63,41 @@ struct AutoCallout {
     expires_at: Instant,
 }
 
-#[derive(Default)]
 struct WakeThrottle {
     last: Option<Instant>,
+    /// Skip wakes entirely while the UI cannot paint (minimized).
+    demand: bool,
+}
+
+impl Default for WakeThrottle {
+    fn default() -> Self {
+        Self {
+            last: None,
+            demand: true,
+        }
+    }
 }
 
 impl WakeThrottle {
     /// Coalesce worker wake-ups to [`WAKE_INTERVAL`], scheduling the trailing
     /// repaint instead of dropping it.
     fn request(&mut self, ctx: &egui::Context) {
+        if !self.demand {
+            return;
+        }
         match self.next_delay(Instant::now()) {
             Some(delay) => ctx.request_repaint_after(delay),
             None => ctx.request_repaint(),
         }
+    }
+
+    fn set_demand(&mut self, demand: bool) {
+        if demand && !self.demand {
+            // Wake as soon as the next update arrives rather than waiting out
+            // a throttle window that started before the window was restored.
+            self.last = None;
+        }
+        self.demand = demand;
     }
 
     fn next_delay(&mut self, now: Instant) -> Option<Duration> {
@@ -1043,6 +1065,9 @@ impl Worker {
             ControlMsg::SetWatchlist(watchlist) => {
                 self.watchlist = watchlist;
             }
+            ControlMsg::SetLiveDemand(demand) => {
+                self.wake.set_demand(demand);
+            }
             ControlMsg::StartCapture(receiver) => {
                 self.processor.on_capture_start();
                 #[cfg(feature = "latency-diagnostics")]
@@ -1465,6 +1490,16 @@ mod tests {
             Some(Duration::from_millis(1))
         );
         assert_eq!(wake.next_delay(t0 + Duration::from_millis(100)), None);
+    }
+
+    #[test]
+    fn restored_demand_clears_the_throttle_window() {
+        let t0 = Instant::now();
+        let mut wake = WakeThrottle::default();
+        assert_eq!(wake.next_delay(t0), None);
+        wake.set_demand(false);
+        wake.set_demand(true);
+        assert_eq!(wake.next_delay(t0 + Duration::from_millis(10)), None);
     }
 
     #[cfg(feature = "latency-diagnostics")]

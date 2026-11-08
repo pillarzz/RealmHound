@@ -1426,6 +1426,7 @@ impl PacketProcessor {
             | ControlMsg::StopCapture
             | ControlMsg::Shutdown
             | ControlMsg::SetWatchlist(_)
+            | ControlMsg::SetLiveDemand(_)
             | ControlMsg::StartHistoricalMaintenance => {}
         }
     }

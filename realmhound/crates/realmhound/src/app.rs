@@ -539,6 +539,8 @@ pub struct RealmHoundApp {
     /// Whether raw packets are being written to a `.rhcap` file (Debug settings).
     record_raw_packets: bool,
     maintenance_ui_frames: u8,
+    /// Last live-demand flag sent to the worker (`None` until the first frame).
+    live_demand: Option<bool>,
     /// Debug "App resolution" width input (pixels, as typed).
     debug_window_width: String,
     /// Debug "App resolution" height input (pixels, as typed).
@@ -1073,6 +1075,7 @@ impl RealmHoundApp {
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
             maintenance_ui_frames: 0,
+            live_demand: None,
             // Honour the REALMHOUND_RECORD env var so the Debug toggle reflects
             // any recording already started at capture start.
             record_raw_packets: std::env::var("REALMHOUND_RECORD")
@@ -10201,6 +10204,14 @@ impl eframe::App for RealmHoundApp {
         if let Some(watchlist) = self.party_panel.take_watchlist_update() {
             self.worker
                 .send_control(ControlMsg::SetWatchlist(watchlist));
+        }
+
+        // A minimized window never paints, so stop the worker waking it.
+        let live_demand = ctx.input(|input| input.viewport().minimized != Some(true));
+        if self.live_demand != Some(live_demand) {
+            self.live_demand = Some(live_demand);
+            self.worker
+                .send_control(ControlMsg::SetLiveDemand(live_demand));
         }
 
         // About window (modal)

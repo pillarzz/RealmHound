@@ -221,6 +221,8 @@ pub enum ControlMsg {
     StopCapture,
     /// The first UI frame has completed; automatic history maintenance may run.
     StartHistoricalMaintenance,
+    /// Whether the UI currently wants repaint wakes (false while minimized).
+    SetLiveDemand(bool),
     /// Flush persistent state and exit the worker loop (app shutdown).
     Shutdown,
     /// Clear the reassembler's ignored-connection set.

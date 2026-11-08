@@ -60,6 +60,14 @@ pub enum UiPayload {
     /// processor's buffering tests assert on.
     Broadcast(GameEvent),
 
+    /// Automatic clipboard work, consumed by the worker before UI delivery.
+    DungeonCallout {
+        display_name: String,
+        modifiers: Vec<String>,
+        grade: Option<String>,
+        origin: Option<DungeonOrigin>,
+    },
+
     /// A resolved chat message to append (whisper direction already tagged).
     Chat(ChatMessage),
     /// An encounter/boss callout for the live feed.
@@ -556,6 +564,7 @@ pub enum LiveEventView {
         display_name: String,
         modifiers: Vec<String>,
         grade: Option<String>,
+        origin: DungeonOrigin,
     },
     /// The player left the dungeon, ordered with the entry it invalidates.
     DungeonLeft,
@@ -593,7 +602,10 @@ pub enum FeedContextEvent {
     /// Realm close detected; starts the castle countdown.
     RealmClosed,
     /// Crystal/Jailer/Totalia lifecycle update.
-    Discovery(super::realm_discovery::DiscoveryEvent),
+    Discovery {
+        scope: u64,
+        event: super::realm_discovery::DiscoveryEvent,
+    },
     /// Connected server display name (from the server-IP mapping).
     ServerName(String),
     /// `/server` reply: authoritative server + realm header override.
@@ -634,31 +646,59 @@ pub struct FeedCurrent {
     pub server_name: Option<String>,
     /// Current map context from the last transition.
     pub location: Option<FeedLocation>,
-    /// Latest realm score.
-    pub realm_score: Option<i32>,
+    pub realm_name: Option<String>,
+    /// Latest score and maximum, retained as stale inside the same realm's dungeon.
+    pub realm_score: Option<(i32, i32)>,
+    pub is_score_stale: bool,
     /// Whether the realm has closed.
     pub realm_closed: bool,
+    pub castle_deadline: Option<std::time::Instant>,
     /// Current character's seasonal flag.
     pub is_seasonal: Option<bool>,
     /// Latest dust amounts.
     pub dust: Option<(realmhound_core::dust::DustAmounts, bool)>,
     /// Current discovery lifecycle per object.
     pub discoveries: Vec<DiscoveryState>,
+    pub discovery_scope: u64,
+    pub discovery_reset_at: Option<std::time::Instant>,
     /// Origin flags for the next callout, so an evicted transition cannot
     /// leave them stale.
     pub map_is_realm: bool,
     pub left_from_realm: bool,
     pub map_is_hub: bool,
     pub left_from_hub: bool,
+    pub hub_host_hint: Option<std::time::Instant>,
+    pub dungeon_origin: Option<DungeonOrigin>,
+    pub dungeon_entered_at: Option<std::time::Instant>,
+    pub left_from_dungeon: bool,
 }
 
 /// One tracked discovery object's durable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryState {
-    pub object_id: i32,
+    pub scope: u64,
+    pub object_id: Option<i32>,
     pub object_type: i32,
+    pub timestamp: chrono::DateTime<chrono::Local>,
     pub present: bool,
     pub defeated: bool,
+    pub packet_seen: bool,
+    pub absent_since: Option<std::time::Instant>,
+    pub last_message: Option<std::time::Instant>,
+    pub defeated_at: Option<std::time::Instant>,
+}
+
+/// Resolved inputs shared by automatic and displayed dungeon callouts.
+#[derive(Debug, Clone, Default)]
+pub struct DungeonOrigin {
+    pub map_seed: i32,
+    pub entered_at: Option<std::time::Instant>,
+    pub server_name: Option<String>,
+    pub realm_name: Option<String>,
+    pub realm_score_percent: Option<i32>,
+    pub entered_from_nexus: bool,
+    pub realm_closed: bool,
+    pub portal_anchor: Option<std::time::Instant>,
 }
 
 /// Map context carried by [`FeedCurrent`].

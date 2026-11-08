@@ -45,7 +45,7 @@ enum PinnedTooltip {
 /// Estimated dungeon portal join window. The portal spawn time isn't in any
 /// packet we receive, so we count down from local entry; the true joinable
 /// window is always somewhat shorter than this upper bound.
-const DUNGEON_JOIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const DUNGEON_JOIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Window during which a repeated boss callout for the same boss is suppressed.
 /// Kept short: it exists only to collapse near-duplicate spawn packets (the same
@@ -650,12 +650,12 @@ const DUNGEON_WINDOW_ANCHORED: std::time::Duration = DUNGEON_JOIN_WINDOW;
 const DUNGEON_WINDOW_ESTIMATED: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Time from a realm-close message to the castle teleport.
-const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long after entering a dungeon the connection to its instance still counts
 /// as that instance's host. The host is identified from the new socket a beat
 /// after the dungeon's MapInfo arrives, so the hint is always slightly late.
-const NEXUS_ORIGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const NEXUS_ORIGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How many recent entries of one dungeon the panel remembers, and therefore the
 /// widest window `learn_event_mods_runs` can compare. An event that started
@@ -745,7 +745,7 @@ pub(crate) fn is_hub_map(display_name: &str) -> bool {
 /// `NexusPortal.<Realm>` and a dungeon opened in a realm reports that same realm
 /// name. So a hub parent is the plain Nexus, never the `NexusPortal.` prefix that
 /// marks a realm (see [`parse_realm_name_for_realm`]).
-fn realm_field_is_hub(realm_name_field: &str) -> bool {
+pub(crate) fn realm_field_is_hub(realm_name_field: &str) -> bool {
     let name = realm_name_field
         .trim()
         .trim_start_matches("{s.")
@@ -2032,25 +2032,16 @@ impl LiveFeedPanel {
     /// Apply a realm-entity discovery to the feed.
     /// Restore durable state that the bounded event history may have evicted.
     pub fn apply_feed_current(&mut self, current: &crate::processing::contract::FeedCurrent) {
-        if let Some(server) = &current.server_name {
-            self.set_server_name(server.clone());
-        }
+        self.server_name = current.server_name.clone();
+        self.realm_name = current.realm_name.clone();
+        self.realm_score = current.realm_score;
+        self.is_score_stale = current.is_score_stale;
+        self.realm_closed = current.realm_closed;
+        self.castle_timer_expires_at = current.castle_deadline;
+        self.hub_host_hint = current.hub_host_hint;
         if let Some(location) = &current.location {
-            // Display fields only: the transition flags stay event-driven.
             self.location_name = format_dungeon_name(&location.display_name);
-            self.realm_name = Some(location.realm_name.clone()).filter(|r| !r.is_empty());
-            self.map_is_realm = location.max_realm_score > 0;
             self.currently_in_dungeon = location.is_dungeon;
-            self.realm_score = (location.max_realm_score > 0)
-                .then_some((location.current_realm_score, location.max_realm_score));
-        }
-        if let Some(score) = current.realm_score {
-            if let Some((_, max)) = self.realm_score {
-                self.realm_score = Some((score, max));
-            }
-        }
-        if current.realm_closed {
-            self.force_realm_closed_at(std::time::Instant::now());
         }
         if let Some((amounts, is_seasonal)) = &current.dust {
             self.update_dust(amounts.clone(), *is_seasonal);
@@ -2062,30 +2053,66 @@ impl LiveFeedPanel {
         self.left_from_realm = current.left_from_realm;
         self.map_is_hub = current.map_is_hub;
         self.left_from_hub = current.left_from_hub;
+        if let Some(at) = current.discovery_reset_at {
+            for entry in &mut self.entries {
+                if let FeedEntry::BossCall(boss) = entry {
+                    if let Some(discovery) = &mut boss.discovery {
+                        if discovery.scope != current.discovery_scope {
+                            discovery.stop_timer(at);
+                        }
+                    }
+                }
+            }
+        }
+        self.discovery_scope = current.discovery_scope;
         self.apply_discovery_state(&current.discoveries);
+        if let Some(origin) = &current.dungeon_origin {
+            if let Some(FeedEntry::Dungeon(entry)) = self.entries.iter_mut().find(
+                |entry| matches!(entry, FeedEntry::Dungeon(d) if d.map_seed == origin.map_seed),
+            ) {
+                entry.server_name = origin.server_name.clone();
+                entry.realm_name = origin.realm_name.clone();
+                entry.realm_score_percent = origin.realm_score_percent;
+                entry.entered_from_nexus = origin.entered_from_nexus;
+            }
+            self.recompute_dungeon_callouts();
+        }
     }
 
     /// Reconcile discovery rows with the durable per-object state, so an
     /// evicted lifecycle event cannot leave stale flags behind.
     fn apply_discovery_state(&mut self, states: &[crate::processing::contract::DiscoveryState]) {
-        for entry in &mut self.entries {
-            let FeedEntry::BossCall(boss) = entry else {
-                continue;
+        for state in states {
+            let matches = |entry: &FeedEntry| {
+                matches!(entry, FeedEntry::BossCall(boss)
+                if boss.boss_id == state.object_type && boss.discovery.as_ref().is_some_and(|d|
+                    d.scope == state.scope && (state.object_type == CRYSTAL_TYPE
+                        || d.object_id == state.object_id)))
             };
-            let Some(discovery) = boss.discovery.as_mut() else {
-                continue;
-            };
-            let Some(object_id) = discovery.object_id else {
-                continue;
-            };
-            let Some(state) = states.iter().find(|state| state.object_id == object_id) else {
-                continue;
-            };
-            discovery.defeated = state.defeated;
-            if state.present {
-                discovery.absent_since = None;
-            } else if discovery.absent_since.is_none() {
-                discovery.absent_since = Some(std::time::Instant::now());
+            if !self.entries.iter().any(matches) {
+                self.push_discovery_entry(
+                    state.object_id,
+                    state.object_type,
+                    state.timestamp,
+                    state.last_message,
+                    state.packet_seen,
+                    state.absent_since,
+                );
+            }
+            if let Some(FeedEntry::BossCall(boss)) =
+                self.entries.iter_mut().find(|entry| matches(entry))
+            {
+                boss.timestamp = state.timestamp;
+                if let Some(discovery) = &mut boss.discovery {
+                    discovery.object_id = state.object_id;
+                    discovery.packet_seen = state.packet_seen;
+                    discovery.defeated = state.defeated;
+                    discovery.absent_since = state.absent_since;
+                    discovery.last_message = state.last_message;
+                    if let Some(at) = state.defeated_at {
+                        discovery.stop_timer(at);
+                    }
+                }
             }
         }
     }
@@ -2137,7 +2164,13 @@ impl LiveFeedPanel {
             FeedContextEvent::Seasonal(is_seasonal) => self.set_seasonal(*is_seasonal),
             FeedContextEvent::RealmScore(score) => self.update_realm_score(*score),
             FeedContextEvent::RealmClosed => self.force_realm_closed_at(observed),
-            FeedContextEvent::Discovery(event) => self.apply_realm_discovery(event.clone()),
+            FeedContextEvent::Discovery { scope, event } => {
+                if !matches!(event, DiscoveryEvent::Reset { .. }) {
+                    self.discovery_scope = *scope;
+                }
+                self.apply_realm_discovery(event.clone());
+                self.discovery_scope = *scope;
+            }
             FeedContextEvent::PortalSpawned { object_id } => {
                 self.portal_spawns.entry(*object_id).or_insert(observed);
             }
@@ -2470,6 +2503,7 @@ impl LiveFeedPanel {
         )));
     }
 
+    #[cfg(test)]
     pub fn force_realm_closed(&mut self) {
         self.force_realm_closed_at(std::time::Instant::now());
     }
@@ -2601,12 +2635,24 @@ impl LiveFeedPanel {
     /// instance (same `fp` seed, name, modifiers, grade) are suppressed to
     /// avoid duplicates on repeated MapInfo packets. A new instance of the
     /// same dungeon type (different `fp`) always produces a fresh entry.
+    #[cfg(test)]
     pub fn push_dungeon(
         &mut self,
         fp: i32,
         dungeon_name: &str,
         modifier_tokens: &[String],
         grade: Option<String>,
+    ) {
+        self.push_dungeon_with_origin(fp, dungeon_name, modifier_tokens, grade, None);
+    }
+
+    fn push_dungeon_with_origin(
+        &mut self,
+        fp: i32,
+        dungeon_name: &str,
+        modifier_tokens: &[String],
+        grade: Option<String>,
+        origin: Option<&crate::processing::contract::DungeonOrigin>,
     ) {
         // Log any modifier tokens that don't resolve in the bonus table so the
         // table can be extended with their exact raw form.
@@ -2631,10 +2677,14 @@ impl LiveFeedPanel {
         // window is only estimated (e.g. joined via a party call).
         // Freshness and the deadline use the entry time, not the repaint time, so
         // recovering an old dungeon cannot mint a new join window.
-        let now = self.event_instant.unwrap_or_else(std::time::Instant::now);
+        let now = origin
+            .and_then(|origin| origin.entered_at)
+            .or(self.event_instant)
+            .unwrap_or_else(std::time::Instant::now);
         let fresh_spawn = self
             .pending_portal_spawn
             .filter(|spawn| now.saturating_duration_since(*spawn) < DUNGEON_JOIN_WINDOW);
+        let fresh_spawn = origin.map_or(fresh_spawn, |origin| origin.portal_anchor);
         let estimated = fresh_spawn.is_none();
         let anchor = fresh_spawn.unwrap_or(now);
         // Realm status is only called for dungeons entered through a portal from
@@ -2642,7 +2692,9 @@ impl LiveFeedPanel {
         // its own, and a dungeon keyed open in the Nexus, inside another dungeon
         // or in the Oryx areas (Castle/Chamber/Wine Cellar/Sanctuary) is not a
         // realm entry -- the realm score is only remembered there, not current.
-        let realm_score_percent = if estimated || !self.left_from_realm {
+        let realm_score_percent = if let Some(origin) = origin {
+            origin.realm_score_percent
+        } else if estimated || !self.left_from_realm {
             None
         } else {
             self.get_score_percent()
@@ -2678,7 +2730,10 @@ impl LiveFeedPanel {
                 "[LIVE_FEED] '{display_name}' names no realm of its own: naming it as opened in the nexus"
             );
         }
-        let entered_from_nexus = self.left_from_hub || hub_hosted || nexus_parent;
+        let entered_from_nexus = origin
+            .map_or(self.left_from_hub || hub_hosted || nexus_parent, |origin| {
+                origin.entered_from_nexus
+            });
         let origin_status = match realm_status {
             Some(status) => Some(status),
             None if entered_from_nexus => self.nexus_marker.text().map(str::to_string),
@@ -2711,13 +2766,20 @@ impl LiveFeedPanel {
             modifier_tokens,
             grade,
             &params,
-            self.server_name.clone(),
-            self.realm_name.clone(),
+            origin.map_or_else(
+                || self.server_name.clone(),
+                |origin| origin.server_name.clone(),
+            ),
+            origin.map_or_else(
+                || self.realm_name.clone(),
+                |origin| origin.realm_name.clone(),
+            ),
             realm_score_percent,
             anchor,
             estimated,
         );
         entry.map_seed = fp;
+        entry.entered_at = now;
         entry.entered_from_nexus = entered_from_nexus;
 
         // Genuinely new dungeon: consume the spawn anchor and expire any prior
@@ -2732,7 +2794,14 @@ impl LiveFeedPanel {
         // only be a key-opened instance inside the castle areas, which stays
         // joinable. The natural Oryx areas (Castle/Chamber/Wine
         // Cellar/Sanctuary) never reach here -- they aren't dungeon feed entries.
-        if !self.realm_closed && self.get_score_percent().map_or(false, |p| p >= 100) {
+        if !origin.map_or(self.realm_closed, |origin| origin.realm_closed)
+            && origin
+                .map_or_else(
+                    || self.get_score_percent(),
+                    |origin| origin.realm_score_percent,
+                )
+                .is_some_and(|p| p >= 100)
+        {
             entry.deactivate();
         }
         // The run may have ended before this row was recovered.
@@ -2815,9 +2884,16 @@ impl LiveFeedPanel {
                 .unwrap_or_default();
             self.event_time = Some(entry.at.with_timezone(&chrono::Local));
             self.event_instant = Some(
-                std::time::Instant::now()
-                    .checked_sub(age)
-                    .unwrap_or_else(|| std::time::Instant::now()),
+                if let LiveEventView::Dungeon { origin, .. } = &entry.event {
+                    origin.entered_at
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| {
+                    std::time::Instant::now()
+                        .checked_sub(age)
+                        .unwrap_or_else(std::time::Instant::now)
+                }),
             );
             match &entry.event {
                 LiveEventView::BossCall { boss_id, name } => {
@@ -2858,8 +2934,15 @@ impl LiveFeedPanel {
                     display_name,
                     modifiers,
                     grade,
+                    origin,
                 } => {
-                    self.push_dungeon(*fp, display_name, modifiers, grade.clone());
+                    self.push_dungeon_with_origin(
+                        *fp,
+                        display_name,
+                        modifiers,
+                        grade.clone(),
+                        Some(origin),
+                    );
                 }
                 LiveEventView::DungeonLeft => self.deactivate_active_dungeons(),
                 LiveEventView::WhoRoster { names } => {
@@ -6848,7 +6931,8 @@ mod tests {
                 max_realm_score: 100,
                 is_dungeon: true,
             }),
-            realm_score: Some(41),
+            realm_name: Some("Medusa".to_string()),
+            realm_score: Some((41, 100)),
             realm_closed: false,
             is_seasonal: Some(true),
             dust: None,
@@ -6857,11 +6941,130 @@ mod tests {
             left_from_realm: false,
             map_is_hub: false,
             left_from_hub: false,
+            ..FeedCurrent::default()
         });
         assert_eq!(panel.server_name.as_deref(), Some("EUWest"));
         assert_eq!(panel.realm_name.as_deref(), Some("Medusa"));
         assert_eq!(panel.realm_score, Some((41, 100)));
         assert!(panel.currently_in_dungeon);
+    }
+
+    #[test]
+    fn feed_current_reconciliation_does_not_create_connection_hints() {
+        use crate::processing::contract::{FeedCurrent, FeedLocation};
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Realm", "NexusPortal.Medusa", 40, 100);
+        panel.update_location("Snake Pit", "NexusPortal.Medusa", 0, 0);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(42, "Snake Pit", &[], None);
+        let current = FeedCurrent {
+            server_name: Some("EUWest".into()),
+            realm_name: Some("Medusa".into()),
+            realm_score: Some((40, 100)),
+            is_score_stale: true,
+            location: Some(FeedLocation {
+                display_name: "Snake Pit".into(),
+                realm_name: "NexusPortal.Medusa".into(),
+                current_realm_score: 0,
+                max_realm_score: 0,
+                is_dungeon: true,
+            }),
+            ..Default::default()
+        };
+        panel.apply_feed_current(&current);
+        panel.apply_feed_current(&current);
+        assert_eq!(panel.realm_name.as_deref(), Some("Medusa"));
+        assert_eq!(panel.get_score_percent(), Some(40));
+        assert!(panel.is_score_stale);
+        assert!(panel.hub_host_hint.is_none());
+        assert!(
+            matches!(panel.entries.front(), Some(FeedEntry::Dungeon(d)) if !d.entered_from_nexus)
+        );
+    }
+
+    #[test]
+    fn feed_current_preserves_expired_castle_deadline_and_clears_it_on_exit() {
+        use crate::processing::contract::FeedCurrent;
+        let mut panel = LiveFeedPanel::new();
+        let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        panel.apply_feed_current(&FeedCurrent {
+            realm_closed: true,
+            castle_deadline: Some(deadline),
+            ..Default::default()
+        });
+        assert_eq!(panel.castle_timer_expires_at, Some(deadline));
+        assert_eq!(
+            panel.castle_timer_remaining(std::time::Instant::now()),
+            Some(std::time::Duration::ZERO)
+        );
+        panel.apply_feed_current(&FeedCurrent::default());
+        assert!(!panel.realm_closed);
+        assert!(panel.castle_timer_expires_at.is_none());
+    }
+
+    #[test]
+    fn feed_current_restores_discovery_without_changing_another_scope() {
+        use crate::processing::contract::{DiscoveryState, FeedCurrent};
+        let mut panel = LiveFeedPanel::new();
+        let message_at = std::time::Instant::now() - std::time::Duration::from_secs(100);
+        let timestamp = Local::now() - chrono::Duration::seconds(100);
+        panel.discovery_scope = 1;
+        panel.apply_realm_discovery(DiscoveryEvent::CrystalMessage {
+            object_id: Some(7),
+            notify: false,
+            at: message_at,
+            timestamp,
+            packet_seen: true,
+            absent_since: None,
+        });
+        let current = FeedCurrent {
+            discovery_scope: 2,
+            discovery_reset_at: Some(message_at + std::time::Duration::from_secs(20)),
+            discoveries: vec![DiscoveryState {
+                scope: 2,
+                object_id: Some(7),
+                object_type: CRYSTAL_TYPE,
+                timestamp,
+                present: false,
+                defeated: true,
+                packet_seen: true,
+                absent_since: Some(message_at + std::time::Duration::from_secs(15)),
+                last_message: Some(message_at),
+                defeated_at: Some(message_at + std::time::Duration::from_secs(10)),
+            }],
+            ..Default::default()
+        };
+        panel.apply_feed_current(&current);
+        panel.apply_feed_current(&current);
+        assert_eq!(
+            panel.entries.len(),
+            2,
+            "reconciliation must not duplicate rows"
+        );
+        let discoveries: Vec<_> = panel
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if let FeedEntry::BossCall(boss) = entry {
+                    boss.discovery.as_ref()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let restored = discoveries.iter().find(|d| d.scope == 2).unwrap();
+        assert!(restored.defeated);
+        assert_eq!(
+            restored.message_elapsed(),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(restored.absent_since, current.discoveries[0].absent_since);
+        let historical = discoveries.iter().find(|d| d.scope == 1).unwrap();
+        assert!(!historical.defeated);
+        assert_eq!(
+            historical.message_elapsed(),
+            Some(std::time::Duration::from_secs(20))
+        );
     }
 
     #[test]
@@ -6876,6 +7079,7 @@ mod tests {
                 display_name: "Snake Pit".to_string(),
                 modifiers: Vec::new(),
                 grade: None,
+                origin: Default::default(),
             },
         });
         match panel.entries.front().unwrap() {
@@ -6900,6 +7104,7 @@ mod tests {
                 display_name: "Snake Pit".to_string(),
                 modifiers: Vec::new(),
                 grade: None,
+                origin: Default::default(),
             },
         });
         panel.apply_live_event(&LiveEventEntry {
@@ -8263,6 +8468,7 @@ mod tests {
                         display_name: "Spider Den".to_string(),
                         modifiers: Vec::new(),
                         grade: None,
+                        origin: Default::default(),
                     },
                 },
             ],

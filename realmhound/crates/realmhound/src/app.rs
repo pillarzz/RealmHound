@@ -50,7 +50,7 @@ use realmhound_core::{
     update::SelfUpdater,
     update::UpdateChecker,
     vault::{AccountData, LiveVaultData},
-    GameSession, Settings,
+    Settings,
 };
 use std::fs;
 use std::sync::{Arc, RwLock};
@@ -1521,6 +1521,7 @@ impl RealmHoundApp {
     /// Apply a single processor [`UiUpdate`] to the UI panels.
     fn apply_update(&mut self, update: UiUpdate) {
         match update.payload {
+            UiPayload::DungeonCallout { .. } => {}
             UiPayload::Broadcast(_) => {
                 // Every state-bearing panel is driven by the snapshot.
             }

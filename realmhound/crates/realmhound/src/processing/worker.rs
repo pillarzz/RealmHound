@@ -600,6 +600,19 @@ impl Worker {
                 for update in updates {
                     match update.payload {
                         UiPayload::Audio(cmd) => self.audio_tx.send(cmd),
+                        UiPayload::DungeonCallout {
+                            display_name,
+                            modifiers,
+                            grade,
+                            origin,
+                        } => {
+                            self.refresh_auto_callout(
+                                &display_name,
+                                &modifiers,
+                                &grade,
+                                origin.as_ref(),
+                            );
+                        }
                         payload => {
                             if let UiPayload::Chat(message) = &payload {
                                 if let Err(error) = self.chat_log.append(message) {
@@ -616,27 +629,6 @@ impl Worker {
                                 for alert in party_alerts(&self.watchlist, event, local_leader) {
                                     self.processor.record_live_event(alert);
                                 }
-                            }
-                            if let UiPayload::Broadcast(GameEvent::MapChanged {
-                                ref display_name,
-                                ref realm_name,
-                                is_dungeon,
-                                current_realm_score,
-                                max_realm_score,
-                                ref dungeon_modifiers,
-                                ref dungeon_grade,
-                                ..
-                            }) = &payload
-                            {
-                                self.refresh_auto_callout(
-                                    display_name,
-                                    realm_name,
-                                    *is_dungeon,
-                                    *current_realm_score,
-                                    *max_realm_score,
-                                    dungeon_modifiers,
-                                    dungeon_grade,
-                                );
                             }
                             had_ui_updates = true;
                             if self
@@ -1133,18 +1125,17 @@ impl Worker {
     }
 
     /// Copy the new dungeon's callout worker-side when auto-clipboard is enabled.
-    #[allow(clippy::too_many_arguments)]
     fn refresh_auto_callout(
         &mut self,
         display_name: &str,
-        realm_name: &str,
-        is_dungeon: bool,
-        current_realm_score: i32,
-        max_realm_score: i32,
         modifiers: &[String],
         grade: &Option<String>,
+        origin: Option<&super::contract::DungeonOrigin>,
     ) {
         self.release_auto_callout();
+        let Some(origin) = origin else {
+            return;
+        };
         let settings = match self.settings.read() {
             Ok(settings) => settings.clone(),
             Err(_) => return,
@@ -1157,23 +1148,9 @@ impl Worker {
                 *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
             ) as usize,
         );
-        let (left_from_realm, left_from_hub, score_percent) = self.processor.callout_origin();
-        let Some((text, expires_at)) = build_auto_callout(
-            &settings,
-            self.processor.server_name(),
-            display_name,
-            realm_name,
-            is_dungeon,
-            current_realm_score,
-            max_realm_score,
-            left_from_realm,
-            left_from_hub,
-            score_percent,
-            modifiers,
-            grade,
-            &learned,
-            self.processor.portal_anchor(),
-        ) else {
+        let Some((text, expires_at)) =
+            build_auto_callout(&settings, display_name, modifiers, grade, &learned, origin)
+        else {
             return;
         };
         if crate::clipboard::set_text(&text) {
@@ -1363,46 +1340,31 @@ fn party_alerts(
 }
 
 /// Build the automatic dungeon callout, if one should be copied.
-#[allow(clippy::too_many_arguments)]
 fn build_auto_callout(
     settings: &Settings,
-    server: Option<&str>,
     display_name: &str,
-    realm_name: &str,
-    is_dungeon: bool,
-    current_realm_score: i32,
-    max_realm_score: i32,
-    left_from_realm: bool,
-    left_from_hub: bool,
-    score_percent: Option<i32>,
     modifiers: &[String],
     grade: &Option<String>,
     learned: &[String],
-    anchor: Option<Instant>,
+    origin: &super::contract::DungeonOrigin,
 ) -> Option<(String, Instant)> {
-    if !is_dungeon || !settings.live_feed.auto_clipboard_dungeon_calls {
+    if !settings.live_feed.auto_clipboard_dungeon_calls {
         return None;
     }
-    let estimated = anchor.is_none();
-    let score =
-        (max_realm_score > 0).then(|| (current_realm_score * 100 / max_realm_score).clamp(0, 100));
-    if score.is_some_and(|percent| percent >= 100) {
+    let estimated = origin.portal_anchor.is_none();
+    let score = origin.realm_score_percent;
+    if !origin.realm_closed && score.is_some_and(|percent| percent >= 100) {
         return None;
     }
-    // Same origin rule as the panel: a realm is named only for a portal entry
-    // from a realm; a hub entry names the Nexus marker instead.
-    let origin_score = if estimated || !left_from_realm {
-        None
-    } else {
-        score_percent
-    };
-    let origin = match crate::panels::dungeon_callout::realm_status_suffix(
+    let origin_status = match crate::panels::dungeon_callout::realm_status_suffix(
         settings.live_feed.realm_status,
         settings.live_feed.realm_status_threshold,
-        origin_score,
+        score,
     ) {
         Some(status) => Some(status),
-        None if left_from_hub => settings.live_feed.nexus_marker.text().map(str::to_string),
+        None if origin.entered_from_nexus => {
+            settings.live_feed.nexus_marker.text().map(str::to_string)
+        }
         None => None,
     };
     let params = crate::panels::dungeon_callout::DungeonCalloutParams {
@@ -1418,21 +1380,23 @@ fn build_auto_callout(
         percent: settings.live_feed.callout_percent,
         reward_mods: &settings.live_feed.reward_mods,
         learned_event_mods: learned,
-        origin_status: origin.as_deref(),
+        origin_status: origin_status.as_deref(),
     };
     // Anchor the countdown to the portal the player used, not to the moment
     // this batch happened to be processed.
     // A known portal-spawn anchor means the countdown is NOT estimated.
-    let estimated = anchor.is_none();
-    let anchor = anchor.unwrap_or_else(Instant::now);
+    let anchor = origin
+        .portal_anchor
+        .or(origin.entered_at)
+        .unwrap_or_else(Instant::now);
     let entry = crate::panels::live_feed::DungeonEntry::new(
         display_name.to_string(),
         None,
         modifiers,
         grade.clone(),
         &params,
-        server.map(str::to_string),
-        Some(realm_name.to_string()),
+        origin.server_name.clone(),
+        origin.realm_name.clone(),
         score,
         anchor,
         estimated,
@@ -1503,63 +1467,66 @@ mod tests {
         settings.live_feed.auto_clipboard_dungeon_calls = true;
         let (text, _) = build_auto_callout(
             &settings,
-            Some("EUWest"),
             "Snake Pit",
-            "NexusPortal.Mesa",
-            true,
-            50,
-            100,
-            false,
-            false,
-            None,
             &[],
             &None,
             &[],
-            None,
+            &crate::processing::contract::DungeonOrigin {
+                server_name: Some("EUWest".to_string()),
+                realm_name: Some("Mesa".to_string()),
+                ..Default::default()
+            },
         )
         .expect("joinable dungeon produces a callout");
         assert!(text.contains("snake"), "unexpected callout: {text}");
     }
 
     #[test]
-    fn auto_callout_requires_dungeon_and_setting() {
+    fn auto_callout_requires_setting_and_callable_dungeon() {
         let mut settings = Settings::default();
-        assert!(build_auto_callout(
-            &settings,
-            None,
-            "Snake Pit",
-            "Mesa",
-            true,
-            0,
-            0,
-            false,
-            false,
-            None,
-            &[],
-            &None,
-            &[],
-            None
-        )
-        .is_none());
+        assert!(
+            build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &Default::default())
+                .is_none()
+        );
 
         settings.live_feed.auto_clipboard_dungeon_calls = true;
-        assert!(build_auto_callout(
-            &settings,
-            None,
-            "Snake Pit",
-            "Mesa",
-            false,
-            0,
-            0,
-            false,
-            false,
-            None,
-            &[],
-            &None,
-            &[],
-            None
-        )
-        .is_none());
+        assert!(
+            build_auto_callout(&settings, "The Void", &[], &None, &[], &Default::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auto_callout_uses_resolved_origin_and_original_deadline() {
+        use crate::processing::contract::DungeonOrigin;
+        let _assets = crate::test_support::modifier_assets();
+        let mut settings = Settings::default();
+        settings.live_feed.auto_clipboard_dungeon_calls = true;
+        settings.live_feed.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        settings.live_feed.realm_status_threshold = 0;
+        let entered_at = Instant::now();
+        let mut origin = DungeonOrigin {
+            entered_at: Some(entered_at),
+            portal_anchor: Some(entered_at - Duration::from_secs(5)),
+            realm_score_percent: Some(74),
+            ..Default::default()
+        };
+        let (text, deadline) =
+            build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &origin).unwrap();
+        assert!(text.contains("in 74% realm"), "{text}");
+        assert_eq!(
+            deadline,
+            origin.portal_anchor.unwrap() + Duration::from_secs(30)
+        );
+        origin.portal_anchor = None;
+        origin.realm_score_percent = None;
+        origin.entered_from_nexus = true;
+        let (text, deadline) =
+            build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &origin).unwrap();
+        assert!(!text.contains("realm"), "{text}");
+        assert_eq!(deadline, entered_at + Duration::from_secs(25));
+        origin.entered_at = Some(entered_at - Duration::from_secs(60));
+        assert!(build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &origin).is_none());
     }
 
     #[test]

@@ -1,0 +1,31 @@
+{
+  "sources": [
+    "https://www.realmeye.com/wiki/set-tier-items",
+    "https://www.realmeye.com/wiki/themed-sets",
+    "https://www.realmeye.com/wiki/equipment-set-gear"
+  ],
+  "coverage": {
+    "ST_set_pages": 91,
+    "themed_UT_sets": 17,
+    "four_slot_entries_including_alternate_rings": 110,
+    "gear_families_in_separate_file": 15
+  },
+  "slot_order": [
+    "weapon",
+    "ability",
+    "armor",
+    "jewelry"
+  ],
+  "alternate_ring_entries": {
+    "Love Witch Necromancer Set (Essence of Enlightened Love)": "Love Witch Necromancer Set",
+    "Shaman Necromancer Set (Soul Gem Amulet)": "Shaman Necromancer Set"
+  },
+  "notes": [
+    "Includes the legacy, vanity, and seasonal sets linked by the ST index.",
+    "The main file covers named four-slot sets listed by RealmEye; it does not invent sets from arbitrary gear combinations.",
+    "The gear-family companion preserves variable equipment choices under the source page section names. Some indexed gear families are themed reskins rather than actual bonus sets.",
+    "Source pages may lag the game; this is coverage of the retrieved wiki indexes, not a guarantee of every unlisted game asset.",
+    "Typographic apostrophes are normalized to ASCII.",
+    "Alternate-ring entry names are dataset labels, not distinct official set names."
+  ]
+}

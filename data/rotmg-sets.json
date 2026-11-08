@@ -1,0 +1,662 @@
+{
+  "2-Bit Mystic Set": [
+    "Monochrome Staff",
+    "Treasure Orb",
+    "1-Bit Robe",
+    "Strange Ring"
+  ],
+  "Acidified Assassin Set": [
+    "Toxin Tooth",
+    "Virulent Venom",
+    "Acidic Armor",
+    "Pernicious Peridot"
+  ],
+  "Akuma Slayer Set": [
+    "Kazekiri",
+    "Ryu's Blade",
+    "Kamishimo",
+    "Akuma's Tear"
+  ],
+  "Alchemist Assassin Set": [
+    "Toxic Toad",
+    "Makeshift Blowpipe",
+    "Alchemist's Disheveled Garbs",
+    "Protective Gloves"
+  ],
+  "Ancestral Shaman Set": [
+    "Firestarter",
+    "Sacred Lute",
+    "Ritualistic Pa'u",
+    "Tiki Pendant"
+  ],
+  "Angelic Bard Set": [
+    "Harmonious Harp",
+    "Angel's Fanfare",
+    "Wings of Sanctity",
+    "Heavenly Halo"
+  ],
+  "Archbishop Priest Set": [
+    "Lumiaire",
+    "Chaotic Scripture",
+    "Vesture of Duality",
+    "Divine Coronation"
+  ],
+  "Archexorcist Priest Set": [
+    "Holy Artifact",
+    "Tome of Exorcism",
+    "Garb of the Ordained",
+    "Pontifex Ring"
+  ],
+  "Astral Arcanist Set": [
+    "Nebular Rod",
+    "Cosmic Astrolabe",
+    "Astronomer's Gown",
+    "Eye of Divination"
+  ],
+  "Blood Viking Knight Set": [
+    "Blood Axe",
+    "Sun Star Buckler",
+    "Fur Coat",
+    "Winter Boots"
+  ],
+  "Chancellor Wizard Set": [
+    "Superior",
+    "Genesis Spell",
+    "Diplomatic Robe",
+    "Chancellor's Cranium"
+  ],
+  "Chief Ninja Set": [
+    "Enforcer",
+    "Ballistic Star",
+    "Centaur's Shielding",
+    "Battalion Banner"
+  ],
+  "Chocolate Bunny Summoner Set": [
+    "Sweet Desire Wand",
+    "Chocolate Egg Mace",
+    "Chocolate Glazed Robe",
+    "Chocolate Bunny Ears"
+  ],
+  "Coral Huntress Set": [
+    "Coral Bow",
+    "Coral Venom Trap",
+    "Coral Silk Armor",
+    "Coral Ring"
+  ],
+  "Corrupted Paladin Set": [
+    "Fallen One's Blade",
+    "Abyssal Insignia",
+    "Vortex Plating",
+    "Eye of the Void"
+  ],
+  "Court Magician Sorcerer Set": [
+    "Magic Wand",
+    "Lightshow Scepter",
+    "Magician's Robe",
+    "Performer's Hat"
+  ],
+  "Crystal Kunoichi Set": [
+    "Quartz Cutter",
+    "Crystalline Kunai",
+    "Luminous Armor",
+    "Radiant Heart"
+  ],
+  "Crystal Necromancer Set": [
+    "Staff of the Crystal Serpent",
+    "Cracked Crystal Skull",
+    "Robe of the Tlatoani",
+    "Crystal Bone Ring"
+  ],
+  "Cuboid Necromancer Set": [
+    "Squaroid Staff",
+    "Cubic Frame",
+    "Polygonal Garbs",
+    "Cuband"
+  ],
+  "Cultist Necromancer Set": [
+    "Staff of Unholy Sacrifice",
+    "Skull of Corrupted Souls",
+    "Ritual Robe",
+    "Bloodshed Ring"
+  ],
+  "Cursed Cursebreaker Huntress Set": [
+    "Silver Revolvers",
+    "Consecrated Trap",
+    "Metal-plated Corset",
+    "Vial of Sustenance"
+  ],
+  "Daeva Trickster Set": [
+    "Archangel's Judgement",
+    "Daevite Progenitor",
+    "Seraphim's Guard",
+    "Flames of Genesis"
+  ],
+  "Daring Discoverer Samurai Set": [
+    "Kiritsukeru",
+    "Watarimono",
+    "Reinforced Root Armor",
+    "Traveler's Trinket"
+  ],
+  "Demon Guitarist Set": [
+    "Electric Guitar",
+    "Inferno Pick",
+    "Wings of the Fallen",
+    "Pointy Tail"
+  ],
+  "Dragon Tamer Set": [
+    "Indomptable",
+    "Helm of Draconic Dominance",
+    "Zaarvox's Heart",
+    "Amulet of Drakefyre"
+  ],
+  "Earthen Bulwark Summoner Set": [
+    "Earthen Ward",
+    "Stonemould Mace",
+    "Rocky Robe",
+    "Steadfast Glyph"
+  ],
+  "Easter Knight Set": [
+    "Eternal Graved Great Sword",
+    "Spriteful Shield",
+    "Eggre Battle Armor",
+    "Tiara of Eggscellent Sturdiness"
+  ],
+  "Esben Necromancer Set": [
+    "Staff of Esben",
+    "Skullish Remains of Esben",
+    "Esben's Shaman Attire",
+    "Esben's Wedding Ring"
+  ],
+  "Esben Wizard Set": [
+    "Staff of Esben",
+    "Esben's Vows",
+    "Esben's Shaman Attire",
+    "Esben's Wedding Ring"
+  ],
+  "Exalted Knight Set": [
+    "Divinity",
+    "Oryx's Escutcheon",
+    "Gladiator Guard",
+    "Exalted God's Horn"
+  ],
+  "Extra Dimensional Druid Set": [
+    "Dimensional Union",
+    "Hyper Sigil",
+    "Sprite's Dream",
+    "Infinite Bands"
+  ],
+  "Fiery Kensei Set": [
+    "Fiery Katana",
+    "Pyro Sheath",
+    "Flame Guard",
+    "Firelight Necklace"
+  ],
+  "Flesh Collector Set": [
+    "Symbiotic Ripper",
+    "Parasitic Concoction",
+    "Rags of the Host",
+    "Hivemind Circlet"
+  ],
+  "Fresh Carrot Paladin Set": [
+    "Nutrient Rich Carrot Blade",
+    "Carrot Cake Crest",
+    "Hardened Carrot Armor",
+    "Sun Bathed Straw Hat"
+  ],
+  "Frost Advisor Set": [
+    "Iceborn Arsenal",
+    "Sublimation Sidearm",
+    "Retainer's Battlesuit",
+    "Legacy's Pendant"
+  ],
+  "Frost Harbinger Set": [
+    "Heartsteel Claymore",
+    "Symbol of the Lost",
+    "Hull of the Tundra",
+    "Frozen Heart"
+  ],
+  "Frost Wander Archer Set": [
+    "Frostbite Mittens",
+    "Snow Critters",
+    "Blizzard Jacket",
+    "Magical Winter Scarf"
+  ],
+  "Ghostly Banshee Summoner Set": [
+    "Tormented Shriek",
+    "Ghastly Mace",
+    "Lacerated Gown",
+    "Unresolved Grudge"
+  ],
+  "Ghostly Trickster Set": [
+    "Spirit Dagger",
+    "Ghostly Prism",
+    "Spectral Cloth Armor",
+    "Captain's Ring"
+  ],
+  "Globular Necromancer Set": [
+    "Bloody Pitch Fork Staff",
+    "Blood Essence",
+    "Curse Binding Robes",
+    "Spike Headband"
+  ],
+  "Golden Archer Set": [
+    "Brilliance Bow",
+    "Quintessential Quiver",
+    "Luxurious Leather",
+    "Regal Ring"
+  ],
+  "Hollow King Necromancer Set": [
+    "Edictum Praetoris",
+    "Memento Mori",
+    "Toga Picta",
+    "Interregnum"
+  ],
+  "Horrific Sorcerer Set": [
+    "Abomination's Wrath",
+    "Grotesque Scepter",
+    "Garment of the Beast",
+    "Horrific Claws"
+  ],
+  "Horticultural Huntress Set": [
+    "Bergenia Bow",
+    "Lifebringing Lotus",
+    "Hollyhock Hide",
+    "Chrysanthemum Corsage"
+  ],
+  "Incubus Sorcerer Set": [
+    "Heartbreaker Wand",
+    "Lovesick Scepter",
+    "Devilish Robes",
+    "Devil Horn Headband"
+  ],
+  "Killbilly Warrior Set": [
+    "Jagged Hatchet",
+    "Burlap Cowl",
+    "Overalls of Endurance",
+    "Headless Ted"
+  ],
+  "Kogbold Pyrotechnician Wizard Set": [
+    "Rocket Launcher",
+    "Unstable Firework",
+    "Blast Proof Robes",
+    "Lucky Grenade"
+  ],
+  "Kogbold Turretsmith Archer Set": [
+    "Experimental Cannon",
+    "Sentry Turret",
+    "Tinkerers Apron",
+    "Targeting Monocular"
+  ],
+  "Legacy Skuld 2 The ReGhostening Set": [
+    "Legacy Etherite Dagger",
+    "Legacy Ghastly Drape",
+    "Legacy Mantle of Skuld",
+    "Legacy Spectral Ring of Horrors"
+  ],
+  "Legacy Swoll Paladin Set": [
+    "Legacy Pixie-Enchanted Sword",
+    "Legacy Seal of the Enchanted Forest",
+    "Legacy Fairy Plate",
+    "Legacy Ring of Pure Wishes"
+  ],
+  "Legacy Twilight Archmage Set": [
+    "Legacy Sentient Staff",
+    "Legacy Ancient Spell: Pierce",
+    "Legacy Robe of Twilight",
+    "Legacy Forgotten Ring"
+  ],
+  "Lei Gong Set": [
+    "Thunder Mallet",
+    "Enchanted Chisel",
+    "Daopao",
+    "Mala Beads"
+  ],
+  "Lost Golem Set": [
+    "Carved Golem Remains",
+    "Brain of the Golem",
+    "Golem Garments",
+    "Rusty Cuffs"
+  ],
+  "Love Witch Necromancer Set": [
+    "Gloves of Love",
+    "Mask of Passion",
+    "Boudoir Robe",
+    "Essence of Love"
+  ],
+  "Love Witch Necromancer Set (Essence of Enlightened Love)": [
+    "Gloves of Love",
+    "Mask of Passion",
+    "Boudoir Robe",
+    "Essence of Enlightened Love"
+  ],
+  "Lycan Warrior Set": [
+    "Savage Claws",
+    "Beastly Mane",
+    "Ragetorn Armor",
+    "Moonstone Ring"
+  ],
+  "Mad God's Messenger Set": [
+    "Theurgy Wand",
+    "Ceremonial Merlot",
+    "Anointed Robe",
+    "Ring of Pagan Favor"
+  ],
+  "Mad Minotaur Set": [
+    "Fury Flail",
+    "Shockwave Shield",
+    "Cyclone Chestplate",
+    "Brass Knuckles"
+  ],
+  "Mad Scientist Sorcerer Set": [
+    "Conducting Wand",
+    "Scepter of Fulmination",
+    "Robe of the Mad Scientist",
+    "Experimental Ring"
+  ],
+  "Magmatic Mystic Set": [
+    "Staff of Eruption",
+    "Scorchium Stone",
+    "Molten Mantle",
+    "Ring of the Inferno"
+  ],
+  "Marble Paladin Set": [
+    "Sword of the Colossus",
+    "Marble Seal",
+    "Breastplate of New Life",
+    "Magical Lodestone"
+  ],
+  "Mechanical Raptor Druid Set": [
+    "Gearhawk Morning Star",
+    "Mechraptor Sigil",
+    "Mechpilot's Jerkin",
+    "Pressure Gauge Band"
+  ],
+  "Nordic Knight Set": [
+    "Dalvar's Battle Axe",
+    "Sunken Buckler",
+    "Chainmail Body Armor",
+    "Gjallarhorn"
+  ],
+  "Onmyoji Ninja Set": [
+    "Shakujo",
+    "Invocation Scroll",
+    "Divination Cloak",
+    "Omamori"
+  ],
+  "Oryx Awesome Set": [
+    "Sword of the Mad God",
+    "Onyx Shield of the Mad God",
+    "Almandine Armor of Anger",
+    "Almandine Ring of Wrath"
+  ],
+  "Oryx's Battle Attires Set": [
+    "Oryx's Greatsword",
+    "Champion's Bastion",
+    "Mercy's Bane",
+    "Bloodstone Ring"
+  ],
+  "Painted Egg Archer Set": [
+    "Spring Wonder Bow",
+    "Fresh Breeze Quiver",
+    "Painted Eggshell Armor",
+    "Painted Egg Amulet"
+  ],
+  "Paranormal Wizard Set": [
+    "Supernatural Staff",
+    "Spectral Spell",
+    "Immortal Mantle",
+    "Phantom Pendant"
+  ],
+  "Phantom Archer Set": [
+    "Deathless Crossbow",
+    "Quiver of Shrieking Specters",
+    "Wraith's Brigandine",
+    "Revenant Ring"
+  ],
+  "Phylactery Mystic Set": [
+    "The Phylactery",
+    "Soul of the Bearer",
+    "Soulless Robe",
+    "Ring of the Covetous Heart"
+  ],
+  "Phytomancer Summoner Set": [
+    "Razorthorn Branch",
+    "Mace of the Woods",
+    "Leafweave Raiment",
+    "Bud of Beginning"
+  ],
+  "Pirate King Warrior Set": [
+    "Swashbuckler's Sickle",
+    "Tricorne of the High Seas",
+    "Naval Uniform",
+    "First Mate's Hook"
+  ],
+  "Plague Doctor Priest Set": [
+    "Cane of Caduceus",
+    "Bloodletting Leeches",
+    "Doctor's Overcoat",
+    "Plague Mask"
+  ],
+  "Priest of Geb Set": [
+    "Wand of Geb",
+    "Book of Geb",
+    "Shendyt of Geb",
+    "Geb's Ring of Wisdom"
+  ],
+  "Purified Priest Set": [
+    "St. Abraham's Wand",
+    "Tome of Purification",
+    "Chasuble of Holy Light",
+    "Ring of Divine Faith"
+  ],
+  "Raijin Disciple Set": [
+    "Reikoku",
+    "Daybreak Chakram",
+    "Hirejou Tenne",
+    "Heavenly Magatama"
+  ],
+  "Reanimated Archer Set": [
+    "Bone Bow",
+    "Spinal Quiver",
+    "Torso Tunic",
+    "Collarbone Collar"
+  ],
+  "Reaper Necromancer Set": [
+    "Gravekeeper's Scythe",
+    "Hooded Skull",
+    "Executioner's Garb",
+    "Grim Goblet"
+  ],
+  "Resurrected Huntress Set": [
+    "Bolt Thrower",
+    "Lightning Rod",
+    "Wedding Dress",
+    "Gothic Bouffant"
+  ],
+  "Rose Keeper Necromancer Set": [
+    "Spring Rose",
+    "Ever Green Skull",
+    "Floral Corset",
+    "Rose Brooch"
+  ],
+  "Scarecrow Trickster Set": [
+    "Maize Machete",
+    "Pumpkin Prism",
+    "Withered Poncho",
+    "Burlap Hat"
+  ],
+  "Scientific Summoner Set": [
+    "C.L.A.W.",
+    "B.O.O.M.",
+    "A.R.M.O.R.",
+    "C.O.N.T.R.O.L.L.E.R."
+  ],
+  "Shaman Necromancer Set": [
+    "Shaman's Staff",
+    "Ritual Skull",
+    "Ragged Robes",
+    "Fang Necklace"
+  ],
+  "Shaman Necromancer Set (Soul Gem Amulet)": [
+    "Shaman's Staff",
+    "Ritual Skull",
+    "Ragged Robes",
+    "Soul Gem Amulet"
+  ],
+  "Skeletosaur Druid Set": [
+    "Aeonic Talon",
+    "Jurassic Sigil",
+    "Primal Padding",
+    "Storied Fossil"
+  ],
+  "Skuld 2 The ReGhostening Set": [
+    "Etherite Dagger",
+    "Ghastly Drape",
+    "Mantle of Skuld",
+    "Spectral Ring of Horrors"
+  ],
+  "Slurp Scion Wizard Set": [
+    "Tideturner Trident",
+    "Slurpian Sea Scroll",
+    "Oceanic Apparel",
+    "Imperial Keepsake"
+  ],
+  "Spectral Sentry Rogue Set": [
+    "Phantom Sickle",
+    "Spectre Cloak",
+    "Reaper's Shroud",
+    "Soul Necklace"
+  ],
+  "Spellbound Soulthief Set": [
+    "Blade of Fates",
+    "Accursed Memory",
+    "Gravetender's Vest",
+    "Jewel of Vengeance"
+  ],
+  "Spirit Mystic Set": [
+    "Spirit Staff",
+    "Enchantment Orb",
+    "Woodland Robe",
+    "Fairy Ring"
+  ],
+  "Storm Caller Bard Set": [
+    "Hailstorm",
+    "Thundering Chorus",
+    "Wind Dancer Robe",
+    "Augur of the Tempest"
+  ],
+  "Storm Shaman Set": [
+    "Lightning Wand",
+    "Totem Scepter",
+    "Thunderstorm Tunic",
+    "Bolt in a Bottle"
+  ],
+  "Summer Solstice Set": [
+    "Staff of the Rising Sun",
+    "Thousand Suns Spell",
+    "Robe of the Summer Solstice",
+    "Ring of the Burning Sun"
+  ],
+  "Swamp Hermit Druid Set": [
+    "Pulsating Wand",
+    "Swampy Sigil",
+    "Mossy Guard",
+    "Willow Sprout"
+  ],
+  "Swarming Huntress Set": [
+    "Nectar Crossfire",
+    "Honeytomb Snare",
+    "Apiary Armor",
+    "Honey Circlet"
+  ],
+  "Swoll Paladin Set": [
+    "Pixie-Enchanted Sword",
+    "Seal of the Enchanted Forest",
+    "Fairy Plate",
+    "Ring of Pure Wishes"
+  ],
+  "Tidal Wave Kensei Set": [
+    "Saif of the Deep",
+    "Loch Sheath",
+    "Barrier Reef",
+    "Alexander's Band"
+  ],
+  "Timekeeper Mystic Set": [
+    "Staff of Rich History",
+    "Entrancing Hourglass",
+    "Traditional Blouse",
+    "Bronze Pocketwatch"
+  ],
+  "Totalia Mystic Set": [
+    "Stygian Torch",
+    "Orb of the Sabbath",
+    "Robe of the Enchantress",
+    "Witch's Brooch"
+  ],
+  "Treasure Hunter Archer Set": [
+    "Resplendent Bow",
+    "Embellished Quiver",
+    "Ornate Armor",
+    "Aquamarine Amulet"
+  ],
+  "Treasurer Trickster Set": [
+    "Avarice",
+    "Gambler's Fate",
+    "Turncoat Cape",
+    "Collector's Monocle"
+  ],
+  "Twilight Archmage Set": [
+    "Corruption Tether",
+    "Ancient Eminence",
+    "Twilight Shroud",
+    "Defiled Equilibrium"
+  ],
+  "Undersea Phantom Wizard Set": [
+    "Cursed Harpoon",
+    "Depth Charge",
+    "Phosphorescent Rags",
+    "Diving Weights"
+  ],
+  "Unholy Paladin Set": [
+    "Hellfire Broadsword",
+    "Sacrilege Seal",
+    "Tormentor's Chainmail",
+    "Horned Ring"
+  ],
+  "Valentine's Day Archer Set": [
+    "Heartstruck Bow",
+    "Quiver of Dazing Love",
+    "Cupid's Garments",
+    "Ring of Unbound Love"
+  ],
+  "Valentine's Day Ninja Set": [
+    "Heartseeker Katana",
+    "Eternal Star",
+    "Chocolate Armor",
+    "Sweetener Ring"
+  ],
+  "Valentine's Day Samurai Set": [
+    "Heartseeker Katana",
+    "Sweetcut Wakizashi",
+    "Lovebite Armor",
+    "Sweetener Ring"
+  ],
+  "Vampire Rogue Set": [
+    "Soulcursed Scythe",
+    "Vampiric Cape",
+    "Hallowed Hide",
+    "Ruthven's Rosary"
+  ],
+  "Void Archer Set": [
+    "Bow of the Void",
+    "Quiver of Shadows",
+    "Armor of Nil",
+    "Sourcestone"
+  ],
+  "Void Doctor Priest Set": [
+    "Cane of the Void",
+    "Void Leeches",
+    "Darkness Overcoat",
+    "Void Mask"
+  ]
+}

@@ -557,6 +557,32 @@ pub struct TreasuryPanel {
 }
 
 impl TreasuryPanel {
+    /// Focus an exact set piece from another panel. The visible query uses the
+    /// item's canonical asset name, while the ID filter keeps same-name legacy
+    /// and current items separate in the storage sections.
+    pub fn focus_item(&mut self, item_id: i32, fallback_name: &str) {
+        let name = get_asset_manager()
+            .object_name(item_id)
+            .unwrap_or_else(|| fallback_name.to_owned());
+        self.active_item_filters.clear();
+        self.active_item_filters.insert(item_id);
+        self.search_text = name.clone();
+        self.search_prev_text = name.clone();
+        self.active_text_filter = Some(name);
+        self.search_popup_open = false;
+        self.search_selected_index = None;
+        self.active_dungeon_filters.clear();
+        self.dungeon_search_text.clear();
+        self.dungeon_search_prev_text.clear();
+        self.dungeon_search_popup_open = false;
+        self.dungeon_search_selected_index = None;
+        self.active_category = None;
+        self.active_subcategory = None;
+        self.props = PropFilter::default();
+        self.pending_item_click.set(None);
+        self.display_cache_valid = false;
+    }
+
     /// Create a new TreasuryPanel with default section order.
     pub fn new() -> Self {
         let order = TreasurySection::default_order();
@@ -3347,7 +3373,31 @@ impl Panel for TreasuryPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::PropFilter;
+    use super::{PropFilter, TreasuryPanel};
+
+    #[test]
+    fn focus_item_sets_name_and_exact_id_without_stale_filters() {
+        let mut panel = TreasuryPanel::new();
+        panel.active_item_filters.insert(999);
+        panel.active_dungeon_filters.insert(42);
+        panel.search_text = "Previous".into();
+        panel.search_prev_text = "Previous".into();
+        panel.props.ut = true;
+        panel.search_popup_open = true;
+        panel.focus_item(43381, "Monochrome Staff");
+        assert_eq!(panel.active_item_filters.len(), 1);
+        assert!(panel.active_item_filters.contains(&43381));
+        assert_eq!(panel.search_text, "Monochrome Staff");
+        assert_eq!(panel.search_prev_text, panel.search_text);
+        assert_eq!(
+            panel.active_text_filter.as_deref(),
+            Some("Monochrome Staff")
+        );
+        assert!(panel.active_dungeon_filters.is_empty());
+        assert!(!panel.props.ut);
+        assert!(!panel.search_popup_open);
+        assert!(!panel.display_cache_valid);
+    }
 
     /// Build a rarity-only filter (type filters off) selecting exactly the given tiers.
     fn rarity_only(none: bool, unc: bool, rare: bool, leg: bool, div: bool) -> PropFilter {

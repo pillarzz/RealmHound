@@ -22,6 +22,7 @@ pub mod pet_card;
 pub mod pet_yard;
 pub mod quest;
 pub mod scroll_nav;
+pub mod sets;
 pub mod taskbar;
 pub mod treasury;
 pub mod trophy_hall;
@@ -168,6 +169,7 @@ pub enum ActiveTab {
     CombatHistory,
     PetYard,
     Missions,
+    Sets,
 }
 
 impl ActiveTab {
@@ -188,6 +190,7 @@ impl ActiveTab {
             10 => ActiveTab::CombatHistory,
             11 => ActiveTab::PetYard,
             12 => ActiveTab::Missions,
+            13 => ActiveTab::Sets,
             _ => ActiveTab::LiveFeed,
         }
     }
@@ -208,6 +211,7 @@ impl ActiveTab {
             ActiveTab::CombatHistory => "CombatHistory",
             ActiveTab::PetYard => "PetYard",
             ActiveTab::Missions => "Missions",
+            ActiveTab::Sets => "Sets",
         }
     }
 }
@@ -225,6 +229,8 @@ impl ActiveTab {
 pub enum AppAction {
     /// Switch to a different tab.
     SwitchTab(ActiveTab),
+    /// Open Treasury focused on one exact item, with its name in the search field.
+    ViewTreasuryItem { item_id: i32, item_name: String },
     /// Set exclusive loot filter for a character and switch to Loot History.
     ViewCharacterLoot {
         char_id: i32,

@@ -669,6 +669,7 @@ pub struct RealmHoundApp {
     treasury_panel: TreasuryPanel,
     /// Trophy Hall panel (item collections unified across loot history, RealmShark, and account data)
     trophy_hall_panel: TrophyHallPanel,
+    sets_panel: crate::panels::sets::SetsPanel,
     /// Pet Yard diagnostics panel (read-only pet identity/inventory cache view)
     pet_yard_panel: PetYardPanel,
     /// Seasonal missions panel.
@@ -1194,6 +1195,7 @@ impl RealmHoundApp {
                 panel
             },
             treasury_panel: TreasuryPanel::new(),
+            sets_panel: crate::panels::sets::SetsPanel::default(),
             trophy_hall_panel: {
                 let mut panel = TrophyHallPanel::new();
                 // Flat compatibility exposes RealmShark imports only for a
@@ -9790,6 +9792,7 @@ impl RealmHoundApp {
             self.render_tab_button(ui, ActiveTab::LootHistory, "Loot History", "A searchable record of loot dropped by monsters.");
             self.render_tab_button(ui, ActiveTab::CombatHistory, "Combat History", "DPS breakdown and history of boss fights.");
             self.render_tab_button(ui, ActiveTab::TrophyHall, "Trophy Hall", "Dungeon collections, completion progress and loot statistics.");
+            self.render_tab_button(ui, ActiveTab::Sets, "Sets", "Account-wide equipment set checklist and wiki-documented sources.");
             self.render_tab_button(ui, ActiveTab::Treasury, "Treasury", "Browse and search every item on your account.");
             self.render_tab_button(ui, ActiveTab::Vault, "Vault", "View your Vault and other storage containers.");
             self.render_tab_button(ui, ActiveTab::Characters, "Characters", "Characters, equipment, statistics and progression.");
@@ -10080,6 +10083,7 @@ impl RealmHoundApp {
                 ActiveTab::LootHistory => self.loot_panel.show(ui, &mut ctx),
                 ActiveTab::CombatHistory => self.combat_panel.show(ui, &mut ctx),
                 ActiveTab::TrophyHall => self.trophy_hall_panel.show(ui, &mut ctx),
+                ActiveTab::Sets => self.sets_panel.show(ui, &mut ctx),
                 ActiveTab::Vault => self.vault_panel.show(ui, &mut ctx),
                 ActiveTab::Quests => self.quest_panel.show(ui, &mut ctx),
                 ActiveTab::Treasury => self.treasury_panel.show(ui, &mut ctx),
@@ -10104,6 +10108,10 @@ impl RealmHoundApp {
             match action {
                 AppAction::SwitchTab(tab) => {
                     self.active_tab = tab;
+                }
+                AppAction::ViewTreasuryItem { item_id, item_name } => {
+                    self.treasury_panel.focus_item(item_id, &item_name);
+                    self.active_tab = ActiveTab::Treasury;
                 }
                 AppAction::ViewCharacterLoot {
                     char_id,

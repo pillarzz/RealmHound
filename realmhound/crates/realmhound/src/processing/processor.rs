@@ -431,6 +431,8 @@ pub struct PacketProcessor {
     live_events: LiveEventWindow,
     /// Monotonic id for `live_events`.
     live_event_seq: u64,
+    /// Number of events evicted from the bounded live-event window.
+    live_event_evictions: u64,
     /// Whether the current map is a dungeon (for Oryx-lag warnings).
     in_dungeon: bool,
     /// Dust amounts used to detect full transitions.
@@ -575,6 +577,7 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
         }
@@ -685,6 +688,7 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
         })
@@ -747,6 +751,7 @@ impl PacketProcessor {
             pending_redeem_quest_id: None,
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
+            live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
         }
@@ -913,6 +918,11 @@ impl PacketProcessor {
         self.live_events.clone()
     }
 
+    /// Cumulative evictions from the bounded live-event window.
+    pub fn live_event_evictions(&self) -> u64 {
+        self.live_event_evictions
+    }
+
     fn record_live_event(&mut self, event: LiveEventView) {
         const WINDOW: usize = 100;
         self.live_event_seq = self.live_event_seq.wrapping_add(1);
@@ -922,6 +932,7 @@ impl PacketProcessor {
         });
         if self.live_events.events.len() > WINDOW {
             self.live_events.events.remove(0);
+            self.live_event_evictions = self.live_event_evictions.wrapping_add(1);
         }
         self.live_events.rev = self.live_events.rev.wrapping_add(1);
     }
@@ -4813,6 +4824,19 @@ mod keyper_tests {
             other => panic!("expected a boss call, got {other:?}"),
         }
         assert_eq!(processor.view_state().live_event_rev, window.rev);
+    }
+
+    #[test]
+    fn live_event_window_counts_evictions() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        for i in 0..101 {
+            processor.record_live_event(crate::processing::contract::LiveEventView::BossCall {
+                boss_id: i,
+                name: "Boss".to_string(),
+            });
+        }
+        assert_eq!(processor.live_event_window().events.len(), 100);
+        assert_eq!(processor.live_event_evictions(), 1);
     }
 
     #[test]

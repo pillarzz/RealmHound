@@ -66,6 +66,8 @@ pub struct HealthSnapshot {
     pub queue_depth: usize,
     /// Cumulative updates dropped by the bounded UI queue.
     pub queue_drops: u64,
+    /// Cumulative Live Feed window evictions.
+    pub live_window_evictions: u64,
     /// Current capture source state.
     pub capture: CaptureState,
     /// Cumulative persistence failures observed by the app/worker.
@@ -81,6 +83,7 @@ pub struct HealthCounters {
     drain_frames: AtomicU64,
     drained_updates: AtomicU64,
     capped_drain_frames: AtomicU64,
+    live_window_evictions: AtomicU64,
     capture: AtomicU8,
     persistence_failures: AtomicU64,
     last_persistence_error: Mutex<Option<String>>,
@@ -94,6 +97,7 @@ impl Default for HealthCounters {
             drain_frames: AtomicU64::new(0),
             drained_updates: AtomicU64::new(0),
             capped_drain_frames: AtomicU64::new(0),
+            live_window_evictions: AtomicU64::new(0),
             capture: AtomicU8::new(CaptureState::Stopped as u8),
             persistence_failures: AtomicU64::new(0),
             last_persistence_error: Mutex::new(None),
@@ -132,6 +136,11 @@ impl HealthCounters {
         *last = Some(error.into());
     }
 
+    /// Set the cumulative Live Feed window eviction count.
+    pub fn set_live_window_evictions(&self, count: u64) {
+        self.live_window_evictions.store(count, Ordering::Relaxed);
+    }
+
     /// Update the observed capture source state.
     pub fn set_capture_state(&self, state: CaptureState) {
         self.capture.store(state as u8, Ordering::Relaxed);
@@ -147,6 +156,7 @@ impl HealthCounters {
             capped_drain_frames: self.capped_drain_frames.load(Ordering::Relaxed),
             queue_depth,
             queue_drops,
+            live_window_evictions: self.live_window_evictions.load(Ordering::Relaxed),
             capture: CaptureState::from_u8(self.capture.load(Ordering::Relaxed)),
             persistence_failures: self.persistence_failures.load(Ordering::Relaxed),
             last_persistence_error: self
@@ -175,6 +185,8 @@ pub struct HealthSummary {
     pub peak_queue_depth: usize,
     /// Queue drops that happened during the window.
     pub queue_drops_delta: u64,
+    /// Cumulative Live Feed window evictions at window end.
+    pub live_window_evictions: u64,
     /// Capture state at window end.
     pub capture: CaptureState,
     /// Cumulative persistence failures at window end.
@@ -193,8 +205,9 @@ impl HealthSummary {
         if backlog && self.peak_frame_gap >= STALL_WARN_GAP {
             tracing::warn!(
                 "[HEALTH][UI] window_ms={} frames={} drained_updates={} capped_frames={} \
-                 peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} capture={} \
-                 persistence_failures={} active_tab={} viewport_focused={} viewport_minimized={}",
+                 peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} live_window_evictions={} \
+                 capture={} persistence_failures={} active_tab={} viewport_focused={} \
+                 viewport_minimized={}",
                 self.window.as_millis(),
                 self.frames,
                 self.drained_updates,
@@ -202,6 +215,7 @@ impl HealthSummary {
                 self.peak_frame_gap.as_millis(),
                 self.peak_queue_depth,
                 self.queue_drops_delta,
+                self.live_window_evictions,
                 self.capture.label(),
                 self.persistence_failures,
                 active_tab,
@@ -211,8 +225,9 @@ impl HealthSummary {
         } else {
             tracing::info!(
                 "[HEALTH][UI] window_ms={} frames={} drained_updates={} capped_frames={} \
-                 peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} capture={} \
-                 persistence_failures={} active_tab={} viewport_focused={} viewport_minimized={}",
+                 peak_frame_gap_ms={} peak_queue_depth={} queue_drops={} live_window_evictions={} \
+                 capture={} persistence_failures={} active_tab={} viewport_focused={} \
+                 viewport_minimized={}",
                 self.window.as_millis(),
                 self.frames,
                 self.drained_updates,
@@ -220,6 +235,7 @@ impl HealthSummary {
                 self.peak_frame_gap.as_millis(),
                 self.peak_queue_depth,
                 self.queue_drops_delta,
+                self.live_window_evictions,
                 self.capture.label(),
                 self.persistence_failures,
                 active_tab,
@@ -311,6 +327,7 @@ impl HealthMonitor {
             peak_frame_gap: self.window_peak_gap,
             peak_queue_depth: self.window_peak_queue,
             queue_drops_delta: drops_delta,
+            live_window_evictions: counters.live_window_evictions,
             capture: counters.capture,
             persistence_failures: counters.persistence_failures,
         });

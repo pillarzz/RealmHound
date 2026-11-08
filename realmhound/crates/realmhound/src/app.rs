@@ -10055,6 +10055,10 @@ impl RealmHoundApp {
                     health.queue_depth, health.queue_drops
                 ));
                 ui.label(format!(
+                    "Live Feed evictions: {}",
+                    health.live_window_evictions
+                ));
+                ui.label(format!(
                     "Drain frames: {} ({} capped), {} updates",
                     health.drain_frames, health.capped_drain_frames, health.drained_updates
                 ));

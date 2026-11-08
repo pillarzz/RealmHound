@@ -643,6 +643,8 @@ impl Worker {
                 self.health
                     .record_persistence_failure(format!("loot insert: {error}"));
             }
+            self.health
+                .set_live_window_evictions(self.processor.live_event_evictions());
             #[cfg(feature = "latency-diagnostics")]
             {
                 segments.save = save_started.elapsed();

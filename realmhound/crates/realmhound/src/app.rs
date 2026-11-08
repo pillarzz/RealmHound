@@ -1556,7 +1556,7 @@ impl RealmHoundApp {
             }
             UiPayload::BossCall { boss_id, text } => {
                 let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                self.maybe_play_realm_event(boss_id, &text, should_sound, None);
+                self.log_realm_event(boss_id, &text, should_sound);
             }
             UiPayload::RealmDiscovery(event) => {
                 use crate::processing::realm_discovery::{
@@ -1565,33 +1565,28 @@ impl RealmHoundApp {
 
                 let notification = match &event {
                     DiscoveryEvent::Discovered {
-                        object_id,
                         object_type: JAILER_TYPE,
                         notify,
                         ..
-                    } => Some((JAILER_TYPE, "Spectral Jailer", *notify, Some(*object_id))),
+                    } => Some((JAILER_TYPE, "Spectral Jailer", *notify)),
                     DiscoveryEvent::Discovered {
                         object_type: CRYSTAL_TYPE,
                         notify,
                         ..
                     }
                     | DiscoveryEvent::CrystalMessage { notify, .. } => {
-                        Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify, None))
+                        Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify))
                     }
-                    // Totalia has no chat announcement: her object update (sent
-                    // even far outside view) is the only trigger. Several
-                    // instances spawn together, so share one sound key to let
-                    // the audio layer coalesce them.
                     DiscoveryEvent::Discovered {
                         object_type: TOTALIA_TYPE,
                         notify,
                         ..
-                    } => Some((TOTALIA_TYPE, "Totalia the Malevolent", *notify, None)),
+                    } => Some((TOTALIA_TYPE, "Totalia the Malevolent", *notify)),
                     _ => None,
                 };
                 self.live_feed_panel.apply_realm_discovery(event);
-                if let Some((boss_id, name, notify, instance_id)) = notification {
-                    self.maybe_play_realm_event(boss_id, name, notify, instance_id);
+                if let Some((boss_id, name, notify)) = notification {
+                    self.log_realm_event(boss_id, name, notify);
                 }
             }
             UiPayload::KeyperEvent { towers } => {
@@ -1607,7 +1602,7 @@ impl RealmHoundApp {
                 let should_sound = self
                     .live_feed_panel
                     .push_boss_call(boss_id, name.to_string());
-                self.maybe_play_realm_event(boss_id, name, should_sound, None);
+                self.log_realm_event(boss_id, name, should_sound);
             }
             UiPayload::RealmClosed => {
                 use crate::panels::live_feed::WarningSeverity;
@@ -6983,15 +6978,9 @@ impl RealmHoundApp {
         changed
     }
 
-    /// Play a realm-event notification sound for a Live Feed boss call, if the
-    /// matching section is enabled (see [`crate::realm_event_sound`]).
-    fn maybe_play_realm_event(
-        &self,
-        boss_id: i32,
-        text: &str,
-        should_sound: bool,
-        instance_id: Option<i32>,
-    ) {
+    /// Log a Live Feed boss call for the diagnostic notification history. The
+    /// sound itself is dispatched worker-side so hidden windows still alert.
+    fn log_realm_event(&self, boss_id: i32, text: &str, should_sound: bool) {
         let (events, custom_sounds, log_events) = match self.settings.read() {
             Ok(s) => (
                 s.sound.realm_events.clone(),
@@ -7001,26 +6990,6 @@ impl RealmHoundApp {
             Err(_) => return,
         };
         let sets = crate::realm_event_sound::EventSets::from_assets();
-
-        // Play first so a slow log write never delays the notification. Repeat
-        // callouts (e.g. the Crystal Prisoner re-announcing itself, or a boss
-        // deduped within the realm) pass `should_sound == false` and are logged
-        // silently.
-        use realmhound_core::settings::EventMode;
-        let any_enabled = events.veteran.mode != EventMode::None
-            || events.adept.mode != EventMode::None
-            || events.seasonal.mode != EventMode::None
-            || events.alien.enabled;
-        if should_sound && any_enabled {
-            if let Some(t) = crate::realm_event_sound::resolve(&events, boss_id, text, &sets) {
-                self.audio_tx.send(AudioCommand::PlayEvent {
-                    sound: t.sound,
-                    custom_key: t.custom_key,
-                    instance_id,
-                    volume: t.volume,
-                });
-            }
-        }
 
         // Diagnostic log: record every boss call (including silent ones) so
         // missing / mis-mapped notification sounds can be traced later. Written
@@ -10054,7 +10023,7 @@ impl RealmHoundApp {
                 }
                 AppAction::PushBossCall { boss_id, text } => {
                     let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                    self.maybe_play_realm_event(boss_id, &text, should_sound, None);
+                    self.log_realm_event(boss_id, &text, should_sound);
                 }
                 AppAction::CharacterCacheChanged => {
                     // The processor owns the canonical character cache now; this

@@ -259,6 +259,14 @@ fn parse_area_unlock_json(message: &str) -> Option<AreaUnlockMsg> {
 
 /// The full packet-processing model. Owns the game session, combat engine,
 /// loot tracker, and account data, and emits [`UiUpdate`]s for the UI.
+/// Worker-side record of a recent boss callout for alert dedup.
+struct RecentBossCallAlert {
+    boss_id: i32,
+    boss_name: String,
+    realm: Option<String>,
+    at: std::time::Instant,
+}
+
 pub struct PacketProcessor {
     // --- Model (moved out of `RealmHoundApp`) ---
     reassembler: TcpReassembler,
@@ -362,6 +370,14 @@ pub struct PacketProcessor {
     /// realm re-arms it.
     keyper_realm: Option<String>,
     realm_discovery: RealmDiscovery,
+
+    /// Current realm key for worker-side alert dedup. Mirrors the Live Feed's
+    /// parsed realm name; `None` outside a realm.
+    current_realm: Option<String>,
+
+    /// Recent boss-call alerts, for the same 5s per-realm suppression the Live
+    /// Feed applies to visible entries.
+    recent_boss_calls: Vec<RecentBossCallAlert>,
 
     /// Events buffered while the current connection is a tentative (unverified)
     /// main and a saved main account already exists. RotMG opens a fresh socket
@@ -522,6 +538,8 @@ impl PacketProcessor {
             selected_scope: None,
             pending_credential: None,
             last_account_gen: 0,
+            current_realm: None,
+            recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
         }
     }
@@ -619,6 +637,8 @@ impl PacketProcessor {
             selected_scope: None,
             pending_credential: None,
             last_account_gen: 0,
+            current_realm: None,
+            recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
         })
     }
@@ -668,6 +688,8 @@ impl PacketProcessor {
             selected_scope: None,
             pending_credential: None,
             last_account_gen: 0,
+            current_realm: None,
+            recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
         }
     }
@@ -816,8 +838,9 @@ impl PacketProcessor {
 
     /// Reset session + reassembler state for a fresh capture.
     pub fn on_capture_start(&mut self) {
+        self.current_realm = None;
         let reset = self.realm_discovery.reset(false);
-        self.emit(UiPayload::RealmDiscovery(reset));
+        self.emit_realm_discovery(reset);
         self.session.reset_for_capture();
         self.reassembler.clear();
         self.start_recorder_if_enabled();
@@ -825,8 +848,88 @@ impl PacketProcessor {
 
     /// Forget realm instances when capture stops.
     pub fn on_capture_stop(&mut self) {
+        self.current_realm = None;
         let reset = self.realm_discovery.reset(false);
-        self.emit(UiPayload::RealmDiscovery(reset));
+        self.emit_realm_discovery(reset);
+    }
+
+    /// Emit a realm discovery, dispatching its alert sound first so the alert
+    /// does not depend on a UI frame.
+    fn emit_realm_discovery(&mut self, update: super::realm_discovery::DiscoveryEvent) {
+        use super::realm_discovery::{DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE};
+        let trigger = match &update {
+            DiscoveryEvent::Discovered {
+                object_id,
+                object_type: JAILER_TYPE,
+                notify: true,
+                ..
+            } => Some((JAILER_TYPE, "Spectral Jailer", Some(*object_id))),
+            DiscoveryEvent::Discovered {
+                object_type: CRYSTAL_TYPE,
+                notify: true,
+                ..
+            }
+            | DiscoveryEvent::CrystalMessage { notify: true, .. } => {
+                Some((CRYSTAL_TYPE, "Mysterious Crystal", None))
+            }
+            DiscoveryEvent::Discovered {
+                object_type: TOTALIA_TYPE,
+                notify: true,
+                ..
+            } => Some((TOTALIA_TYPE, "Totalia the Malevolent", None)),
+            _ => None,
+        };
+        if let Some((boss_id, name, instance_id)) = trigger {
+            self.play_realm_event_sound(boss_id, name, instance_id);
+        }
+        self.emit(UiPayload::RealmDiscovery(update));
+    }
+
+    /// Play a realm-event sound for a boss call when its section is enabled.
+    fn play_realm_event_sound(&mut self, boss_id: i32, text: &str, instance_id: Option<i32>) {
+        let events = match self.settings.read() {
+            Ok(settings) => settings.sound.realm_events.clone(),
+            Err(_) => return,
+        };
+        use realmhound_core::settings::EventMode;
+        let any_enabled = events.veteran.mode != EventMode::None
+            || events.adept.mode != EventMode::None
+            || events.seasonal.mode != EventMode::None
+            || events.alien.enabled;
+        if !any_enabled {
+            return;
+        }
+        let sets = crate::realm_event_sound::EventSets::from_assets();
+        if let Some(trigger) = crate::realm_event_sound::resolve(&events, boss_id, text, &sets) {
+            self.emit(UiPayload::Audio(AudioCommand::PlayEvent {
+                sound: trigger.sound,
+                custom_key: trigger.custom_key,
+                instance_id,
+                volume: trigger.volume,
+            }));
+        }
+    }
+
+    /// Apply the Live Feed's 5s per-realm boss-call suppression on the worker.
+    fn should_play_boss_call(&mut self, boss_id: i32, boss_name: &str) -> bool {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        self.recent_boss_calls
+            .retain(|call| now.duration_since(call.at) <= WINDOW);
+        if self.recent_boss_calls.iter().any(|call| {
+            call.boss_id == boss_id
+                && call.boss_name == boss_name
+                && call.realm == self.current_realm
+        }) {
+            return false;
+        }
+        self.recent_boss_calls.push(RecentBossCallAlert {
+            boss_id,
+            boss_name: boss_name.to_string(),
+            realm: self.current_realm.clone(),
+            at: now,
+        });
+        true
     }
 
     /// Start a raw-packet recorder when `REALMHOUND_RECORD` is set. The value may
@@ -1662,7 +1765,7 @@ impl PacketProcessor {
                         self.forward_dungeon_freeze();
                         self.realm_entered_at = None;
                         let reset = self.realm_discovery.reset(false);
-                        self.emit(UiPayload::RealmDiscovery(reset));
+                        self.emit_realm_discovery(reset);
                         self.pending_events.clear();
                         self.pending_credential = None;
                     }
@@ -2244,7 +2347,7 @@ impl PacketProcessor {
         // existing `handle_event`. Chat and characters are resolved here.
         self.emit(UiPayload::Broadcast(event.clone()));
         for update in self.realm_discovery.on_event(&event) {
-            self.emit(UiPayload::RealmDiscovery(update));
+            self.emit_realm_discovery(update);
         }
 
         // --- Phase 2: model-side orchestration ---
@@ -2600,6 +2703,11 @@ impl PacketProcessor {
                         self.keyper_towers_announced = false;
                     }
                 }
+                // Mirror the Live Feed's realm key ("NexusPortal.Mesa" -> "Mesa")
+                // so worker-side alert dedup matches the visible entry scope.
+                self.current_realm = realm_name
+                    .split_once('.')
+                    .map(|(_, realm)| realm.to_string());
 
                 // Optional alerts: play a dedicated sound once when entering a
                 // dungeon whose modifier set drives a special callout outline.
@@ -2683,7 +2791,7 @@ impl PacketProcessor {
                     text.recipient.is_empty() && text.name.contains("Mysterious Crystal");
                 if is_crystal {
                     if let Some(update) = self.realm_discovery.crystal_message(text.object_id) {
-                        self.emit(UiPayload::RealmDiscovery(update));
+                        self.emit_realm_discovery(update);
                     }
                 }
                 // Detect realm-close / lag-warning before from_text_packet filters them out.
@@ -2770,6 +2878,9 @@ impl PacketProcessor {
                             .map(|t| t.elapsed() < REALM_JOIN_SETTLE)
                             .unwrap_or(false);
                         if !in_join_settle && !is_crystal {
+                            if self.should_play_boss_call(boss_id, &chat_msg.text) {
+                                self.play_realm_event_sound(boss_id, &chat_msg.text, None);
+                            }
                             self.emit(UiPayload::BossCall {
                                 boss_id,
                                 text: chat_msg.text.clone(),
@@ -3567,10 +3678,13 @@ impl PacketProcessor {
     /// Keyper spawn means the towers were just destroyed, so it resets the latch
     /// to arm the next tower wave.
     fn on_keyper_cue(&mut self, cue: realmhound_core::keyper::KeyperCue) {
-        use realmhound_core::keyper::KeyperCue;
+        use realmhound_core::keyper::{KeyperCue, KEYPER_BOSS_ID, KEYPER_TOWER_SPRITE_ID};
         match cue {
             KeyperCue::KeyperSpawned => {
                 self.keyper_towers_announced = false;
+                if self.should_play_boss_call(KEYPER_BOSS_ID, "The Keyper") {
+                    self.play_realm_event_sound(KEYPER_BOSS_ID, "The Keyper", None);
+                }
                 self.emit(UiPayload::KeyperEvent { towers: false });
             }
             KeyperCue::TowersAppeared => {
@@ -3581,6 +3695,9 @@ impl PacketProcessor {
                     return;
                 }
                 self.keyper_towers_announced = true;
+                if self.should_play_boss_call(KEYPER_TOWER_SPRITE_ID, "Keyper Towers") {
+                    self.play_realm_event_sound(KEYPER_TOWER_SPRITE_ID, "Keyper Towers", None);
+                }
                 self.emit(UiPayload::KeyperEvent { towers: true });
             }
         }
@@ -4334,6 +4451,28 @@ mod keyper_tests {
         processor.realm_entered_at = Some(
             std::time::Instant::now() - (REALM_JOIN_SETTLE + std::time::Duration::from_secs(1)),
         );
+    }
+
+    #[test]
+    fn boss_call_alert_dedupes_per_realm() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.current_realm = Some("Mesa".to_string());
+        assert!(processor.should_play_boss_call(1234, "Sphinx"));
+        assert!(!processor.should_play_boss_call(1234, "Sphinx"));
+        processor.current_realm = Some("Ocean".to_string());
+        assert!(
+            processor.should_play_boss_call(1234, "Sphinx"),
+            "the same boss in another realm must alert"
+        );
+    }
+
+    #[test]
+    fn map_change_sets_dedup_realm_key() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        assert_eq!(processor.current_realm.as_deref(), Some("Mesa"));
+        processor.dispatch_event(map_changed_realm(0, "Nexus"));
+        assert_eq!(processor.current_realm, None);
     }
 
     #[test]

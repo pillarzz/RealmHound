@@ -1530,7 +1530,6 @@ impl RealmHoundApp {
                     let session = &self.event_session;
                     actions.extend(self.quest_panel.handle_event(&event, session));
                     actions.extend(self.party_panel.handle_event(&event, session));
-                    actions.extend(self.vault_panel.handle_event(&event, session));
                 }
                 self.process_actions(actions);
             }
@@ -1659,19 +1658,47 @@ impl RealmHoundApp {
             }
             self.owned_quest_rev = snap.view.quest_rev;
         }
-        if snap.view.live_event_rev != self.owned_live_event_rev {
-            self.live_feed_panel.recover_live_events(&snap.live_events);
-            self.owned_live_event_rev = snap.view.live_event_rev;
+        let live_new = snap.view.live_event_rev != self.owned_live_event_rev;
+        let feed_new = snap.view.feed_rev != self.owned_feed_rev;
+        if feed_new {
+            self.live_feed_panel
+                .set_learned_mod_sets(snap.feed.learned_mod_sets.clone());
         }
-        if snap.view.feed_rev != self.owned_feed_rev {
-            for entry in &snap.feed.events {
-                if entry.seq > self.owned_feed_seq {
-                    self.live_feed_panel
-                        .apply_context_event(&entry.event, entry.at);
-                    self.owned_feed_seq = entry.seq;
+        if live_new || feed_new {
+            // Replay both domains in observation order, so a recovered row sees
+            // the map context that was current when the worker saw it.
+            let mut merged: Vec<(chrono::DateTime<chrono::Utc>, bool, usize)> =
+                Vec::with_capacity(snap.live_events.events.len() + snap.feed.events.len());
+            if live_new {
+                for (index, entry) in snap.live_events.events.iter().enumerate() {
+                    merged.push((entry.at, true, index));
                 }
             }
-            self.owned_feed_rev = snap.view.feed_rev;
+            if feed_new {
+                for (index, entry) in snap.feed.events.iter().enumerate() {
+                    merged.push((entry.at, false, index));
+                }
+            }
+            merged.sort_by_key(|(at, is_live, index)| (*at, *is_live, *index));
+            for (_, is_live, index) in merged {
+                if is_live {
+                    self.live_feed_panel
+                        .apply_live_event(&snap.live_events.events[index]);
+                } else {
+                    let entry = &snap.feed.events[index];
+                    if entry.seq > self.owned_feed_seq {
+                        self.live_feed_panel
+                            .apply_context_event(&entry.event, entry.at);
+                        self.owned_feed_seq = entry.seq;
+                    }
+                }
+            }
+            if live_new {
+                self.owned_live_event_rev = snap.view.live_event_rev;
+            }
+            if feed_new {
+                self.owned_feed_rev = snap.view.feed_rev;
+            }
         }
         self.maybe_confirm_client_launch(conn_changed);
     }

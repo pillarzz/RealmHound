@@ -979,7 +979,9 @@ impl PacketProcessor {
 
     /// The worker-owned Live Feed context.
     pub fn feed_context(&self) -> FeedContext {
-        self.feed.clone()
+        let mut feed = self.feed.clone();
+        feed.learned_mod_sets = self.learned_mod_sets.clone();
+        feed
     }
 
     /// Take the "realm just closed" edge (clears the automatic callout).
@@ -999,6 +1001,7 @@ impl PacketProcessor {
             dungeon,
             tokens,
         );
+        self.feed.rev = self.feed.rev.wrapping_add(1);
     }
 
     /// Event-added modifier tokens learned for `dungeon`.

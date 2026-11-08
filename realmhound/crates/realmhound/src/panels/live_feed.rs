@@ -1390,13 +1390,18 @@ impl LiveFeedPanel {
         select_learned_mods(self.learn_event_mods, runs, &self.dungeon_mod_sets, dungeon)
     }
 
-    /// Record a dungeon entry's modifier set for [`Self::learned_event_mods`].
+    /// Adopt the worker-owned learned modifier sets.
+    pub fn set_learned_mod_sets(
+        &mut self,
+        sets: std::collections::HashMap<String, Vec<Vec<String>>>,
+    ) {
+        self.dungeon_mod_sets = sets;
+    }
+
+    /// Record a dungeon entry's modifier set locally; the worker's published
+    /// set replaces this on the next feed revision.
     fn remember_dungeon_mods(&mut self, dungeon: &str, modifier_tokens: &[String]) {
-        crate::panels::live_feed::remember_dungeon_mods(
-            &mut self.dungeon_mod_sets,
-            dungeon,
-            modifier_tokens,
-        );
+        remember_dungeon_mods(&mut self.dungeon_mod_sets, dungeon, modifier_tokens);
     }
 
     /// Borrow the current dungeon-callout formatting parameters from the panel's
@@ -2692,12 +2697,25 @@ impl LiveFeedPanel {
 
     /// Recover Live Feed events the UI missed while it was not painting. The
     /// worker window is the authority for these entry types.
+    /// Apply a whole window in order (tests and any bulk consumer).
+    #[cfg(test)]
     pub fn recover_live_events(&mut self, window: &crate::processing::contract::LiveEventWindow) {
-        use crate::processing::contract::LiveEventView;
         for entry in &window.events {
+            self.apply_live_event(entry);
+        }
+        if let Some(last) = window.events.last() {
+            self.recovered_event_seq = self.recovered_event_seq.max(last.seq);
+        }
+    }
+
+    /// Apply one worker event; callers may interleave this with context events.
+    pub fn apply_live_event(&mut self, entry: &crate::processing::contract::LiveEventEntry) {
+        use crate::processing::contract::LiveEventView;
+        {
             if entry.seq <= self.recovered_event_seq {
-                continue;
+                return;
             }
+            self.recovered_event_seq = entry.seq;
             let rows_before = self.entries.len();
             match &entry.event {
                 LiveEventView::BossCall { boss_id, name } => {
@@ -2778,9 +2796,6 @@ impl LiveFeedPanel {
             if self.entries.len() > rows_before {
                 self.set_newest_timestamp(entry.at.with_timezone(&chrono::Local));
             }
-        }
-        if let Some(last) = window.events.last() {
-            self.recovered_event_seq = self.recovered_event_seq.max(last.seq);
         }
     }
 

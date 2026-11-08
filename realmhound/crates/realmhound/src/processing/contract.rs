@@ -622,7 +622,9 @@ pub struct FeedContextEntry {
 pub struct FeedContext {
     /// Updates oldest to newest.
     pub events: Vec<FeedContextEntry>,
-    /// Bumps on every append.
+    /// Modifier sets learned per dungeon (single owner: the worker).
+    pub learned_mod_sets: std::collections::HashMap<String, Vec<Vec<String>>>,
+    /// Bumps on every append or learning change.
     pub rev: u64,
 }
 

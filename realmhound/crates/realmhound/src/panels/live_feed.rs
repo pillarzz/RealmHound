@@ -2017,7 +2017,7 @@ impl LiveFeedPanel {
                 self.left_from_dungeon = self.currently_in_dungeon;
                 self.currently_in_dungeon = *is_dungeon;
                 if !*is_dungeon {
-                    self.deactivate_active_dungeons();
+                    // Row lifecycle comes from `DungeonLeft` in the event window.
                     self.clear_dungeon_signature();
                     self.pending_portal_spawn = None;
                 }
@@ -2710,7 +2710,19 @@ impl LiveFeedPanel {
                     grade,
                 } => {
                     self.push_dungeon(*fp, display_name, modifiers, grade.clone());
+                    // Keep the original join deadline, not the repaint time.
+                    let age = chrono::Utc::now()
+                        .signed_duration_since(entry.at)
+                        .to_std()
+                        .unwrap_or_default();
+                    if let Some(FeedEntry::Dungeon(d)) = self.entries.front_mut() {
+                        d.expires_at = d
+                            .expires_at
+                            .checked_sub(age)
+                            .unwrap_or_else(|| std::time::Instant::now());
+                    }
                 }
+                LiveEventView::DungeonLeft => self.deactivate_active_dungeons(),
                 LiveEventView::WhoRoster { names } => {
                     if self.show_who_roster {
                         self.push_who_roster(names.clone());

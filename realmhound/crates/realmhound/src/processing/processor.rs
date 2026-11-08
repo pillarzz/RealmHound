@@ -3023,6 +3023,11 @@ impl PacketProcessor {
                 // The Live Feed clears its own location state; the worker clears
                 // its authoritative encounter set here.
                 self.clear_encounters();
+                if !is_dungeon {
+                    // Same ordered window as the entry, so a dungeon entered and
+                    // left between paints cannot reappear as joinable.
+                    self.record_live_event(LiveEventView::DungeonLeft);
+                }
                 self.in_dungeon = is_dungeon;
                 if is_dungeon {
                     self.record_live_event(LiveEventView::Dungeon {
@@ -4895,8 +4900,19 @@ mod keyper_tests {
         processor.dispatch_event(keyper_taunt("Wha- Again? REALLY?!"));
 
         let window = processor.live_event_window();
-        assert_eq!(window.events.len(), 1);
-        match &window.events[0].event {
+        // Map transitions also record lifecycle entries; count only the call.
+        let calls: Vec<_> = window
+            .events
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.event,
+                    crate::processing::contract::LiveEventView::BossCall { .. }
+                )
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        match &calls[0].event {
             crate::processing::contract::LiveEventView::BossCall { boss_id, name } => {
                 assert_eq!(*boss_id, realmhound_core::keyper::KEYPER_BOSS_ID);
                 assert_eq!(name, "The Keyper");

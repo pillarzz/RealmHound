@@ -550,6 +550,8 @@ pub enum LiveEventView {
         modifiers: Vec<String>,
         grade: Option<String>,
     },
+    /// The player left the dungeon, ordered with the entry it invalidates.
+    DungeonLeft,
     WhoRoster {
         names: Vec<String>,
     },

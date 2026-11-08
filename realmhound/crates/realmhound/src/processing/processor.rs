@@ -436,6 +436,7 @@ pub struct PacketProcessor {
     feed_seq: u64,
     realm_close_pending: bool,
     portal_anchor: Option<std::time::Instant>,
+    learned_mod_sets: std::collections::HashMap<String, Vec<Vec<String>>>,
     /// Monotonic id for `live_events`.
     live_event_seq: u64,
     /// Number of events evicted from the bounded live-event window.
@@ -589,6 +590,7 @@ impl PacketProcessor {
             feed_seq: 0,
             realm_close_pending: false,
             portal_anchor: None,
+            learned_mod_sets: std::collections::HashMap::new(),
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -705,6 +707,7 @@ impl PacketProcessor {
             feed_seq: 0,
             realm_close_pending: false,
             portal_anchor: None,
+            learned_mod_sets: std::collections::HashMap::new(),
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -773,6 +776,7 @@ impl PacketProcessor {
             feed_seq: 0,
             realm_close_pending: false,
             portal_anchor: None,
+            learned_mod_sets: std::collections::HashMap::new(),
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -986,6 +990,25 @@ impl PacketProcessor {
     /// When the local player last took a portal (callout countdown anchor).
     pub fn portal_anchor(&self) -> Option<std::time::Instant> {
         self.portal_anchor
+    }
+
+    /// Record a dungeon entry's modifier set for learned event mods.
+    pub(crate) fn remember_dungeon_mods(&mut self, dungeon: &str, tokens: &[String]) {
+        crate::panels::live_feed::remember_dungeon_mods(
+            &mut self.learned_mod_sets,
+            dungeon,
+            tokens,
+        );
+    }
+
+    /// Event-added modifier tokens learned for `dungeon`.
+    pub fn learned_event_mods(&self, dungeon: &str, enabled: bool, runs: usize) -> Vec<String> {
+        crate::panels::live_feed::select_learned_mods(
+            enabled,
+            runs,
+            &self.learned_mod_sets,
+            dungeon,
+        )
     }
 
     pub(crate) fn record_live_event(&mut self, event: LiveEventView) {
@@ -3041,6 +3064,8 @@ impl PacketProcessor {
                 }
                 self.in_dungeon = is_dungeon;
                 if is_dungeon {
+                    let key = crate::panels::live_feed::format_dungeon_name(display_name);
+                    self.remember_dungeon_mods(&key, dungeon_modifiers);
                     self.record_live_event(LiveEventView::Dungeon {
                         fp,
                         display_name: display_name.clone(),
@@ -4947,6 +4972,19 @@ mod keyper_tests {
         assert_eq!(window.events.first().map(|entry| entry.seq), Some(1));
         assert_eq!(window.events.last().map(|entry| entry.seq), Some(250));
         assert_eq!(processor.live_event_evictions(), 0);
+    }
+
+    #[test]
+    fn learned_event_mods_are_available_to_the_worker() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.remember_dungeon_mods("Snake Pit", &["m1".to_string()]);
+        assert!(p.learned_event_mods("Snake Pit", true, 2).is_empty());
+        p.remember_dungeon_mods("Snake Pit", &["m1".to_string()]);
+        assert_eq!(
+            p.learned_event_mods("Snake Pit", true, 2),
+            vec!["m1".to_string()]
+        );
+        assert!(p.learned_event_mods("Snake Pit", false, 2).is_empty());
     }
 
     #[test]

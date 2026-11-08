@@ -661,6 +661,56 @@ fn same_modifier(a: &str, b: &str) -> bool {
         == realmhound_core::dungeon_modifiers::canonical(b)
 }
 
+/// Add a dungeon entry's modifier set to the learned history.
+pub(crate) fn remember_dungeon_mods(
+    sets_by_dungeon: &mut std::collections::HashMap<String, Vec<Vec<String>>>,
+    dungeon: &str,
+    modifier_tokens: &[String],
+) {
+    let sets = sets_by_dungeon.entry(dungeon.to_string()).or_default();
+    sets.push(modifier_tokens.to_vec());
+    if sets.len() > MAX_LEARN_EVENT_MOD_SETS {
+        let overflow = sets.len() - MAX_LEARN_EVENT_MOD_SETS;
+        sets.drain(0..overflow);
+    }
+}
+
+/// Mods the session has recognized as applied by an event to every instance of
+/// `dungeon`. Shared by the panel callout and the worker's automatic callout.
+pub(crate) fn select_learned_mods(
+    enabled: bool,
+    runs: usize,
+    sets_by_dungeon: &std::collections::HashMap<String, Vec<Vec<String>>>,
+    dungeon: &str,
+) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    let Some(sets) = sets_by_dungeon.get(dungeon) else {
+        return Vec::new();
+    };
+    if sets.len() < runs || runs == 0 {
+        return Vec::new();
+    }
+    let recent = &sets[sets.len() - runs..];
+    let mut candidates = recent[0].clone();
+    candidates.retain(|modifier| {
+        recent[1..]
+            .iter()
+            .all(|set| set.iter().any(|t| same_modifier(t, modifier)))
+    });
+    // A mod that stood alone in at least one of those entries cannot be part of
+    // the rolled set (which fills the instance's grade), so it is one the game
+    // added. Requiring this keeps three identical *rolls* from suppressing a
+    // genuine call.
+    candidates.retain(|modifier| {
+        recent
+            .iter()
+            .any(|set| set.len() == 1 && same_modifier(&set[0], modifier))
+    });
+    candidates
+}
+
 /// Whether a MapInfo map name is a hub space whose portals are Nexus portals:
 /// the Nexus itself plus the Vault, Guild Hall and Bazaar.
 ///
@@ -826,7 +876,7 @@ fn format_run_timer(d: std::time::Duration) -> String {
 /// First resolves known localization keys via the dungeon portal map. If the
 /// name is still an unresolved localization key (e.g. "{s.spider_den}"), strips
 /// the `{s.` / `}` wrapper and title-cases the words so it renders cleanly.
-fn format_dungeon_name(raw: &str) -> String {
+pub(crate) fn format_dungeon_name(raw: &str) -> String {
     let normalized = get_dungeon_portal_map().normalize_dungeon_name(raw);
 
     let trimmed = normalized.trim();
@@ -1333,49 +1383,20 @@ impl LiveFeedPanel {
     /// [`LiveFeedSettings::learn_event_mods_runs`]: realmhound_core::settings::LiveFeedSettings::learn_event_mods_runs
     /// [`EVENT_PRESET_MODS`]: realmhound_core::dungeon_modifiers::EVENT_PRESET_MODS
     fn learned_event_mods(&self, dungeon: &str) -> Vec<String> {
-        if !self.learn_event_mods {
-            return Vec::new();
-        }
         let runs = self.learn_event_mods_runs.clamp(
             *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
             *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
         ) as usize;
-        let Some(sets) = self.dungeon_mod_sets.get(dungeon) else {
-            return Vec::new();
-        };
-        if sets.len() < runs {
-            return Vec::new();
-        }
-        let recent = &sets[sets.len() - runs..];
-        let mut candidates = recent[0].clone();
-        candidates.retain(|modifier| {
-            recent[1..]
-                .iter()
-                .all(|set| set.iter().any(|t| same_modifier(t, modifier)))
-        });
-        // A mod that stood alone in at least one of those entries cannot be part
-        // of the rolled set (which fills the instance's grade), so it is one the
-        // game added. Requiring this keeps three identical *rolls* from
-        // suppressing a genuine call.
-        candidates.retain(|modifier| {
-            recent
-                .iter()
-                .any(|set| set.len() == 1 && same_modifier(&set[0], modifier))
-        });
-        candidates
+        select_learned_mods(self.learn_event_mods, runs, &self.dungeon_mod_sets, dungeon)
     }
 
     /// Record a dungeon entry's modifier set for [`Self::learned_event_mods`].
     fn remember_dungeon_mods(&mut self, dungeon: &str, modifier_tokens: &[String]) {
-        let sets = self
-            .dungeon_mod_sets
-            .entry(dungeon.to_string())
-            .or_default();
-        sets.push(modifier_tokens.to_vec());
-        if sets.len() > MAX_LEARN_EVENT_MOD_SETS {
-            let overflow = sets.len() - MAX_LEARN_EVENT_MOD_SETS;
-            sets.drain(0..overflow);
-        }
+        crate::panels::live_feed::remember_dungeon_mods(
+            &mut self.dungeon_mod_sets,
+            dungeon,
+            modifier_tokens,
+        );
     }
 
     /// Borrow the current dungeon-callout formatting parameters from the panel's

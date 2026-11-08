@@ -1149,6 +1149,14 @@ impl Worker {
             Ok(settings) => settings.clone(),
             Err(_) => return,
         };
+        let learned = self.processor.learned_event_mods(
+            &crate::panels::live_feed::format_dungeon_name(display_name),
+            settings.live_feed.learn_event_mods,
+            settings.live_feed.learn_event_mods_runs.clamp(
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+            ) as usize,
+        );
         let Some((text, expires_at)) = build_auto_callout(
             &settings,
             self.processor.server_name(),
@@ -1159,6 +1167,7 @@ impl Worker {
             max_realm_score,
             modifiers,
             grade,
+            &learned,
             self.processor.portal_anchor(),
         ) else {
             return;
@@ -1361,6 +1370,7 @@ fn build_auto_callout(
     max_realm_score: i32,
     modifiers: &[String],
     grade: &Option<String>,
+    learned: &[String],
     anchor: Option<Instant>,
 ) -> Option<(String, Instant)> {
     if !is_dungeon || !settings.live_feed.auto_clipboard_dungeon_calls {
@@ -1388,7 +1398,6 @@ fn build_auto_callout(
         }
         origin_status(&settings.live_feed, score)
     };
-    let learned: Vec<String> = Vec::new();
     let params = crate::panels::dungeon_callout::DungeonCalloutParams {
         name_style: settings.live_feed.dungeon_name_style,
         name_overrides: &settings.live_feed.dungeon_name_overrides,
@@ -1401,7 +1410,7 @@ fn build_auto_callout(
         call_event_mods: settings.live_feed.call_event_mods,
         percent: settings.live_feed.callout_percent,
         reward_mods: &settings.live_feed.reward_mods,
-        learned_event_mods: &learned,
+        learned_event_mods: learned,
         origin_status: origin.as_deref(),
     };
     // Anchor the countdown to the portal the player used, not to the moment
@@ -1494,6 +1503,7 @@ mod tests {
             100,
             &[],
             &None,
+            &[],
             None,
         )
         .expect("joinable dungeon produces a callout");
@@ -1513,6 +1523,7 @@ mod tests {
             0,
             &[],
             &None,
+            &[],
             None
         )
         .is_none());
@@ -1528,6 +1539,7 @@ mod tests {
             0,
             &[],
             &None,
+            &[],
             None
         )
         .is_none());

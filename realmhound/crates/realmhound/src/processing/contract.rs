@@ -250,6 +250,8 @@ pub enum ControlMsg {
         progress: Option<PlayerMissions>,
         scope: AccountOperationScope,
     },
+    /// Replace the worker's watchlist snapshot after a UI edit.
+    SetWatchlist(realmhound_core::watchlist::Watchlist),
 }
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -575,6 +577,12 @@ pub enum LiveEventView {
     DustFull {
         is_seasonal: bool,
         dust_type: realmhound_core::dust::DustType,
+    },
+    KickAlert {
+        name: String,
+    },
+    JoinRequestAlert {
+        name: String,
     },
 }
 

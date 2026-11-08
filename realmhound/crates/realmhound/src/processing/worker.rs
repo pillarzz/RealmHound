@@ -21,13 +21,14 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use realmhound_core::account::AccountContext;
 use realmhound_core::capture::PacketReceiver;
+use realmhound_core::watchlist::{PlayerStatus, Watchlist};
 use realmhound_core::{GameEvent, Settings};
 
 use crate::audio::AudioSender;
 
 use super::chat_log::ChatLogWriter;
 use super::contract::{
-    ControlMsg, ModelSnapshot, SelectedIdentity, ShutdownReport, UiPayload, UiUpdate,
+    ControlMsg, LiveEventView, ModelSnapshot, SelectedIdentity, ShutdownReport, UiPayload, UiUpdate,
 };
 use super::health::{CaptureState, HealthCounters};
 use super::processor::PacketProcessor;
@@ -196,6 +197,10 @@ pub fn spawn(
     let (done_tx, done_rx) = channel::<ShutdownReport>();
     let health = Arc::new(HealthCounters::new());
     let settings = processor.settings_handle();
+    let watchlist = Watchlist::load_from(
+        account.storage_root().path().join("watchlist.txt"),
+        Some(account.persistence().watchlist_detections().to_path_buf()),
+    );
     let chat_log = ChatLogWriter::new(account.persistence().chat_logs().to_path_buf());
 
     let selected_identity =
@@ -216,6 +221,7 @@ pub fn spawn(
         health: health.clone(),
         chat_log,
         settings,
+        watchlist,
         auto_callout: None,
         exalts_fetched: false,
         wake: WakeThrottle::default(),
@@ -268,6 +274,8 @@ struct Worker {
     chat_log: ChatLogWriter,
     /// Shared settings for worker-side side effects.
     settings: Arc<RwLock<Settings>>,
+    /// Watchlist snapshot for worker-side kick/join alerts.
+    watchlist: Watchlist,
     /// Automatic dungeon callout currently on the clipboard.
     auto_callout: Option<AutoCallout>,
     /// One-shot exalt stats fetch, triggered by the first released token.
@@ -571,6 +579,12 @@ impl Worker {
                             }
                             if let UiPayload::AccessTokenCaptured(token) = &payload {
                                 self.fetch_exalts_once(token);
+                            }
+                            if let UiPayload::Broadcast(event) = &payload {
+                                let local_leader = self.processor.party_view().is_local_leader;
+                                for alert in party_alerts(&self.watchlist, event, local_leader) {
+                                    self.processor.record_live_event(alert);
+                                }
                             }
                             if matches!(&payload, UiPayload::RealmClosed) {
                                 self.release_auto_callout();
@@ -1024,6 +1038,9 @@ impl Worker {
             ControlMsg::StartHistoricalMaintenance => {
                 self.next_maintenance.get_or_insert_with(Instant::now);
             }
+            ControlMsg::SetWatchlist(watchlist) => {
+                self.watchlist = watchlist;
+            }
             ControlMsg::StartCapture(receiver) => {
                 self.processor.on_capture_start();
                 #[cfg(feature = "latency-diagnostics")]
@@ -1223,6 +1240,39 @@ impl Worker {
     }
 }
 
+/// Watchlist alerts carried by a party event.
+fn party_alerts(
+    watchlist: &Watchlist,
+    event: &GameEvent,
+    local_leader: bool,
+) -> Vec<LiveEventView> {
+    let mut alerts = Vec::new();
+    let mut kick_if_banned = |name: &str| {
+        if watchlist.check_player(name) == PlayerStatus::Banned {
+            alerts.push(LiveEventView::KickAlert {
+                name: name.to_string(),
+            });
+        }
+    };
+    match event {
+        GameEvent::PartyListReceived(info) => {
+            for player in &info.party_players {
+                kick_if_banned(&player.name);
+            }
+        }
+        GameEvent::PartyMemberJoined(member) => kick_if_banned(&member.name),
+        GameEvent::PartyJoinRequestResponse(response) if local_leader && response.state == 1 => {
+            if watchlist.check_player(&response.player_name) == PlayerStatus::Banned {
+                alerts.push(LiveEventView::JoinRequestAlert {
+                    name: response.player_name.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+    alerts
+}
+
 /// Build the automatic dungeon callout, if one should be copied.
 #[allow(clippy::too_many_arguments)]
 fn build_auto_callout(
@@ -1308,6 +1358,45 @@ fn build_auto_callout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn party_alerts_follow_the_worker_watchlist() {
+        use realmhound_core::protocol::{PartyMemberAddedPacket, PartyRequestResponsePacket};
+
+        let mut watchlist = Watchlist::new();
+        watchlist.replace_entries("Bad");
+        assert_eq!(watchlist.check_player("Bad"), PlayerStatus::Banned);
+
+        let joined = party_alerts(
+            &watchlist,
+            &GameEvent::PartyMemberJoined(PartyMemberAddedPacket {
+                player_id: 1,
+                name: "Bad".to_string(),
+                class_id: 0,
+                skin_id: 0,
+            }),
+            false,
+        );
+        assert!(matches!(
+            joined.as_slice(),
+            [LiveEventView::KickAlert { name }] if name == "Bad"
+        ));
+
+        let requested = party_alerts(
+            &watchlist,
+            &GameEvent::PartyJoinRequestResponse(PartyRequestResponsePacket {
+                player_name: "Bad".to_string(),
+                class_id: 0,
+                skin_id: 0,
+                state: 1,
+            }),
+            true,
+        );
+        assert!(matches!(
+            requested.as_slice(),
+            [LiveEventView::JoinRequestAlert { name }] if name == "Bad"
+        ));
+    }
 
     #[test]
     fn auto_callout_builds_joinable_callout() {

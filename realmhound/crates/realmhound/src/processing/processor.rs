@@ -938,7 +938,7 @@ impl PacketProcessor {
         self.live_event_evictions
     }
 
-    fn record_live_event(&mut self, event: LiveEventView) {
+    pub(crate) fn record_live_event(&mut self, event: LiveEventView) {
         const WINDOW: usize = 100;
         self.live_event_seq = self.live_event_seq.wrapping_add(1);
         self.live_events.events.push(LiveEventEntry {
@@ -1425,6 +1425,7 @@ impl PacketProcessor {
             ControlMsg::StartCapture(_)
             | ControlMsg::StopCapture
             | ControlMsg::Shutdown
+            | ControlMsg::SetWatchlist(_)
             | ControlMsg::StartHistoricalMaintenance => {}
         }
     }

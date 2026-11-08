@@ -2659,6 +2659,12 @@ impl LiveFeedPanel {
                         *dust_type,
                     )));
                 }
+                LiveEventView::KickAlert { name } => {
+                    self.push_kick_alert(name.clone());
+                }
+                LiveEventView::JoinRequestAlert { name } => {
+                    self.push_join_request_alert(name.clone());
+                }
             }
         }
         if let Some(last) = window.events.last() {

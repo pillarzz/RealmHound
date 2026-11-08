@@ -87,6 +87,8 @@ pub struct PartyPanel {
     max_size: u8,
     members: Vec<PartyMember>,
     watchlist: Watchlist,
+    /// Set when a UI edit should be pushed to the worker.
+    watchlist_dirty: bool,
     is_local_leader: bool,
     editor_open: bool,
     editor_content: String,
@@ -109,6 +111,7 @@ impl Default for PartyPanel {
             max_size: 0,
             members: Vec::new(),
             watchlist: Watchlist::new(),
+            watchlist_dirty: false,
             is_local_leader: false,
             editor_open: false,
             editor_content: String::new(),
@@ -333,6 +336,16 @@ impl PartyPanel {
         self.is_local_leader = false;
     }
 
+    /// Take a pending watchlist edit so the app can push it to the worker.
+    pub fn take_watchlist_update(&mut self) -> Option<Watchlist> {
+        if self.watchlist_dirty {
+            self.watchlist_dirty = false;
+            Some(self.watchlist.clone())
+        } else {
+            None
+        }
+    }
+
     /// Rebuild membership from the worker-owned snapshot, preserving watchlist
     /// status and world sightings for members already known.
     pub fn apply_party_view(&mut self, view: &crate::processing::contract::PartyView) {
@@ -376,20 +389,6 @@ impl PartyPanel {
 
     pub fn mod_tools(&self) -> bool {
         self.mod_tools
-    }
-
-    /// Check a join request name against the banlist. Only fires when the
-    /// local player is the party leader and the banlist has entries.
-    /// Returns the player name if banned, for kick alert purposes.
-    fn check_join_request(&self, player_name: &str) -> Option<String> {
-        if !self.is_local_leader || self.watchlist.banned_count() == 0 {
-            return None;
-        }
-        if self.watchlist.check_player(player_name) == PlayerStatus::Banned {
-            Some(player_name.to_string())
-        } else {
-            None
-        }
     }
 
     /// Get the number of members in the party.
@@ -960,6 +959,7 @@ impl PartyPanel {
                             self.set_status(&format!("Error saving: {}", e));
                         } else {
                             self.set_status("Ban list saved");
+                            self.watchlist_dirty = true;
                             for member in &mut self.members {
                                 member.update_status(&self.watchlist);
                             }
@@ -1000,30 +1000,16 @@ impl Panel for PartyPanel {
     ) -> Vec<AppAction> {
         match event {
             realmhound_core::GameEvent::PartyListReceived(ref party_info) => {
-                let banned_names = self.set_party(party_info);
-                banned_names
-                    .into_iter()
-                    .map(AppAction::PushKickAlert)
-                    .collect()
+                let _ = self.set_party(party_info);
+                vec![]
             }
             realmhound_core::GameEvent::PartyMemberJoined(ref member_added) => {
-                let status = self.add_member(member_added);
-                if status == PlayerStatus::Banned {
-                    vec![AppAction::PushKickAlert(member_added.name.clone())]
-                } else {
-                    vec![]
-                }
+                let _ = self.add_member(member_added);
+                vec![]
             }
-            realmhound_core::GameEvent::PartyJoinRequestResponse(ref response) => {
-                if response.state == 1 {
-                    if let Some(name) = self.check_join_request(&response.player_name) {
-                        vec![AppAction::PushJoinRequestAlert(name)]
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
+            realmhound_core::GameEvent::PartyJoinRequestResponse(_) => {
+                // The worker's watchlist drives kick/join alerts.
+                vec![]
             }
             realmhound_core::GameEvent::PartyActionReceived {
                 player_id,

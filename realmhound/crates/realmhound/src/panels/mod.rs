@@ -233,10 +233,6 @@ pub enum AppAction {
     SaveLiveFeedFilterSettings(realmhound_core::settings::LiveFeedFilterSettings),
     /// Custom quick-clipboard buttons changed -- app should persist them.
     SaveQuickClipButtons(Vec<realmhound_core::settings::QuickClipButton>),
-    /// Push a kick alert to the live feed.
-    PushKickAlert(String),
-    /// Push a join request alert to the live feed (banned player trying to join).
-    PushJoinRequestAlert(String),
     /// Push a boss call to the live feed.
     PushBossCall { boss_id: i32, text: String },
     /// Character cache was modified -- app should sync and mark AccountData dirty.

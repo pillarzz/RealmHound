@@ -9876,12 +9876,6 @@ impl RealmHoundApp {
                         s.save();
                     }
                 }
-                AppAction::PushKickAlert(name) => {
-                    self.live_feed_panel.push_kick_alert(name);
-                }
-                AppAction::PushJoinRequestAlert(name) => {
-                    self.live_feed_panel.push_join_request_alert(name);
-                }
                 AppAction::PushBossCall { boss_id, text } => {
                     self.live_feed_panel.push_boss_call(boss_id, text);
                 }
@@ -10194,6 +10188,11 @@ impl eframe::App for RealmHoundApp {
             }
             self.render_content(ui);
         });
+
+        if let Some(watchlist) = self.party_panel.take_watchlist_update() {
+            self.worker
+                .send_control(ControlMsg::SetWatchlist(watchlist));
+        }
 
         // About window (modal)
         if self.modals.show_about {

@@ -1415,7 +1415,8 @@ fn build_auto_callout(
     };
     // Anchor the countdown to the portal the player used, not to the moment
     // this batch happened to be processed.
-    let anchor_known = anchor.is_some();
+    // A known portal-spawn anchor means the countdown is NOT estimated.
+    let estimated = anchor.is_none();
     let anchor = anchor.unwrap_or_else(Instant::now);
     let entry = crate::panels::live_feed::DungeonEntry::new(
         display_name.to_string(),
@@ -1427,7 +1428,7 @@ fn build_auto_callout(
         Some(realm_name.to_string()),
         score,
         anchor,
-        anchor_known,
+        estimated,
     );
     let body = entry.callout.as_deref()?;
     if entry.remaining(Instant::now()).is_zero() {

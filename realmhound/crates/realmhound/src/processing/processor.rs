@@ -42,6 +42,26 @@ use super::contract::{
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
+/// Player appearance observed from world updates, kept across party refreshes.
+#[derive(Clone)]
+struct PartyAppearance {
+    class_id: i32,
+    skin_id: i32,
+    tex1: u32,
+    tex2: u32,
+    guild: Option<String>,
+}
+
+impl PartyAppearance {
+    fn apply(&self, member: &mut PartyMemberView) {
+        member.class_id = Some(self.class_id);
+        member.skin_id = self.skin_id;
+        member.tex1 = self.tex1;
+        member.tex2 = self.tex2;
+        member.guild = self.guild.clone();
+    }
+}
+
 /// Failure opening a selected profile's database writers during startup.
 ///
 /// Returned by [`PacketProcessor::new_selected`] so selected-profile startup can
@@ -433,10 +453,12 @@ pub struct PacketProcessor {
     /// Recent recoverable Live Feed events the UI can recover after missing a wake.
     live_events: LiveEventWindow,
     feed: FeedContext,
-    feed_seq: u64,
     realm_close_pending: bool,
     portal_anchor: Option<std::time::Instant>,
     learned_mod_sets: std::collections::HashMap<String, Vec<Vec<String>>>,
+    last_learned_fp: Option<i32>,
+    portal_spawns: std::collections::HashMap<i32, std::time::Instant>,
+    known_appearance: std::collections::HashMap<String, PartyAppearance>,
     /// Monotonic id for `live_events`.
     live_event_seq: u64,
     /// Number of events evicted from the bounded live-event window.
@@ -587,10 +609,12 @@ impl PacketProcessor {
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
             feed: FeedContext::default(),
-            feed_seq: 0,
             realm_close_pending: false,
             portal_anchor: None,
             learned_mod_sets: std::collections::HashMap::new(),
+            last_learned_fp: None,
+            portal_spawns: std::collections::HashMap::new(),
+            known_appearance: std::collections::HashMap::new(),
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -704,10 +728,12 @@ impl PacketProcessor {
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
             feed: FeedContext::default(),
-            feed_seq: 0,
             realm_close_pending: false,
             portal_anchor: None,
             learned_mod_sets: std::collections::HashMap::new(),
+            last_learned_fp: None,
+            portal_spawns: std::collections::HashMap::new(),
+            known_appearance: std::collections::HashMap::new(),
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -773,10 +799,12 @@ impl PacketProcessor {
             live_events: LiveEventWindow::default(),
             live_event_seq: 0,
             feed: FeedContext::default(),
-            feed_seq: 0,
             realm_close_pending: false,
             portal_anchor: None,
             learned_mod_sets: std::collections::HashMap::new(),
+            last_learned_fp: None,
+            portal_spawns: std::collections::HashMap::new(),
+            known_appearance: std::collections::HashMap::new(),
             live_event_evictions: 0,
             in_dungeon: false,
             dust_state: realmhound_core::dust::DustState::new(),
@@ -886,20 +914,27 @@ impl PacketProcessor {
         self.party.party_id = party_info.party_id;
         self.party.party_name = party_info.description.clone();
         self.party.max_size = party_info.max_size;
-        self.party.members = party_info
+        let mut members: Vec<PartyMemberView> = party_info
             .party_players
             .iter()
-            .map(|player| PartyMemberView {
-                player_id: player.id,
-                name: player.name.clone(),
-                is_leader: player.id == party_info.leader_id,
-                class_id: None,
-                skin_id: 0,
-                tex1: 0,
-                tex2: 0,
-                guild: None,
+            .map(|player| {
+                let mut member = PartyMemberView {
+                    player_id: player.id,
+                    name: player.name.clone(),
+                    is_leader: player.id == party_info.leader_id,
+                    class_id: None,
+                    skin_id: 0,
+                    tex1: 0,
+                    tex2: 0,
+                    guild: None,
+                };
+                if let Some(appearance) = self.known_appearance.get(&player.name) {
+                    appearance.apply(&mut member);
+                }
+                member
             })
             .collect();
+        self.party.members = members;
         self.bump_party();
     }
 
@@ -907,7 +942,7 @@ impl PacketProcessor {
         if self.party.members.iter().any(|member| member.name == name) {
             return;
         }
-        self.party.members.push(PartyMemberView {
+        let mut member = PartyMemberView {
             player_id,
             name: name.to_string(),
             is_leader: false,
@@ -916,7 +951,11 @@ impl PacketProcessor {
             tex1: 0,
             tex2: 0,
             guild: None,
-        });
+        };
+        if let Some(appearance) = self.known_appearance.get(name) {
+            appearance.apply(&mut member);
+        }
+        self.party.members.push(member);
         self.bump_party();
     }
 
@@ -978,13 +1017,21 @@ impl PacketProcessor {
 
     /// Record an authoritative Live Feed context update.
     pub(crate) fn record_feed_event(&mut self, event: FeedContextEvent) {
-        self.feed_seq = self.feed_seq.wrapping_add(1);
+        // One monotonic sequence for both streams; callers merge by it.
+        self.live_event_seq = self.live_event_seq.wrapping_add(1);
         self.feed.events.push(FeedContextEntry {
-            seq: self.feed_seq,
+            seq: self.live_event_seq,
             at: chrono::Utc::now(),
             event,
         });
         self.feed.rev = self.feed.rev.wrapping_add(1);
+        const WINDOW: usize = 500;
+        while self.feed.events.len() > WINDOW {
+            if let Some(dropped) = self.feed.events.first() {
+                self.feed.dropped_before_seq = dropped.seq;
+            }
+            self.feed.events.remove(0);
+        }
     }
 
     /// The worker-owned Live Feed context.
@@ -1023,29 +1070,28 @@ impl PacketProcessor {
             let Some(name) = stat(StatType::Name).and_then(|s| s.string_stat_value.clone()) else {
                 continue;
             };
+            let appearance = PartyAppearance {
+                class_id,
+                skin_id: stat(StatType::SkinId).map(|s| s.stat_value).unwrap_or(0),
+                tex1: stat(StatType::Texture1)
+                    .map(|s| s.stat_value as u32)
+                    .unwrap_or(0),
+                tex2: stat(StatType::Texture2)
+                    .map(|s| s.stat_value as u32)
+                    .unwrap_or(0),
+                guild: stat(StatType::GuildName)
+                    .and_then(|s| s.string_stat_value.clone())
+                    .filter(|g| !g.is_empty()),
+            };
+            // Keep sightings even before they join, so a party list refresh can
+            // hydrate them.
+            self.known_appearance
+                .insert(name.clone(), appearance.clone());
             let Some(member) = self.party.members.iter_mut().find(|m| m.name == name) else {
                 continue;
             };
-            let skin_id = stat(StatType::SkinId).map(|s| s.stat_value).unwrap_or(0);
-            let tex1 = stat(StatType::Texture1)
-                .map(|s| s.stat_value as u32)
-                .unwrap_or(0);
-            let tex2 = stat(StatType::Texture2)
-                .map(|s| s.stat_value as u32)
-                .unwrap_or(0);
-            let guild = stat(StatType::GuildName)
-                .and_then(|s| s.string_stat_value.clone())
-                .filter(|g| !g.is_empty());
-            let next = PartyMemberView {
-                player_id: member.player_id,
-                name: member.name.clone(),
-                is_leader: member.is_leader,
-                class_id: Some(class_id),
-                skin_id,
-                tex1,
-                tex2,
-                guild,
-            };
+            let mut next = member.clone();
+            appearance.apply(&mut next);
             if *member != next {
                 *member = next;
                 changed = true;
@@ -1077,8 +1123,6 @@ impl PacketProcessor {
     }
 
     pub(crate) fn record_live_event(&mut self, event: LiveEventView) {
-        // The whole session is kept so the UI can always rebuild its rows.
-        // `live_event_evictions` exists as a must-stay-zero signal.
         self.live_event_seq = self.live_event_seq.wrapping_add(1);
         self.live_events.events.push(LiveEventEntry {
             seq: self.live_event_seq,
@@ -1086,6 +1130,15 @@ impl PacketProcessor {
             event,
         });
         self.live_events.rev = self.live_events.rev.wrapping_add(1);
+        // Bounded recovery window; `dropped_before_seq` makes the gap visible.
+        const WINDOW: usize = 500;
+        while self.live_events.events.len() > WINDOW {
+            if let Some(dropped) = self.live_events.events.first() {
+                self.live_events.dropped_before_seq = dropped.seq;
+            }
+            self.live_events.events.remove(0);
+            self.live_event_evictions = self.live_event_evictions.wrapping_add(1);
+        }
     }
 
     fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
@@ -2752,7 +2805,13 @@ impl PacketProcessor {
             }
             GameEvent::PortalUsed { object_id } => {
                 self.record_feed_event(FeedContextEvent::PortalUsed { object_id });
-                self.portal_anchor = Some(std::time::Instant::now());
+                // Anchor to the portal's spawn, matching the displayed callout.
+                self.portal_anchor = Some(
+                    self.portal_spawns
+                        .get(&object_id)
+                        .copied()
+                        .unwrap_or_else(std::time::Instant::now),
+                );
             }
             GameEvent::PartyJoinRequestResponse(_) | GameEvent::ReconnectReceived { .. } => {}
 
@@ -3131,11 +3190,18 @@ impl PacketProcessor {
                     // left between paints cannot reappear as joinable.
                     self.record_live_event(LiveEventView::DungeonLeft);
                     self.portal_anchor = None;
+                    self.portal_spawns.clear();
+                    self.last_learned_fp = None;
                 }
                 self.in_dungeon = is_dungeon;
                 if is_dungeon {
                     let key = crate::panels::live_feed::format_dungeon_name(display_name);
-                    self.remember_dungeon_mods(&key, dungeon_modifiers);
+                    // Repeated MapInfo for the same instance must not count as a
+                    // new run for learned event modifiers.
+                    if self.last_learned_fp != Some(fp) {
+                        self.last_learned_fp = Some(fp);
+                        self.remember_dungeon_mods(&key, dungeon_modifiers);
+                    }
                     self.record_live_event(LiveEventView::Dungeon {
                         fp,
                         display_name: display_name.clone(),
@@ -3696,9 +3762,11 @@ impl PacketProcessor {
                 let assets = realmhound_core::assets::get_asset_manager();
                 for object in &update.new_objects {
                     if assets.is_portal_object(object.object_type as i32) {
-                        self.record_feed_event(FeedContextEvent::PortalSpawned {
-                            object_id: object.object_id(),
-                        });
+                        let object_id = object.object_id();
+                        self.record_feed_event(FeedContextEvent::PortalSpawned { object_id });
+                        self.portal_spawns
+                            .entry(object_id)
+                            .or_insert_with(std::time::Instant::now);
                     }
                 }
 

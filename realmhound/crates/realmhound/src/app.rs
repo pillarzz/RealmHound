@@ -593,6 +593,7 @@ pub struct RealmHoundApp {
     owned_quest_rev: u64,
     /// Last applied worker-owned recoverable Live Feed revision.
     owned_live_event_rev: u64,
+    owned_live_event_seq: u64,
     owned_feed_rev: u64,
     owned_feed_seq: u64,
     /// Handle to the packet-processing worker thread (owns the model: session,
@@ -1119,6 +1120,7 @@ impl RealmHoundApp {
             owned_encounter_rev: 0,
             owned_quest_rev: 0,
             owned_live_event_rev: 0,
+            owned_live_event_seq: 0,
             owned_feed_rev: 0,
             owned_feed_seq: 0,
             worker,
@@ -1656,21 +1658,34 @@ impl RealmHoundApp {
         if live_new || feed_new {
             // Replay both domains in observation order, so a recovered row sees
             // the map context that was current when the worker saw it.
-            let mut merged: Vec<(chrono::DateTime<chrono::Utc>, bool, usize)> =
-                Vec::with_capacity(snap.live_events.events.len() + snap.feed.events.len());
+            let mut merged: Vec<(u64, bool, usize)> = Vec::with_capacity(64);
             if live_new {
-                for (index, entry) in snap.live_events.events.iter().enumerate() {
-                    merged.push((entry.at, true, index));
+                for (index, entry) in snap
+                    .live_events
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.seq > self.owned_live_event_seq)
+                {
+                    merged.push((entry.seq, true, index));
                 }
             }
             if feed_new {
-                for (index, entry) in snap.feed.events.iter().enumerate() {
-                    merged.push((entry.at, false, index));
+                for (index, entry) in snap
+                    .feed
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.seq > self.owned_feed_seq)
+                {
+                    merged.push((entry.seq, false, index));
                 }
             }
-            merged.sort_by_key(|(at, is_live, index)| (*at, *is_live, *index));
+            // One worker-owned monotonic sequence: no wall-clock ordering.
+            merged.sort_by_key(|(seq, is_live, index)| (*seq, *is_live, *index));
             for (_, is_live, index) in merged {
                 if is_live {
+                    self.owned_live_event_seq = snap.live_events.events[index].seq;
                     self.live_feed_panel
                         .apply_live_event(&snap.live_events.events[index]);
                 } else {

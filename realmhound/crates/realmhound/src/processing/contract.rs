@@ -630,8 +630,10 @@ pub struct FeedContextEntry {
 /// Worker-owned Live Feed context (whole session).
 #[derive(Debug, Clone, Default)]
 pub struct FeedContext {
-    /// Updates oldest to newest.
+    /// Updates oldest to newest (bounded).
     pub events: Vec<FeedContextEntry>,
+    /// Highest sequence dropped from the front.
+    pub dropped_before_seq: u64,
     /// Modifier sets learned per dungeon (single owner: the worker).
     pub learned_mod_sets: std::collections::HashMap<String, Vec<Vec<String>>>,
     /// Bumps on every append or learning change.
@@ -652,8 +654,10 @@ pub struct LiveEventEntry {
 /// Bounded worker-owned window of recent recoverable Live Feed events.
 #[derive(Debug, Clone, Default)]
 pub struct LiveEventWindow {
-    /// Events oldest to newest.
+    /// Events oldest to newest (bounded).
     pub events: Vec<LiveEventEntry>,
+    /// Highest sequence dropped from the front, so a gap is detectable.
+    pub dropped_before_seq: u64,
     /// Bumps on every append.
     pub rev: u64,
 }

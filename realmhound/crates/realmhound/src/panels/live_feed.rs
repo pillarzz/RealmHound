@@ -101,6 +101,13 @@ impl FeedEntry {
             FeedEntry::AreaUnlock(entry) => entry.timestamp = timestamp,
         }
     }
+
+    /// Keep the worker's observation time for the run timer origin.
+    fn set_entered_at(&mut self, instant: std::time::Instant) {
+        if let FeedEntry::Dungeon(entry) = self {
+            entry.entered_at = instant;
+        }
+    }
 }
 
 /// Loot drop entry data.
@@ -942,6 +949,12 @@ pub struct LiveFeedPanel {
     recovered_event_seq: u64,
     /// Whether older entries were trimmed from the displayed window.
     trimmed_history: bool,
+    /// Original time of the event currently being recovered.
+    event_time: Option<DateTime<Local>>,
+    /// Same event as an `Instant`, for deadlines and countdowns.
+    event_instant: Option<std::time::Instant>,
+    /// True once the worker has published the learned modifier sets.
+    learned_from_worker: bool,
     /// Timer freezes that arrived before their dungeon row (keyed by map seed).
     pending_freezes: HashMap<i32, i64>,
 
@@ -1176,6 +1189,9 @@ impl LiveFeedPanel {
         Self {
             entries: VecDeque::with_capacity(MAX_FEED_ENTRIES),
             trimmed_history: false,
+            event_time: None,
+            event_instant: None,
+            learned_from_worker: false,
             pending_freezes: HashMap::new(),
             auto_scroll: true,
             needs_scroll_to_top: false,
@@ -1396,6 +1412,7 @@ impl LiveFeedPanel {
         sets: std::collections::HashMap<String, Vec<Vec<String>>>,
     ) {
         self.dungeon_mod_sets = sets;
+        self.learned_from_worker = true;
     }
 
     /// Record a dungeon entry's modifier set locally; the worker's published
@@ -2059,7 +2076,7 @@ impl LiveFeedPanel {
             } => self.update_dust(amounts.clone(), *is_seasonal),
             FeedContextEvent::Seasonal(is_seasonal) => self.set_seasonal(*is_seasonal),
             FeedContextEvent::RealmScore(score) => self.update_realm_score(*score),
-            FeedContextEvent::RealmClosed => self.force_realm_closed(),
+            FeedContextEvent::RealmClosed => self.force_realm_closed_at(observed),
             FeedContextEvent::Discovery(event) => self.apply_realm_discovery(event.clone()),
             FeedContextEvent::PortalSpawned { object_id } => {
                 self.portal_spawns.entry(*object_id).or_insert(observed);
@@ -2211,7 +2228,8 @@ impl LiveFeedPanel {
 
     /// Push a new entry to the feed.
     /// Automatically evicts oldest entries if the feed exceeds MAX_FEED_ENTRIES.
-    pub fn push_entry(&mut self, entry: FeedEntry) {
+    pub fn push_entry(&mut self, mut entry: FeedEntry) {
+        self.stamp_pending_event(&mut entry);
         // Add to front (newest first)
         self.entries.push_front(entry);
 
@@ -2227,10 +2245,13 @@ impl LiveFeedPanel {
         }
     }
 
-    /// Overwrite the newest row's display time (recovery keeps the original).
-    fn set_newest_timestamp(&mut self, timestamp: DateTime<Local>) {
-        if let Some(entry) = self.entries.front_mut() {
+    /// Build the row with the worker's time, before it is pushed.
+    fn stamp_pending_event(&self, entry: &mut FeedEntry) {
+        if let Some(timestamp) = self.event_time {
             entry.set_timestamp(timestamp);
+        }
+        if let Some(instant) = self.event_instant {
+            entry.set_entered_at(instant);
         }
     }
 
@@ -2390,6 +2411,11 @@ impl LiveFeedPanel {
     }
 
     pub fn force_realm_closed(&mut self) {
+        self.force_realm_closed_at(std::time::Instant::now());
+    }
+
+    /// Start the castle countdown from the worker's observation time.
+    fn force_realm_closed_at(&mut self, now: std::time::Instant) {
         if let Some((_, max)) = self.realm_score {
             self.realm_score = Some((max, max));
             self.is_score_stale = false;
@@ -2400,7 +2426,7 @@ impl LiveFeedPanel {
         // Start the castle teleport countdown; ignore repeated
         // realm-close messages so the window isn't reset each time.
         if self.castle_timer_expires_at.is_none() {
-            self.castle_timer_expires_at = Some(std::time::Instant::now() + CASTLE_TELEPORT_WINDOW);
+            self.castle_timer_expires_at = Some(now + CASTLE_TELEPORT_WINDOW);
         }
     }
 
@@ -2611,7 +2637,9 @@ impl LiveFeedPanel {
         }
         // Recognize (and remember) the mods this event applies to every instance
         // of this dungeon, so calls stop advertising a mod nobody rolled.
-        self.remember_dungeon_mods(&display_name, modifier_tokens);
+        if !self.learned_from_worker {
+            self.remember_dungeon_mods(&display_name, modifier_tokens);
+        }
         let learned_event_mods = self.learned_event_mods(&display_name);
         let params = self.dungeon_callout_params(origin_status.as_deref(), &learned_event_mods);
         let mut entry = DungeonEntry::new(
@@ -2716,7 +2744,16 @@ impl LiveFeedPanel {
                 return;
             }
             self.recovered_event_seq = entry.seq;
-            let rows_before = self.entries.len();
+            let age = chrono::Utc::now()
+                .signed_duration_since(entry.at)
+                .to_std()
+                .unwrap_or_default();
+            self.event_time = Some(entry.at.with_timezone(&chrono::Local));
+            self.event_instant = Some(
+                std::time::Instant::now()
+                    .checked_sub(age)
+                    .unwrap_or_else(|| std::time::Instant::now()),
+            );
             match &entry.event {
                 LiveEventView::BossCall { boss_id, name } => {
                     self.push_boss_call(*boss_id, name.clone());
@@ -2758,17 +2795,6 @@ impl LiveFeedPanel {
                     grade,
                 } => {
                     self.push_dungeon(*fp, display_name, modifiers, grade.clone());
-                    // Keep the original join deadline, not the repaint time.
-                    let age = chrono::Utc::now()
-                        .signed_duration_since(entry.at)
-                        .to_std()
-                        .unwrap_or_default();
-                    if let Some(FeedEntry::Dungeon(d)) = self.entries.front_mut() {
-                        d.expires_at = d
-                            .expires_at
-                            .checked_sub(age)
-                            .unwrap_or_else(|| std::time::Instant::now());
-                    }
                 }
                 LiveEventView::DungeonLeft => self.deactivate_active_dungeons(),
                 LiveEventView::WhoRoster { names } => {
@@ -2792,10 +2818,8 @@ impl LiveFeedPanel {
                     self.push_join_request_alert(name.clone());
                 }
             }
-            // Recovered rows keep the worker's timestamp, not the repaint time.
-            if self.entries.len() > rows_before {
-                self.set_newest_timestamp(entry.at.with_timezone(&chrono::Local));
-            }
+            self.event_time = None;
+            self.event_instant = None;
         }
     }
 
@@ -8048,6 +8072,7 @@ mod tests {
                     name: "First".to_string(),
                 },
             }],
+            dropped_before_seq: 0,
             rev: 1,
         });
         assert_eq!(panel.entries.len(), 1);
@@ -8091,6 +8116,7 @@ mod tests {
                     },
                 },
             ],
+            dropped_before_seq: 0,
             rev: 2,
         });
         assert_eq!(panel.entries.len(), 4, "seq 1 is not replayed");

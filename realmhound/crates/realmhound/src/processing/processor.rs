@@ -35,8 +35,8 @@ use crate::processing::mission_tracker::{MissionTracker, MissionView};
 use crate::sound::SoundType;
 
 use super::contract::{
-    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, PartyMemberView, PartyView,
-    TokenState, UiPayload, UiUpdate, ViewState,
+    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, EncounterSet, EncounterView,
+    PartyMemberView, PartyView, TokenState, UiPayload, UiUpdate, ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
 
@@ -418,6 +418,8 @@ pub struct PacketProcessor {
     token_gen: u64,
     /// Authoritative party membership (watchlist/sightings stay UI-side).
     party: PartyView,
+    /// Authoritative set of currently visible encounters.
+    encounters: EncounterSet,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -552,6 +554,7 @@ impl PacketProcessor {
             token: None,
             token_gen: 0,
             party: PartyView::default(),
+            encounters: EncounterSet::default(),
         }
     }
 
@@ -654,6 +657,7 @@ impl PacketProcessor {
             token: None,
             token_gen: 0,
             party: PartyView::default(),
+            encounters: EncounterSet::default(),
         })
     }
 
@@ -708,6 +712,7 @@ impl PacketProcessor {
             token: None,
             token_gen: 0,
             party: PartyView::default(),
+            encounters: EncounterSet::default(),
         }
     }
 
@@ -768,6 +773,7 @@ impl PacketProcessor {
             mission_view_gen: self.mission_tracker.generation(),
             token_gen: self.token_gen,
             party_rev: self.party.rev,
+            encounter_rev: self.encounters.rev,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -848,6 +854,45 @@ impl PacketProcessor {
             self.party.is_local_leader = false;
             self.party.local_player_name = None;
             self.bump_party();
+        }
+    }
+
+    /// The authoritative current encounter set.
+    pub fn encounter_set(&self) -> EncounterSet {
+        self.encounters.clone()
+    }
+
+    fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
+        if self
+            .encounters
+            .encounters
+            .iter()
+            .any(|encounter| encounter.object_id == object_id)
+        {
+            return;
+        }
+        self.encounters.encounters.push(EncounterView {
+            object_id,
+            object_type,
+            name,
+        });
+        self.encounters.rev = self.encounters.rev.wrapping_add(1);
+    }
+
+    fn remove_encounter(&mut self, object_id: i32) {
+        let before = self.encounters.encounters.len();
+        self.encounters
+            .encounters
+            .retain(|encounter| encounter.object_id != object_id);
+        if self.encounters.encounters.len() != before {
+            self.encounters.rev = self.encounters.rev.wrapping_add(1);
+        }
+    }
+
+    fn clear_encounters(&mut self) {
+        if !self.encounters.encounters.is_empty() {
+            self.encounters.encounters.clear();
+            self.encounters.rev = self.encounters.rev.wrapping_add(1);
         }
     }
 
@@ -2780,7 +2825,9 @@ impl PacketProcessor {
                 ref dungeon_grade,
                 ..
             } => {
-                // Location update + encounter clearing handled by LiveFeedPanel (broadcast).
+                // The Live Feed clears its own location state; the worker clears
+                // its authoritative encounter set here.
+                self.clear_encounters();
                 // Remaining: notify loot tracker of new map.
                 self.loot_tracker.on_map_info(display_name, fp);
                 self.combat
@@ -3301,6 +3348,11 @@ impl PacketProcessor {
 
                 // Forward encounter spawns to live feed
                 for encounter in extract_encounter_spawns(&update.new_objects) {
+                    self.add_encounter(
+                        encounter.object_id,
+                        encounter.sprite_id,
+                        encounter.name.clone(),
+                    );
                     self.emit(UiPayload::AddEncounter {
                         object_id: encounter.object_id,
                         object_type: encounter.sprite_id,
@@ -3333,6 +3385,7 @@ impl PacketProcessor {
                     self.loot_tracker.on_entity_dropped(object_id, time_ms);
                     self.loot_tracker.on_entity_removed(object_id);
                     self.combat.on_object_removed(object_id, time_ms as i64);
+                    self.remove_encounter(object_id);
                     self.emit(UiPayload::RemoveEncounter(object_id));
                     self.pet_object_buffer.remove(&object_id);
                 }
@@ -5398,6 +5451,23 @@ mod isolation_gate_tests {
         p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
         assert_eq!(access_tokens(&p), vec!["main-tok".to_string()]);
         assert!(p.pending_credential.is_none());
+    }
+
+    #[test]
+    fn encounter_set_tracks_add_remove_and_clear() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.add_encounter(1, 100, "Boss".to_string());
+        p.add_encounter(1, 100, "Boss".to_string());
+        assert_eq!(p.encounter_set().encounters.len(), 1);
+
+        let rev = p.encounter_set().rev;
+        p.remove_encounter(1);
+        assert!(p.encounter_set().encounters.is_empty());
+        assert!(p.encounter_set().rev > rev);
+
+        p.add_encounter(2, 200, "Other".to_string());
+        p.clear_encounters();
+        assert!(p.encounter_set().encounters.is_empty());
     }
 
     #[test]

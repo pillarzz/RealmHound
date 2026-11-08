@@ -437,6 +437,8 @@ pub struct ViewState {
     pub token_gen: u64,
     /// Generation of worker-owned party membership.
     pub party_rev: u64,
+    /// Generation of worker-owned current encounters.
+    pub encounter_rev: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -469,6 +471,7 @@ impl ViewState {
             mission_view_gen: 0,
             token_gen: 0,
             party_rev: 0,
+            encounter_rev: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -503,6 +506,26 @@ pub struct PartyMemberView {
     pub name: String,
     /// Whether this member is the party leader.
     pub is_leader: bool,
+}
+
+/// An encounter currently visible in the world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncounterView {
+    /// Instance object id.
+    pub object_id: i32,
+    /// Sprite/object type id.
+    pub object_type: u16,
+    /// Display name.
+    pub name: String,
+}
+
+/// Worker-owned set of currently visible encounters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncounterSet {
+    /// Current encounters.
+    pub encounters: Vec<EncounterView>,
+    /// Bumps on every set change.
+    pub rev: u64,
 }
 
 /// A released access token with its original capture time and account binding.
@@ -576,6 +599,8 @@ pub struct ModelSnapshot {
     pub token: Option<Arc<TokenState>>,
     /// Worker-owned party membership.
     pub party: Arc<PartyView>,
+    /// Worker-owned current encounters.
+    pub encounters: Arc<EncounterSet>,
 }
 
 impl ModelSnapshot {
@@ -597,6 +622,7 @@ impl ModelSnapshot {
             mission_view: Arc::new(MissionView::default()),
             token: None,
             party: Arc::new(PartyView::default()),
+            encounters: Arc::new(EncounterSet::default()),
         }
     }
 
@@ -612,6 +638,7 @@ impl ModelSnapshot {
         mission_view: Option<Arc<MissionView>>,
         token: Option<Arc<TokenState>>,
         party: Option<Arc<PartyView>>,
+        encounters: Option<Arc<EncounterSet>>,
     ) -> Self {
         Self {
             selected_identity: self.selected_identity.clone(),
@@ -623,6 +650,7 @@ impl ModelSnapshot {
             mission_view: mission_view.unwrap_or_else(|| self.mission_view.clone()),
             token: token.or_else(|| self.token.clone()),
             party: party.unwrap_or_else(|| self.party.clone()),
+            encounters: encounters.unwrap_or_else(|| self.encounters.clone()),
         }
     }
 }
@@ -659,6 +687,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
@@ -681,10 +710,12 @@ mod tests {
             None,
             Some(token.clone()),
             None,
+            None,
         );
         assert!(Arc::ptr_eq(with_token.token.as_ref().unwrap(), &token));
         let reused = with_token.next(
             ViewState::new(None, None),
+            None,
             None,
             None,
             None,

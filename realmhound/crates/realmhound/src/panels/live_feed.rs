@@ -2743,6 +2743,28 @@ impl LiveFeedPanel {
         self.active_encounters.clear();
     }
 
+    /// Rebuild the encounter set from the worker snapshot, preserving each
+    /// existing encounter's first-seen ordering.
+    pub fn apply_encounter_view(&mut self, view: &crate::processing::contract::EncounterSet) {
+        let mut next = HashMap::with_capacity(view.encounters.len());
+        for encounter in &view.encounters {
+            let added_at = self
+                .active_encounters
+                .get(&encounter.object_id)
+                .map(|existing| existing.added_at)
+                .unwrap_or_else(std::time::Instant::now);
+            next.insert(
+                encounter.object_id,
+                ActiveEncounter {
+                    object_type: encounter.object_type,
+                    name: encounter.name.clone(),
+                    added_at,
+                },
+            );
+        }
+        self.active_encounters = next;
+    }
+
     /// Set a status message that will display briefly.
     fn set_status(&mut self, message: &str) {
         self.status_message = Some((message.to_string(), std::time::Instant::now()));

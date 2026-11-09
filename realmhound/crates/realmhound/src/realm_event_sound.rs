@@ -215,64 +215,6 @@ pub fn override_key(kind: SectionKind, boss_id: i32) -> String {
     format!("event:{}:{}", kind.key_prefix(), boss_id)
 }
 
-/// Why a boss call produced no sound (recorded by the diagnostic log so a
-/// silent event can be traced back to its cause).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SilentReason {
-    /// Alien Invasion event but the Alien section is disabled.
-    AlienDisabled,
-    /// The boss belongs to a section whose mode is None.
-    SectionNone,
-    /// Selected mode and the boss is not in the section's list.
-    NotSelected,
-    /// The boss id matched no notification section at all.
-    NoSection,
-}
-
-impl SilentReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SilentReason::AlienDisabled => "Alien section disabled",
-            SilentReason::SectionNone => "section set to None",
-            SilentReason::NotSelected => "Selected mode, boss not in list",
-            SilentReason::NoSection => "boss not in any notification section",
-        }
-    }
-}
-
-/// The full outcome of matching a boss call, for both playback and the
-/// diagnostic log. `section` is a human label ("Veteran"/"Adept"/"Seasonal"/
-/// "Alien"/"-"); `matched_id` is the representative catalog id the spawn id
-/// resolved to (the same id the settings picker stores), or `None` when the
-/// spawn id matched nothing.
-#[derive(Debug, Clone)]
-pub struct EventDiagnosis {
-    pub section: &'static str,
-    pub matched_id: Option<i32>,
-    pub trigger: Option<EventTrigger>,
-    pub silent_reason: Option<SilentReason>,
-}
-
-impl EventDiagnosis {
-    fn played(section: &'static str, matched_id: Option<i32>, trigger: EventTrigger) -> Self {
-        Self {
-            section,
-            matched_id,
-            trigger: Some(trigger),
-            silent_reason: None,
-        }
-    }
-
-    fn silent(section: &'static str, matched_id: Option<i32>, reason: SilentReason) -> Self {
-        Self {
-            section,
-            matched_id,
-            trigger: None,
-            silent_reason: Some(reason),
-        }
-    }
-}
-
 /// Decide which realm-event sound (if any) a boss call should play.
 ///
 /// Alien Invasion is matched first (by callout text / boss id) so Calbrik and
@@ -283,94 +225,51 @@ pub fn resolve(
     text: &str,
     sets: &EventSets,
 ) -> Option<EventTrigger> {
-    diagnose(events, boss_id, text, sets).trigger
-}
-
-/// Like [`resolve`] but always returns the full [`EventDiagnosis`] (matched
-/// section, representative id, and -- when silent -- the reason). Used by the
-/// diagnostic log so every Live Feed boss call can be recorded, including the
-/// silent ones.
-pub fn diagnose(
-    events: &RealmEventSounds,
-    boss_id: i32,
-    text: &str,
-    sets: &EventSets,
-) -> EventDiagnosis {
     use realmhound_core::settings::EventMode;
 
     // Alien Invasion: wave starts announce as "Alien Invasion ..."; the UFO and
     // Commander Calbrik are identified by id (with a text fallback for the UFO).
-    let alien =
-        |sound: EventSound, key: &str, volume: f32, matched: Option<i32>| -> EventDiagnosis {
-            if events.alien.enabled {
-                EventDiagnosis::played(
-                    "Alien",
-                    matched,
-                    EventTrigger {
-                        sound,
-                        custom_key: key.to_string(),
-                        volume,
-                    },
-                )
-            } else {
-                EventDiagnosis::silent("Alien", matched, SilentReason::AlienDisabled)
-            }
-        };
+    let alien = |sound: EventSound, key: &str, volume: f32| -> Option<EventTrigger> {
+        events.alien.enabled.then(|| EventTrigger {
+            sound,
+            custom_key: key.to_string(),
+            volume,
+        })
+    };
     if text.starts_with("Alien Invasion") {
         return alien(
             EventSound::AlienWave,
             ALIEN_WAVE_KEY,
             events.alien.wave.volume,
-            None,
         );
     }
     if text == "UFO" || sets.ufo == Some(boss_id) {
-        return alien(
-            EventSound::Ufo,
-            ALIEN_UFO_KEY,
-            events.alien.ufo.volume,
-            Some(boss_id),
-        );
+        return alien(EventSound::Ufo, ALIEN_UFO_KEY, events.alien.ufo.volume);
     }
     if sets.calbrik == Some(boss_id) {
         return alien(
             EventSound::Calbrik,
             ALIEN_CALBRIK_KEY,
             events.alien.calbrik.volume,
-            Some(boss_id),
         );
     }
 
-    // Encounter sections. Each map is disjoint, so a spawn id belongs to at most
-    // one section -- find that section (regardless of mode) so a silent outcome
-    // can name the real reason.
+    // Encounter sections. Each map is disjoint, so a spawn id belongs to at
+    // most one section.
     let sections = [
-        (
-            SectionKind::Veteran,
-            "Veteran",
-            &events.veteran,
-            &sets.veteran,
-        ),
-        (SectionKind::Adept, "Adept", &events.adept, &sets.adept),
-        (
-            SectionKind::Seasonal,
-            "Seasonal",
-            &events.seasonal,
-            &sets.seasonal,
-        ),
+        (SectionKind::Veteran, &events.veteran, &sets.veteran),
+        (SectionKind::Adept, &events.adept, &sets.adept),
+        (SectionKind::Seasonal, &events.seasonal, &sets.seasonal),
     ];
-    let Some((kind, label, section, rep)) =
-        sections
-            .into_iter()
-            .find_map(|(kind, label, section, map)| {
-                map.get(&boss_id).map(|&rep| (kind, label, section, rep))
-            })
+    let Some((kind, section, rep)) = sections
+        .into_iter()
+        .find_map(|(kind, section, map)| map.get(&boss_id).map(|&rep| (kind, section, rep)))
     else {
-        return EventDiagnosis::silent("-", None, SilentReason::NoSection);
+        return None;
     };
 
     if section.mode == EventMode::None {
-        return EventDiagnosis::silent(label, Some(rep), SilentReason::SectionNone);
+        return None;
     }
 
     // Match the override against the representative id (what the picker stores)
@@ -388,20 +287,14 @@ pub fn diagnose(
             format!("event:{}:default:{}", kind.key_prefix(), rep),
         ),
         // Selected: unlisted bosses are silent.
-        (EventMode::Selected, None) => {
-            return EventDiagnosis::silent(label, Some(rep), SilentReason::NotSelected);
-        }
+        (EventMode::Selected, None) => return None,
         (EventMode::None, None) => unreachable!("None handled above"),
     };
-    EventDiagnosis::played(
-        label,
-        Some(rep),
-        EventTrigger {
-            sound: kind.default_sound(),
-            custom_key,
-            volume,
-        },
-    )
+    Some(EventTrigger {
+        sound: kind.default_sound(),
+        custom_key,
+        volume,
+    })
 }
 
 #[cfg(test)]

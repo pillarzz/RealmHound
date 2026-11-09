@@ -17,6 +17,7 @@ use realmhound_core::{
     api::{ClientSeasons, PlayerMissions},
     capture::PacketReceiver,
     loot::{LootBagType, ProcessedLootDrop},
+    protocol::QuestFetchResponsePacket,
     session::MainAccountStatus,
     settings::{CombatHistorySettings, LootTrackingSettings},
     stream::CaptureHealth,
@@ -27,6 +28,8 @@ use realmhound_core::{
 use crate::panels::chat::ChatMessage;
 use crate::processing::mission_tracker::MissionView;
 use crate::sound::{EventSound, SoundType};
+use chrono::{DateTime, Utc};
+use std::sync::Arc;
 #[cfg(feature = "latency-diagnostics")]
 use std::time::Instant;
 
@@ -52,42 +55,33 @@ pub struct UiUpdate {
 
 /// The payload of a [`UiUpdate`].
 pub enum UiPayload {
-    /// Re-broadcast a domain event to the session-independent transient panels
-    /// (quest / party / live feed / vault). The processor has already applied
-    /// any model-side effects; this reproduces the panels' `handle_event`.
+    /// Re-broadcast a domain event. No panel consumes it any more; every panel
+    /// that matters is driven by the snapshot. Kept as the replay signal the
+    /// processor's buffering tests assert on.
     Broadcast(GameEvent),
+
+    /// Automatic clipboard work, consumed by the worker before UI delivery.
+    DungeonCallout {
+        display_name: String,
+        modifiers: Vec<String>,
+        grade: Option<String>,
+        origin: Option<DungeonOrigin>,
+    },
 
     /// A resolved chat message to append (whisper direction already tagged).
     Chat(ChatMessage),
     /// An encounter/boss callout for the live feed.
     BossCall { boss_id: i32, text: String },
-    /// Instance-scoped Crystal/Jailer discovery updates.
-    RealmDiscovery(super::realm_discovery::DiscoveryEvent),
 
     /// A Keyper seasonal-event cue for the live feed. `towers` = true when a
     /// crystal-tower wave appeared, false when The Keyper boss spawned. Carries
     /// its own Live Feed entry + sound (independent of the realm-event system).
     KeyperEvent { towers: bool },
 
-    /// Display name for the connected server (from server-IP mapping).
-    SetServerName(String),
-
     /// A processed loot drop (already recorded to the DB by the processor).
     PushLoot(ProcessedLootDrop),
     /// At least one loot drop was recorded this batch (refresh autocomplete).
     LootBatchAdded,
-
-    /// An encounter spawned (forward to the live feed).
-    AddEncounter {
-        object_id: i32,
-        object_type: u16,
-        name: String,
-    },
-    /// An encounter was removed.
-    RemoveEncounter(i32),
-
-    /// A party member left (parsed from a chat "has left the party" message).
-    PartyMemberLeft(String),
 
     /// A dungeon key was popped nearby (public portal open). Carries the opener
     /// name, the dungeon key's object id (for the sprite), and the resolved
@@ -110,16 +104,6 @@ pub enum UiPayload {
         callout: String,
     },
 
-    /// Whether the local player is currently the party leader.
-    PartyLocalLeaderStatus(bool),
-
-    /// The local (main) account's player name, forwarded to the party panel so
-    /// it can render the local player with their real skin/dyes.
-    PartyLocalPlayerName(Option<String>),
-
-    /// The party panel should be cleared (e.g. a rejected mule/alt connection).
-    PartyCleared,
-
     /// A pet inventory slot changed (forward to the vault panel's API copy).
     UpdateVaultPetSlot {
         pet_instance_id: i32,
@@ -139,16 +123,8 @@ pub enum UiPayload {
     /// A sound should be played (App owns the `SoundEngine` this session).
     Audio(AudioCommand),
 
-    /// Oryx realm-close announcement detected.
-    RealmClosed,
-
     /// Oryx "MY MINIONS HAVE FAILED ME" detected while in dungeon.
     OryxLagWarning,
-
-    /// The current dungeon run's timer has settled to its committed per-run
-    /// value (fired when the run ends: leave/nexus, death, disconnect). Carries
-    /// the map seed of the run so the Live Feed can target the matching row.
-    DungeonTimerFrozen { map_seed: i32, elapsed_ms: i64 },
 
     /// A stored Combat History card changed without a new fight being recorded
     /// (a loot bag completing an escaped fight or an encounter run), which the
@@ -218,6 +194,8 @@ pub enum ControlMsg {
     StopCapture,
     /// The first UI frame has completed; automatic history maintenance may run.
     StartHistoricalMaintenance,
+    /// Whether the UI currently wants repaint wakes (false while minimized).
+    SetLiveDemand(bool),
     /// Flush persistent state and exit the worker loop (app shutdown).
     Shutdown,
     /// Clear the reassembler's ignored-connection set.
@@ -247,6 +225,8 @@ pub enum ControlMsg {
         progress: Option<PlayerMissions>,
         scope: AccountOperationScope,
     },
+    /// Replace the worker's watchlist snapshot after a UI edit.
+    SetWatchlist(realmhound_core::watchlist::Watchlist),
 }
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -431,6 +411,18 @@ pub struct ViewState {
     pub capture_queue_drops: u64,
     /// Generation of the mission tracker (bumps on any mission-state change).
     pub mission_view_gen: u64,
+    /// Generation of the released access token (bumps on a changed token).
+    pub token_gen: u64,
+    /// Generation of worker-owned party membership.
+    pub party_rev: u64,
+    /// Generation of worker-owned current encounters.
+    pub encounter_rev: u64,
+    /// Generation of worker-owned quest state.
+    pub quest_rev: u64,
+    /// Generation of the worker-owned recoverable Live Feed window.
+    pub live_event_rev: u64,
+    /// Bumps when the worker-side Live Feed context changes.
+    pub feed_rev: u64,
     /// Remaining loot-drop-boost seconds for the live player, if a boost is
     /// active. Server-driven (already paused by the game in safe areas), shown
     /// on the live character card.
@@ -461,6 +453,12 @@ impl ViewState {
             capture_unsync_ms: 0,
             capture_queue_drops: 0,
             mission_view_gen: 0,
+            token_gen: 0,
+            party_rev: 0,
+            encounter_rev: 0,
+            quest_rev: 0,
+            live_event_rev: 0,
+            feed_rev: 0,
             loot_boost_secs: None,
             // Nothing heard yet, so nothing may be counted down.
             map_pauses_boost_timers: true,
@@ -471,6 +469,306 @@ impl ViewState {
 // ---------------------------------------------------------------------------
 // ModelSnapshot (worker -> UI shared latest-value model snapshot)
 // ---------------------------------------------------------------------------
+
+/// Worker-owned party membership. Watchlist status and world sightings stay in
+/// the UI panel; this is the authoritative member list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartyView {
+    /// Party id from the party list packet.
+    pub party_id: i32,
+    /// Party description shown in the header.
+    pub party_name: String,
+    /// Maximum party size.
+    pub max_size: u8,
+    /// Current members.
+    pub members: Vec<PartyMemberView>,
+    /// Whether the local player is the party leader.
+    pub is_local_leader: bool,
+    /// The local (main) player's name, if known.
+    pub local_player_name: Option<String>,
+    /// Bumps on every membership change.
+    pub rev: u64,
+}
+
+/// One party member as owned by the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartyMemberView {
+    /// Internal player id.
+    pub player_id: i16,
+    /// Player name.
+    pub name: String,
+    /// Whether this member is the party leader.
+    pub is_leader: bool,
+    /// Player class id from the last world update.
+    pub class_id: Option<i32>,
+    /// Skin, texture and guild from the last world update.
+    pub skin_id: i32,
+    /// Texture 1.
+    pub tex1: u32,
+    /// Texture 2.
+    pub tex2: u32,
+    /// Guild name, if any.
+    pub guild: Option<String>,
+}
+
+/// An encounter currently visible in the world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncounterView {
+    /// Instance object id.
+    pub object_id: i32,
+    /// Sprite/object type id.
+    pub object_type: u16,
+    /// Display name.
+    pub name: String,
+}
+
+/// Worker-owned set of currently visible encounters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncounterSet {
+    /// Current encounters.
+    pub encounters: Vec<EncounterView>,
+    /// Bumps on every set change.
+    pub rev: u64,
+}
+
+/// One recoverable Live Feed event emitted by the worker.
+#[derive(Debug, Clone)]
+pub enum LiveEventView {
+    BossCall {
+        boss_id: i32,
+        name: String,
+        server_name: Option<String>,
+        realm_name: Option<String>,
+    },
+    KeyPop {
+        opener: String,
+        key_id: i32,
+        dungeon_name: String,
+        thankable: bool,
+    },
+    AreaUnlock {
+        title: String,
+        contributions: Vec<(i32, String)>,
+        callout: String,
+    },
+    Warning {
+        text: String,
+        severity: crate::panels::live_feed::WarningSeverity,
+        copyable: bool,
+    },
+    Dm {
+        sender: String,
+        text: String,
+    },
+    Loot(ProcessedLootDrop),
+    Dungeon {
+        fp: i32,
+        display_name: String,
+        modifiers: Vec<String>,
+        grade: Option<String>,
+        origin: DungeonOrigin,
+    },
+    /// The player left the dungeon, ordered with the entry it invalidates.
+    DungeonLeft,
+    WhoRoster {
+        names: Vec<String>,
+    },
+    DustFull {
+        is_seasonal: bool,
+        dust_type: realmhound_core::dust::DustType,
+    },
+    KickAlert {
+        name: String,
+    },
+    JoinRequestAlert {
+        name: String,
+    },
+}
+
+/// One authoritative Live Feed context update produced by the worker.
+///
+/// These used to travel as UI payloads, which let a stale queued event undo a
+/// newer snapshot. They now live in the snapshot and are replayed in order.
+#[derive(Debug, Clone)]
+pub enum FeedContextEvent {
+    /// Map transition with the realm context it was observed in.
+    Location {
+        display_name: String,
+        realm_name: String,
+        current_realm_score: i32,
+        max_realm_score: i32,
+        is_dungeon: bool,
+    },
+    /// Realm score tick.
+    RealmScore(i32),
+    /// Realm close detected; starts the castle countdown.
+    RealmClosed,
+    /// Crystal/Jailer/Totalia lifecycle update.
+    Discovery {
+        scope: u64,
+        event: super::realm_discovery::DiscoveryEvent,
+    },
+    /// Connected server display name (from the server-IP mapping).
+    ServerName(String),
+    /// `/server` reply: authoritative server + realm header override.
+    ServerCommand {
+        server: String,
+        realm: Option<String>,
+    },
+    /// Forge dust amounts changed.
+    DustUpdated {
+        amounts: realmhound_core::dust::DustAmounts,
+        is_seasonal: bool,
+    },
+    /// Seasonal status of the current character.
+    Seasonal(bool),
+    /// A portal object appeared on the current map (anchor for callout timing).
+    PortalSpawned { object_id: i32 },
+    /// The local player used a portal object.
+    PortalUsed { object_id: i32 },
+    /// A dungeon run's timer settled, keyed by map seed.
+    DungeonTimerFrozen { map_seed: i32, elapsed_ms: i64 },
+}
+
+/// A sequenced, timestamped context update.
+#[derive(Debug, Clone)]
+pub struct FeedContextEntry {
+    /// Monotonic id used by the UI to apply only new updates.
+    pub seq: u64,
+    /// When the worker observed it.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// The update.
+    pub event: FeedContextEvent,
+}
+
+/// Authoritative current feed context, kept outside the bounded event history.
+#[derive(Debug, Clone, Default)]
+pub struct FeedCurrent {
+    /// Connected server display name.
+    pub server_name: Option<String>,
+    /// Current map context from the last transition.
+    pub location: Option<FeedLocation>,
+    pub realm_name: Option<String>,
+    /// Latest score and maximum, retained as stale inside the same realm's dungeon.
+    pub realm_score: Option<(i32, i32)>,
+    pub is_score_stale: bool,
+    /// Whether the realm has closed.
+    pub realm_closed: bool,
+    pub castle_deadline: Option<std::time::Instant>,
+    /// Current character's seasonal flag.
+    pub is_seasonal: Option<bool>,
+    /// Latest dust amounts.
+    pub dust: Option<(realmhound_core::dust::DustAmounts, bool)>,
+    /// Current discovery lifecycle per object.
+    pub discoveries: Vec<DiscoveryState>,
+    pub discovery_scope: u64,
+    pub discovery_reset_at: Option<std::time::Instant>,
+    /// Origin flags for the next callout, so an evicted transition cannot
+    /// leave them stale.
+    pub map_is_realm: bool,
+    pub left_from_realm: bool,
+    pub map_is_hub: bool,
+    pub left_from_hub: bool,
+    pub hub_host_hint: Option<std::time::Instant>,
+    pub dungeon_origin: Option<DungeonOrigin>,
+    pub dungeon_entered_at: Option<std::time::Instant>,
+    pub left_from_dungeon: bool,
+}
+
+/// One tracked discovery object's durable state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryState {
+    pub scope: u64,
+    pub object_id: Option<i32>,
+    pub object_type: i32,
+    pub timestamp: chrono::DateTime<chrono::Local>,
+    pub present: bool,
+    pub defeated: bool,
+    pub packet_seen: bool,
+    pub absent_since: Option<std::time::Instant>,
+    pub last_message: Option<std::time::Instant>,
+    pub defeated_at: Option<std::time::Instant>,
+}
+
+/// Resolved inputs shared by automatic and displayed dungeon callouts.
+#[derive(Debug, Clone, Default)]
+pub struct DungeonOrigin {
+    pub map_seed: i32,
+    pub entered_at: Option<std::time::Instant>,
+    pub server_name: Option<String>,
+    pub realm_name: Option<String>,
+    pub realm_score_percent: Option<i32>,
+    pub entered_from_nexus: bool,
+    pub realm_closed: bool,
+    pub portal_anchor: Option<std::time::Instant>,
+}
+
+/// Map context carried by [`FeedCurrent`].
+#[derive(Debug, Clone)]
+pub struct FeedLocation {
+    pub display_name: String,
+    pub realm_name: String,
+    pub current_realm_score: i32,
+    pub max_realm_score: i32,
+    pub is_dungeon: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FeedContext {
+    /// Current state, always available even when the history is evicted.
+    pub current: FeedCurrent,
+    /// Updates oldest to newest (bounded).
+    pub events: Vec<FeedContextEntry>,
+    /// Highest sequence dropped from the front.
+    pub dropped_before_seq: u64,
+    /// Modifier sets learned per dungeon (single owner: the worker).
+    pub learned_mod_sets: std::collections::HashMap<String, Vec<Vec<String>>>,
+    /// Bumps on every append or learning change.
+    pub rev: u64,
+}
+
+/// A sequenced Live Feed event.
+#[derive(Debug, Clone)]
+pub struct LiveEventEntry {
+    /// Monotonic event id used by the UI to recover only missed entries.
+    pub seq: u64,
+    /// When the worker observed the event (the UI must not re-date it).
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// Event payload.
+    pub event: LiveEventView,
+}
+
+/// Bounded worker-owned window of recent recoverable Live Feed events.
+#[derive(Debug, Clone, Default)]
+pub struct LiveEventWindow {
+    /// Events oldest to newest (bounded).
+    pub events: Vec<LiveEventEntry>,
+    /// Highest sequence dropped from the front, so a gap is detectable.
+    pub dropped_before_seq: u64,
+    /// Bumps on every append.
+    pub rev: u64,
+}
+
+/// Worker-owned quest state: the last fetched quests plus local completion.
+#[derive(Debug, Clone)]
+pub struct QuestView {
+    /// Latest quest fetch response.
+    pub packet: QuestFetchResponsePacket,
+    /// Bumps on fetch and redeem completion.
+    pub rev: u64,
+}
+
+/// A released access token with its original capture time and account binding.
+/// Memory only: never persisted.
+#[derive(Debug, Clone)]
+pub struct TokenState {
+    /// The token value.
+    pub token: String,
+    /// When the token was captured from the client's HELLO.
+    pub captured_at: DateTime<Utc>,
+    /// The verified account the token belongs to.
+    pub account_id: AccountId,
+}
 
 /// The immutable identity of the one selected account for the process lifetime.
 ///
@@ -503,12 +801,10 @@ impl SelectedIdentity {
     }
 }
 
-/// Heavy model state published by the worker into a shared `Arc<Mutex<..>>`.
+/// Immutable model state published by the worker as an `Arc`.
 ///
-/// The worker overwrites the latest value (coalescing); the App reads it each
-/// frame and refreshes its owned copies + dependent panels only when the
-/// matching generation in `view` bumps. Cloning the heavy fields is gated on the
-/// generations so it happens only on actual change.
+/// Publishing builds the next snapshot outside the lock and swaps the pointer;
+/// unchanged domains reuse their `Arc`, so the lock only protects the pointer.
 #[derive(Debug, Clone)]
 pub struct ModelSnapshot {
     /// The immutable selected-account identity. Set once at construction and
@@ -518,9 +814,9 @@ pub struct ModelSnapshot {
     /// Coalesced scalar view state (connection fields + generations).
     pub view: ViewState,
     /// Latest account data (characters + vaults). Single source of truth.
-    pub account_data: AccountData,
+    pub account_data: Arc<AccountData>,
     /// Latest live vault data.
-    pub live_vault_data: LiveVaultData,
+    pub live_vault_data: Arc<LiveVaultData>,
     /// Currently playing character id.
     pub live_char_id: Option<i32>,
     /// Socket of the verified main game-client connection, if tracked. Lets the
@@ -528,7 +824,19 @@ pub struct ModelSnapshot {
     /// relaunch safeguard.
     pub main_connection: Option<realmhound_core::stream::ConnectionKey>,
     /// Latest seasonal mission tracklist snapshot.
-    pub mission_view: MissionView,
+    pub mission_view: Arc<MissionView>,
+    /// Released access token with capture time and account binding (memory only).
+    pub token: Option<Arc<TokenState>>,
+    /// Worker-owned party membership.
+    pub party: Arc<PartyView>,
+    /// Worker-owned current encounters.
+    pub encounters: Arc<EncounterSet>,
+    /// Worker-owned quest state.
+    pub quests: Option<Arc<QuestView>>,
+    /// Worker-owned recent recoverable Live Feed window.
+    pub live_events: Arc<LiveEventWindow>,
+    /// Worker-owned Live Feed context (location, score, discovery, anchors).
+    pub feed: Arc<FeedContext>,
 }
 
 impl ModelSnapshot {
@@ -543,11 +851,51 @@ impl ModelSnapshot {
         Self {
             selected_identity,
             view,
-            account_data,
-            live_vault_data,
+            account_data: Arc::new(account_data),
+            live_vault_data: Arc::new(live_vault_data),
             live_char_id,
             main_connection: None,
-            mission_view: MissionView::default(),
+            mission_view: Arc::new(MissionView::default()),
+            token: None,
+            party: Arc::new(PartyView::default()),
+            encounters: Arc::new(EncounterSet::default()),
+            quests: None,
+            live_events: Arc::new(LiveEventWindow::default()),
+            feed: Arc::new(FeedContext::default()),
+        }
+    }
+
+    /// Build the next immutable snapshot, reusing unchanged domain `Arc`s.
+    /// `None` means "unchanged", so the previous `Arc` is cloned cheaply.
+    pub fn next(
+        &self,
+        view: ViewState,
+        live_char_id: Option<i32>,
+        main_connection: Option<realmhound_core::stream::ConnectionKey>,
+        account_data: Option<Arc<AccountData>>,
+        live_vault_data: Option<Arc<LiveVaultData>>,
+        mission_view: Option<Arc<MissionView>>,
+        token: Option<Arc<TokenState>>,
+        party: Option<Arc<PartyView>>,
+        encounters: Option<Arc<EncounterSet>>,
+        quests: Option<Arc<QuestView>>,
+        live_events: Option<Arc<LiveEventWindow>>,
+        feed: Option<Arc<FeedContext>>,
+    ) -> Self {
+        Self {
+            selected_identity: self.selected_identity.clone(),
+            view,
+            account_data: account_data.unwrap_or_else(|| self.account_data.clone()),
+            live_vault_data: live_vault_data.unwrap_or_else(|| self.live_vault_data.clone()),
+            live_char_id,
+            main_connection,
+            mission_view: mission_view.unwrap_or_else(|| self.mission_view.clone()),
+            token: token.or_else(|| self.token.clone()),
+            party: party.unwrap_or_else(|| self.party.clone()),
+            encounters: encounters.unwrap_or_else(|| self.encounters.clone()),
+            quests: quests.or_else(|| self.quests.clone()),
+            live_events: live_events.unwrap_or_else(|| self.live_events.clone()),
+            feed: feed.unwrap_or_else(|| self.feed.clone()),
         }
     }
 }
@@ -559,6 +907,81 @@ mod tests {
 
     fn identity(account_id: &str) -> SelectedIdentity {
         SelectedIdentity::new(AccountKey::generate(), AccountId::new(account_id).unwrap())
+    }
+
+    #[test]
+    fn next_snapshot_reuses_unchanged_domains() {
+        let snap = ModelSnapshot::new(
+            identity("ACCT-SNAPSHOT"),
+            ViewState::new(None, None),
+            AccountData::new(),
+            LiveVaultData::default(),
+            None,
+        );
+        let old_account = snap.account_data.clone();
+        let old_vault = snap.live_vault_data.clone();
+
+        let mut changed = AccountData::new();
+        changed.generation = 7;
+        let next = snap.next(
+            ViewState::new(None, None),
+            None,
+            None,
+            Some(Arc::new(changed)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(Arc::ptr_eq(&next.live_vault_data, &old_vault));
+        assert!(Arc::ptr_eq(&next.mission_view, &snap.mission_view));
+        assert!(!Arc::ptr_eq(&next.account_data, &old_account));
+        assert_eq!(next.account_data.generation, 7);
+        assert_eq!(old_account.generation, 0, "old snapshot is immutable");
+
+        let token = Arc::new(TokenState {
+            token: "tok".to_string(),
+            captured_at: Utc::now(),
+            account_id: identity("ACCT-SNAPSHOT").account_id().clone(),
+        });
+        let with_token = next.next(
+            ViewState::new(None, None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(token.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(Arc::ptr_eq(with_token.token.as_ref().unwrap(), &token));
+        let reused = with_token.next(
+            ViewState::new(None, None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            Arc::ptr_eq(reused.token.as_ref().unwrap(), &token),
+            "None keeps the previous token"
+        );
     }
 
     #[test]

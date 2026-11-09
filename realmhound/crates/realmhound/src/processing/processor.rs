@@ -35,9 +35,32 @@ use crate::processing::mission_tracker::{MissionTracker, MissionView};
 use crate::sound::SoundType;
 
 use super::contract::{
-    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, UiPayload, UiUpdate, ViewState,
+    AccountOperationScope, AudioCommand, ControlMsg, DbCloseError, EncounterSet, EncounterView,
+    FeedContext, FeedContextEntry, FeedContextEvent, LiveEventEntry, LiveEventView,
+    LiveEventWindow, PartyMemberView, PartyView, QuestView, TokenState, UiPayload, UiUpdate,
+    ViewState,
 };
 use realmhound_core::account::{AccountId, AccountKey};
+
+/// Player appearance observed from world updates, kept across party refreshes.
+#[derive(Clone)]
+struct PartyAppearance {
+    class_id: i32,
+    skin_id: i32,
+    tex1: u32,
+    tex2: u32,
+    guild: Option<String>,
+}
+
+impl PartyAppearance {
+    fn apply(&self, member: &mut PartyMemberView) {
+        member.class_id = Some(self.class_id);
+        member.skin_id = self.skin_id;
+        member.tex1 = self.tex1;
+        member.tex2 = self.tex2;
+        member.guild = self.guild.clone();
+    }
+}
 
 /// Failure opening a selected profile's database writers during startup.
 ///
@@ -259,6 +282,14 @@ fn parse_area_unlock_json(message: &str) -> Option<AreaUnlockMsg> {
 
 /// The full packet-processing model. Owns the game session, combat engine,
 /// loot tracker, and account data, and emits [`UiUpdate`]s for the UI.
+/// Worker-side record of a recent boss callout for alert dedup.
+struct RecentBossCallAlert {
+    boss_id: i32,
+    boss_name: String,
+    realm: Option<String>,
+    at: std::time::Instant,
+}
+
 pub struct PacketProcessor {
     // --- Model (moved out of `RealmHoundApp`) ---
     reassembler: TcpReassembler,
@@ -363,6 +394,16 @@ pub struct PacketProcessor {
     keyper_realm: Option<String>,
     realm_discovery: RealmDiscovery,
 
+    /// Current realm key for worker-side alert dedup. Mirrors the Live Feed's
+    /// parsed realm name; `None` outside a realm.
+    current_realm: Option<String>,
+    /// Last resolved server name (for worker-side callout assembly).
+    server_name: Option<String>,
+
+    /// Recent boss-call alerts, for the same 5s per-realm suppression the Live
+    /// Feed applies to visible entries.
+    recent_boss_calls: Vec<RecentBossCallAlert>,
+
     /// Events buffered while the current connection is a tentative (unverified)
     /// main and a saved main account already exists. RotMG opens a fresh socket
     /// per map change, so the real main re-enters this tentative window every
@@ -395,6 +436,37 @@ pub struct PacketProcessor {
     last_account_gen: u64,
     /// Last applied generation for seasonal-mission completions.
     last_mission_gen: u64,
+    /// Released access token with original capture time and account binding.
+    token: Option<TokenState>,
+    /// Bumps when `token` changes.
+    token_gen: u64,
+    /// Authoritative party membership (watchlist/sightings stay UI-side).
+    party: PartyView,
+    /// Authoritative set of currently visible encounters.
+    encounters: EncounterSet,
+    /// Latest quest fetch, including local redeem completions.
+    quests: Option<realmhound_core::protocol::QuestFetchResponsePacket>,
+    /// Bumps on quest fetch and redeem completion.
+    quest_rev: u64,
+    /// Quest most recently redeemed, awaiting its result.
+    pending_redeem_quest_id: Option<String>,
+    /// Recent recoverable Live Feed events the UI can recover after missing a wake.
+    live_events: LiveEventWindow,
+    feed: FeedContext,
+    realm_close_pending: bool,
+    portal_anchor: Option<std::time::Instant>,
+    learned_mod_sets: std::collections::HashMap<String, Vec<Vec<String>>>,
+    last_learned_fp: Option<i32>,
+    portal_spawns: std::collections::HashMap<i32, std::time::Instant>,
+    known_appearance: std::collections::HashMap<String, PartyAppearance>,
+    /// Monotonic id for `live_events`.
+    live_event_seq: u64,
+    /// Number of events evicted from the bounded live-event window.
+    live_event_evictions: u64,
+    /// Whether the current map is a dungeon (for Oryx-lag warnings).
+    in_dungeon: bool,
+    /// Dust amounts used to detect full transitions.
+    dust_state: realmhound_core::dust::DustState,
 }
 
 /// The selected account a worker is bound to, used to validate async completions.
@@ -409,6 +481,7 @@ struct SelectedScope {
 struct PendingCredential {
     connection: ConnectionKey,
     token: String,
+    captured_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Boss-call taunts received within this window of entering a realm are treated
@@ -522,7 +595,29 @@ impl PacketProcessor {
             selected_scope: None,
             pending_credential: None,
             last_account_gen: 0,
+            current_realm: None,
+            server_name: None,
+            recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
+            token: None,
+            token_gen: 0,
+            party: PartyView::default(),
+            encounters: EncounterSet::default(),
+            quests: None,
+            quest_rev: 0,
+            pending_redeem_quest_id: None,
+            live_events: LiveEventWindow::default(),
+            live_event_seq: 0,
+            feed: FeedContext::default(),
+            realm_close_pending: false,
+            portal_anchor: None,
+            learned_mod_sets: std::collections::HashMap::new(),
+            last_learned_fp: None,
+            portal_spawns: std::collections::HashMap::new(),
+            known_appearance: std::collections::HashMap::new(),
+            live_event_evictions: 0,
+            in_dungeon: false,
+            dust_state: realmhound_core::dust::DustState::new(),
         }
     }
 
@@ -619,7 +714,29 @@ impl PacketProcessor {
             selected_scope: None,
             pending_credential: None,
             last_account_gen: 0,
+            current_realm: None,
+            server_name: None,
+            recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
+            token: None,
+            token_gen: 0,
+            party: PartyView::default(),
+            encounters: EncounterSet::default(),
+            quests: None,
+            quest_rev: 0,
+            pending_redeem_quest_id: None,
+            live_events: LiveEventWindow::default(),
+            live_event_seq: 0,
+            feed: FeedContext::default(),
+            realm_close_pending: false,
+            portal_anchor: None,
+            learned_mod_sets: std::collections::HashMap::new(),
+            last_learned_fp: None,
+            portal_spawns: std::collections::HashMap::new(),
+            known_appearance: std::collections::HashMap::new(),
+            live_event_evictions: 0,
+            in_dungeon: false,
+            dust_state: realmhound_core::dust::DustState::new(),
         })
     }
 
@@ -668,7 +785,29 @@ impl PacketProcessor {
             selected_scope: None,
             pending_credential: None,
             last_account_gen: 0,
+            current_realm: None,
+            server_name: None,
+            recent_boss_calls: Vec::new(),
             last_mission_gen: 0,
+            token: None,
+            token_gen: 0,
+            party: PartyView::default(),
+            encounters: EncounterSet::default(),
+            quests: None,
+            quest_rev: 0,
+            pending_redeem_quest_id: None,
+            live_events: LiveEventWindow::default(),
+            live_event_seq: 0,
+            feed: FeedContext::default(),
+            realm_close_pending: false,
+            portal_anchor: None,
+            learned_mod_sets: std::collections::HashMap::new(),
+            last_learned_fp: None,
+            portal_spawns: std::collections::HashMap::new(),
+            known_appearance: std::collections::HashMap::new(),
+            live_event_evictions: 0,
+            in_dungeon: false,
+            dust_state: realmhound_core::dust::DustState::new(),
         }
     }
 
@@ -727,6 +866,12 @@ impl PacketProcessor {
             capture_unsync_ms: metrics.total_unsync_duration_ms(),
             capture_queue_drops: metrics.queue_drops,
             mission_view_gen: self.mission_tracker.generation(),
+            token_gen: self.token_gen,
+            party_rev: self.party.rev,
+            encounter_rev: self.encounters.rev,
+            quest_rev: self.quest_rev,
+            live_event_rev: self.live_events.rev,
+            feed_rev: self.feed.rev,
             loot_boost_secs: self.session.player.loot_boost_secs,
             map_pauses_boost_timers: self.live_char_id.is_none()
                 || self.session.map.pauses_boost_timers(),
@@ -736,6 +881,472 @@ impl PacketProcessor {
     /// Build the current seasonal mission tracklist snapshot for the UI.
     pub fn mission_view(&self) -> MissionView {
         self.mission_tracker.build_view()
+    }
+
+    /// The released token with its capture time and account binding, if any.
+    pub fn token_state(&self) -> Option<TokenState> {
+        self.token.clone()
+    }
+
+    /// The authoritative party membership.
+    pub fn party_view(&self) -> PartyView {
+        self.party.clone()
+    }
+
+    /// Shared settings handle for worker-side side effects.
+    pub fn settings_handle(&self) -> Arc<std::sync::RwLock<Settings>> {
+        self.settings.clone()
+    }
+
+    fn bump_party(&mut self) {
+        self.party.rev = self.party.rev.wrapping_add(1);
+    }
+
+    fn set_party_members(
+        &mut self,
+        party_info: &realmhound_core::protocol::IncomingPartyMemberInfoPacket,
+    ) {
+        self.party.party_id = party_info.party_id;
+        self.party.party_name = party_info.description.clone();
+        self.party.max_size = party_info.max_size;
+        let members: Vec<PartyMemberView> = party_info
+            .party_players
+            .iter()
+            .map(|player| {
+                let mut member = PartyMemberView {
+                    player_id: player.id,
+                    name: player.name.clone(),
+                    is_leader: player.id == party_info.leader_id,
+                    class_id: None,
+                    skin_id: 0,
+                    tex1: 0,
+                    tex2: 0,
+                    guild: None,
+                };
+                if let Some(appearance) = self.known_appearance.get(&player.name) {
+                    appearance.apply(&mut member);
+                }
+                member
+            })
+            .collect();
+        self.party.members = members;
+        self.bump_party();
+    }
+
+    fn add_party_member(&mut self, player_id: i16, name: &str) {
+        if self.party.members.iter().any(|member| member.name == name) {
+            return;
+        }
+        let mut member = PartyMemberView {
+            player_id,
+            name: name.to_string(),
+            is_leader: false,
+            class_id: None,
+            skin_id: 0,
+            tex1: 0,
+            tex2: 0,
+            guild: None,
+        };
+        if let Some(appearance) = self.known_appearance.get(name) {
+            appearance.apply(&mut member);
+        }
+        self.party.members.push(member);
+        self.bump_party();
+    }
+
+    fn remove_party_member_by_id(&mut self, player_id: i16) {
+        let before = self.party.members.len();
+        self.party
+            .members
+            .retain(|member| member.player_id != player_id);
+        if self.party.members.len() != before {
+            self.bump_party();
+        }
+    }
+
+    fn remove_party_member_by_name(&mut self, name: &str) {
+        let before = self.party.members.len();
+        self.party.members.retain(|member| member.name != name);
+        if self.party.members.len() != before {
+            self.bump_party();
+        }
+    }
+
+    fn clear_party(&mut self) {
+        if !self.party.members.is_empty()
+            || self.party.is_local_leader
+            || self.party.local_player_name.is_some()
+        {
+            self.party.members.clear();
+            self.party.party_id = 0;
+            self.party.party_name.clear();
+            self.party.max_size = 0;
+            self.party.is_local_leader = false;
+            self.party.local_player_name = None;
+            self.bump_party();
+        }
+    }
+
+    /// The authoritative current encounter set.
+    pub fn encounter_set(&self) -> EncounterSet {
+        self.encounters.clone()
+    }
+
+    /// The latest quest state, if a fetch has been seen.
+    pub fn quest_view(&self) -> Option<QuestView> {
+        self.quests.as_ref().map(|packet| QuestView {
+            packet: packet.clone(),
+            rev: self.quest_rev,
+        })
+    }
+
+    /// Recent recoverable Live Feed events for UI recovery.
+    pub fn live_event_window(&self) -> LiveEventWindow {
+        self.live_events.clone()
+    }
+
+    /// Cumulative evictions from the bounded live-event window.
+    pub fn live_event_evictions(&self) -> u64 {
+        self.live_event_evictions
+    }
+
+    /// Record an authoritative Live Feed context update.
+    pub(crate) fn record_feed_event(&mut self, event: FeedContextEvent) {
+        let now = std::time::Instant::now();
+        let portal_anchor = if matches!(&event, FeedContextEvent::Location { .. }) {
+            self.portal_anchor.take()
+        } else {
+            None
+        };
+        let current = &mut self.feed.current;
+        let mut origin_updated = false;
+        match &event {
+            FeedContextEvent::ServerName(name) => {
+                current.server_name = Some(name.clone());
+                current.hub_host_hint = Some(now);
+                if !current.left_from_dungeon
+                    && current.dungeon_entered_at.is_some_and(|at| {
+                        now.saturating_duration_since(at)
+                            < crate::panels::live_feed::NEXUS_ORIGIN_WINDOW
+                    })
+                {
+                    if let Some(origin) = &mut current.dungeon_origin {
+                        origin.server_name = Some(name.clone());
+                        origin.entered_from_nexus = true;
+                        origin_updated = true;
+                    }
+                }
+            }
+            FeedContextEvent::ServerCommand { server, realm } => {
+                current.server_name = Some(server.clone());
+                if realm.is_none() || current.realm_name != *realm {
+                    current.realm_score = None;
+                    current.is_score_stale = false;
+                    current.realm_closed = false;
+                    current.castle_deadline = None;
+                }
+                current.realm_name = realm.clone();
+            }
+            FeedContextEvent::Location {
+                display_name,
+                realm_name,
+                current_realm_score,
+                max_realm_score,
+                is_dungeon,
+            } => {
+                current.left_from_realm = current.map_is_realm;
+                current.left_from_hub = current.map_is_hub;
+                current.left_from_dungeon = current
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| location.is_dungeon);
+                current.map_is_realm = *max_realm_score > 0;
+                current.map_is_hub = crate::panels::live_feed::is_hub_map(display_name);
+                let parsed_realm = realm_name
+                    .split_once('.')
+                    .map(|(_, name)| name)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string);
+                let same_realm = parsed_realm.is_some() && current.realm_name == parsed_realm;
+                if current.map_is_realm {
+                    if !same_realm {
+                        current.realm_closed = false;
+                        current.castle_deadline = None;
+                    }
+                    current.realm_score = Some((*current_realm_score, *max_realm_score));
+                    current.is_score_stale = false;
+                } else if same_realm && current.realm_score.is_some() {
+                    current.is_score_stale = true;
+                } else {
+                    current.realm_score = None;
+                    current.is_score_stale = false;
+                    current.realm_closed = false;
+                    current.castle_deadline = None;
+                }
+                current.realm_name = parsed_realm;
+                if current.map_is_hub {
+                    current.hub_host_hint = None;
+                }
+                current.location = Some(super::contract::FeedLocation {
+                    display_name: display_name.clone(),
+                    realm_name: realm_name.clone(),
+                    current_realm_score: *current_realm_score,
+                    max_realm_score: *max_realm_score,
+                    is_dungeon: *is_dungeon,
+                });
+                current.dungeon_origin = is_dungeon.then(|| {
+                    let anchor = portal_anchor.filter(|at| {
+                        now.saturating_duration_since(*at)
+                            < crate::panels::live_feed::DUNGEON_JOIN_WINDOW
+                    });
+                    let hub_hosted = current.hub_host_hint.take().is_some_and(|at| {
+                        now.saturating_duration_since(at)
+                            < crate::panels::live_feed::NEXUS_ORIGIN_WINDOW
+                    });
+                    current.dungeon_entered_at = is_dungeon.then_some(now);
+                    super::contract::DungeonOrigin {
+                        map_seed: 0,
+                        entered_at: Some(now),
+                        server_name: current.server_name.clone(),
+                        realm_name: current.realm_name.clone(),
+                        realm_score_percent: (anchor.is_some() && current.left_from_realm)
+                            .then(|| {
+                                current.realm_score.map(|(score, max)| {
+                                    ((i64::from(score) * 100) / i64::from(max.max(1))).clamp(0, 100)
+                                        as i32
+                                })
+                            })
+                            .flatten(),
+                        entered_from_nexus: current.left_from_hub
+                            || hub_hosted
+                            || crate::panels::live_feed::realm_field_is_hub(realm_name),
+                        realm_closed: current.realm_closed,
+                        portal_anchor: anchor,
+                    }
+                });
+            }
+            FeedContextEvent::RealmScore(score) => {
+                if let Some((_, max)) = current.realm_score {
+                    current.realm_score = Some((*score, max));
+                    current.is_score_stale = false;
+                }
+            }
+            FeedContextEvent::RealmClosed => {
+                current.realm_closed = true;
+                if let Some((_, max)) = current.realm_score {
+                    current.realm_score = Some((max, max));
+                    current.is_score_stale = false;
+                }
+                current
+                    .castle_deadline
+                    .get_or_insert(now + crate::panels::live_feed::CASTLE_TELEPORT_WINDOW);
+            }
+            FeedContextEvent::DustUpdated {
+                amounts,
+                is_seasonal,
+            } => {
+                current.dust = Some((amounts.clone(), *is_seasonal));
+            }
+            FeedContextEvent::Seasonal(is_seasonal) => {
+                current.is_seasonal = Some(*is_seasonal);
+            }
+            FeedContextEvent::Discovery { .. }
+            | FeedContextEvent::PortalSpawned { .. }
+            | FeedContextEvent::PortalUsed { .. }
+            | FeedContextEvent::DungeonTimerFrozen { .. } => {}
+        }
+        // One monotonic sequence for both streams; callers merge by it.
+        self.live_event_seq = self.live_event_seq.wrapping_add(1);
+        self.feed.events.push(FeedContextEntry {
+            seq: self.live_event_seq,
+            at: chrono::Utc::now(),
+            event,
+        });
+        self.feed.rev = self.feed.rev.wrapping_add(1);
+        const WINDOW: usize = 500;
+        while self.feed.events.len() > WINDOW {
+            if let Some(dropped) = self.feed.events.first() {
+                self.feed.dropped_before_seq = dropped.seq;
+            }
+            self.feed.events.remove(0);
+        }
+        if origin_updated {
+            let origin = self.feed.current.dungeon_origin.clone();
+            let callout = self.live_events.events.iter_mut().rev().find_map(|entry| {
+                if let LiveEventView::Dungeon {
+                    display_name,
+                    modifiers,
+                    grade,
+                    origin: stored,
+                    ..
+                } = &mut entry.event
+                {
+                    *stored = origin.clone().unwrap_or_default();
+                    Some(UiPayload::DungeonCallout {
+                        display_name: display_name.clone(),
+                        modifiers: modifiers.clone(),
+                        grade: grade.clone(),
+                        origin: origin.clone(),
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some(callout) = callout {
+                self.live_events.rev = self.live_events.rev.wrapping_add(1);
+                self.emit(callout);
+            }
+        }
+    }
+
+    /// The worker-owned Live Feed context.
+    pub fn feed_context(&self) -> FeedContext {
+        let mut feed = self.feed.clone();
+        feed.learned_mod_sets = self.learned_mod_sets.clone();
+        feed.current.discovery_scope = self.realm_discovery.scope();
+        feed.current.discovery_reset_at = self.realm_discovery.reset_at();
+        feed.current.discoveries = self.realm_discovery.state();
+        feed
+    }
+
+    /// Take the "realm just closed" edge (clears the automatic callout).
+    pub fn take_realm_close(&mut self) -> bool {
+        std::mem::take(&mut self.realm_close_pending)
+    }
+
+    /// Copy world-update appearance onto the authoritative party members, so the
+    /// party panel never needs queued events for their skins or guild.
+    fn observe_party_appearance(
+        &mut self,
+        update: &realmhound_core::protocol::packets::UpdatePacket,
+    ) {
+        use realmhound_core::loot::class_ids;
+        use realmhound_core::protocol::data::StatType;
+
+        let mut changed = false;
+        for obj in &update.new_objects {
+            let class_id = obj.object_type as i32;
+            if !class_ids::is_player_class(class_id) {
+                continue;
+            }
+            let stat = |kind: StatType| obj.status.stats.iter().find(|s| s.stat_type == kind);
+            let Some(name) = stat(StatType::Name).and_then(|s| s.string_stat_value.clone()) else {
+                continue;
+            };
+            let appearance = PartyAppearance {
+                class_id,
+                skin_id: stat(StatType::SkinId).map(|s| s.stat_value).unwrap_or(0),
+                tex1: stat(StatType::Texture1)
+                    .map(|s| s.stat_value as u32)
+                    .unwrap_or(0),
+                tex2: stat(StatType::Texture2)
+                    .map(|s| s.stat_value as u32)
+                    .unwrap_or(0),
+                guild: stat(StatType::GuildName)
+                    .and_then(|s| s.string_stat_value.clone())
+                    .filter(|g| !g.is_empty()),
+            };
+            // Keep sightings even before they join, so a party list refresh can
+            // hydrate them.
+            self.known_appearance
+                .insert(name.clone(), appearance.clone());
+            let Some(member) = self.party.members.iter_mut().find(|m| m.name == name) else {
+                continue;
+            };
+            let mut next = member.clone();
+            appearance.apply(&mut next);
+            if *member != next {
+                *member = next;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump_party();
+        }
+    }
+
+    /// Record a dungeon entry's modifier set for learned event mods.
+    pub(crate) fn remember_dungeon_mods(&mut self, dungeon: &str, tokens: &[String]) {
+        crate::panels::live_feed::remember_dungeon_mods(
+            &mut self.learned_mod_sets,
+            dungeon,
+            tokens,
+        );
+        self.feed.rev = self.feed.rev.wrapping_add(1);
+    }
+
+    /// Origin inputs shared with the displayed dungeon callout:
+    /// `(left_from_realm, left_from_hub, realm_score_percent)`.
+    #[cfg(test)]
+    pub fn callout_origin(&self) -> (bool, bool, Option<i32>) {
+        let current = &self.feed.current;
+        let score = current.realm_score.map(|(score, max)| {
+            ((i64::from(score) * 100) / i64::from(max.max(1))).clamp(0, 100) as i32
+        });
+        (current.left_from_realm, current.left_from_hub, score)
+    }
+
+    /// Event-added modifier tokens learned for `dungeon`.
+    pub fn learned_event_mods(&self, dungeon: &str, enabled: bool, runs: usize) -> Vec<String> {
+        crate::panels::live_feed::select_learned_mods(
+            enabled,
+            runs,
+            &self.learned_mod_sets,
+            dungeon,
+        )
+    }
+
+    pub(crate) fn record_live_event(&mut self, event: LiveEventView) {
+        self.live_event_seq = self.live_event_seq.wrapping_add(1);
+        self.live_events.events.push(LiveEventEntry {
+            seq: self.live_event_seq,
+            at: chrono::Utc::now(),
+            event,
+        });
+        self.live_events.rev = self.live_events.rev.wrapping_add(1);
+        // Bounded recovery window; `dropped_before_seq` makes the gap visible.
+        const WINDOW: usize = 500;
+        while self.live_events.events.len() > WINDOW {
+            if let Some(dropped) = self.live_events.events.first() {
+                self.live_events.dropped_before_seq = dropped.seq;
+            }
+            self.live_events.events.remove(0);
+            self.live_event_evictions = self.live_event_evictions.wrapping_add(1);
+        }
+    }
+
+    fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
+        if self
+            .encounters
+            .encounters
+            .iter()
+            .any(|encounter| encounter.object_id == object_id)
+        {
+            return;
+        }
+        self.encounters.encounters.push(EncounterView {
+            object_id,
+            object_type,
+            name,
+        });
+        self.encounters.rev = self.encounters.rev.wrapping_add(1);
+    }
+
+    fn remove_encounter(&mut self, object_id: i32) {
+        let before = self.encounters.encounters.len();
+        self.encounters
+            .encounters
+            .retain(|encounter| encounter.object_id != object_id);
+        if self.encounters.encounters.len() != before {
+            self.encounters.rev = self.encounters.rev.wrapping_add(1);
+        }
+    }
+
+    fn clear_encounters(&mut self) {
+        if !self.encounters.encounters.is_empty() {
+            self.encounters.encounters.clear();
+            self.encounters.rev = self.encounters.rev.wrapping_add(1);
+        }
     }
 
     /// Advance elapsed mission cooldowns before publishing or applying packets.
@@ -774,6 +1385,22 @@ impl PacketProcessor {
         );
         if bound_to_main {
             if let Some(cred) = self.pending_credential.take() {
+                if let Some(scope) = &self.selected_scope {
+                    // A re-captured identical token keeps its original capture
+                    // time and generation: a map change must not make the token
+                    // look freshly issued.
+                    let unchanged = self.token.as_ref().is_some_and(|t| {
+                        t.token == cred.token && &t.account_id == &scope.account_id
+                    });
+                    if !unchanged {
+                        self.token = Some(TokenState {
+                            token: cred.token.clone(),
+                            captured_at: cred.captured_at,
+                            account_id: scope.account_id.clone(),
+                        });
+                        self.token_gen = self.token_gen.wrapping_add(1);
+                    }
+                }
                 self.emit(UiPayload::AccessTokenCaptured(cred.token));
             }
         }
@@ -816,8 +1443,10 @@ impl PacketProcessor {
 
     /// Reset session + reassembler state for a fresh capture.
     pub fn on_capture_start(&mut self) {
+        self.current_realm = None;
+        self.in_dungeon = false;
         let reset = self.realm_discovery.reset(false);
-        self.emit(UiPayload::RealmDiscovery(reset));
+        self.emit_realm_discovery(reset);
         self.session.reset_for_capture();
         self.reassembler.clear();
         self.start_recorder_if_enabled();
@@ -825,8 +1454,92 @@ impl PacketProcessor {
 
     /// Forget realm instances when capture stops.
     pub fn on_capture_stop(&mut self) {
+        self.current_realm = None;
+        self.in_dungeon = false;
         let reset = self.realm_discovery.reset(false);
-        self.emit(UiPayload::RealmDiscovery(reset));
+        self.emit_realm_discovery(reset);
+    }
+
+    /// Emit a realm discovery, dispatching its alert sound first so the alert
+    /// does not depend on a UI frame.
+    fn emit_realm_discovery(&mut self, update: super::realm_discovery::DiscoveryEvent) {
+        use super::realm_discovery::{DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE};
+        let trigger = match &update {
+            DiscoveryEvent::Discovered {
+                object_id,
+                object_type: JAILER_TYPE,
+                notify: true,
+                ..
+            } => Some((JAILER_TYPE, "Spectral Jailer", Some(*object_id))),
+            DiscoveryEvent::Discovered {
+                object_type: CRYSTAL_TYPE,
+                notify: true,
+                ..
+            }
+            | DiscoveryEvent::CrystalMessage { notify: true, .. } => {
+                Some((CRYSTAL_TYPE, "Mysterious Crystal", None))
+            }
+            DiscoveryEvent::Discovered {
+                object_type: TOTALIA_TYPE,
+                notify: true,
+                ..
+            } => Some((TOTALIA_TYPE, "Totalia the Malevolent", None)),
+            _ => None,
+        };
+        if let Some((boss_id, name, instance_id)) = trigger {
+            self.play_realm_event_sound(boss_id, name, instance_id);
+        }
+        self.record_feed_event(FeedContextEvent::Discovery {
+            scope: self.realm_discovery.scope(),
+            event: update,
+        });
+    }
+
+    /// Play a realm-event sound for a boss call when its section is enabled.
+    fn play_realm_event_sound(&mut self, boss_id: i32, text: &str, instance_id: Option<i32>) {
+        let events = match self.settings.read() {
+            Ok(settings) => settings.sound.realm_events.clone(),
+            Err(_) => return,
+        };
+        use realmhound_core::settings::EventMode;
+        let any_enabled = events.veteran.mode != EventMode::None
+            || events.adept.mode != EventMode::None
+            || events.seasonal.mode != EventMode::None
+            || events.alien.enabled;
+        if !any_enabled {
+            return;
+        }
+        let sets = crate::realm_event_sound::EventSets::from_assets();
+        if let Some(trigger) = crate::realm_event_sound::resolve(&events, boss_id, text, &sets) {
+            self.emit(UiPayload::Audio(AudioCommand::PlayEvent {
+                sound: trigger.sound,
+                custom_key: trigger.custom_key,
+                instance_id,
+                volume: trigger.volume,
+            }));
+        }
+    }
+
+    /// Apply the Live Feed's 5s per-realm boss-call suppression on the worker.
+    fn should_play_boss_call(&mut self, boss_id: i32, boss_name: &str) -> bool {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        self.recent_boss_calls
+            .retain(|call| now.duration_since(call.at) <= WINDOW);
+        if self.recent_boss_calls.iter().any(|call| {
+            call.boss_id == boss_id
+                && call.boss_name == boss_name
+                && call.realm == self.current_realm
+        }) {
+            return false;
+        }
+        self.recent_boss_calls.push(RecentBossCallAlert {
+            boss_id,
+            boss_name: boss_name.to_string(),
+            realm: self.current_realm.clone(),
+            at: now,
+        });
+        true
     }
 
     /// Start a raw-packet recorder when `REALMHOUND_RECORD` is set. The value may
@@ -1086,28 +1799,30 @@ impl PacketProcessor {
             ControlMsg::StartCapture(_)
             | ControlMsg::StopCapture
             | ControlMsg::Shutdown
+            | ControlMsg::SetWatchlist(_)
+            | ControlMsg::SetLiveDemand(_)
             | ControlMsg::StartHistoricalMaintenance => {}
         }
     }
 
     /// Periodic save: persists `account_data` if dirty. Returns whether a save
-    /// was attempted (so the caller can reset its timer).
-    pub fn save_account_if_dirty(&mut self) -> bool {
-        if self.account_data.is_dirty() {
-            #[cfg(feature = "latency-diagnostics")]
-            let started = std::time::Instant::now();
-            if let Err(e) = self
-                .account_data
-                .save_and_clear_dirty(&self.account_repository)
-            {
-                tracing::warn!("[ACCOUNT] Periodic save failed: {}", e);
-            }
-            #[cfg(feature = "latency-diagnostics")]
-            self.log_account_storage_latency("account_periodic_save", started.elapsed());
-            true
-        } else {
-            false
+    /// was attempted (so the caller can reset its timer) and surfaces the error
+    /// so the caller can record it in health; the save itself is unchanged.
+    pub fn save_account_if_dirty(&mut self) -> Result<bool, String> {
+        if !self.account_data.is_dirty() {
+            return Ok(false);
         }
+        #[cfg(feature = "latency-diagnostics")]
+        let started = std::time::Instant::now();
+        let result = self
+            .account_data
+            .save_and_clear_dirty(&self.account_repository);
+        if let Err(e) = &result {
+            tracing::warn!("[ACCOUNT] Periodic save failed: {}", e);
+        }
+        #[cfg(feature = "latency-diagnostics")]
+        self.log_account_storage_latency("account_periodic_save", started.elapsed());
+        result.map(|()| true).map_err(|e| e.to_string())
     }
 
     /// Save `account_data` on exit, surfacing the error so a relaunch can abort.
@@ -1517,6 +2232,18 @@ impl PacketProcessor {
         !self.updates.is_empty()
     }
 
+    /// Take loot insert failures since the last call for health reporting.
+    pub fn drain_loot_persistence_errors(&mut self) -> Vec<String> {
+        self.loot_tracker.drain_persistence_errors()
+    }
+
+    /// Test-only: queue a chat update so worker-side persistence can be tested
+    /// without crafting an encrypted chat packet.
+    #[cfg(test)]
+    pub(crate) fn queue_chat_for_test(&mut self, message: ChatMessage) {
+        self.emit(UiPayload::Chat(message));
+    }
+
     pub fn historical_maintenance_batch(&mut self) -> Result<(bool, bool), String> {
         if !self
             .combat
@@ -1615,7 +2342,8 @@ impl PacketProcessor {
                         self.session.connection.server_ip = Some(new_ip);
                         if let Some(name) = ip_to_server_name(new_ip) {
                             tracing::info!("[SERVER] Connected to {} ({})", name, new_ip);
-                            self.emit(UiPayload::SetServerName(name.to_string()));
+                            self.server_name = Some(name.to_string());
+                            self.record_feed_event(FeedContextEvent::ServerName(name.to_string()));
                         } else {
                             tracing::info!("[SERVER] Unknown server IP: {} (int={}) - not in the server-name table", new_ip, u32::from_be_bytes(new_ip.octets()) as i32);
                         }
@@ -1650,7 +2378,7 @@ impl PacketProcessor {
                         self.forward_dungeon_freeze();
                         self.realm_entered_at = None;
                         let reset = self.realm_discovery.reset(false);
-                        self.emit(UiPayload::RealmDiscovery(reset));
+                        self.emit_realm_discovery(reset);
                         self.pending_events.clear();
                         self.pending_credential = None;
                     }
@@ -1701,6 +2429,7 @@ impl PacketProcessor {
                                         self.pending_credential = Some(PendingCredential {
                                             connection: conn_key,
                                             token: hello.access_token.clone(),
+                                            captured_at: chrono::Utc::now(),
                                         });
                                     }
                                     if self.session.connection.is_account_verified() {
@@ -1722,6 +2451,7 @@ impl PacketProcessor {
                                         self.pending_credential = Some(PendingCredential {
                                             connection: conn_key,
                                             token: hello.access_token.clone(),
+                                            captured_at: chrono::Utc::now(),
                                         });
                                         if self.session.connection.is_account_verified() {
                                             self.release_pending_credential();
@@ -1869,6 +2599,11 @@ impl PacketProcessor {
             return;
         }
         let callout = Self::monument_callout(&eligible);
+        self.record_live_event(LiveEventView::AreaUnlock {
+            title: "Sanctuary runes".to_string(),
+            contributions: contributions.clone(),
+            callout: callout.clone(),
+        });
         self.emit(UiPayload::AreaUnlock {
             title: "Sanctuary runes".to_string(),
             contributions,
@@ -2087,6 +2822,11 @@ impl PacketProcessor {
                     } else {
                         format!("Thanks {} for the {}!", popper, short)
                     };
+                    self.record_live_event(LiveEventView::AreaUnlock {
+                        title: title.to_string(),
+                        contributions: vec![(item_id, popper.clone())],
+                        callout: callout.clone(),
+                    });
                     self.emit(UiPayload::AreaUnlock {
                         title: title.to_string(),
                         contributions: vec![(item_id, popper)],
@@ -2150,7 +2890,7 @@ impl PacketProcessor {
                 // A rejected alt/mule may have tentatively populated the party
                 // panel before its identity was known; wipe it so a mule's party
                 // never lingers on the main's UI.
-                self.emit(UiPayload::PartyCleared);
+                self.clear_party();
             }
             AccountVerifyResult::Verified => {
                 tracing::info!(
@@ -2232,25 +2972,62 @@ impl PacketProcessor {
         // existing `handle_event`. Chat and characters are resolved here.
         self.emit(UiPayload::Broadcast(event.clone()));
         for update in self.realm_discovery.on_event(&event) {
-            self.emit(UiPayload::RealmDiscovery(update));
+            self.emit_realm_discovery(update);
         }
 
         // --- Phase 2: model-side orchestration ---
         match event {
-            GameEvent::QuestsReceived(_)
-            | GameEvent::RealmScoreChanged { .. }
-            | GameEvent::PartyMemberJoined(_)
-            | GameEvent::PartyJoinRequestResponse(_)
-            | GameEvent::PartyActionReceived { .. }
-            | GameEvent::PortalUsed { .. }
-            | GameEvent::QuestRedeemAttempted { .. }
-            | GameEvent::QuestRedeemResult { .. }
-            | GameEvent::ReconnectReceived { .. } => {}
+            GameEvent::RealmScoreChanged { score } => {
+                self.record_feed_event(FeedContextEvent::RealmScore(score));
+            }
+            GameEvent::PortalUsed { object_id } => {
+                self.record_feed_event(FeedContextEvent::PortalUsed { object_id });
+                // Anchor to the portal's spawn, matching the displayed callout.
+                // Unknown spawn stays unknown: never pretend `now` is the anchor.
+                self.portal_anchor = self.portal_spawns.get(&object_id).copied();
+            }
+            GameEvent::PartyJoinRequestResponse(_) | GameEvent::ReconnectReceived { .. } => {}
+
+            GameEvent::QuestsReceived(ref response) => {
+                self.quests = Some(response.clone());
+                self.pending_redeem_quest_id = None;
+                self.quest_rev = self.quest_rev.wrapping_add(1);
+            }
+            GameEvent::QuestRedeemAttempted { ref quest_id } => {
+                self.pending_redeem_quest_id = Some(quest_id.clone());
+            }
+            GameEvent::QuestRedeemResult { ok } => {
+                if ok {
+                    if let Some(quest_id) = self.pending_redeem_quest_id.take() {
+                        if let Some(quest) = self
+                            .quests
+                            .as_mut()
+                            .and_then(|packet| packet.quests.iter_mut().find(|q| q.id == quest_id))
+                        {
+                            quest.completed = true;
+                            self.quest_rev = self.quest_rev.wrapping_add(1);
+                        }
+                    }
+                }
+            }
 
             GameEvent::ActivePetChanged { instance_id } => {
                 self.apply_active_pet(instance_id);
             }
+            GameEvent::PartyMemberJoined(ref member) => {
+                self.add_party_member(member.player_id, &member.name);
+            }
+            GameEvent::PartyActionReceived {
+                player_id,
+                action_id,
+            } => {
+                // action 2 = Kicked, 6 = LeftParty
+                if action_id == 2 || action_id == 6 {
+                    self.remove_party_member_by_id(player_id);
+                }
+            }
             GameEvent::PartyListReceived(ref party_info) => {
+                self.set_party_members(party_info);
                 let local_name = self.session.connection.detected_account_name.clone();
                 let leader_name = party_info
                     .party_players
@@ -2261,8 +3038,9 @@ impl PacketProcessor {
                     (Some(me), Some(leader)) => me.eq_ignore_ascii_case(leader),
                     _ => false,
                 };
-                self.emit(UiPayload::PartyLocalLeaderStatus(is_leader));
-                self.emit(UiPayload::PartyLocalPlayerName(local_name));
+                self.party.is_local_leader = is_leader;
+                self.party.local_player_name = local_name.clone();
+                self.bump_party();
             }
 
             // Character cache events (previously handled by CharactersPanel).
@@ -2318,6 +3096,7 @@ impl PacketProcessor {
                 char_id,
                 is_seasonal,
             } => {
+                self.record_feed_event(FeedContextEvent::Seasonal(is_seasonal));
                 self.account_data
                     .characters
                     .update_seasonal_status(char_id, is_seasonal);
@@ -2399,6 +3178,23 @@ impl PacketProcessor {
                     is_seasonal,
                     &self.account_repository,
                 );
+                self.record_feed_event(FeedContextEvent::DustUpdated {
+                    amounts: amounts.clone(),
+                    is_seasonal,
+                });
+                let previous = self.dust_state.get(is_seasonal).cloned();
+                self.dust_state.update(amounts.clone(), is_seasonal);
+                if let Some(previous) = previous {
+                    let previously_full = previous.full_types();
+                    for dust_type in amounts.full_types() {
+                        if !previously_full.contains(&dust_type) {
+                            self.record_live_event(LiveEventView::DustFull {
+                                is_seasonal,
+                                dust_type,
+                            });
+                        }
+                    }
+                }
             }
 
             // Account-level Widget Bar stats (stars, fame, gold, forge fire, materials).
@@ -2544,12 +3340,67 @@ impl PacketProcessor {
                 ref realm_name,
                 fp,
                 is_dungeon,
+                current_realm_score,
                 max_realm_score,
                 ref dungeon_modifiers,
                 ref dungeon_grade,
                 ..
             } => {
-                // Location update + encounter clearing handled by LiveFeedPanel (broadcast).
+                // The UI must see the same transition context the worker saw,
+                // even if it paints much later.
+                let previous_origin = (is_dungeon && self.last_learned_fp == Some(fp))
+                    .then(|| self.feed.current.dungeon_origin.clone())
+                    .flatten();
+                self.record_feed_event(FeedContextEvent::Location {
+                    display_name: display_name.clone(),
+                    realm_name: realm_name.clone(),
+                    current_realm_score,
+                    max_realm_score,
+                    is_dungeon,
+                });
+                if let Some(origin) = previous_origin {
+                    self.feed.current.dungeon_origin = Some(origin);
+                }
+                if let Some(origin) = &mut self.feed.current.dungeon_origin {
+                    origin.map_seed = fp;
+                }
+                let origin = self.feed.current.dungeon_origin.clone();
+                self.emit(UiPayload::DungeonCallout {
+                    display_name: display_name.clone(),
+                    modifiers: dungeon_modifiers.clone(),
+                    grade: dungeon_grade.clone(),
+                    origin: origin.clone(),
+                });
+                // The Live Feed clears its own location state; the worker clears
+                // its authoritative encounter set here.
+                self.clear_encounters();
+                if !is_dungeon {
+                    // Same ordered window as the entry, so a dungeon entered and
+                    // left between paints cannot reappear as joinable.
+                    self.record_live_event(LiveEventView::DungeonLeft);
+                    self.portal_anchor = None;
+                    self.portal_spawns.clear();
+                    self.last_learned_fp = None;
+                }
+                // Portal observations belong to the map they were seen on.
+                self.portal_spawns.clear();
+                self.in_dungeon = is_dungeon;
+                if is_dungeon {
+                    let key = crate::panels::live_feed::format_dungeon_name(display_name);
+                    // Repeated MapInfo for the same instance must not count as a
+                    // new run for learned event modifiers.
+                    if self.last_learned_fp != Some(fp) {
+                        self.last_learned_fp = Some(fp);
+                        self.remember_dungeon_mods(&key, dungeon_modifiers);
+                    }
+                    self.record_live_event(LiveEventView::Dungeon {
+                        fp,
+                        display_name: display_name.clone(),
+                        modifiers: dungeon_modifiers.clone(),
+                        grade: dungeon_grade.clone(),
+                        origin: origin.unwrap_or_default(),
+                    });
+                }
                 // Remaining: notify loot tracker of new map.
                 self.loot_tracker.on_map_info(display_name, fp);
                 self.combat
@@ -2588,6 +3439,11 @@ impl PacketProcessor {
                         self.keyper_towers_announced = false;
                     }
                 }
+                // Mirror the Live Feed's realm key ("NexusPortal.Mesa" -> "Mesa")
+                // so worker-side alert dedup matches the visible entry scope.
+                self.current_realm = realm_name
+                    .split_once('.')
+                    .map(|(_, realm)| realm.to_string());
 
                 // Optional alerts: play a dedicated sound once when entering a
                 // dungeon whose modifier set drives a special callout outline.
@@ -2667,27 +3523,38 @@ impl PacketProcessor {
                 }
             }
             GameEvent::TextReceived(ref text) => {
+                if let Some((server, realm)) =
+                    crate::panels::live_feed::parse_server_command_packet(text)
+                {
+                    self.record_feed_event(FeedContextEvent::ServerCommand { server, realm });
+                }
                 let is_crystal =
                     text.recipient.is_empty() && text.name.contains("Mysterious Crystal");
                 if is_crystal {
                     if let Some(update) = self.realm_discovery.crystal_message(text.object_id) {
-                        self.emit(UiPayload::RealmDiscovery(update));
+                        self.emit_realm_discovery(update);
                     }
                 }
                 // Detect realm-close / lag-warning before from_text_packet filters them out.
                 if text.name.contains("Oryx the Mad God") {
                     let raw = &text.text;
                     if raw.contains("s.oryx_closed_realm") {
-                        self.emit(UiPayload::RealmClosed);
+                        self.record_live_event(LiveEventView::Warning {
+                            text: "Realm closed!".to_string(),
+                            severity: crate::panels::live_feed::WarningSeverity::Orange,
+                            copyable: false,
+                        });
+                        self.record_feed_event(FeedContextEvent::RealmClosed);
+                        self.realm_close_pending = true;
                     } else if raw.contains("s.oryx_minions_failed") {
+                        if self.in_dungeon {
+                            self.record_live_event(LiveEventView::Warning {
+                                text: "Oryx lag incoming, careful!".to_string(),
+                                severity: crate::panels::live_feed::WarningSeverity::Red,
+                                copyable: true,
+                            });
+                        }
                         self.emit(UiPayload::OryxLagWarning);
-                    }
-                    // Discovery capture: Oryx's per-encounter death / "still alive"
-                    // taunts arrive under stringlist keys the spawn parser ignores
-                    // (only `.new.` is understood). Log the non-spawn ones so their
-                    // key format can be identified for the dedup-reset-on-kill work.
-                    if !raw.contains(".new.") {
-                        crate::event_log::capture_oryx_taunt(&text.name, raw);
                     }
                 }
 
@@ -2746,6 +3613,10 @@ impl PacketProcessor {
                     }
                 }
 
+                if let Some(names) = crate::panels::live_feed::parse_who_roster(&text.text) {
+                    self.record_live_event(LiveEventView::WhoRoster { names });
+                }
+
                 // Chat message + boss call (resolved here using our own session).
                 if let Some(mut chat_msg) = ChatMessage::from_text_packet(text) {
                     if let Some(boss_id) = chat_msg.boss_id {
@@ -2758,6 +3629,15 @@ impl PacketProcessor {
                             .map(|t| t.elapsed() < REALM_JOIN_SETTLE)
                             .unwrap_or(false);
                         if !in_join_settle && !is_crystal {
+                            if self.should_play_boss_call(boss_id, &chat_msg.text) {
+                                self.play_realm_event_sound(boss_id, &chat_msg.text, None);
+                            }
+                            self.record_live_event(LiveEventView::BossCall {
+                                boss_id,
+                                name: chat_msg.text.clone(),
+                                server_name: self.feed.current.server_name.clone(),
+                                realm_name: self.feed.current.realm_name.clone(),
+                            });
                             self.emit(UiPayload::BossCall {
                                 boss_id,
                                 text: chat_msg.text.clone(),
@@ -2861,13 +3741,19 @@ impl PacketProcessor {
                                 }
                             }
                         }
+                        if chat_msg.chat_type == ChatType::Whisper && !chat_msg.is_outgoing {
+                            self.record_live_event(LiveEventView::Dm {
+                                sender: chat_msg.sender.clone(),
+                                text: chat_msg.text.clone(),
+                            });
+                        }
                         self.emit(UiPayload::Chat(chat_msg));
                     }
                 }
 
                 // Party leave messages.
                 if let Some(player_name) = text.text.strip_suffix(" has left the party") {
-                    self.emit(UiPayload::PartyMemberLeft(player_name.to_string()));
+                    self.remove_party_member_by_name(player_name);
                 }
 
                 // Notify loot tracker (for delayed drop triggers).
@@ -2918,6 +3804,12 @@ impl PacketProcessor {
                                 .key_id_for_dungeon(&dungeon_name)
                                 .unwrap_or(picture_type);
                             let thankable = !self.is_local_player(&opener);
+                            self.record_live_event(LiveEventView::KeyPop {
+                                opener: opener.clone(),
+                                key_id,
+                                dungeon_name: dungeon_name.clone(),
+                                thankable,
+                            });
                             self.emit(UiPayload::KeyPop {
                                 opener,
                                 key_id,
@@ -2940,6 +3832,7 @@ impl PacketProcessor {
                 }
             }
             GameEvent::UpdateReceived(ref update, time_ms) => {
+                self.observe_party_appearance(update);
                 // Player stats + loot tracker
                 if let Some(player_id) = self.session.player.object_id {
                     if let Some(obj) = update.find_object(player_id) {
@@ -3059,13 +3952,25 @@ impl PacketProcessor {
                 }
                 self.enrich_detected_pet();
 
+                // Portal spawn times anchor the callout countdowns.
+                let assets = realmhound_core::assets::get_asset_manager();
+                for object in &update.new_objects {
+                    if assets.is_portal_object(object.object_type as i32) {
+                        let object_id = object.object_id();
+                        self.record_feed_event(FeedContextEvent::PortalSpawned { object_id });
+                        self.portal_spawns
+                            .entry(object_id)
+                            .or_insert_with(std::time::Instant::now);
+                    }
+                }
+
                 // Forward encounter spawns to live feed
                 for encounter in extract_encounter_spawns(&update.new_objects) {
-                    self.emit(UiPayload::AddEncounter {
-                        object_id: encounter.object_id,
-                        object_type: encounter.sprite_id,
-                        name: encounter.name,
-                    });
+                    self.add_encounter(
+                        encounter.object_id,
+                        encounter.sprite_id,
+                        encounter.name.clone(),
+                    );
                 }
 
                 // Keyper crystal-tower wave: the first wave (~33% realm score)
@@ -3093,7 +3998,7 @@ impl PacketProcessor {
                     self.loot_tracker.on_entity_dropped(object_id, time_ms);
                     self.loot_tracker.on_entity_removed(object_id);
                     self.combat.on_object_removed(object_id, time_ms as i64);
-                    self.emit(UiPayload::RemoveEncounter(object_id));
+                    self.remove_encounter(object_id);
                     self.pet_object_buffer.remove(&object_id);
                 }
             }
@@ -3384,6 +4289,7 @@ impl PacketProcessor {
                             .map(|item| item.item_id)
                             .collect::<Vec<i32>>(),
                     );
+                    self.record_live_event(LiveEventView::Loot(drop.clone()));
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
                     // Shiny-loot notification keyed off the shiny item's own bag
@@ -3533,7 +4439,7 @@ impl PacketProcessor {
     /// to the Live Feed so its run timer settles to the committed per-run value.
     fn forward_dungeon_freeze(&mut self) {
         if let Some((map_seed, elapsed_ms)) = self.combat.take_dungeon_freeze() {
-            self.emit(UiPayload::DungeonTimerFrozen {
+            self.record_feed_event(FeedContextEvent::DungeonTimerFrozen {
                 map_seed,
                 elapsed_ms,
             });
@@ -3555,10 +4461,19 @@ impl PacketProcessor {
     /// Keyper spawn means the towers were just destroyed, so it resets the latch
     /// to arm the next tower wave.
     fn on_keyper_cue(&mut self, cue: realmhound_core::keyper::KeyperCue) {
-        use realmhound_core::keyper::KeyperCue;
+        use realmhound_core::keyper::{KeyperCue, KEYPER_BOSS_ID, KEYPER_TOWER_SPRITE_ID};
         match cue {
             KeyperCue::KeyperSpawned => {
                 self.keyper_towers_announced = false;
+                if self.should_play_boss_call(KEYPER_BOSS_ID, "The Keyper") {
+                    self.play_realm_event_sound(KEYPER_BOSS_ID, "The Keyper", None);
+                }
+                self.record_live_event(LiveEventView::BossCall {
+                    boss_id: KEYPER_BOSS_ID,
+                    name: "The Keyper".to_string(),
+                    server_name: self.feed.current.server_name.clone(),
+                    realm_name: self.feed.current.realm_name.clone(),
+                });
                 self.emit(UiPayload::KeyperEvent { towers: false });
             }
             KeyperCue::TowersAppeared => {
@@ -3569,6 +4484,15 @@ impl PacketProcessor {
                     return;
                 }
                 self.keyper_towers_announced = true;
+                if self.should_play_boss_call(KEYPER_TOWER_SPRITE_ID, "Keyper Towers") {
+                    self.play_realm_event_sound(KEYPER_TOWER_SPRITE_ID, "Keyper Towers", None);
+                }
+                self.record_live_event(LiveEventView::BossCall {
+                    boss_id: KEYPER_TOWER_SPRITE_ID,
+                    name: "Keyper Towers".to_string(),
+                    server_name: self.feed.current.server_name.clone(),
+                    realm_name: self.feed.current.realm_name.clone(),
+                });
                 self.emit(UiPayload::KeyperEvent { towers: true });
             }
         }
@@ -4190,12 +5114,14 @@ mod join_gate_tests {
         processor.dispatch_event(crystal.clone());
         processor.dispatch_event(crystal);
         let notifications: Vec<bool> = processor
-            .updates
+            .feed_context()
+            .events
             .iter()
-            .filter_map(|update| match &update.payload {
-                UiPayload::RealmDiscovery(DiscoveryEvent::CrystalMessage { notify, .. }) => {
-                    Some(*notify)
-                }
+            .filter_map(|entry| match &entry.event {
+                crate::processing::contract::FeedContextEvent::Discovery {
+                    event: DiscoveryEvent::CrystalMessage { notify, .. },
+                    ..
+                } => Some(*notify),
                 _ => None,
             })
             .collect();
@@ -4262,7 +5188,7 @@ mod join_gate_tests {
 #[cfg(test)]
 mod keyper_tests {
     use super::{PacketProcessor, REALM_JOIN_SETTLE};
-    use crate::processing::contract::UiPayload;
+    use crate::processing::contract::{FeedContextEvent, UiPayload};
     use realmhound_core::protocol::TextPacket;
     use realmhound_core::vault::AccountData;
     use realmhound_core::GameEvent;
@@ -4322,6 +5248,432 @@ mod keyper_tests {
         processor.realm_entered_at = Some(
             std::time::Instant::now() - (REALM_JOIN_SETTLE + std::time::Duration::from_secs(1)),
         );
+    }
+
+    #[test]
+    fn boss_call_alert_dedupes_per_realm() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.current_realm = Some("Mesa".to_string());
+        assert!(processor.should_play_boss_call(1234, "Sphinx"));
+        assert!(!processor.should_play_boss_call(1234, "Sphinx"));
+        processor.current_realm = Some("Ocean".to_string());
+        assert!(
+            processor.should_play_boss_call(1234, "Sphinx"),
+            "the same boss in another realm must alert"
+        );
+    }
+
+    #[test]
+    fn map_change_sets_dedup_realm_key() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        assert_eq!(processor.current_realm.as_deref(), Some("Mesa"));
+        processor.dispatch_event(map_changed_realm(0, "Nexus"));
+        assert_eq!(processor.current_realm, None);
+    }
+
+    #[test]
+    fn live_event_window_records_keyper_cues() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        enter_realm_settled(&mut processor);
+        processor.dispatch_event(keyper_taunt("Wha- Again? REALLY?!"));
+
+        let window = processor.live_event_window();
+        // Map transitions also record lifecycle entries; count only the call.
+        let calls: Vec<_> = window
+            .events
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.event,
+                    crate::processing::contract::LiveEventView::BossCall { .. }
+                )
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        match &calls[0].event {
+            crate::processing::contract::LiveEventView::BossCall { boss_id, name, .. } => {
+                assert_eq!(*boss_id, realmhound_core::keyper::KEYPER_BOSS_ID);
+                assert_eq!(name, "The Keyper");
+            }
+            other => panic!("expected a boss call, got {other:?}"),
+        }
+        assert_eq!(processor.view_state().live_event_rev, window.rev);
+    }
+
+    #[test]
+    fn boss_origin_survives_eviction_of_its_location_context() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.record_feed_event(FeedContextEvent::ServerName("EUWest".into()));
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        p.realm_entered_at =
+            Some(std::time::Instant::now() - REALM_JOIN_SETTLE - std::time::Duration::from_secs(1));
+        p.dispatch_event(keyper_taunt("Wha- Again? REALLY?!"));
+        for _ in 0..501 {
+            p.dispatch_event(GameEvent::RealmScoreChanged { score: 50 });
+        }
+        assert!(!p
+            .feed_context()
+            .events
+            .iter()
+            .any(|entry| matches!(entry.event, FeedContextEvent::Location { .. })));
+        let window = p.live_event_window();
+        let call = window.events.iter().find_map(|entry| {
+            if let crate::processing::contract::LiveEventView::BossCall {
+                server_name,
+                realm_name,
+                ..
+            } = &entry.event
+            {
+                Some((server_name.as_deref(), realm_name.as_deref()))
+            } else {
+                None
+            }
+        });
+        assert_eq!(call, Some((Some("EUWest"), Some("Mesa"))));
+    }
+
+    #[test]
+    fn live_event_window_keeps_the_whole_session() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        for i in 0..250 {
+            processor.record_live_event(crate::processing::contract::LiveEventView::BossCall {
+                boss_id: i,
+                name: "Boss".to_string(),
+                server_name: None,
+                realm_name: None,
+            });
+        }
+        let window = processor.live_event_window();
+        assert_eq!(window.events.len(), 250);
+        assert_eq!(window.events.first().map(|entry| entry.seq), Some(1));
+        assert_eq!(window.events.last().map(|entry| entry.seq), Some(250));
+        assert_eq!(processor.live_event_evictions(), 0);
+    }
+
+    #[test]
+    fn callout_origin_tracks_the_last_transition() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        p.dispatch_event(GameEvent::MapChanged {
+            name: "Snake Pit".to_string(),
+            display_name: "Snake Pit".to_string(),
+            realm_name: "NexusPortal.Mesa".to_string(),
+            fp: 7,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: true,
+            dungeon_modifiers: Vec::new(),
+            dungeon_grade: None,
+        });
+        let (left_from_realm, left_from_hub, score) = p.callout_origin();
+        assert!(left_from_realm, "dungeon entered from a realm");
+        assert!(!left_from_hub);
+        assert_eq!(score, Some(0), "realm score is remembered from the realm");
+
+        // A hub entry names the Nexus instead.
+        p.dispatch_event(GameEvent::MapChanged {
+            name: "Nexus".to_string(),
+            display_name: "Nexus".to_string(),
+            realm_name: String::new(),
+            fp: 8,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: false,
+            dungeon_modifiers: Vec::new(),
+            dungeon_grade: None,
+        });
+        p.dispatch_event(GameEvent::MapChanged {
+            name: "Snake Pit".to_string(),
+            display_name: "Snake Pit".to_string(),
+            realm_name: String::new(),
+            fp: 9,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: true,
+            dungeon_modifiers: Vec::new(),
+            dungeon_grade: None,
+        });
+        let (left_from_realm, left_from_hub, _) = p.callout_origin();
+        assert!(!left_from_realm);
+        assert!(left_from_hub, "dungeon opened in a hub");
+    }
+
+    #[test]
+    fn feed_current_survives_eviction_and_preserves_server_overrides() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        p.dispatch_event(GameEvent::RealmScoreChanged { score: 40 });
+        p.record_feed_event(FeedContextEvent::Location {
+            display_name: "Snake Pit".into(),
+            realm_name: "NexusPortal.Mesa".into(),
+            current_realm_score: 0,
+            max_realm_score: 0,
+            is_dungeon: true,
+        });
+        assert_eq!(p.feed.current.realm_name.as_deref(), Some("Mesa"));
+        assert_eq!(p.feed.current.realm_score, Some((40, 100)));
+        assert!(p.feed.current.is_score_stale);
+        p.record_feed_event(FeedContextEvent::ServerCommand {
+            server: "EUWest".into(),
+            realm: Some("Medusa".into()),
+        });
+        assert!(p.feed.current.realm_score.is_none());
+        for _ in 0..501 {
+            p.dispatch_event(GameEvent::RealmScoreChanged { score: 80 });
+        }
+        let feed = p.feed_context();
+        assert!(feed.dropped_before_seq > 0);
+        assert_eq!(feed.current.server_name.as_deref(), Some("EUWest"));
+        assert_eq!(feed.current.realm_name.as_deref(), Some("Medusa"));
+        assert!(feed.current.realm_score.is_none());
+        p.dispatch_event(map_changed_realm(200, "NexusPortal.NewRealm"));
+        assert_eq!(p.feed.current.realm_score, Some((0, 200)));
+        p.record_feed_event(FeedContextEvent::ServerCommand {
+            server: "EUWest".into(),
+            realm: None,
+        });
+        assert!(p.feed.current.realm_name.is_none());
+        assert!(p.feed.current.realm_score.is_none());
+    }
+
+    #[test]
+    fn callout_uses_latest_score_and_preserves_nexus_parent_origin() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        p.dispatch_event(GameEvent::RealmScoreChanged { score: 74 });
+        p.portal_spawns.insert(1, std::time::Instant::now());
+        p.dispatch_event(GameEvent::PortalUsed { object_id: 1 });
+        p.record_feed_event(FeedContextEvent::Location {
+            display_name: "Snake Pit".into(),
+            realm_name: "NexusPortal.Mesa".into(),
+            current_realm_score: 0,
+            max_realm_score: 0,
+            is_dungeon: true,
+        });
+        let origin = p.feed.current.dungeon_origin.as_ref().unwrap();
+        assert_eq!(origin.realm_score_percent, Some(74));
+        assert!(!origin.entered_from_nexus);
+        p.record_feed_event(FeedContextEvent::Location {
+            display_name: "Snake Pit".into(),
+            realm_name: "Nexus".into(),
+            current_realm_score: 0,
+            max_realm_score: 0,
+            is_dungeon: true,
+        });
+        let origin = p.feed.current.dungeon_origin.as_ref().unwrap();
+        assert!(origin.entered_from_nexus);
+        assert!(origin.realm_score_percent.is_none());
+        assert!(
+            origin.portal_anchor.is_none(),
+            "a portal anchor is consumed once"
+        );
+    }
+
+    #[test]
+    fn late_hub_connection_updates_the_stored_and_automatic_callout_origin() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        let mut entered = map_changed_realm(0, "NexusPortal.Mesa");
+        if let GameEvent::MapChanged {
+            display_name,
+            is_dungeon,
+            ..
+        } = &mut entered
+        {
+            *display_name = "Snake Pit".into();
+            *is_dungeon = true;
+        }
+        p.dispatch_event(entered);
+        p.updates.clear();
+        p.record_feed_event(FeedContextEvent::ServerName("EUWest".into()));
+        let stored = p
+            .live_events
+            .events
+            .iter()
+            .find_map(|entry| {
+                if let crate::processing::contract::LiveEventView::Dungeon { origin, .. } =
+                    &entry.event
+                {
+                    Some(origin)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(stored.entered_from_nexus);
+        assert_eq!(stored.server_name.as_deref(), Some("EUWest"));
+        assert!(p.updates.iter().any(|update| matches!(&update.payload,
+            UiPayload::DungeonCallout { origin: Some(origin), .. } if origin.entered_from_nexus)));
+    }
+
+    #[test]
+    fn feed_current_retains_castle_deadline_after_close_event_eviction() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.Mesa"));
+        p.record_feed_event(FeedContextEvent::RealmClosed);
+        let deadline = p.feed.current.castle_deadline.unwrap();
+        for _ in 0..501 {
+            p.dispatch_event(GameEvent::RealmScoreChanged { score: 100 });
+        }
+        let feed = p.feed_context();
+        assert!(!feed
+            .events
+            .iter()
+            .any(|e| matches!(e.event, FeedContextEvent::RealmClosed)));
+        assert_eq!(feed.current.castle_deadline, Some(deadline));
+        p.record_feed_event(FeedContextEvent::RealmClosed);
+        assert_eq!(p.feed.current.castle_deadline, Some(deadline));
+        p.dispatch_event(map_changed_realm(100, "NexusPortal.NewRealm"));
+        assert!(p.feed.current.castle_deadline.is_none());
+        assert!(!p.feed.current.realm_closed);
+    }
+    #[test]
+    fn learned_event_mods_are_available_to_the_worker() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.remember_dungeon_mods("Snake Pit", &["m1".to_string()]);
+        assert!(p.learned_event_mods("Snake Pit", true, 2).is_empty());
+        p.remember_dungeon_mods("Snake Pit", &["m1".to_string()]);
+        assert_eq!(
+            p.learned_event_mods("Snake Pit", true, 2),
+            vec!["m1".to_string()]
+        );
+        assert!(p.learned_event_mods("Snake Pit", false, 2).is_empty());
+    }
+
+    #[test]
+    fn feed_context_keeps_every_map_transition() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(map_changed(1));
+        p.dispatch_event(map_changed(2));
+        let locations: Vec<(u64, String)> = p
+            .feed_context()
+            .events
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                crate::processing::contract::FeedContextEvent::Location {
+                    display_name, ..
+                } => Some((entry.seq, display_name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(locations.len(), 2, "both transitions are kept");
+        assert!(locations[0].0 < locations[1].0, "applied in observed order");
+    }
+
+    #[test]
+    fn live_event_window_records_dust_full_transition() {
+        use realmhound_core::dust::{DustAmounts, DustType};
+
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::DustUpdated {
+            amounts: DustAmounts::new(),
+            is_seasonal: false,
+        });
+        assert!(processor.live_event_window().events.is_empty());
+
+        let mut full = DustAmounts::new();
+        full.set(DustType::Green, 100, 100);
+        processor.dispatch_event(GameEvent::DustUpdated {
+            amounts: full,
+            is_seasonal: false,
+        });
+        assert!(matches!(
+            processor
+                .live_event_window()
+                .events
+                .last()
+                .map(|entry| &entry.event),
+            Some(crate::processing::contract::LiveEventView::DustFull { .. })
+        ));
+    }
+
+    #[test]
+    fn live_event_window_records_who_roster() {
+        use realmhound_core::protocol::TextPacket;
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: String::new(),
+            object_id: -1,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: String::new(),
+            text: "Players online (2): A, B".to_string(),
+            clean_text: String::new(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+
+        let window = processor.live_event_window();
+        assert!(matches!(
+            window.events.last().map(|entry| &entry.event),
+            Some(crate::processing::contract::LiveEventView::WhoRoster { .. })
+        ));
+    }
+
+    #[test]
+    fn live_event_window_records_dungeon_entries() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::MapChanged {
+            name: "Spider Den".to_string(),
+            display_name: "Spider Den".to_string(),
+            realm_name: "NexusPortal.Mesa".to_string(),
+            fp: 123,
+            current_realm_score: 0,
+            max_realm_score: 0,
+            allows_api: true,
+            is_dungeon: true,
+            dungeon_modifiers: vec!["CHEF".to_string()],
+            dungeon_grade: Some("S".to_string()),
+        });
+
+        let window = processor.live_event_window();
+        assert!(matches!(
+            window.events.last().map(|entry| &entry.event),
+            Some(crate::processing::contract::LiveEventView::Dungeon { .. })
+        ));
+    }
+
+    #[test]
+    fn live_event_window_records_warnings_and_dms() {
+        use realmhound_core::protocol::TextPacket;
+
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        processor.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: "Oryx the Mad God".to_string(),
+            object_id: 0,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: String::new(),
+            text: "s.oryx_closed_realm".to_string(),
+            clean_text: String::new(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+        processor.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: "Sender".to_string(),
+            object_id: -1,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: "Me".to_string(),
+            text: "hello".to_string(),
+            clean_text: "hello".to_string(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+
+        let window = processor.live_event_window();
+        assert_eq!(window.events.len(), 2);
+        assert!(matches!(
+            window.events[0].event,
+            crate::processing::contract::LiveEventView::Warning { .. }
+        ));
+        assert!(matches!(
+            window.events[1].event,
+            crate::processing::contract::LiveEventView::Dm { .. }
+        ));
     }
 
     #[test]
@@ -4765,6 +6117,55 @@ mod isolation_gate_tests {
         )
     }
 
+    #[test]
+    fn party_member_cosmetics_come_from_world_updates() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.party
+            .members
+            .push(crate::processing::contract::PartyMemberView {
+                player_id: 5,
+                name: "Ally".to_string(),
+                is_leader: false,
+                class_id: None,
+                skin_id: 0,
+                tex1: 0,
+                tex2: 0,
+                guild: None,
+            });
+        let obj = ObjectData {
+            object_type: 768,
+            status: ObjectStatusData {
+                object_id: 1,
+                pos: WorldPosData { x: 0.0, y: 0.0 },
+                stats: vec![
+                    string_stat(StatType::Name, "Ally"),
+                    string_stat(StatType::GuildName, "Guild"),
+                    StatData {
+                        stat_type_id: 0,
+                        stat_type: StatType::SkinId,
+                        stat_value: 42,
+                        stat_value_two: 0,
+                        string_stat_value: None,
+                    },
+                ],
+            },
+        };
+        p.dispatch_event(GameEvent::UpdateReceived(
+            UpdatePacket {
+                pos: WorldPosData { x: 0.0, y: 0.0 },
+                level_type: 0,
+                tiles: Vec::new(),
+                new_objects: vec![obj],
+                drops: Vec::new(),
+            },
+            0,
+        ));
+        let member = &p.party_view().members[0];
+        assert_eq!(member.class_id, Some(768));
+        assert_eq!(member.skin_id, 42);
+        assert_eq!(member.guild.as_deref(), Some("Guild"));
+    }
+
     fn map_changed(name: &str) -> GameEvent {
         GameEvent::MapChanged {
             name: name.to_string(),
@@ -4973,13 +6374,6 @@ mod isolation_gate_tests {
             .collect()
     }
 
-    fn party_cleared_count(p: &PacketProcessor) -> usize {
-        p.updates
-            .iter()
-            .filter(|u| matches!(u.payload, UiPayload::PartyCleared))
-            .count()
-    }
-
     fn scope(key: AccountKey, id: &AccountId, generation: u64) -> AccountOperationScope {
         AccountOperationScope {
             account_key: key,
@@ -5019,6 +6413,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "tok".into(),
+            captured_at: chrono::Utc::now(),
         });
         for _ in 0..PENDING_EVENT_CAP {
             p.dispatch_event(map_changed("Buffered"));
@@ -5040,9 +6435,8 @@ mod isolation_gate_tests {
             p.session.connection.main_account_status,
             MainAccountStatus::WaitingForConnection
         );
-        assert_eq!(
-            party_cleared_count(&p),
-            0,
+        assert!(
+            p.party_view().members.is_empty(),
             "overflow is not a positive mismatch"
         );
         assert!(access_tokens(&p).is_empty(), "no token leaked");
@@ -5056,6 +6450,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "tok".into(),
+            captured_at: chrono::Utc::now(),
         });
         p.dispatch_event(map_changed("Buffered"));
 
@@ -5094,6 +6489,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "mule-tok".into(),
+            captured_at: chrono::Utc::now(),
         });
 
         p.dispatch_event(identity_update(1, "MULE999", "MuleToon"));
@@ -5115,6 +6511,7 @@ mod isolation_gate_tests {
         p.pending_credential = Some(PendingCredential {
             connection: main_conn(),
             token: "main-tok".into(),
+            captured_at: chrono::Utc::now(),
         });
 
         p.dispatch_event(map_changed("Nexus"));
@@ -5126,6 +6523,175 @@ mod isolation_gate_tests {
         p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
         assert_eq!(access_tokens(&p), vec!["main-tok".to_string()]);
         assert!(p.pending_credential.is_none());
+    }
+
+    #[test]
+    fn quest_view_tracks_fetch_and_redeem() {
+        use realmhound_core::protocol::data::QuestData;
+        use realmhound_core::protocol::QuestFetchResponsePacket;
+
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(GameEvent::QuestsReceived(QuestFetchResponsePacket {
+            quests: vec![QuestData {
+                id: "q1".to_string(),
+                name: "Quest".to_string(),
+                description: String::new(),
+                expiration: String::new(),
+                category: 0,
+                unknown_int: 0,
+                requirements: Vec::new(),
+                rewards: Vec::new(),
+                completed: false,
+                item_of_choice: false,
+                repeatable: false,
+            }],
+            next_refresh_price: 50,
+            unknown: 0,
+        }));
+        assert!(p.quest_view().is_some());
+        let rev = p.view_state().quest_rev;
+
+        p.dispatch_event(GameEvent::QuestRedeemAttempted {
+            quest_id: "q1".to_string(),
+        });
+        p.dispatch_event(GameEvent::QuestRedeemResult { ok: true });
+
+        let view = p.quest_view().expect("quests published");
+        assert!(view.packet.quests[0].completed);
+        assert!(view.rev > rev);
+    }
+
+    #[test]
+    fn encounter_set_tracks_add_remove_and_clear() {
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.add_encounter(1, 100, "Boss".to_string());
+        p.add_encounter(1, 100, "Boss".to_string());
+        assert_eq!(p.encounter_set().encounters.len(), 1);
+
+        let rev = p.encounter_set().rev;
+        p.remove_encounter(1);
+        assert!(p.encounter_set().encounters.is_empty());
+        assert!(p.encounter_set().rev > rev);
+
+        p.add_encounter(2, 200, "Other".to_string());
+        p.clear_encounters();
+        assert!(p.encounter_set().encounters.is_empty());
+    }
+
+    #[test]
+    fn party_view_tracks_join_leave_and_clear() {
+        use realmhound_core::protocol::data::PartyPlayerData;
+        use realmhound_core::protocol::{
+            IncomingPartyMemberInfoPacket, PartyMemberAddedPacket, TextPacket,
+        };
+
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.dispatch_event(GameEvent::PartyListReceived(
+            IncomingPartyMemberInfoPacket {
+                party_id: 1,
+                leader_id: 10,
+                max_size: 6,
+                party_players: vec![
+                    PartyPlayerData {
+                        id: 10,
+                        name: "Leader".to_string(),
+                        object_id: 0,
+                        unknown: 0,
+                    },
+                    PartyPlayerData {
+                        id: 11,
+                        name: "Member".to_string(),
+                        object_id: 0,
+                        unknown: 0,
+                    },
+                ],
+                description: "Party".to_string(),
+            },
+        ));
+        let listed = p.party_view();
+        assert_eq!(listed.members.len(), 2);
+        assert!(listed
+            .members
+            .iter()
+            .find(|member| member.name == "Leader")
+            .is_some_and(|member| member.is_leader));
+
+        p.dispatch_event(GameEvent::PartyMemberJoined(PartyMemberAddedPacket {
+            player_id: 12,
+            name: "Joined".to_string(),
+            class_id: 0,
+            skin_id: 0,
+        }));
+        assert_eq!(p.party_view().members.len(), 3);
+
+        p.dispatch_event(GameEvent::PartyActionReceived {
+            player_id: 11,
+            action_id: 6,
+        });
+        assert_eq!(p.party_view().members.len(), 2);
+
+        p.dispatch_event(GameEvent::TextReceived(TextPacket {
+            name: "Joined".to_string(),
+            object_id: 0,
+            num_stars: 0,
+            bubble_time: 0,
+            recipient: String::new(),
+            text: "Joined has left the party".to_string(),
+            clean_text: String::new(),
+            is_supporter: false,
+            star_background: 0,
+        }));
+        assert_eq!(p.party_view().members.len(), 1);
+
+        p.clear_party();
+        assert!(p.party_view().members.is_empty());
+    }
+
+    #[test]
+    fn released_token_preserves_capture_time_and_binding() {
+        let mut p = tentative_with_saved_main("MAIN123");
+        p.set_selected_scope(AccountKey::generate(), AccountId::new("MAIN123").unwrap());
+        let captured_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        p.pending_credential = Some(PendingCredential {
+            connection: main_conn(),
+            token: "main-tok".into(),
+            captured_at,
+        });
+
+        p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
+
+        let token = p.token_state().expect("token released");
+        assert_eq!(token.token, "main-tok");
+        assert_eq!(token.captured_at, captured_at);
+        assert_eq!(token.account_id.as_str(), "MAIN123");
+        assert_eq!(p.view_state().token_gen, 1);
+    }
+
+    #[test]
+    fn recaptured_identical_token_keeps_its_original_age() {
+        let mut p = tentative_with_saved_main("MAIN123");
+        p.set_selected_scope(AccountKey::generate(), AccountId::new("MAIN123").unwrap());
+        let captured_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        p.pending_credential = Some(PendingCredential {
+            connection: main_conn(),
+            token: "main-tok".into(),
+            captured_at,
+        });
+        p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
+        assert_eq!(p.view_state().token_gen, 1);
+
+        // The same token on a later HELLO (map change): a fresh capture time must
+        // not make the token look newly issued.
+        p.pending_credential = Some(PendingCredential {
+            connection: main_conn(),
+            token: "main-tok".into(),
+            captured_at: chrono::Utc::now(),
+        });
+        p.dispatch_event(identity_update(1, "MAIN123", "MainToon"));
+
+        let token = p.token_state().expect("token kept");
+        assert_eq!(token.captured_at, captured_at);
+        assert_eq!(p.view_state().token_gen, 1);
     }
 
     /// After a restart selecting a new main, an old (now-foreign) account that is

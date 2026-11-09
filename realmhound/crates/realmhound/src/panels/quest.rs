@@ -452,10 +452,6 @@ pub struct QuestPanel {
     compact_view: bool,
     /// When the data was last updated
     cached_at: Option<SystemTime>,
-    /// Id of the quest the player most recently tried to redeem, tracked so
-    /// the subsequent `QuestRedeemResult` can mark it completed immediately
-    /// instead of waiting for a fresh QuestFetchResponse.
-    pending_redeem_quest_id: Option<String>,
     /// Bumped on any `quests` change; part of the item-count memo key.
     quests_revision: u64,
     /// Owned-item counts per required item, keyed on `(account_epoch, quests_revision)`.
@@ -493,7 +489,6 @@ impl QuestPanel {
             from_cache,
             compact_view: false,
             cached_at,
-            pending_redeem_quest_id: None,
             quests_revision: 0,
             item_counts_memo: Memo::new(),
             collapsed: HashSet::new(),
@@ -664,17 +659,6 @@ impl QuestPanel {
         self.save_cache();
 
         tracing::info!("[QUEST_PANEL] Updated with {} quests", self.quests.len());
-    }
-
-    /// Mark a quest completed locally by id, so it disappears immediately
-    /// (subject to `should_display`) without waiting for a fresh
-    /// QuestFetchResponse from re-entering the Tinkerer's portal.
-    fn mark_quest_completed(&mut self, quest_id: &str) {
-        if let Some(quest) = self.quests.iter_mut().find(|q| q.id == quest_id) {
-            quest.completed = true;
-            self.quests_revision = self.quests_revision.wrapping_add(1);
-            self.save_cache();
-        }
     }
 
     /// Get quests that should be displayed (filters based on settings).
@@ -2088,31 +2072,6 @@ impl Panel for QuestPanel {
             ctx.shadcn,
             (ctx.client_launch_unix > 0).then_some(ctx.client_launch_unix),
         )
-    }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        _session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        match event {
-            realmhound_core::GameEvent::QuestsReceived(response) => {
-                self.update_quests(response);
-                self.pending_redeem_quest_id = None;
-            }
-            realmhound_core::GameEvent::QuestRedeemAttempted { quest_id } => {
-                self.pending_redeem_quest_id = Some(quest_id.clone());
-            }
-            realmhound_core::GameEvent::QuestRedeemResult { ok } => {
-                if let Some(quest_id) = self.pending_redeem_quest_id.take() {
-                    if *ok {
-                        self.mark_quest_completed(&quest_id);
-                    }
-                }
-            }
-            _ => {}
-        }
-        vec![]
     }
 }
 

@@ -513,12 +513,6 @@ pub struct LiveFeedSettings {
     /// deserialize here for the migration. Never written back out.
     #[serde(default, skip_serializing)]
     pub taskbar: TaskbarSettings,
-
-    /// Opt-in: append every Live Feed boss call to the per-account event
-    /// notification diagnostic log. Global toggle, `false` by default; when off,
-    /// no event-notification history is written.
-    #[serde(default)]
-    pub log_event_notifications: bool,
 }
 
 /// Live Feed Taskbar settings: the full-width bar of mission/quest progress
@@ -1032,7 +1026,6 @@ impl Default for LiveFeedSettings {
             custom_clip_buttons: default_clip_buttons(),
             season_warnings: SeasonWarningSettings::default(),
             taskbar: TaskbarSettings::default(),
-            log_event_notifications: false,
         }
     }
 }

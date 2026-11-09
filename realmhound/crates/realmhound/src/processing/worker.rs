@@ -13,23 +13,24 @@
 //! - worker -> audio: an [`AudioSender`] (audio commands are routed here, never
 //!   forwarded to the UI).
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use realmhound_core::account::AccountContext;
 use realmhound_core::capture::PacketReceiver;
-use realmhound_core::GameEvent;
+use realmhound_core::watchlist::{PlayerStatus, Watchlist};
+use realmhound_core::{GameEvent, Settings};
 
 use crate::audio::AudioSender;
-use crate::panels::ActiveTab;
 
+use super::chat_log::ChatLogWriter;
 use super::contract::{
-    ControlMsg, ModelSnapshot, SelectedIdentity, ShutdownReport, UiPayload, UiUpdate,
+    ControlMsg, LiveEventView, ModelSnapshot, SelectedIdentity, ShutdownReport, UiPayload, UiUpdate,
 };
+use super::health::{CaptureState, HealthCounters};
 use super::processor::PacketProcessor;
 use super::ui_channel::{self, UiReceiver, UiSender};
 
@@ -40,11 +41,11 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_PACKETS_PER_BATCH: usize = 256;
 /// Periodic account-data save interval (interim S2 persistence).
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
-/// Bounded-staleness fallback: when a batch produced only updates irrelevant to
-/// the active tab, drain the queue (and refresh background tabs) at ~1 Hz rather
-/// than waking every frame. True idle (no traffic) arms nothing, so static tabs
-/// still sleep fully while connected.
-const SUPPRESSED_DRAIN_INTERVAL: Duration = Duration::from_millis(1000);
+/// Background health summary interval, independent of UI painting.
+const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Target maximum repaint rate from worker traffic (~10 Hz). The trailing
+/// `request_repaint_after` guarantees the last update is still painted.
+const WAKE_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(feature = "latency-diagnostics")]
 const PIPELINE_WARN_AGE: Duration = Duration::from_millis(500);
 #[cfg(feature = "latency-diagnostics")]
@@ -57,6 +58,62 @@ const PIPELINE_EXTREME_WORK: Duration = Duration::from_secs(1);
 const PIPELINE_WARN_THROTTLE: Duration = Duration::from_secs(2);
 #[cfg(feature = "latency-diagnostics")]
 const HEALTH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Automatic dungeon callout currently on the clipboard.
+struct AutoCallout {
+    text: String,
+    expires_at: Instant,
+}
+
+struct WakeThrottle {
+    last: Option<Instant>,
+    /// Skip wakes entirely while the UI cannot paint (minimized).
+    demand: bool,
+}
+
+impl Default for WakeThrottle {
+    fn default() -> Self {
+        Self {
+            last: None,
+            demand: true,
+        }
+    }
+}
+
+impl WakeThrottle {
+    /// Coalesce worker wake-ups to [`WAKE_INTERVAL`], scheduling the trailing
+    /// repaint instead of dropping it.
+    fn request(&mut self, ctx: &egui::Context) {
+        if !self.demand {
+            return;
+        }
+        match self.next_delay(Instant::now()) {
+            Some(delay) => ctx.request_repaint_after(delay),
+            None => ctx.request_repaint(),
+        }
+    }
+
+    fn set_demand(&mut self, demand: bool) {
+        if demand && !self.demand {
+            // Wake as soon as the next update arrives rather than waiting out
+            // a throttle window that started before the window was restored.
+            self.last = None;
+        }
+        self.demand = demand;
+    }
+
+    fn next_delay(&mut self, now: Instant) -> Option<Duration> {
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < WAKE_INTERVAL => {
+                Some(WAKE_INTERVAL - now.saturating_duration_since(last))
+            }
+            _ => {
+                self.last = Some(now);
+                None
+            }
+        }
+    }
+}
 
 /// Signal delivered to a freshly spawned, still-inactive worker deciding
 /// whether it begins processing or exits without ever persisting.
@@ -75,8 +132,10 @@ pub struct WorkerHandle {
     start_tx: Sender<StartSignal>,
     /// Worker -> UI ordered update stream (bounded, drop-oldest on overflow).
     pub ui_rx: UiReceiver,
-    /// Shared latest-value model snapshot.
-    pub snapshot: Arc<Mutex<ModelSnapshot>>,
+    /// Shared latest-value model snapshot (pointer swap, immutable).
+    pub snapshot: Arc<Mutex<Arc<ModelSnapshot>>>,
+    /// Always-on health counters shared with the UI.
+    pub health: Arc<HealthCounters>,
     /// Signalled by the worker once its final flush is done, carrying the outcome.
     shutdown_done: Receiver<ShutdownReport>,
     /// Join handle for the worker thread.
@@ -152,7 +211,6 @@ pub fn spawn(
     mut processor: PacketProcessor,
     ctx: egui::Context,
     audio_tx: AudioSender,
-    active_tab: Arc<AtomicU8>,
     account: Arc<AccountContext>,
 ) -> std::io::Result<WorkerHandle> {
     processor.set_selected_scope(account.account_key(), account.account_id().clone());
@@ -161,29 +219,43 @@ pub fn spawn(
     let (start_tx, start_rx) = channel::<StartSignal>();
     let (ui_tx, ui_rx) = ui_channel::channel(ui_channel::DEFAULT_BOUND);
     let (done_tx, done_rx) = channel::<ShutdownReport>();
+    let health = Arc::new(HealthCounters::new());
+    let settings = processor.settings_handle();
+    let watchlist = Watchlist::load_from(
+        account.storage_root().path().join("watchlist.txt"),
+        Some(account.persistence().watchlist_detections().to_path_buf()),
+    );
+    let chat_log = ChatLogWriter::new(account.persistence().chat_logs().to_path_buf());
 
     let selected_identity =
         SelectedIdentity::new(account.account_key(), account.account_id().clone());
-    let snapshot = Arc::new(Mutex::new(ModelSnapshot::new(
+    let snapshot = Arc::new(Mutex::new(Arc::new(ModelSnapshot::new(
         selected_identity,
         processor.view_state(),
         processor.account_data().clone(),
         processor.live_vault_data(),
         processor.live_char_id(),
-    )));
+    ))));
 
     let worker = Worker {
         processor,
         ui_tx,
         audio_tx,
         snapshot: snapshot.clone(),
+        health: health.clone(),
+        chat_log,
+        settings,
+        watchlist,
+        auto_callout: None,
+        exalts_fetched: false,
+        wake: WakeThrottle::default(),
         ctx,
-        active_tab,
         account,
         receiver: None,
         #[cfg(feature = "latency-diagnostics")]
         capture_drops: CaptureDropTotals::default(),
         last_save: Instant::now(),
+        last_health_log: Instant::now(),
         next_maintenance: None,
         maintenance_history_dirty: false,
         next_maintenance_refresh: Instant::now(),
@@ -192,6 +264,12 @@ pub fn spawn(
         pub_vault_gen: u64::MAX,
         pub_view: None,
         pub_mission_gen: u64::MAX,
+        pub_token_gen: u64::MAX,
+        pub_party_rev: u64::MAX,
+        pub_encounter_rev: u64::MAX,
+        pub_quest_rev: u64::MAX,
+        pub_live_event_rev: u64::MAX,
+        pub_feed_rev: u64::MAX,
         #[cfg(feature = "latency-diagnostics")]
         latency: LatencyDiagnostics::default(),
     };
@@ -205,6 +283,7 @@ pub fn spawn(
         start_tx,
         ui_rx,
         snapshot,
+        health,
         shutdown_done: done_rx,
         join: Some(join),
     })
@@ -214,11 +293,22 @@ struct Worker {
     processor: PacketProcessor,
     ui_tx: UiSender,
     audio_tx: AudioSender,
-    snapshot: Arc<Mutex<ModelSnapshot>>,
+    snapshot: Arc<Mutex<Arc<ModelSnapshot>>>,
+    /// Always-on health counters shared with the UI.
+    health: Arc<HealthCounters>,
+    /// Worker-owned chat persistence (independent of UI frames).
+    chat_log: ChatLogWriter,
+    /// Shared settings for worker-side side effects.
+    settings: Arc<RwLock<Settings>>,
+    /// Watchlist snapshot for worker-side kick/join alerts.
+    watchlist: Watchlist,
+    /// Automatic dungeon callout currently on the clipboard.
+    auto_callout: Option<AutoCallout>,
+    /// One-shot exalt stats fetch, triggered by the first released token.
+    exalts_fetched: bool,
+    /// Coalesced repaint requests from worker traffic.
+    wake: WakeThrottle,
     ctx: egui::Context,
-    /// Shared active-tab signal written by the UI thread; read to decide whether
-    /// an update is worth waking the UI for (relevance-gated repaints).
-    active_tab: Arc<AtomicU8>,
     /// Shared immutable account context. Held so the exclusive profile lock
     /// inside it lives as long as the worker (including after a detached
     /// shutdown), keeping the selected profile owned by this process.
@@ -228,6 +318,7 @@ struct Worker {
     #[cfg(feature = "latency-diagnostics")]
     capture_drops: CaptureDropTotals,
     last_save: Instant,
+    last_health_log: Instant,
     next_maintenance: Option<Instant>,
     maintenance_history_dirty: bool,
     next_maintenance_refresh: Instant,
@@ -236,6 +327,12 @@ struct Worker {
     pub_vault_gen: u64,
     pub_view: Option<super::contract::ViewState>,
     pub_mission_gen: u64,
+    pub_token_gen: u64,
+    pub_party_rev: u64,
+    pub_encounter_rev: u64,
+    pub_quest_rev: u64,
+    pub_live_event_rev: u64,
+    pub_feed_rev: u64,
     #[cfg(feature = "latency-diagnostics")]
     latency: LatencyDiagnostics,
 }
@@ -425,17 +522,22 @@ impl Worker {
                     #[cfg(feature = "latency-diagnostics")]
                     let wait_started = Instant::now();
                     let result = rx.recv_timeout(MAX_PACKETS_PER_BATCH, RECV_TIMEOUT);
+                    // Read the counter before borrowing self mutably below.
+                    #[cfg(feature = "latency-diagnostics")]
+                    let dropped_now = rx.dropped();
                     #[cfg(feature = "latency-diagnostics")]
                     {
                         wait_time += wait_started.elapsed();
-                        capture_queue_drops = self.capture_drops.observe(rx.dropped());
+                        capture_queue_drops = self.capture_drops.observe(dropped_now);
                     }
                     if result.closed {
                         tracing::warn!("[WORKER] capture source closed; awaiting restart");
+                        self.health.set_capture_state(CaptureState::Closed);
+                        self.release_auto_callout();
                         capture_closed = true;
                         #[cfg(feature = "latency-diagnostics")]
                         {
-                            capture_queue_drops = self.capture_drops.finish_source(rx.dropped());
+                            capture_queue_drops = self.capture_drops.finish_source(dropped_now);
                         }
                         self.receiver = None;
                     }
@@ -490,23 +592,45 @@ impl Worker {
                 {
                     segments.process = process_started.elapsed();
                 }
-                let active = ActiveTab::from_u8(self.active_tab.load(Ordering::Relaxed));
-                // Wake the UI only for updates the active tab (or a global widget)
-                // actually displays; `suppressed` tracks irrelevant traffic so a
-                // slow fallback still drains the queue and covers background tabs.
-                let mut wake = false;
-                let mut suppressed = false;
+                // Wake hints are paint-only: every UI update wakes the throttled
+                // UI, regardless of the active tab.
+                let mut had_ui_updates = false;
                 #[cfg(feature = "latency-diagnostics")]
                 let dispatch_started = Instant::now();
                 for update in updates {
                     match update.payload {
                         UiPayload::Audio(cmd) => self.audio_tx.send(cmd),
+                        UiPayload::DungeonCallout {
+                            display_name,
+                            modifiers,
+                            grade,
+                            origin,
+                        } => {
+                            self.refresh_auto_callout(
+                                &display_name,
+                                &modifiers,
+                                &grade,
+                                origin.as_ref(),
+                            );
+                        }
                         payload => {
-                            if payload_relevant(&payload, active) {
-                                wake = true;
-                            } else {
-                                suppressed = true;
+                            if let UiPayload::Chat(message) = &payload {
+                                if let Err(error) = self.chat_log.append(message) {
+                                    tracing::warn!("[CHAT] failed to write log: {error}");
+                                    self.health
+                                        .record_persistence_failure(format!("chat log: {error}"));
+                                }
                             }
+                            if let UiPayload::AccessTokenCaptured(token) = &payload {
+                                self.fetch_exalts_once(token);
+                            }
+                            if let UiPayload::Broadcast(event) = &payload {
+                                let local_leader = self.processor.party_view().is_local_leader;
+                                for alert in party_alerts(&self.watchlist, event, local_leader) {
+                                    self.processor.record_live_event(alert);
+                                }
+                            }
+                            had_ui_updates = true;
                             if self
                                 .ui_tx
                                 .send(UiUpdate {
@@ -536,10 +660,8 @@ impl Worker {
                 {
                     segments.snapshot = snapshot_started.elapsed();
                 }
-                if wake || view_changed {
-                    self.ctx.request_repaint();
-                } else if suppressed {
-                    self.ctx.request_repaint_after(SUPPRESSED_DRAIN_INTERVAL);
+                if had_ui_updates || view_changed {
+                    self.wake.request(&self.ctx);
                 }
             } else if missions_changed || identity_changed {
                 #[cfg(feature = "latency-diagnostics")]
@@ -549,7 +671,7 @@ impl Worker {
                 {
                     segments.snapshot = snapshot_started.elapsed();
                 }
-                self.ctx.request_repaint();
+                self.wake.request(&self.ctx);
             }
 
             if queue_remaining == 0
@@ -582,7 +704,7 @@ impl Worker {
                 };
                 self.next_maintenance = Some(Instant::now() + delay);
                 if self.publish_snapshot() {
-                    self.ctx.request_repaint();
+                    self.wake.request(&self.ctx);
                 }
             }
 
@@ -590,6 +712,19 @@ impl Worker {
             #[cfg(feature = "latency-diagnostics")]
             let save_started = Instant::now();
             self.maybe_periodic_save();
+            self.maybe_log_health();
+            for error in self.processor.drain_loot_persistence_errors() {
+                self.health
+                    .record_persistence_failure(format!("loot insert: {error}"));
+            }
+            self.health
+                .set_live_window_evictions(self.processor.live_event_evictions());
+            let (audio_stale, audio_full) = crate::audio::drop_counts();
+            self.health.set_audio_drops(audio_stale, audio_full);
+            self.expire_auto_callout();
+            if self.processor.take_realm_close() {
+                self.release_auto_callout();
+            }
             #[cfg(feature = "latency-diagnostics")]
             {
                 segments.save = save_started.elapsed();
@@ -613,10 +748,27 @@ impl Worker {
 
         // Shutdown: drain combat/loot, flush account data, close databases,
         // publish a final snapshot, then report the outcome.
+        self.release_auto_callout();
         self.processor.final_drain();
+        for error in self.processor.drain_loot_persistence_errors() {
+            self.health
+                .record_persistence_failure(format!("loot insert: {error}"));
+        }
         let persistence = self.processor.save_account_on_exit();
         let db_close = self.processor.close_databases();
         let report = ShutdownReport::from_results(persistence, db_close);
+        match &report {
+            ShutdownReport::PersistenceFailed(error) => {
+                self.health
+                    .record_persistence_failure(format!("account save: {error}"));
+            }
+            ShutdownReport::DatabaseCloseFailed(error) => {
+                self.health
+                    .record_persistence_failure(format!("database close: {error}"));
+            }
+            ShutdownReport::Success | ShutdownReport::TimedOut => {}
+        }
+        self.health.set_capture_state(CaptureState::Stopped);
         self.publish_snapshot();
         tracing::info!("[WORKER] processing thread stopped: {:?}", report);
         let _ = done_tx.send(report);
@@ -912,6 +1064,12 @@ impl Worker {
             ControlMsg::StartHistoricalMaintenance => {
                 self.next_maintenance.get_or_insert_with(Instant::now);
             }
+            ControlMsg::SetWatchlist(watchlist) => {
+                self.watchlist = watchlist;
+            }
+            ControlMsg::SetLiveDemand(demand) => {
+                self.wake.set_demand(demand);
+            }
             ControlMsg::StartCapture(receiver) => {
                 self.processor.on_capture_start();
                 #[cfg(feature = "latency-diagnostics")]
@@ -919,9 +1077,10 @@ impl Worker {
                     self.capture_drops.finish_source(previous.dropped());
                 }
                 self.receiver = Some(receiver);
+                self.health.set_capture_state(CaptureState::Active);
                 // Reset publishes so the UI re-syncs after a capture restart.
                 self.publish_snapshot();
-                self.ctx.request_repaint();
+                self.wake.request(&self.ctx);
             }
             ControlMsg::StopCapture => {
                 self.processor.on_capture_stop();
@@ -933,31 +1092,136 @@ impl Worker {
                 {
                     self.receiver = None;
                 }
+                self.release_auto_callout();
+                self.health.set_capture_state(CaptureState::Stopped);
             }
             other => {
                 self.processor.apply_control(other);
                 let view_changed = self.publish_snapshot();
                 if view_changed {
-                    self.ctx.request_repaint();
+                    self.wake.request(&self.ctx);
                 }
             }
         }
         false
     }
 
+    /// Release any automatic callout this worker put on the clipboard.
+    fn release_auto_callout(&mut self) {
+        if let Some(auto) = self.auto_callout.take() {
+            crate::clipboard::clear_if_ours(&auto.text);
+        }
+    }
+
+    /// Clear the automatic callout once its join window elapses.
+    fn expire_auto_callout(&mut self) {
+        if self
+            .auto_callout
+            .as_ref()
+            .is_some_and(|auto| Instant::now() >= auto.expires_at)
+        {
+            self.release_auto_callout();
+        }
+    }
+
+    /// Copy the new dungeon's callout worker-side when auto-clipboard is enabled.
+    fn refresh_auto_callout(
+        &mut self,
+        display_name: &str,
+        modifiers: &[String],
+        grade: &Option<String>,
+        origin: Option<&super::contract::DungeonOrigin>,
+    ) {
+        self.release_auto_callout();
+        let Some(origin) = origin else {
+            return;
+        };
+        let settings = match self.settings.read() {
+            Ok(settings) => settings.clone(),
+            Err(_) => return,
+        };
+        let learned = self.processor.learned_event_mods(
+            &crate::panels::live_feed::format_dungeon_name(display_name),
+            settings.live_feed.learn_event_mods,
+            settings.live_feed.learn_event_mods_runs.clamp(
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+            ) as usize,
+        );
+        let Some((text, expires_at)) =
+            build_auto_callout(&settings, display_name, modifiers, grade, &learned, origin)
+        else {
+            return;
+        };
+        if crate::clipboard::set_text(&text) {
+            self.auto_callout = Some(AutoCallout { text, expires_at });
+        }
+    }
+
+    /// Fetch exalt stats once per worker session, off the UI drain path.
+    fn fetch_exalts_once(&mut self, token: &str) {
+        if self.exalts_fetched {
+            return;
+        }
+        self.exalts_fetched = true;
+        let token = token.to_string();
+        std::thread::spawn(move || {
+            tracing::debug!("[API] Fetching exalt stats...");
+            let client = realmhound_core::api::RotmgApiClient::new(token);
+            match client.get_power_up_stats() {
+                Ok(xml) => tracing::info!("[EXALTS] Loaded exalt stats ({} bytes)", xml.len()),
+                Err(error) => tracing::warn!("[EXALTS] Failed to load: {}", error),
+            }
+        });
+    }
+
     /// Periodic account save, mirroring the App's prior 60s/dirty policy.
     fn maybe_periodic_save(&mut self) {
         if self.last_save.elapsed() >= SAVE_INTERVAL {
-            if self.processor.save_account_if_dirty() {
-                self.last_save = Instant::now();
+            match self.processor.save_account_if_dirty() {
+                Ok(true) => self.last_save = Instant::now(),
+                Ok(false) => {}
+                Err(error) => {
+                    self.health
+                        .record_persistence_failure(format!("periodic account save: {error}"));
+                    self.last_save = Instant::now();
+                }
             }
         }
+    }
+
+    /// Throttled health summary that does not depend on the UI painting.
+    ///
+    /// Frame measurements stay in the UI-side monitor; this line covers the
+    /// worker-owned numbers so a stalled or minimized window is still visible.
+    fn maybe_log_health(&mut self) {
+        if !super::health::pipeline_logs_enabled()
+            || self.last_health_log.elapsed() < HEALTH_LOG_INTERVAL
+        {
+            return;
+        }
+        self.last_health_log = Instant::now();
+        let counters = self.health.snapshot(0, 0);
+        tracing::info!(
+            "[HEALTH][WORKER] ui_backlog={} ui_drops={} capture={} persistence_failures={} \
+             live_window_events={} live_window_evictions={} audio_stale_drops={} \
+             audio_full_drops={}",
+            self.ui_tx.len(),
+            self.ui_tx.dropped(),
+            counters.capture.label(),
+            counters.persistence_failures,
+            self.processor.live_event_window().events.len(),
+            counters.live_window_evictions,
+            counters.audio_stale_drops,
+            counters.audio_full_drops
+        );
     }
 
     /// Publish the latest model state into the shared snapshot, cloning heavy
     /// fields only when their generation changed. Returns whether the scalar
     /// view state changed (so the caller can request a repaint).
     fn publish_snapshot(&mut self) -> bool {
+        let started = Instant::now();
         let view = self.processor.view_state();
         let char_gen = view.char_view_gen;
         let account_gen = view.account_generation;
@@ -969,214 +1233,328 @@ impl Worker {
         let vault_changed = vault_gen != self.pub_vault_gen;
         let mission_gen = view.mission_view_gen;
         let mission_changed = mission_gen != self.pub_mission_gen;
+        let token_gen = view.token_gen;
+        let token_changed = token_gen != self.pub_token_gen;
+        let party_rev = view.party_rev;
+        let party_changed = party_rev != self.pub_party_rev;
+        let encounter_rev = view.encounter_rev;
+        let encounters_changed = encounter_rev != self.pub_encounter_rev;
+        let quest_rev = view.quest_rev;
+        let quests_changed = quest_rev != self.pub_quest_rev;
+        let live_event_rev = view.live_event_rev;
+        let live_events_changed = live_event_rev != self.pub_live_event_rev;
+        let feed_rev = view.feed_rev;
+        let feed_changed = feed_rev != self.pub_feed_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
-        if let Ok(mut snap) = self.snapshot.lock() {
-            snap.view = view.clone();
-            snap.live_char_id = live_char_id;
-            snap.main_connection = main_connection;
-            if account_changed {
-                snap.account_data = self.processor.account_data().clone();
-            }
-            if vault_changed {
-                snap.live_vault_data = self.processor.live_vault_data();
-            }
-            if mission_changed {
-                snap.mission_view = self.processor.mission_view();
-            }
-        }
+        let lock_started = Instant::now();
+        let previous = match self.snapshot.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return false,
+        };
+        self.health
+            .record_snapshot_lock_wait(lock_started.elapsed());
+
+        // Heavy clones happen outside the lock; unchanged domains reuse their Arc.
+        let account_data = account_changed.then(|| Arc::new(self.processor.account_data().clone()));
+        let live_vault_data = vault_changed.then(|| Arc::new(self.processor.live_vault_data()));
+        let mission_view = mission_changed.then(|| Arc::new(self.processor.mission_view()));
+        let token = token_changed
+            .then(|| self.processor.token_state().map(Arc::new))
+            .flatten();
+        let party = party_changed.then(|| Arc::new(self.processor.party_view()));
+        let encounters = encounters_changed.then(|| Arc::new(self.processor.encounter_set()));
+        let quests = quests_changed
+            .then(|| self.processor.quest_view().map(Arc::new))
+            .flatten();
+        let live_events = live_events_changed.then(|| Arc::new(self.processor.live_event_window()));
+        let feed = feed_changed.then(|| Arc::new(self.processor.feed_context()));
+        let next = previous.next(
+            view.clone(),
+            live_char_id,
+            main_connection,
+            account_data,
+            live_vault_data,
+            mission_view,
+            token,
+            party,
+            encounters,
+            quests,
+            live_events,
+            feed,
+        );
+        let lock_started = Instant::now();
+        let replaced = match self.snapshot.lock() {
+            Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
+            Err(_) => return false,
+        };
+        self.health
+            .record_snapshot_lock_wait(lock_started.elapsed());
+        self.health.record_snapshot_publish(started.elapsed());
+        drop(replaced);
 
         self.pub_char_gen = char_gen;
         self.pub_account_gen = account_gen;
         self.pub_vault_gen = vault_gen;
         self.pub_mission_gen = mission_gen;
+        self.pub_token_gen = token_gen;
+        self.pub_party_rev = party_rev;
+        self.pub_encounter_rev = encounter_rev;
+        self.pub_quest_rev = quest_rev;
+        self.pub_live_event_rev = live_event_rev;
+        self.pub_feed_rev = feed_rev;
         self.pub_view = Some(view);
         view_changed
     }
 }
 
-/// Whether a produced [`UiPayload`] should wake the UI given the current
-/// `active` tab. Payloads that feed always-visible global widgets (the party
-/// status bar) or carry side effects return `true` regardless of tab; the rest
-/// wake only the tabs whose panels render them. `Audio` is routed to the audio
-/// thread before this decision and never reaches here.
-fn payload_relevant(payload: &UiPayload, active: ActiveTab) -> bool {
-    use ActiveTab::*;
-    match payload {
-        // Global: drive the always-visible status bar or have deferred-unsafe
-        // side effects (token persistence + one-time exalt fetch).
-        UiPayload::PartyMemberLeft(_)
-        | UiPayload::PartyLocalLeaderStatus(_)
-        | UiPayload::PartyLocalPlayerName(_)
-        | UiPayload::PartyCleared
-        | UiPayload::AccessTokenCaptured(_) => true,
-
-        // Every GameEvent is broadcast here. Party-membership variants also feed
-        // the global status bar, so they always wake; the rest wake only the
-        // tabs that render live game events.
-        UiPayload::Broadcast(event) => {
-            is_global_event(event)
-                || matches!(active, LiveFeed | Quests | Party | Vault | CombatHistory)
+/// Watchlist alerts carried by a party event.
+fn party_alerts(
+    watchlist: &Watchlist,
+    event: &GameEvent,
+    local_leader: bool,
+) -> Vec<LiveEventView> {
+    let mut alerts = Vec::new();
+    let mut kick_if_banned = |name: &str| {
+        if watchlist.check_player(name) == PlayerStatus::Banned {
+            alerts.push(LiveEventView::KickAlert {
+                name: name.to_string(),
+            });
         }
-
-        UiPayload::Chat(_) => matches!(active, Chat | LiveFeed),
-        UiPayload::PushLoot(_) => matches!(active, LiveFeed | LootHistory | TrophyHall),
-        UiPayload::LootBatchAdded => matches!(active, LootHistory | TrophyHall),
-        UiPayload::UpdateVaultPetSlot { .. } => matches!(active, Vault | PetYard),
-        UiPayload::SetVaultActivePet { .. } => matches!(active, Vault | PetYard),
-
-        UiPayload::BossCall { .. }
-        | UiPayload::RealmDiscovery(_)
-        | UiPayload::KeyperEvent { .. }
-        | UiPayload::SetServerName(_)
-        | UiPayload::AddEncounter { .. }
-        | UiPayload::RemoveEncounter(_)
-        | UiPayload::RealmClosed
-        | UiPayload::KeyPop { .. }
-        | UiPayload::AreaUnlock { .. }
-        | UiPayload::DungeonTimerFrozen { .. }
-        | UiPayload::OryxLagWarning => matches!(active, LiveFeed),
-
-        // Only the Combat History panel shows stored fight cards.
-        UiPayload::CombatHistoryChanged => matches!(active, CombatHistory),
-
-        // Handled by the audio thread before this point.
-        UiPayload::Audio(_) => false,
+    };
+    match event {
+        GameEvent::PartyListReceived(info) => {
+            for player in &info.party_players {
+                kick_if_banned(&player.name);
+            }
+        }
+        GameEvent::PartyMemberJoined(member) => kick_if_banned(&member.name),
+        GameEvent::PartyJoinRequestResponse(response) if local_leader && response.state == 1 => {
+            if watchlist.check_player(&response.player_name) == PlayerStatus::Banned {
+                alerts.push(LiveEventView::JoinRequestAlert {
+                    name: response.player_name.clone(),
+                });
+            }
+        }
+        _ => {}
     }
+    alerts
 }
 
-/// Broadcast events that mutate the always-visible party status bar (leader
-/// crown + member/watchlist counts), so they must wake any active tab.
-fn is_global_event(event: &GameEvent) -> bool {
-    matches!(
-        event,
-        GameEvent::PartyListReceived(_)
-            | GameEvent::PartyMemberJoined(_)
-            | GameEvent::PartyJoinRequestResponse(_)
-            | GameEvent::PartyActionReceived { .. }
-    )
+/// Build the automatic dungeon callout, if one should be copied.
+fn build_auto_callout(
+    settings: &Settings,
+    display_name: &str,
+    modifiers: &[String],
+    grade: &Option<String>,
+    learned: &[String],
+    origin: &super::contract::DungeonOrigin,
+) -> Option<(String, Instant)> {
+    if !settings.live_feed.auto_clipboard_dungeon_calls {
+        return None;
+    }
+    let estimated = origin.portal_anchor.is_none();
+    let score = origin.realm_score_percent;
+    if !origin.realm_closed && score.is_some_and(|percent| percent >= 100) {
+        return None;
+    }
+    let origin_status = match crate::panels::dungeon_callout::realm_status_suffix(
+        settings.live_feed.realm_status,
+        settings.live_feed.realm_status_threshold,
+        score,
+    ) {
+        Some(status) => Some(status),
+        None if origin.entered_from_nexus => {
+            settings.live_feed.nexus_marker.text().map(str::to_string)
+        }
+        None => None,
+    };
+    let params = crate::panels::dungeon_callout::DungeonCalloutParams {
+        name_style: settings.live_feed.dungeon_name_style,
+        name_overrides: &settings.live_feed.dungeon_name_overrides,
+        loot_label: settings.live_feed.loot_label,
+        dust_label: settings.live_feed.dust_label,
+        xp_label: settings.live_feed.xp_label,
+        loot_threshold: settings.live_feed.loot_threshold,
+        dust_threshold: settings.live_feed.dust_threshold,
+        xp_threshold: settings.live_feed.xp_threshold,
+        call_event_mods: settings.live_feed.call_event_mods,
+        percent: settings.live_feed.callout_percent,
+        reward_mods: &settings.live_feed.reward_mods,
+        learned_event_mods: learned,
+        origin_status: origin_status.as_deref(),
+    };
+    // Anchor the countdown to the portal the player used, not to the moment
+    // this batch happened to be processed.
+    // A known portal-spawn anchor means the countdown is NOT estimated.
+    let anchor = origin
+        .portal_anchor
+        .or(origin.entered_at)
+        .unwrap_or_else(Instant::now);
+    let entry = crate::panels::live_feed::DungeonEntry::new(
+        display_name.to_string(),
+        None,
+        modifiers,
+        grade.clone(),
+        &params,
+        origin.server_name.clone(),
+        origin.realm_name.clone(),
+        score,
+        anchor,
+        estimated,
+    );
+    let body = entry.callout.as_deref()?;
+    if entry.remaining(Instant::now()).is_zero() {
+        return None;
+    }
+    let text = crate::panels::dungeon_callout::assemble_callout(
+        body,
+        entry.server_name.as_deref(),
+        entry.realm_name.as_deref(),
+        settings.live_feed.dungeon_join_position,
+        settings.live_feed.call_for_party,
+        settings.live_feed.include_server_name,
+        settings.live_feed.include_realm_name,
+    );
+    Some((text, entry.expires_at))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn non_party_broadcast() -> UiPayload {
-        UiPayload::Broadcast(GameEvent::EntityHit { target_id: 1 })
-    }
+    #[test]
+    fn party_alerts_follow_the_worker_watchlist() {
+        use realmhound_core::protocol::{PartyMemberAddedPacket, PartyRequestResponsePacket};
 
-    fn party_broadcast() -> UiPayload {
-        UiPayload::Broadcast(GameEvent::PartyActionReceived {
-            player_id: 0,
-            action_id: 0,
-        })
+        let mut watchlist = Watchlist::new();
+        watchlist.replace_entries("Bad");
+        assert_eq!(watchlist.check_player("Bad"), PlayerStatus::Banned);
+
+        let joined = party_alerts(
+            &watchlist,
+            &GameEvent::PartyMemberJoined(PartyMemberAddedPacket {
+                player_id: 1,
+                name: "Bad".to_string(),
+                class_id: 0,
+                skin_id: 0,
+            }),
+            false,
+        );
+        assert!(matches!(
+            joined.as_slice(),
+            [LiveEventView::KickAlert { name }] if name == "Bad"
+        ));
+
+        let requested = party_alerts(
+            &watchlist,
+            &GameEvent::PartyJoinRequestResponse(PartyRequestResponsePacket {
+                player_name: "Bad".to_string(),
+                class_id: 0,
+                skin_id: 0,
+                state: 1,
+            }),
+            true,
+        );
+        assert!(matches!(
+            requested.as_slice(),
+            [LiveEventView::JoinRequestAlert { name }] if name == "Bad"
+        ));
     }
 
     #[test]
-    fn broadcast_wakes_only_dynamic_game_tabs() {
-        let p = non_party_broadcast();
-        for tab in [
-            ActiveTab::LiveFeed,
-            ActiveTab::Quests,
-            ActiveTab::Party,
-            ActiveTab::Vault,
-            ActiveTab::CombatHistory,
-        ] {
-            assert!(
-                payload_relevant(&p, tab),
-                "{:?} should wake on broadcast",
-                tab
-            );
-        }
-        // Expensive static tabs must sleep through unrelated broadcast traffic.
-        for tab in [
-            ActiveTab::Treasury,
-            ActiveTab::TrophyHall,
-            ActiveTab::Characters,
-            ActiveTab::Exaltations,
-            ActiveTab::LootHistory,
-            ActiveTab::Chat,
-        ] {
-            assert!(
-                !payload_relevant(&p, tab),
-                "{:?} should sleep on broadcast",
-                tab
-            );
-        }
+    fn auto_callout_builds_joinable_callout() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut settings = Settings::default();
+        settings.live_feed.auto_clipboard_dungeon_calls = true;
+        let (text, _) = build_auto_callout(
+            &settings,
+            "Snake Pit",
+            &[],
+            &None,
+            &[],
+            &crate::processing::contract::DungeonOrigin {
+                server_name: Some("EUWest".to_string()),
+                realm_name: Some("Mesa".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("joinable dungeon produces a callout");
+        assert!(text.contains("snake"), "unexpected callout: {text}");
     }
 
     #[test]
-    fn party_membership_broadcast_is_global() {
-        // Feeds the always-visible status bar, so it wakes even a static tab.
-        assert!(payload_relevant(&party_broadcast(), ActiveTab::Treasury));
-        assert!(payload_relevant(&party_broadcast(), ActiveTab::Characters));
+    fn auto_callout_requires_setting_and_callable_dungeon() {
+        let mut settings = Settings::default();
+        assert!(
+            build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &Default::default())
+                .is_none()
+        );
+
+        settings.live_feed.auto_clipboard_dungeon_calls = true;
+        assert!(
+            build_auto_callout(&settings, "The Void", &[], &None, &[], &Default::default())
+                .is_none()
+        );
     }
 
     #[test]
-    fn party_status_payloads_are_global() {
-        for p in [
-            UiPayload::PartyMemberLeft("x".into()),
-            UiPayload::PartyLocalLeaderStatus(true),
-        ] {
-            assert!(payload_relevant(&p, ActiveTab::Treasury));
-            assert!(payload_relevant(&p, ActiveTab::TrophyHall));
-        }
-    }
-
-    #[test]
-    fn access_token_capture_is_global() {
-        let p = UiPayload::AccessTokenCaptured("tok".into());
-        assert!(payload_relevant(&p, ActiveTab::Treasury));
-    }
-
-    #[test]
-    fn loot_payloads_wake_loot_and_trophy_tabs() {
-        let p = UiPayload::LootBatchAdded;
-        assert!(payload_relevant(&p, ActiveTab::LootHistory));
-        assert!(payload_relevant(&p, ActiveTab::TrophyHall));
-        assert!(!payload_relevant(&p, ActiveTab::Treasury));
-        assert!(!payload_relevant(&p, ActiveTab::LiveFeed));
-    }
-
-    #[test]
-    fn live_feed_only_payloads_scope_to_live_feed() {
-        for p in [
-            UiPayload::RealmClosed,
-            UiPayload::OryxLagWarning,
-            UiPayload::RemoveEncounter(1),
-            UiPayload::SetServerName("s".into()),
-        ] {
-            assert!(payload_relevant(&p, ActiveTab::LiveFeed));
-            assert!(!payload_relevant(&p, ActiveTab::Treasury));
-            assert!(!payload_relevant(&p, ActiveTab::Party));
-        }
-    }
-
-    #[test]
-    fn combat_history_change_scopes_to_combat_history() {
-        let p = UiPayload::CombatHistoryChanged;
-        assert!(payload_relevant(&p, ActiveTab::CombatHistory));
-        for tab in [
-            ActiveTab::LiveFeed,
-            ActiveTab::Party,
-            ActiveTab::Treasury,
-            ActiveTab::TrophyHall,
-        ] {
-            assert!(!payload_relevant(&p, tab), "{tab:?} should sleep");
-        }
-    }
-
-    #[test]
-    fn vault_pet_slot_scopes_to_vault() {
-        let p = UiPayload::UpdateVaultPetSlot {
-            pet_instance_id: 1,
-            seasonal: false,
-            slot: 0,
-            item_id: 2,
-            stack_count: 1,
+    fn auto_callout_uses_resolved_origin_and_original_deadline() {
+        use crate::processing::contract::DungeonOrigin;
+        let _assets = crate::test_support::modifier_assets();
+        let mut settings = Settings::default();
+        settings.live_feed.auto_clipboard_dungeon_calls = true;
+        settings.live_feed.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        settings.live_feed.realm_status_threshold = 0;
+        let entered_at = Instant::now();
+        let mut origin = DungeonOrigin {
+            entered_at: Some(entered_at),
+            portal_anchor: Some(entered_at - Duration::from_secs(5)),
+            realm_score_percent: Some(74),
+            ..Default::default()
         };
-        assert!(payload_relevant(&p, ActiveTab::Vault));
-        assert!(!payload_relevant(&p, ActiveTab::LiveFeed));
+        let (text, deadline) =
+            build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &origin).unwrap();
+        assert!(text.contains("in 74% realm"), "{text}");
+        assert_eq!(
+            deadline,
+            origin.portal_anchor.unwrap() + Duration::from_secs(30)
+        );
+        origin.portal_anchor = None;
+        origin.realm_score_percent = None;
+        origin.entered_from_nexus = true;
+        let (text, deadline) =
+            build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &origin).unwrap();
+        assert!(!text.contains("realm"), "{text}");
+        assert_eq!(deadline, entered_at + Duration::from_secs(25));
+        origin.entered_at = Some(entered_at - Duration::from_secs(60));
+        assert!(build_auto_callout(&settings, "Snake Pit", &[], &None, &[], &origin).is_none());
+    }
+
+    #[test]
+    fn wake_throttle_coalesces_and_keeps_a_trailing_repaint() {
+        let t0 = Instant::now();
+        let mut wake = WakeThrottle::default();
+        assert_eq!(wake.next_delay(t0), None);
+        assert_eq!(
+            wake.next_delay(t0 + Duration::from_millis(10)),
+            Some(Duration::from_millis(90))
+        );
+        assert_eq!(
+            wake.next_delay(t0 + Duration::from_millis(99)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(wake.next_delay(t0 + Duration::from_millis(100)), None);
+    }
+
+    #[test]
+    fn restored_demand_clears_the_throttle_window() {
+        let t0 = Instant::now();
+        let mut wake = WakeThrottle::default();
+        assert_eq!(wake.next_delay(t0), None);
+        wake.set_demand(false);
+        wake.set_demand(true);
+        assert_eq!(wake.next_delay(t0 + Duration::from_millis(10)), None);
     }
 
     #[cfg(feature = "latency-diagnostics")]
@@ -1506,7 +1884,6 @@ mod staging_tests {
             processor(&account),
             egui::Context::default(),
             AudioSender::disconnected(),
-            Arc::new(AtomicU8::new(0)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1528,7 +1905,6 @@ mod staging_tests {
             processor(&account),
             egui::Context::default(),
             AudioSender::disconnected(),
-            Arc::new(AtomicU8::new(0)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1555,7 +1931,6 @@ mod staging_tests {
             processor,
             egui::Context::default(),
             AudioSender::disconnected(),
-            Arc::new(AtomicU8::new(0)),
             account,
         )
         .unwrap();

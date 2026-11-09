@@ -5,8 +5,7 @@ use chrono::{DateTime, Local, NaiveDate, NaiveTime};
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, RichText, ScrollArea, Sense, TextFormat, Ui};
 use realmhound_core::assets::get_asset_manager;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -329,7 +328,7 @@ impl ChatMessage {
 
             // Crystal callouts carry no resolvable boss_id, so synthesize the
             // Mysterious Crystal sprite + name. This routes them to the Live Feed
-            // (via PushBossCall) like other encounter callouts, instead of leaving
+            // like other encounter callouts, instead of leaving
             // them as a plain chat announcement.
             if is_crystal && boss_id.is_none() {
                 let asset_manager = get_asset_manager();
@@ -1302,85 +1301,12 @@ impl ChatPanel {
         }
     }
 
-    /// Persist a new chat message to the daily log file. The unified chat view is
-    /// disk-backed and refreshes on tab entry / Refresh, so nothing is retained in
-    /// memory here.
-    pub fn add_message(&mut self, message: ChatMessage) {
-        self.log_to_file(&message);
-    }
-
     /// The per-account chat log directory, or `None` when unset.
     fn chat_log_dir(&self) -> Option<&Path> {
         if self.log_dir.as_os_str().is_empty() {
             None
         } else {
             Some(self.log_dir.as_path())
-        }
-    }
-
-    /// Log a chat message to the daily log file.
-    fn log_to_file(&self, message: &ChatMessage) {
-        // Only log normal, guild, party, and whisper chats
-        match message.chat_type {
-            ChatType::Normal | ChatType::Guild | ChatType::Party | ChatType::Whisper => {}
-            _ => return,
-        }
-
-        let Some(log_dir) = self.chat_log_dir() else {
-            return;
-        };
-
-        // Create log directory if it doesn't exist
-        if let Err(e) = fs::create_dir_all(&log_dir) {
-            tracing::warn!("Failed to create chat log directory: {}", e);
-            return;
-        }
-
-        // Create daily log file name
-        let date_str = Local::now().format("%Y-%m-%d").to_string();
-        let log_path = log_dir.join(format!("chat_{}.log", date_str));
-
-        // Format log line
-        let time_str = message.timestamp.format("%H:%M:%S").to_string();
-        let type_str = match message.chat_type {
-            ChatType::Normal => "[PUBLIC]",
-            ChatType::Guild => "[GUILD]",
-            ChatType::Party => "[PARTY]",
-            ChatType::Whisper => "[WHISPER]",
-            _ => return,
-        };
-
-        // Optional metadata prefix so history can render the sender's star rank
-        // and supporter badge (parsed back by `parse_log_line`).
-        let mut meta = String::new();
-        if message.stars > 0 {
-            meta.push_str(&format!("★{} ", message.stars));
-        }
-        if message.is_supporter {
-            meta.push_str("♦ ");
-        }
-
-        let log_line = match &message.recipient {
-            Some(recipient) => format!(
-                "{} {} {}{} → {}: {}\n",
-                time_str, type_str, meta, message.sender, recipient, message.text
-            ),
-            None => format!(
-                "{} {} {}{}: {}\n",
-                time_str, type_str, meta, message.sender, message.text
-            ),
-        };
-
-        // Append to log file
-        match OpenOptions::new().create(true).append(true).open(&log_path) {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(log_line.as_bytes()) {
-                    tracing::warn!("Failed to write to chat log: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to open chat log file: {}", e);
-            }
         }
     }
 
@@ -2131,39 +2057,6 @@ impl Panel for ChatPanel {
             vec![]
         }
     }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        if let realmhound_core::GameEvent::TextReceived(ref text) = event {
-            if let Some(mut chat_msg) = ChatMessage::from_text_packet(text) {
-                let mut actions = Vec::new();
-                if let Some(boss_id) = chat_msg.boss_id {
-                    // Encounter callouts are surfaced in the Live Feed only, not the chat list.
-                    actions.push(AppAction::PushBossCall {
-                        boss_id,
-                        text: chat_msg.text.clone(),
-                    });
-                    return actions;
-                }
-                // Whispers always involve the local player. Both directions render
-                // the full "sender → recipient: text"; we only tag outgoing whispers
-                // (sender == me) so click-to-filter targets the conversation partner.
-                if chat_msg.chat_type == ChatType::Whisper {
-                    if let Some(me) = session.connection.detected_account_name.as_deref() {
-                        if chat_msg.sender.eq_ignore_ascii_case(me) {
-                            chat_msg.is_outgoing = true;
-                        }
-                    }
-                }
-                self.add_message(chat_msg);
-                return actions;
-            }
-        }
-        vec![]
-    }
 }
 
 #[cfg(test)]
@@ -2183,35 +2076,6 @@ mod tests {
             is_supporter: false,
             star_background: 0,
         }
-    }
-
-    #[test]
-    fn chat_logs_to_the_injected_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let log_dir = temp.path().join("logs").join("chat");
-        let settings = realmhound_core::settings::ChatSettings::default();
-        let mut panel = ChatPanel::new_with_settings(&settings, log_dir.clone());
-
-        let message = ChatMessage {
-            timestamp: Local::now(),
-            sender: "Pillar".to_string(),
-            text: "hello world".to_string(),
-            chat_type: ChatType::Normal,
-            recipient: None,
-            stars: 0,
-            is_supporter: false,
-            boss_id: None,
-            is_outgoing: false,
-        };
-        panel.add_message(message);
-
-        // A daily log file was created under the injected per-account directory.
-        assert!(log_dir.exists());
-        let count = std::fs::read_dir(&log_dir).unwrap().count();
-        assert_eq!(
-            count, 1,
-            "one daily chat log written under the injected dir"
-        );
     }
 
     #[test]
@@ -2254,24 +2118,6 @@ mod tests {
             panel.history_author_catalog.len(),
             "lowercase search keys stay aligned with the catalogue"
         );
-    }
-
-    #[test]
-    fn chat_without_bound_directory_writes_nothing() {
-        let settings = realmhound_core::settings::ChatSettings::default();
-        let mut panel = ChatPanel::new_with_settings(&settings, std::path::PathBuf::new());
-        // Must not panic or create files when no log directory is bound.
-        panel.add_message(ChatMessage {
-            timestamp: Local::now(),
-            sender: "Pillar".to_string(),
-            text: "hello".to_string(),
-            chat_type: ChatType::Normal,
-            recipient: None,
-            stars: 0,
-            is_supporter: false,
-            boss_id: None,
-            is_outgoing: false,
-        });
     }
 
     #[test]

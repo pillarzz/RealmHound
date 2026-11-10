@@ -25,6 +25,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 # Utilities
+base64 = "0.22"
 chrono = { workspace = true }
 hex = "0.4"
 dirs = "5.0"

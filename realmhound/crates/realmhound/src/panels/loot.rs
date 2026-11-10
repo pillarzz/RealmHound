@@ -422,10 +422,10 @@ impl LootPanel {
         &self.filters
     }
 
-    /// Reset the history list back to the top on the next render. Called when
-    /// the Loot History tab is (re)activated so it always opens on the most
-    /// recent drops instead of inheriting a stale scroll position.
+    /// Re-read history and return to the top when the tab is (re)activated.
     pub fn reset_scroll(&mut self) {
+        self.reset_history();
+        self.invalidate_autocomplete_cache();
         self.reset_scroll_pending = true;
     }
 
@@ -2133,6 +2133,41 @@ impl Panel for LootPanel {
 mod property_history_tests {
     use super::*;
     use realmhound_core::loot::{NewLootDrop, NewLootItem, PlayerStateTracker};
+
+    #[test]
+    fn reopening_history_reloads_new_drops_without_appending_cached_pages() {
+        let mut db = LootDatabase::open_in_memory().unwrap();
+        let mut player = PlayerStateTracker::new();
+        player.on_create_success(1, 1);
+        player.on_new_map("Realm", 1);
+        let mut drop = NewLootDrop {
+            timestamp: 61_000,
+            player: player.capture_snapshot().unwrap(),
+            bag_type: LootBagType::White,
+            mob_type: 8200,
+            mob_name: String::new(),
+            items: Vec::new(),
+        };
+        for _ in 0..101 {
+            db.insert_loot_drop(&drop).unwrap();
+        }
+        let mut panel = LootPanel::default();
+        panel.load_history(&db);
+        panel.history_offset = 100;
+        panel.history_needs_refresh = true;
+        panel.load_history(&db);
+        assert_eq!(panel.history_drops.len(), 101);
+
+        drop.timestamp = 90_000;
+        let new_id = db.insert_loot_drop(&drop).unwrap();
+        panel.load_history(&db);
+        assert_eq!(panel.history_total_count, Some(101));
+        panel.reset_scroll();
+        panel.load_history(&db);
+        assert_eq!(panel.history_total_count, Some(102));
+        assert_eq!(panel.history_drops.len(), 100);
+        assert_eq!(panel.history_drops[0].id, new_id);
+    }
 
     #[test]
     fn property_pages_counts_and_resets_use_matching_bags_only() {

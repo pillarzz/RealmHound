@@ -76,6 +76,20 @@ pub fn channel(bound: usize) -> (UiSender, UiReceiver) {
 }
 
 impl UiSender {
+    /// Updates currently waiting for the UI (always-on health).
+    pub fn len(&self) -> usize {
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Total updates dropped so far due to overflow (always-on health).
+    pub fn dropped(&self) -> u64 {
+        self.shared.dropped.load(Ordering::Relaxed)
+    }
+
     /// Enqueue an update. On overflow the oldest queued update is dropped and the
     /// dropped counter is bumped. Returns `Err(Disconnected)` only if the UI
     /// receiver has been dropped.
@@ -139,8 +153,7 @@ impl UiReceiver {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
-    /// Number of updates currently waiting for the UI.
-    #[cfg(feature = "latency-diagnostics")]
+    /// Number of updates currently waiting for the UI (always-on health).
     pub fn len(&self) -> usize {
         self.shared
             .queue

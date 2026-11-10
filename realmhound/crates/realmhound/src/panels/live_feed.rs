@@ -45,7 +45,7 @@ enum PinnedTooltip {
 /// Estimated dungeon portal join window. The portal spawn time isn't in any
 /// packet we receive, so we count down from local entry; the true joinable
 /// window is always somewhat shorter than this upper bound.
-const DUNGEON_JOIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const DUNGEON_JOIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Window during which a repeated boss callout for the same boss is suppressed.
 /// Kept short: it exists only to collapse near-duplicate spawn packets (the same
@@ -83,6 +83,31 @@ pub enum FeedEntry {
     KeyPop(KeyPopEntry),
     /// Special area unlock (Incantation / Rune / Vial pop).
     AreaUnlock(AreaUnlockEntry),
+}
+
+impl FeedEntry {
+    /// Replace the row's display time (recovered rows keep the worker's time).
+    fn set_timestamp(&mut self, timestamp: DateTime<Local>) {
+        match self {
+            FeedEntry::Loot(entry) => entry.timestamp = timestamp,
+            FeedEntry::BossCall(entry) => entry.timestamp = timestamp,
+            FeedEntry::KickAlert(entry) => entry.timestamp = timestamp,
+            FeedEntry::Dungeon(entry) => entry.timestamp = timestamp,
+            FeedEntry::DustFull(entry) => entry.timestamp = timestamp,
+            FeedEntry::DirectMessage(entry) => entry.timestamp = timestamp,
+            FeedEntry::WhoRoster(entry) => entry.timestamp = timestamp,
+            FeedEntry::Warning(entry) => entry.timestamp = timestamp,
+            FeedEntry::KeyPop(entry) => entry.timestamp = timestamp,
+            FeedEntry::AreaUnlock(entry) => entry.timestamp = timestamp,
+        }
+    }
+
+    /// Keep the worker's observation time for the run timer origin.
+    fn set_entered_at(&mut self, instant: std::time::Instant) {
+        if let FeedEntry::Dungeon(entry) = self {
+            entry.entered_at = instant;
+        }
+    }
 }
 
 /// Loot drop entry data.
@@ -449,7 +474,7 @@ impl AreaUnlockEntry {
 /// `None` for any text that is not a `/who` reply. A reply with an empty roster
 /// (`Players online (0): `) yields `Some(vec![])`. Names are sorted
 /// case-insensitively.
-fn parse_who_roster(text: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_who_roster(text: &str) -> Option<Vec<String>> {
     let trimmed = text.trim();
     if !trimmed.starts_with("Players online (") {
         return None;
@@ -509,7 +534,7 @@ fn parse_server_command(text: &str) -> Option<(String, Option<String>)> {
 /// whereas player whisper/party/guild chat has a recipient or `#`-prefixed name
 /// and public chat has a non-negative object id. Gating this way means ordinary
 /// chat that happens to read like `<Server> Nexus` can never spoof the header.
-fn parse_server_command_packet(
+pub(crate) fn parse_server_command_packet(
     packet: &realmhound_core::protocol::TextPacket,
 ) -> Option<(String, Option<String>)> {
     let is_system = packet.recipient.is_empty() && (packet.object_id < 0 || packet.name.is_empty());
@@ -625,12 +650,12 @@ const DUNGEON_WINDOW_ANCHORED: std::time::Duration = DUNGEON_JOIN_WINDOW;
 const DUNGEON_WINDOW_ESTIMATED: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Time from a realm-close message to the castle teleport.
-const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long after entering a dungeon the connection to its instance still counts
 /// as that instance's host. The host is identified from the new socket a beat
 /// after the dungeon's MapInfo arrives, so the hint is always slightly late.
-const NEXUS_ORIGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const NEXUS_ORIGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How many recent entries of one dungeon the panel remembers, and therefore the
 /// widest window `learn_event_mods_runs` can compare. An event that started
@@ -641,6 +666,56 @@ const MAX_LEARN_EVENT_MOD_SETS: usize = 10;
 fn same_modifier(a: &str, b: &str) -> bool {
     realmhound_core::dungeon_modifiers::canonical(a)
         == realmhound_core::dungeon_modifiers::canonical(b)
+}
+
+/// Add a dungeon entry's modifier set to the learned history.
+pub(crate) fn remember_dungeon_mods(
+    sets_by_dungeon: &mut std::collections::HashMap<String, Vec<Vec<String>>>,
+    dungeon: &str,
+    modifier_tokens: &[String],
+) {
+    let sets = sets_by_dungeon.entry(dungeon.to_string()).or_default();
+    sets.push(modifier_tokens.to_vec());
+    if sets.len() > MAX_LEARN_EVENT_MOD_SETS {
+        let overflow = sets.len() - MAX_LEARN_EVENT_MOD_SETS;
+        sets.drain(0..overflow);
+    }
+}
+
+/// Mods the session has recognized as applied by an event to every instance of
+/// `dungeon`. Shared by the panel callout and the worker's automatic callout.
+pub(crate) fn select_learned_mods(
+    enabled: bool,
+    runs: usize,
+    sets_by_dungeon: &std::collections::HashMap<String, Vec<Vec<String>>>,
+    dungeon: &str,
+) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    let Some(sets) = sets_by_dungeon.get(dungeon) else {
+        return Vec::new();
+    };
+    if sets.len() < runs || runs == 0 {
+        return Vec::new();
+    }
+    let recent = &sets[sets.len() - runs..];
+    let mut candidates = recent[0].clone();
+    candidates.retain(|modifier| {
+        recent[1..]
+            .iter()
+            .all(|set| set.iter().any(|t| same_modifier(t, modifier)))
+    });
+    // A mod that stood alone in at least one of those entries cannot be part of
+    // the rolled set (which fills the instance's grade), so it is one the game
+    // added. Requiring this keeps three identical *rolls* from suppressing a
+    // genuine call.
+    candidates.retain(|modifier| {
+        recent
+            .iter()
+            .any(|set| set.len() == 1 && same_modifier(&set[0], modifier))
+    });
+    candidates
 }
 
 /// Whether a MapInfo map name is a hub space whose portals are Nexus portals:
@@ -655,7 +730,7 @@ fn same_modifier(a: &str, b: &str) -> bool {
 /// Realm entries reached from a hub are not hub maps: they report their own
 /// names (Meridian, Hearth, ...) plus a realm score, so a realm portal used in
 /// the Nexus never produces a Nexus marker.
-fn is_hub_map(display_name: &str) -> bool {
+pub(crate) fn is_hub_map(display_name: &str) -> bool {
     const HUB_MARKERS: &[&str] = &["nexus", "vault", "guildhall", "guild hall", "bazaar"];
     let name = display_name.trim().to_ascii_lowercase();
     HUB_MARKERS.iter().any(|hub| name.contains(hub))
@@ -670,7 +745,7 @@ fn is_hub_map(display_name: &str) -> bool {
 /// `NexusPortal.<Realm>` and a dungeon opened in a realm reports that same realm
 /// name. So a hub parent is the plain Nexus, never the `NexusPortal.` prefix that
 /// marks a realm (see [`parse_realm_name_for_realm`]).
-fn realm_field_is_hub(realm_name_field: &str) -> bool {
+pub(crate) fn realm_field_is_hub(realm_name_field: &str) -> bool {
     let name = realm_name_field
         .trim()
         .trim_start_matches("{s.")
@@ -808,7 +883,7 @@ fn format_run_timer(d: std::time::Duration) -> String {
 /// First resolves known localization keys via the dungeon portal map. If the
 /// name is still an unresolved localization key (e.g. "{s.spider_den}"), strips
 /// the `{s.` / `}` wrapper and title-cases the words so it renders cleanly.
-fn format_dungeon_name(raw: &str) -> String {
+pub(crate) fn format_dungeon_name(raw: &str) -> String {
     let normalized = get_dungeon_portal_map().normalize_dungeon_name(raw);
 
     let trimmed = normalized.trim();
@@ -850,17 +925,6 @@ pub struct ActiveEncounter {
     pub added_at: std::time::Instant,
 }
 
-/// A clipboard write the Live Feed panel asks the app to perform.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClipboardWrite {
-    /// Put this callout on the clipboard.
-    Copy(String),
-    /// Empty the clipboard, but only while it still holds exactly this callout.
-    /// The user may have copied something else in the meantime, and that content
-    /// is theirs to keep.
-    ClearIfUnchanged(String),
-}
-
 /// Live feed panel state and UI.
 pub struct LiveFeedPanel {
     /// Feed entries (newest at front)
@@ -881,6 +945,18 @@ pub struct LiveFeedPanel {
     /// Active encounters (realm bosses/events currently in view)
     /// Key is object_id (instance ID)
     active_encounters: HashMap<i32, ActiveEncounter>,
+    /// Highest recovered Live Feed event id from the worker window.
+    recovered_event_seq: u64,
+    /// Whether older entries were trimmed from the displayed window.
+    trimmed_history: bool,
+    /// Original time of the event currently being recovered.
+    event_time: Option<DateTime<Local>>,
+    /// Same event as an `Instant`, for deadlines and countdowns.
+    event_instant: Option<std::time::Instant>,
+    /// True once the worker has published the learned modifier sets.
+    learned_from_worker: bool,
+    /// Timer freezes that arrived before their dungeon row (keyed by map seed).
+    pending_freezes: HashMap<i32, i64>,
 
     // === Realm Status Bar State ===
     /// Current server name (e.g., "EUWest")
@@ -1032,20 +1108,6 @@ pub struct LiveFeedPanel {
     /// Whether callout reward values include a `%` sign.
     /// Mirrors `Settings.live_feed.callout_percent`.
     callout_percent: bool,
-    /// Whether entering a joinable dungeon copies its callout to the clipboard
-    /// by itself. Mirrors `Settings.live_feed.auto_clipboard_dungeon_calls`.
-    auto_clipboard_calls: bool,
-    /// `map_seed` of the dungeon whose callout this panel put on the clipboard
-    /// automatically and has not released yet.
-    auto_clipboard_seed: Option<i32>,
-    /// Exact text this panel put on the clipboard for `auto_clipboard_seed`, so
-    /// the automatic release can tell our callout from anything the user copied
-    /// afterwards.
-    auto_clipboard_text: Option<String>,
-    /// Clipboard write the app still has to perform for this panel. The panel
-    /// is only rendered while its tab is open, so it hands the write to the
-    /// app, which has the egui context every frame.
-    pending_clipboard: Option<ClipboardWrite>,
     /// Editable reward-modifier callout tags. Mirrors `Settings.live_feed.reward_mods`.
     reward_mods: Vec<realmhound_core::settings::RewardModEntry>,
     /// Dungeon short-name overrides. Mirrors `Settings.live_feed.dungeon_name_overrides`.
@@ -1126,12 +1188,18 @@ impl LiveFeedPanel {
     pub fn new() -> Self {
         Self {
             entries: VecDeque::with_capacity(MAX_FEED_ENTRIES),
+            trimmed_history: false,
+            event_time: None,
+            event_instant: None,
+            learned_from_worker: false,
+            pending_freezes: HashMap::new(),
             auto_scroll: true,
             needs_scroll_to_top: false,
             status_message: None,
             awaiting_first_map: true,
             has_captured_connection: false,
             active_encounters: HashMap::new(),
+            recovered_event_seq: 0,
             // Realm status bar state
             server_name: None,
             realm_name: None,
@@ -1176,10 +1244,6 @@ impl LiveFeedPanel {
             realm_status_threshold: 33,
             nexus_marker: realmhound_core::settings::NexusMarker::None,
             callout_percent: false,
-            auto_clipboard_calls: false,
-            auto_clipboard_seed: None,
-            auto_clipboard_text: None,
-            pending_clipboard: None,
             reward_mods: realmhound_core::settings::default_reward_mods(),
             dungeon_name_overrides: std::collections::BTreeMap::new(),
             event_name_overrides: std::collections::BTreeMap::new(),
@@ -1265,11 +1329,6 @@ impl LiveFeedPanel {
         self.realm_status_threshold = settings.realm_status_threshold;
         self.nexus_marker = settings.nexus_marker;
         self.callout_percent = settings.callout_percent;
-        self.auto_clipboard_calls = settings.auto_clipboard_dungeon_calls;
-        // Turning the feature off releases any callout it is holding.
-        if !self.auto_clipboard_calls {
-            self.release_auto_clipboard();
-        }
         self.reward_mods = settings.reward_mods.clone();
         self.dungeon_name_overrides = settings.dungeon_name_overrides.clone();
         self.event_name_overrides = settings.event_name_overrides.clone();
@@ -1340,49 +1399,26 @@ impl LiveFeedPanel {
     /// [`LiveFeedSettings::learn_event_mods_runs`]: realmhound_core::settings::LiveFeedSettings::learn_event_mods_runs
     /// [`EVENT_PRESET_MODS`]: realmhound_core::dungeon_modifiers::EVENT_PRESET_MODS
     fn learned_event_mods(&self, dungeon: &str) -> Vec<String> {
-        if !self.learn_event_mods {
-            return Vec::new();
-        }
         let runs = self.learn_event_mods_runs.clamp(
             *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
             *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
         ) as usize;
-        let Some(sets) = self.dungeon_mod_sets.get(dungeon) else {
-            return Vec::new();
-        };
-        if sets.len() < runs {
-            return Vec::new();
-        }
-        let recent = &sets[sets.len() - runs..];
-        let mut candidates = recent[0].clone();
-        candidates.retain(|modifier| {
-            recent[1..]
-                .iter()
-                .all(|set| set.iter().any(|t| same_modifier(t, modifier)))
-        });
-        // A mod that stood alone in at least one of those entries cannot be part
-        // of the rolled set (which fills the instance's grade), so it is one the
-        // game added. Requiring this keeps three identical *rolls* from
-        // suppressing a genuine call.
-        candidates.retain(|modifier| {
-            recent
-                .iter()
-                .any(|set| set.len() == 1 && same_modifier(&set[0], modifier))
-        });
-        candidates
+        select_learned_mods(self.learn_event_mods, runs, &self.dungeon_mod_sets, dungeon)
     }
 
-    /// Record a dungeon entry's modifier set for [`Self::learned_event_mods`].
+    /// Adopt the worker-owned learned modifier sets.
+    pub fn set_learned_mod_sets(
+        &mut self,
+        sets: std::collections::HashMap<String, Vec<Vec<String>>>,
+    ) {
+        self.dungeon_mod_sets = sets;
+        self.learned_from_worker = true;
+    }
+
+    /// Record a dungeon entry's modifier set locally; the worker's published
+    /// set replaces this on the next feed revision.
     fn remember_dungeon_mods(&mut self, dungeon: &str, modifier_tokens: &[String]) {
-        let sets = self
-            .dungeon_mod_sets
-            .entry(dungeon.to_string())
-            .or_default();
-        sets.push(modifier_tokens.to_vec());
-        if sets.len() > MAX_LEARN_EVENT_MOD_SETS {
-            let overflow = sets.len() - MAX_LEARN_EVENT_MOD_SETS;
-            sets.drain(0..overflow);
-        }
+        remember_dungeon_mods(&mut self.dungeon_mod_sets, dungeon, modifier_tokens);
     }
 
     /// Borrow the current dungeon-callout formatting parameters from the panel's
@@ -1505,32 +1541,15 @@ impl LiveFeedPanel {
         realm: Option<&str>,
         join: realmhound_core::settings::JoinPosition,
     ) -> String {
-        use realmhound_core::settings::JoinPosition;
-        // Assembled from parts so an empty body (a name-less call with no tag to
-        // name) still reads as `/p j` rather than carrying a stray double space.
-        let mut parts: Vec<String> = Vec::new();
-        if self.call_for_party {
-            parts.push("/p".to_string());
-        }
-        if join == JoinPosition::Beginning {
-            parts.push("j".to_string());
-        }
-        if self.include_server_name {
-            if let Some(server) = server {
-                parts.push(realmhound_core::protocol::short_server_name(server).to_string());
-            }
-        }
-        if self.include_realm_name {
-            if let Some(realm) = realm {
-                parts.push(realm.to_string());
-            }
-        }
-        parts.push(body.to_string());
-        if join == JoinPosition::End {
-            parts.push("j".to_string());
-        }
-        parts.retain(|part| !part.is_empty());
-        parts.join(" ")
+        crate::panels::dungeon_callout::assemble_callout(
+            body,
+            server,
+            realm,
+            join,
+            self.call_for_party,
+            self.include_server_name,
+            self.include_realm_name,
+        )
     }
 
     /// Initialize dust state from cached account data.
@@ -1551,23 +1570,8 @@ impl LiveFeedPanel {
     /// observation of an account only seeds state, so an account already at cap
     /// on login does not spam notifications.
     pub fn update_dust(&mut self, amounts: DustAmounts, is_seasonal: bool) {
-        let previous = self.dust_state.get(is_seasonal).cloned();
-        self.dust_state.update(amounts.clone(), is_seasonal);
+        self.dust_state.update(amounts, is_seasonal);
         self.is_seasonal = is_seasonal;
-
-        let Some(previous) = previous else {
-            return;
-        };
-
-        let previously_full = previous.full_types();
-        for dust_type in amounts.full_types() {
-            if !previously_full.contains(&dust_type) {
-                self.push_entry(FeedEntry::DustFull(DustFullEntry::new(
-                    is_seasonal,
-                    dust_type,
-                )));
-            }
-        }
     }
 
     /// Set the current character's seasonal status (for display emphasis).
@@ -1759,7 +1763,7 @@ impl LiveFeedPanel {
         // name. It is read whatever we came from (a realm, or another dungeon).
         self.nexus_parent_dungeon =
             !in_realm && !self.map_is_hub && realm_field_is_hub(realm_name_field);
-        if !in_realm && !self.map_is_hub {
+        if !in_realm && !self.map_is_hub && crate::processing::health::pipeline_logs_enabled() {
             tracing::info!(
                 "[LIVE_FEED] entering '{display_name}': realm field '{realm_name_field}' \
                  (came from realm={}, hub={})",
@@ -2026,6 +2030,160 @@ impl LiveFeedPanel {
     // === End Realm Status Bar Methods ===
 
     /// Apply a realm-entity discovery to the feed.
+    /// Restore durable state that the bounded event history may have evicted.
+    pub fn apply_feed_current(&mut self, current: &crate::processing::contract::FeedCurrent) {
+        self.server_name = current.server_name.clone();
+        self.realm_name = current.realm_name.clone();
+        self.realm_score = current.realm_score;
+        self.is_score_stale = current.is_score_stale;
+        self.realm_closed = current.realm_closed;
+        self.castle_timer_expires_at = current.castle_deadline;
+        self.hub_host_hint = current.hub_host_hint;
+        if let Some(location) = &current.location {
+            self.location_name = format_dungeon_name(&location.display_name);
+            self.currently_in_dungeon = location.is_dungeon;
+        }
+        if let Some((amounts, is_seasonal)) = &current.dust {
+            self.update_dust(amounts.clone(), *is_seasonal);
+        }
+        if let Some(is_seasonal) = current.is_seasonal {
+            self.set_seasonal(is_seasonal);
+        }
+        self.map_is_realm = current.map_is_realm;
+        self.left_from_realm = current.left_from_realm;
+        self.map_is_hub = current.map_is_hub;
+        self.left_from_hub = current.left_from_hub;
+        if let Some(at) = current.discovery_reset_at {
+            for entry in &mut self.entries {
+                if let FeedEntry::BossCall(boss) = entry {
+                    if let Some(discovery) = &mut boss.discovery {
+                        if discovery.scope != current.discovery_scope {
+                            discovery.stop_timer(at);
+                        }
+                    }
+                }
+            }
+        }
+        self.discovery_scope = current.discovery_scope;
+        self.apply_discovery_state(&current.discoveries);
+        if let Some(origin) = &current.dungeon_origin {
+            if let Some(FeedEntry::Dungeon(entry)) = self.entries.iter_mut().find(
+                |entry| matches!(entry, FeedEntry::Dungeon(d) if d.map_seed == origin.map_seed),
+            ) {
+                entry.server_name = origin.server_name.clone();
+                entry.realm_name = origin.realm_name.clone();
+                entry.realm_score_percent = origin.realm_score_percent;
+                entry.entered_from_nexus = origin.entered_from_nexus;
+            }
+            self.recompute_dungeon_callouts();
+        }
+    }
+
+    /// Reconcile discovery rows with the durable per-object state, so an
+    /// evicted lifecycle event cannot leave stale flags behind.
+    fn apply_discovery_state(&mut self, states: &[crate::processing::contract::DiscoveryState]) {
+        for state in states {
+            let matches = |entry: &FeedEntry| {
+                matches!(entry, FeedEntry::BossCall(boss)
+                if boss.boss_id == state.object_type && boss.discovery.as_ref().is_some_and(|d|
+                    d.scope == state.scope && (state.object_type == CRYSTAL_TYPE
+                        || d.object_id == state.object_id)))
+            };
+            if !self.entries.iter().any(matches) {
+                self.push_discovery_entry(
+                    state.object_id,
+                    state.object_type,
+                    state.timestamp,
+                    state.last_message,
+                    state.packet_seen,
+                    state.absent_since,
+                );
+            }
+            if let Some(FeedEntry::BossCall(boss)) =
+                self.entries.iter_mut().find(|entry| matches(entry))
+            {
+                boss.timestamp = state.timestamp;
+                if let Some(discovery) = &mut boss.discovery {
+                    discovery.object_id = state.object_id;
+                    discovery.packet_seen = state.packet_seen;
+                    discovery.defeated = state.defeated;
+                    discovery.absent_since = state.absent_since;
+                    discovery.last_message = state.last_message;
+                    if let Some(at) = state.defeated_at {
+                        discovery.stop_timer(at);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply one authoritative context update from the worker snapshot.
+    pub fn apply_context_event(
+        &mut self,
+        event: &crate::processing::contract::FeedContextEvent,
+        at: DateTime<Utc>,
+    ) {
+        use crate::processing::contract::FeedContextEvent;
+        // Anchor times carried by the snapshot must not shift with the repaint.
+        let observed = std::time::Instant::now()
+            - chrono::Utc::now()
+                .signed_duration_since(at)
+                .to_std()
+                .unwrap_or_default();
+        match event {
+            FeedContextEvent::Location {
+                display_name,
+                realm_name,
+                current_realm_score,
+                max_realm_score,
+                is_dungeon,
+            } => {
+                self.update_location(
+                    display_name,
+                    realm_name,
+                    *current_realm_score,
+                    *max_realm_score,
+                );
+                self.left_from_dungeon = self.currently_in_dungeon;
+                self.currently_in_dungeon = *is_dungeon;
+                if !*is_dungeon {
+                    // Row lifecycle comes from `DungeonLeft` in the event window.
+                    self.clear_dungeon_signature();
+                    self.pending_portal_spawn = None;
+                }
+                self.portal_spawns.clear();
+            }
+            FeedContextEvent::ServerName(name) => self.set_server_name(name.clone()),
+            FeedContextEvent::ServerCommand { server, realm } => {
+                self.apply_server_command(server.clone(), realm.clone())
+            }
+            FeedContextEvent::DustUpdated {
+                amounts,
+                is_seasonal,
+            } => self.update_dust(amounts.clone(), *is_seasonal),
+            FeedContextEvent::Seasonal(is_seasonal) => self.set_seasonal(*is_seasonal),
+            FeedContextEvent::RealmScore(score) => self.update_realm_score(*score),
+            FeedContextEvent::RealmClosed => self.force_realm_closed_at(observed),
+            FeedContextEvent::Discovery { scope, event } => {
+                if !matches!(event, DiscoveryEvent::Reset { .. }) {
+                    self.discovery_scope = *scope;
+                }
+                self.apply_realm_discovery(event.clone());
+                self.discovery_scope = *scope;
+            }
+            FeedContextEvent::PortalSpawned { object_id } => {
+                self.portal_spawns.entry(*object_id).or_insert(observed);
+            }
+            FeedContextEvent::PortalUsed { object_id } => {
+                self.pending_portal_spawn = self.portal_spawns.get(object_id).copied();
+            }
+            FeedContextEvent::DungeonTimerFrozen {
+                map_seed,
+                elapsed_ms,
+            } => self.apply_dungeon_freeze(*map_seed, *elapsed_ms),
+        }
+    }
+
     pub fn apply_realm_discovery(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Reset { at } => {
@@ -2163,18 +2321,30 @@ impl LiveFeedPanel {
 
     /// Push a new entry to the feed.
     /// Automatically evicts oldest entries if the feed exceeds MAX_FEED_ENTRIES.
-    pub fn push_entry(&mut self, entry: FeedEntry) {
+    pub fn push_entry(&mut self, mut entry: FeedEntry) {
+        self.stamp_pending_event(&mut entry);
         // Add to front (newest first)
         self.entries.push_front(entry);
 
-        // Evict oldest if over capacity
+        // Evict oldest if over capacity; the worker still keeps the full session.
         while self.entries.len() > MAX_FEED_ENTRIES {
             self.entries.pop_back();
+            self.trimmed_history = true;
         }
 
         // Trigger scroll to top if auto-scroll is enabled
         if self.auto_scroll {
             self.needs_scroll_to_top = true;
+        }
+    }
+
+    /// Build the row with the worker's time, before it is pushed.
+    fn stamp_pending_event(&self, entry: &mut FeedEntry) {
+        if let Some(timestamp) = self.event_time {
+            entry.set_timestamp(timestamp);
+        }
+        if let Some(instant) = self.event_instant {
+            entry.set_entered_at(instant);
         }
     }
 
@@ -2222,7 +2392,23 @@ impl LiveFeedPanel {
     /// For every other boss, repeated callouts for the same boss in the
     /// same realm within `BOSS_CALL_DEDUP_WINDOW` are suppressed (one Live Feed
     /// entry, one sound).
-    pub fn push_boss_call(&mut self, boss_id: i32, boss_name: String) -> bool {
+    #[cfg(test)]
+    fn push_boss_call(&mut self, boss_id: i32, boss_name: String) -> bool {
+        self.push_boss_call_with_origin(
+            boss_id,
+            boss_name,
+            self.server_name.clone(),
+            self.realm_name.clone(),
+        )
+    }
+
+    fn push_boss_call_with_origin(
+        &mut self,
+        boss_id: i32,
+        boss_name: String,
+        server: Option<String>,
+        realm: Option<String>,
+    ) -> bool {
         if boss_id == CRYSTAL_TYPE || boss_name.contains("Mysterious Crystal") {
             return self.push_discovery_entry(
                 None,
@@ -2233,7 +2419,7 @@ impl LiveFeedPanel {
                 None,
             );
         }
-        let now = Local::now();
+        let now = self.event_time.unwrap_or_else(Local::now);
         for entry in &self.entries {
             if let FeedEntry::BossCall(existing) = entry {
                 // Queued discoveries can predate neighboring UI-created rows.
@@ -2244,14 +2430,12 @@ impl LiveFeedPanel {
                 // different realm entered within the window still notifies.
                 if existing.boss_id == boss_id
                     && existing.boss_name == boss_name
-                    && existing.realm_name == self.realm_name
+                    && existing.realm_name == realm
                 {
                     return false;
                 }
             }
         }
-        let server = self.server_name.clone();
-        let realm = self.realm_name.clone();
         // When a new Alien Invasion wave spawns, the previous wave(s) in the
         // same realm are superseded: fade them out and make them non-copyable.
         if Self::is_alien_wave(&boss_name) {
@@ -2333,7 +2517,13 @@ impl LiveFeedPanel {
         )));
     }
 
+    #[cfg(test)]
     pub fn force_realm_closed(&mut self) {
+        self.force_realm_closed_at(std::time::Instant::now());
+    }
+
+    /// Start the castle countdown from the worker's observation time.
+    fn force_realm_closed_at(&mut self, now: std::time::Instant) {
         if let Some((_, max)) = self.realm_score {
             self.realm_score = Some((max, max));
             self.is_score_stale = false;
@@ -2341,12 +2531,10 @@ impl LiveFeedPanel {
         // The realm is closing and the Oryx endgame begins; dungeons opened with
         // a key inside the castle areas from here on stay callable.
         self.realm_closed = true;
-        // A realm close makes the dungeon we may have auto-copied unjoinable.
-        self.release_auto_clipboard();
         // Start the castle teleport countdown; ignore repeated
         // realm-close messages so the window isn't reset each time.
         if self.castle_timer_expires_at.is_none() {
-            self.castle_timer_expires_at = Some(std::time::Instant::now() + CASTLE_TELEPORT_WINDOW);
+            self.castle_timer_expires_at = Some(now + CASTLE_TELEPORT_WINDOW);
         }
     }
 
@@ -2449,10 +2637,6 @@ impl LiveFeedPanel {
         }
     }
 
-    pub fn is_in_dungeon(&self) -> bool {
-        self.currently_in_dungeon
-    }
-
     /// Whether the DM-in-live-feed feature is enabled (mirrors setting).
     pub fn dm_display_enabled(&self) -> bool {
         self.show_dms
@@ -2465,12 +2649,24 @@ impl LiveFeedPanel {
     /// instance (same `fp` seed, name, modifiers, grade) are suppressed to
     /// avoid duplicates on repeated MapInfo packets. A new instance of the
     /// same dungeon type (different `fp`) always produces a fresh entry.
+    #[cfg(test)]
     pub fn push_dungeon(
         &mut self,
         fp: i32,
         dungeon_name: &str,
         modifier_tokens: &[String],
         grade: Option<String>,
+    ) {
+        self.push_dungeon_with_origin(fp, dungeon_name, modifier_tokens, grade, None);
+    }
+
+    fn push_dungeon_with_origin(
+        &mut self,
+        fp: i32,
+        dungeon_name: &str,
+        modifier_tokens: &[String],
+        grade: Option<String>,
+        origin: Option<&crate::processing::contract::DungeonOrigin>,
     ) {
         // Log any modifier tokens that don't resolve in the bonus table so the
         // table can be extended with their exact raw form.
@@ -2493,17 +2689,26 @@ impl LiveFeedPanel {
         // the join window can't belong to the portal we just entered (it lives
         // only 30s), so treat it as unknown. Without a real spawn anchor the
         // window is only estimated (e.g. joined via a party call).
+        // Freshness and the deadline use the entry time, not the repaint time, so
+        // recovering an old dungeon cannot mint a new join window.
+        let now = origin
+            .and_then(|origin| origin.entered_at)
+            .or(self.event_instant)
+            .unwrap_or_else(std::time::Instant::now);
         let fresh_spawn = self
             .pending_portal_spawn
-            .filter(|spawn| spawn.elapsed() < DUNGEON_JOIN_WINDOW);
+            .filter(|spawn| now.saturating_duration_since(*spawn) < DUNGEON_JOIN_WINDOW);
+        let fresh_spawn = origin.map_or(fresh_spawn, |origin| origin.portal_anchor);
         let estimated = fresh_spawn.is_none();
-        let anchor = fresh_spawn.unwrap_or_else(std::time::Instant::now);
+        let anchor = fresh_spawn.unwrap_or(now);
         // Realm status is only called for dungeons entered through a portal from
         // a realm: a party-call join (estimated window) belongs to no realm of
         // its own, and a dungeon keyed open in the Nexus, inside another dungeon
         // or in the Oryx areas (Castle/Chamber/Wine Cellar/Sanctuary) is not a
         // realm entry -- the realm score is only remembered there, not current.
-        let realm_score_percent = if estimated || !self.left_from_realm {
+        let realm_score_percent = if let Some(origin) = origin {
+            origin.realm_score_percent
+        } else if estimated || !self.left_from_realm {
             None
         } else {
             self.get_score_percent()
@@ -2539,7 +2744,10 @@ impl LiveFeedPanel {
                 "[LIVE_FEED] '{display_name}' names no realm of its own: naming it as opened in the nexus"
             );
         }
-        let entered_from_nexus = self.left_from_hub || hub_hosted || nexus_parent;
+        let entered_from_nexus = origin
+            .map_or(self.left_from_hub || hub_hosted || nexus_parent, |origin| {
+                origin.entered_from_nexus
+            });
         let origin_status = match realm_status {
             Some(status) => Some(status),
             None if entered_from_nexus => self.nexus_marker.text().map(str::to_string),
@@ -2561,7 +2769,9 @@ impl LiveFeedPanel {
         }
         // Recognize (and remember) the mods this event applies to every instance
         // of this dungeon, so calls stop advertising a mod nobody rolled.
-        self.remember_dungeon_mods(&display_name, modifier_tokens);
+        if !self.learned_from_worker {
+            self.remember_dungeon_mods(&display_name, modifier_tokens);
+        }
         let learned_event_mods = self.learned_event_mods(&display_name);
         let params = self.dungeon_callout_params(origin_status.as_deref(), &learned_event_mods);
         let mut entry = DungeonEntry::new(
@@ -2570,13 +2780,20 @@ impl LiveFeedPanel {
             modifier_tokens,
             grade,
             &params,
-            self.server_name.clone(),
-            self.realm_name.clone(),
+            origin.map_or_else(
+                || self.server_name.clone(),
+                |origin| origin.server_name.clone(),
+            ),
+            origin.map_or_else(
+                || self.realm_name.clone(),
+                |origin| origin.realm_name.clone(),
+            ),
             realm_score_percent,
             anchor,
             estimated,
         );
         entry.map_seed = fp;
+        entry.entered_at = now;
         entry.entered_from_nexus = entered_from_nexus;
 
         // Genuinely new dungeon: consume the spawn anchor and expire any prior
@@ -2591,11 +2808,21 @@ impl LiveFeedPanel {
         // only be a key-opened instance inside the castle areas, which stays
         // joinable. The natural Oryx areas (Castle/Chamber/Wine
         // Cellar/Sanctuary) never reach here -- they aren't dungeon feed entries.
-        if !self.realm_closed && self.get_score_percent().map_or(false, |p| p >= 100) {
+        if !origin.map_or(self.realm_closed, |origin| origin.realm_closed)
+            && origin
+                .map_or_else(
+                    || self.get_score_percent(),
+                    |origin| origin.realm_score_percent,
+                )
+                .is_some_and(|p| p >= 100)
+        {
             entry.deactivate();
         }
+        // The run may have ended before this row was recovered.
+        if let Some(elapsed) = self.pending_freezes.remove(&fp) {
+            entry.frozen_elapsed_ms = Some(elapsed);
+        }
         self.push_entry(FeedEntry::Dungeon(entry));
-        self.queue_auto_clipboard();
     }
 
     /// Force-expire every still-active dungeon entry in the feed. Called when the
@@ -2604,93 +2831,17 @@ impl LiveFeedPanel {
     /// any entry that has not already been frozen by the authoritative
     /// CombatManager freeze (e.g. non-groupable dungeons it does not track).
     fn deactivate_active_dungeons(&mut self) {
-        let now = std::time::Instant::now();
+        // Use the leave event's time, or a recovered run would count the time
+        // the window spent unpainted.
+        let now = self.event_instant.unwrap_or_else(std::time::Instant::now);
         for entry in self.entries.iter_mut() {
             if let FeedEntry::Dungeon(d) = entry {
-                d.deactivate();
+                d.expires_at = now;
                 if d.frozen_elapsed_ms.is_none() {
                     d.frozen_elapsed_ms = Some(now.duration_since(d.entered_at).as_millis() as i64);
                 }
             }
         }
-        // The dungeon we may have auto-copied can no longer be joined.
-        self.release_auto_clipboard();
-    }
-
-    /// Queue the newly entered dungeon's callout for the clipboard, when the
-    /// "Auto clipboard dungeon calls" setting is on and the dungeon can actually
-    /// be joined from the outside. Instances that start out unjoinable -
-    /// non-callable ones (Cultist Hideout, The Void, Crystal Cavern, which carry
-    /// no callout at all) and dungeons entered from a realm that is already full
-    /// - are skipped.
-    fn queue_auto_clipboard(&mut self) {
-        if !self.auto_clipboard_calls {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let queued = match self.entries.front() {
-            Some(FeedEntry::Dungeon(entry))
-                if entry.callout.is_some() && !entry.remaining(now).is_zero() =>
-            {
-                Some((
-                    entry.map_seed,
-                    self.assemble_callout(
-                        entry.callout.as_deref().unwrap_or_default(),
-                        entry.server_name.as_deref(),
-                        entry.realm_name.as_deref(),
-                        self.dungeon_join_position,
-                    ),
-                ))
-            }
-            _ => None,
-        };
-        if let Some((seed, text)) = queued {
-            self.auto_clipboard_seed = Some(seed);
-            self.auto_clipboard_text = Some(text.clone());
-            self.pending_clipboard = Some(ClipboardWrite::Copy(text));
-        }
-    }
-
-    /// Stop holding the automatic callout copy and queue a clipboard clear.
-    /// Does nothing when this panel never put a callout there, and the clear it
-    /// queues only fires while the clipboard still holds that callout, so
-    /// anything the user copied since is left alone.
-    fn release_auto_clipboard(&mut self) {
-        if self.auto_clipboard_seed.take().is_some() {
-            self.pending_clipboard = Some(ClipboardWrite::ClearIfUnchanged(
-                self.auto_clipboard_text.take().unwrap_or_default(),
-            ));
-        }
-    }
-
-    /// The clipboard write the app should perform this frame, if any: a queued
-    /// copy/clear, or the clear that follows the auto-copied callout becoming
-    /// uncallable (its join window elapsed, or the player moved on).
-    ///
-    /// The panel is only rendered while its tab is open, so the app polls this
-    /// every frame and does the actual clipboard access.
-    pub fn poll_clipboard(&mut self) -> Option<ClipboardWrite> {
-        if let Some(write) = self.pending_clipboard.take() {
-            return Some(write);
-        }
-        let seed = self.auto_clipboard_seed?;
-        let now = std::time::Instant::now();
-        let live = self.auto_clipboard_calls
-            && self.entries.iter().any(|entry| match entry {
-                FeedEntry::Dungeon(dungeon) => {
-                    dungeon.map_seed == seed
-                        && dungeon.callout.is_some()
-                        && !dungeon.remaining(now).is_zero()
-                }
-                _ => false,
-            });
-        if live {
-            return None;
-        }
-        self.auto_clipboard_seed = None;
-        Some(ClipboardWrite::ClearIfUnchanged(
-            self.auto_clipboard_text.take().unwrap_or_default(),
-        ))
     }
 
     /// Settle the live dungeon run timer for the row matching `map_seed` to the
@@ -2705,6 +2856,8 @@ impl LiveFeedPanel {
                 }
             }
         }
+        // The row may not exist yet (recovery); apply it when the row arrives.
+        self.pending_freezes.insert(map_seed, elapsed_ms.max(0));
     }
 
     /// Forget the last dungeon signature (call when leaving a dungeon) so that
@@ -2718,29 +2871,150 @@ impl LiveFeedPanel {
         self.entries.clear();
     }
 
-    /// Add an active encounter (realm boss/event in view).
-    pub fn add_encounter(&mut self, object_id: i32, object_type: u16, name: String) {
-        if !ENABLE_ACTIVE_ENCOUNTERS {
-            return;
+    /// Recover Live Feed events the UI missed while it was not painting. The
+    /// worker window is the authority for these entry types.
+    /// Apply a whole window in order (tests and any bulk consumer).
+    #[cfg(test)]
+    pub fn recover_live_events(&mut self, window: &crate::processing::contract::LiveEventWindow) {
+        for entry in &window.events {
+            self.apply_live_event(entry);
         }
-        // Only insert if not already present (preserve original timestamp)
-        self.active_encounters
-            .entry(object_id)
-            .or_insert(ActiveEncounter {
-                object_type,
-                name,
-                added_at: std::time::Instant::now(),
-            });
+        if let Some(last) = window.events.last() {
+            self.recovered_event_seq = self.recovered_event_seq.max(last.seq);
+        }
     }
 
-    /// Remove an encounter when it leaves view (drops).
-    pub fn remove_encounter(&mut self, object_id: i32) {
-        self.active_encounters.remove(&object_id);
+    /// Apply one worker event; callers may interleave this with context events.
+    pub fn apply_live_event(&mut self, entry: &crate::processing::contract::LiveEventEntry) {
+        use crate::processing::contract::LiveEventView;
+        {
+            if entry.seq <= self.recovered_event_seq {
+                return;
+            }
+            self.recovered_event_seq = entry.seq;
+            let age = chrono::Utc::now()
+                .signed_duration_since(entry.at)
+                .to_std()
+                .unwrap_or_default();
+            self.event_time = Some(entry.at.with_timezone(&chrono::Local));
+            self.event_instant = Some(
+                if let LiveEventView::Dungeon { origin, .. } = &entry.event {
+                    origin.entered_at
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| {
+                    std::time::Instant::now()
+                        .checked_sub(age)
+                        .unwrap_or_else(std::time::Instant::now)
+                }),
+            );
+            match &entry.event {
+                LiveEventView::BossCall {
+                    boss_id,
+                    name,
+                    server_name,
+                    realm_name,
+                } => {
+                    self.push_boss_call_with_origin(
+                        *boss_id,
+                        name.clone(),
+                        server_name.clone(),
+                        realm_name.clone(),
+                    );
+                }
+                LiveEventView::KeyPop {
+                    opener,
+                    key_id,
+                    dungeon_name,
+                    thankable,
+                } => {
+                    self.push_key_pop(*key_id, dungeon_name.clone(), opener.clone(), *thankable);
+                }
+                LiveEventView::AreaUnlock {
+                    title,
+                    contributions,
+                    callout,
+                } => {
+                    self.push_area_unlock(title.clone(), contributions.clone(), callout.clone());
+                }
+                LiveEventView::Warning {
+                    text,
+                    severity,
+                    copyable,
+                } => {
+                    self.push_warning(text.clone(), *severity, *copyable);
+                }
+                LiveEventView::Dm { sender, text } => {
+                    if self.dm_display_enabled() {
+                        self.push_dm(sender.clone(), text.clone());
+                    }
+                }
+                LiveEventView::Loot(drop) => {
+                    self.push_loot(drop);
+                }
+                LiveEventView::Dungeon {
+                    fp,
+                    display_name,
+                    modifiers,
+                    grade,
+                    origin,
+                } => {
+                    self.push_dungeon_with_origin(
+                        *fp,
+                        display_name,
+                        modifiers,
+                        grade.clone(),
+                        Some(origin),
+                    );
+                }
+                LiveEventView::DungeonLeft => self.deactivate_active_dungeons(),
+                LiveEventView::WhoRoster { names } => {
+                    if self.show_who_roster {
+                        self.push_who_roster(names.clone());
+                    }
+                }
+                LiveEventView::DustFull {
+                    is_seasonal,
+                    dust_type,
+                } => {
+                    self.push_entry(FeedEntry::DustFull(DustFullEntry::new(
+                        *is_seasonal,
+                        *dust_type,
+                    )));
+                }
+                LiveEventView::KickAlert { name } => {
+                    self.push_kick_alert(name.clone());
+                }
+                LiveEventView::JoinRequestAlert { name } => {
+                    self.push_join_request_alert(name.clone());
+                }
+            }
+            self.event_time = None;
+            self.event_instant = None;
+        }
     }
 
-    /// Clear all active encounters (on map change).
-    pub fn clear_encounters(&mut self) {
-        self.active_encounters.clear();
+    /// Rebuild the encounter set from the worker snapshot, preserving each
+    /// existing encounter's first-seen ordering.
+    pub fn apply_encounter_view(&mut self, view: &crate::processing::contract::EncounterSet) {
+        let mut next = HashMap::with_capacity(view.encounters.len());
+        for encounter in &view.encounters {
+            let added_at = self
+                .active_encounters
+                .get(&encounter.object_id)
+                .map(|existing| existing.added_at)
+                .unwrap_or_else(std::time::Instant::now);
+            next.insert(
+                encounter.object_id,
+                ActiveEncounter {
+                    object_type: encounter.object_type,
+                    name: encounter.name.clone(),
+                    added_at,
+                },
+            );
+        }
+        self.active_encounters = next;
     }
 
     /// Set a status message that will display briefly.
@@ -3361,6 +3635,15 @@ impl LiveFeedPanel {
                         }
                     }
                 }
+            }
+
+            if self.trimmed_history {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Older session entries are not shown")
+                        .small()
+                        .weak(),
+                );
             }
 
             // Handle copy after iteration to avoid borrow issues
@@ -5334,92 +5617,6 @@ impl Panel for LiveFeedPanel {
         actions.append(&mut self.pending_actions);
         actions
     }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        _session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        match event {
-            realmhound_core::GameEvent::RealmScoreChanged { score } => {
-                self.update_realm_score(*score);
-            }
-            realmhound_core::GameEvent::MapChanged {
-                ref display_name,
-                ref realm_name,
-                fp,
-                current_realm_score,
-                max_realm_score,
-                is_dungeon,
-                ref dungeon_modifiers,
-                ref dungeon_grade,
-                ..
-            } => {
-                self.update_location(
-                    display_name,
-                    realm_name,
-                    *current_realm_score,
-                    *max_realm_score,
-                );
-                self.clear_encounters();
-                self.left_from_dungeon = self.currently_in_dungeon;
-                self.currently_in_dungeon = *is_dungeon;
-
-                if *is_dungeon {
-                    self.push_dungeon(*fp, display_name, dungeon_modifiers, dungeon_grade.clone());
-                } else {
-                    // Left the dungeon (hub/realm): you can no longer call it, so
-                    // expire any still-active dungeon entries and allow a fresh
-                    // entry on re-entry. A non-dungeon transition also voids any
-                    // pending portal anchor (e.g. a realm/nexus portal we used).
-                    self.deactivate_active_dungeons();
-                    self.clear_dungeon_signature();
-                    self.pending_portal_spawn = None;
-                }
-                // Portal spawn times are map-local; drop them when the map changes.
-                self.portal_spawns.clear();
-            }
-            realmhound_core::GameEvent::UpdateReceived(update, _) => {
-                let am = realmhound_core::assets::get_asset_manager();
-                for obj in &update.new_objects {
-                    if am.is_portal_object(obj.object_type as i32) {
-                        // Keep the first-seen spawn time; re-seeing the same
-                        // portal must not reset its countdown. Drops are not
-                        // pruned (map change clears the whole map).
-                        self.portal_spawns
-                            .entry(obj.object_id())
-                            .or_insert_with(std::time::Instant::now);
-                    }
-                }
-            }
-            realmhound_core::GameEvent::PortalUsed { object_id } => {
-                self.pending_portal_spawn = self.portal_spawns.get(object_id).copied();
-            }
-            realmhound_core::GameEvent::DustUpdated {
-                amounts,
-                is_seasonal,
-            } => {
-                self.update_dust(amounts.clone(), *is_seasonal);
-            }
-            realmhound_core::GameEvent::SeasonalStatusReceived { is_seasonal, .. } => {
-                self.set_seasonal(*is_seasonal);
-            }
-            realmhound_core::GameEvent::TextReceived(ref text) => {
-                if self.show_who_roster {
-                    if let Some(names) = parse_who_roster(&text.text) {
-                        self.push_who_roster(names);
-                    }
-                }
-                // `/server` reply: authoritatively override the header server +
-                // realm. Gated to system messages so player chat can't spoof it.
-                if let Some((server, realm)) = parse_server_command_packet(text) {
-                    self.apply_server_command(server, realm);
-                }
-            }
-            _ => {}
-        }
-        vec![]
-    }
 }
 
 /// Render the Live Feed Taskbar: a full-width, wrapping row of progress pills
@@ -6155,14 +6352,6 @@ mod tests {
             .count()
     }
 
-    fn dust_full_count(panel: &LiveFeedPanel) -> usize {
-        panel
-            .entries
-            .iter()
-            .filter(|e| matches!(e, FeedEntry::DustFull(_)))
-            .count()
-    }
-
     fn sample_dungeon_entry() -> FeedEntry {
         let (mods, ov) = test_callout_inputs();
         let params = test_params(&mods, &ov);
@@ -6241,70 +6430,6 @@ mod tests {
             entry.callout(),
             Some("Thanks Alice for the key!".to_string())
         );
-    }
-
-    #[test]
-    fn dust_full_notifies_once_on_transition() {
-        let mut panel = LiveFeedPanel::new();
-
-        // Green below cap: no notification.
-        let mut amounts = DustAmounts::new();
-        amounts.green = (1900, 2000);
-        amounts.red = (500, 2000);
-        amounts.purple = (500, 2000);
-        panel.update_dust(amounts.clone(), false);
-        assert_eq!(dust_full_count(&panel), 0);
-
-        // Green reaches cap: one notification.
-        amounts.green = (2000, 2000);
-        panel.update_dust(amounts.clone(), false);
-        assert_eq!(dust_full_count(&panel), 1);
-
-        // Still full on the next update: no new notification.
-        panel.update_dust(amounts.clone(), false);
-        assert_eq!(dust_full_count(&panel), 1);
-
-        // A different type fills: a second notification.
-        amounts.red = (2000, 2000);
-        panel.update_dust(amounts, false);
-        assert_eq!(dust_full_count(&panel), 2);
-    }
-
-    #[test]
-    fn dust_full_separate_per_account() {
-        let mut panel = LiveFeedPanel::new();
-
-        // Seed both accounts below cap (first observation does not notify).
-        let mut below = DustAmounts::new();
-        below.green = (0, 2000);
-        below.red = (0, 2000);
-        below.purple = (0, 2000);
-        panel.update_dust(below.clone(), false);
-        panel.update_dust(below, true);
-        assert_eq!(dust_full_count(&panel), 0);
-
-        // Fill green on each account: one notification per account.
-        let mut full_green = DustAmounts::new();
-        full_green.green = (2000, 2000);
-        full_green.red = (0, 2000);
-        full_green.purple = (0, 2000);
-        panel.update_dust(full_green.clone(), false);
-        panel.update_dust(full_green, true);
-        assert_eq!(dust_full_count(&panel), 2);
-    }
-
-    #[test]
-    fn dust_full_first_observation_already_full_does_not_notify() {
-        let mut panel = LiveFeedPanel::new();
-
-        let mut full_green = DustAmounts::new();
-        full_green.green = (2000, 2000);
-        full_green.red = (0, 2000);
-        full_green.purple = (0, 2000);
-
-        // First-ever update for the account already at cap: seed only.
-        panel.update_dust(full_green, false);
-        assert_eq!(dust_full_count(&panel), 0);
     }
 
     #[test]
@@ -6508,6 +6633,50 @@ mod tests {
         panel.push_boss_call(22129, "Grand Sphinx".to_string());
         // Different bosses must each produce their own callout.
         assert_eq!(boss_call_count(&panel), 2);
+    }
+
+    #[test]
+    fn recovered_boss_calls_use_original_context_for_rows_and_deduplication() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView};
+        let mut panel = LiveFeedPanel::new();
+        panel.server_name = Some("Server A".into());
+        panel.realm_name = Some("Realm A".into());
+        panel.push_boss_call(22128, "Beer God".into());
+        let at = Utc::now();
+        for (seq, realm) in [(1, "Realm B"), (2, "Realm C"), (3, "Realm B")] {
+            panel.apply_live_event(&LiveEventEntry {
+                seq,
+                at,
+                event: LiveEventView::BossCall {
+                    boss_id: 22128,
+                    name: "Beer God".into(),
+                    server_name: Some("Server B".into()),
+                    realm_name: Some(realm.into()),
+                },
+            });
+        }
+        assert_eq!(boss_call_count(&panel), 3);
+        let origins: Vec<_> = panel
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if let FeedEntry::BossCall(boss) = entry {
+                    Some((boss.server_name.as_deref(), boss.realm_name.as_deref()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            origins,
+            vec![
+                (Some("Server B"), Some("Realm C")),
+                (Some("Server B"), Some("Realm B")),
+                (Some("Server A"), Some("Realm A")),
+            ]
+        );
+        assert_eq!(panel.server_name.as_deref(), Some("Server A"));
+        assert_eq!(panel.realm_name.as_deref(), Some("Realm A"));
     }
 
     #[test]
@@ -6813,6 +6982,225 @@ mod tests {
         panel.apply_dungeon_freeze(11, 4_000);
         match panel.entries.front().unwrap() {
             FeedEntry::Dungeon(d) => assert_eq!(d.frozen_elapsed_ms, Some(4_000)),
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn feed_current_restores_the_map_context() {
+        use crate::processing::contract::{FeedCurrent, FeedLocation};
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_feed_current(&FeedCurrent {
+            server_name: Some("EUWest".to_string()),
+            location: Some(FeedLocation {
+                display_name: "Snake Pit".to_string(),
+                realm_name: "Medusa".to_string(),
+                current_realm_score: 40,
+                max_realm_score: 100,
+                is_dungeon: true,
+            }),
+            realm_name: Some("Medusa".to_string()),
+            realm_score: Some((41, 100)),
+            realm_closed: false,
+            is_seasonal: Some(true),
+            dust: None,
+            discoveries: Vec::new(),
+            map_is_realm: false,
+            left_from_realm: false,
+            map_is_hub: false,
+            left_from_hub: false,
+            ..FeedCurrent::default()
+        });
+        assert_eq!(panel.server_name.as_deref(), Some("EUWest"));
+        assert_eq!(panel.realm_name.as_deref(), Some("Medusa"));
+        assert_eq!(panel.realm_score, Some((41, 100)));
+        assert!(panel.currently_in_dungeon);
+    }
+
+    #[test]
+    fn feed_current_reconciliation_does_not_create_connection_hints() {
+        use crate::processing::contract::{FeedCurrent, FeedLocation};
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Realm", "NexusPortal.Medusa", 40, 100);
+        panel.update_location("Snake Pit", "NexusPortal.Medusa", 0, 0);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(42, "Snake Pit", &[], None);
+        let current = FeedCurrent {
+            server_name: Some("EUWest".into()),
+            realm_name: Some("Medusa".into()),
+            realm_score: Some((40, 100)),
+            is_score_stale: true,
+            location: Some(FeedLocation {
+                display_name: "Snake Pit".into(),
+                realm_name: "NexusPortal.Medusa".into(),
+                current_realm_score: 0,
+                max_realm_score: 0,
+                is_dungeon: true,
+            }),
+            ..Default::default()
+        };
+        panel.apply_feed_current(&current);
+        panel.apply_feed_current(&current);
+        assert_eq!(panel.realm_name.as_deref(), Some("Medusa"));
+        assert_eq!(panel.get_score_percent(), Some(40));
+        assert!(panel.is_score_stale);
+        assert!(panel.hub_host_hint.is_none());
+        assert!(
+            matches!(panel.entries.front(), Some(FeedEntry::Dungeon(d)) if !d.entered_from_nexus)
+        );
+    }
+
+    #[test]
+    fn feed_current_preserves_expired_castle_deadline_and_clears_it_on_exit() {
+        use crate::processing::contract::FeedCurrent;
+        let mut panel = LiveFeedPanel::new();
+        let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        panel.apply_feed_current(&FeedCurrent {
+            realm_closed: true,
+            castle_deadline: Some(deadline),
+            ..Default::default()
+        });
+        assert_eq!(panel.castle_timer_expires_at, Some(deadline));
+        assert_eq!(
+            panel.castle_timer_remaining(std::time::Instant::now()),
+            Some(std::time::Duration::ZERO)
+        );
+        panel.apply_feed_current(&FeedCurrent::default());
+        assert!(!panel.realm_closed);
+        assert!(panel.castle_timer_expires_at.is_none());
+    }
+
+    #[test]
+    fn feed_current_restores_discovery_without_changing_another_scope() {
+        use crate::processing::contract::{DiscoveryState, FeedCurrent};
+        let mut panel = LiveFeedPanel::new();
+        let message_at = std::time::Instant::now() - std::time::Duration::from_secs(100);
+        let timestamp = Local::now() - chrono::Duration::seconds(100);
+        panel.discovery_scope = 1;
+        panel.apply_realm_discovery(DiscoveryEvent::CrystalMessage {
+            object_id: Some(7),
+            notify: false,
+            at: message_at,
+            timestamp,
+            packet_seen: true,
+            absent_since: None,
+        });
+        let current = FeedCurrent {
+            discovery_scope: 2,
+            discovery_reset_at: Some(message_at + std::time::Duration::from_secs(20)),
+            discoveries: vec![DiscoveryState {
+                scope: 2,
+                object_id: Some(7),
+                object_type: CRYSTAL_TYPE,
+                timestamp,
+                present: false,
+                defeated: true,
+                packet_seen: true,
+                absent_since: Some(message_at + std::time::Duration::from_secs(15)),
+                last_message: Some(message_at),
+                defeated_at: Some(message_at + std::time::Duration::from_secs(10)),
+            }],
+            ..Default::default()
+        };
+        panel.apply_feed_current(&current);
+        panel.apply_feed_current(&current);
+        assert_eq!(
+            panel.entries.len(),
+            2,
+            "reconciliation must not duplicate rows"
+        );
+        let discoveries: Vec<_> = panel
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if let FeedEntry::BossCall(boss) = entry {
+                    boss.discovery.as_ref()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let restored = discoveries.iter().find(|d| d.scope == 2).unwrap();
+        assert!(restored.defeated);
+        assert_eq!(
+            restored.message_elapsed(),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(restored.absent_since, current.discoveries[0].absent_since);
+        let historical = discoveries.iter().find(|d| d.scope == 1).unwrap();
+        assert!(!historical.defeated);
+        assert_eq!(
+            historical.message_elapsed(),
+            Some(std::time::Duration::from_secs(20))
+        );
+    }
+
+    #[test]
+    fn recovered_dungeon_keeps_its_original_deadline() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView};
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_event(&LiveEventEntry {
+            seq: 1,
+            at: chrono::Utc::now() - chrono::Duration::seconds(60),
+            event: LiveEventView::Dungeon {
+                fp: 3,
+                display_name: "Snake Pit".to_string(),
+                modifiers: Vec::new(),
+                grade: None,
+                origin: Default::default(),
+            },
+        });
+        match panel.entries.front().unwrap() {
+            FeedEntry::Dungeon(entry) => assert!(
+                entry.remaining(std::time::Instant::now()).is_zero(),
+                "a dungeon recovered after its window must stay closed"
+            ),
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn recovered_leave_freezes_the_run_at_the_leave_time() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView};
+        let mut panel = LiveFeedPanel::new();
+        let entered = chrono::Utc::now() - chrono::Duration::seconds(3_600);
+        panel.apply_live_event(&LiveEventEntry {
+            seq: 1,
+            at: entered,
+            event: LiveEventView::Dungeon {
+                fp: 5,
+                display_name: "Snake Pit".to_string(),
+                modifiers: Vec::new(),
+                grade: None,
+                origin: Default::default(),
+            },
+        });
+        panel.apply_live_event(&LiveEventEntry {
+            seq: 2,
+            at: entered + chrono::Duration::seconds(10),
+            event: LiveEventView::DungeonLeft,
+        });
+        match panel.entries.front().unwrap() {
+            FeedEntry::Dungeon(entry) => {
+                let frozen = entry.frozen_elapsed_ms.expect("run is settled");
+                assert!(
+                    (9_900..=10_100).contains(&frozen),
+                    "the fallback duration ends at the leave event, not at paint time: {frozen}ms"
+                );
+                assert!(entry.remaining(std::time::Instant::now()).is_zero());
+            }
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn freeze_before_the_row_is_applied_when_it_arrives() {
+        let mut panel = LiveFeedPanel::new();
+        // The run ended before the row was recovered from the worker window.
+        panel.apply_dungeon_freeze(42, 12_000);
+        panel.push_dungeon(42, "Snake Pit", &[], None);
+        match panel.entries.front().unwrap() {
+            FeedEntry::Dungeon(d) => assert_eq!(d.frozen_elapsed_ms, Some(12_000)),
             other => panic!("Expected Dungeon entry, got {:?}", other),
         }
     }
@@ -7772,137 +8160,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_clipboard_copies_joinable_dungeon_callout() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(7, "Snake Pit", &["LOOTING".to_string()], None);
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::Copy("/p snake 50 lb j".to_string()))
-        );
-        // The copy is handed over once; afterwards the panel only tracks the
-        // entry so it can release the clipboard later.
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    // With names off, a dungeon whose modifiers clear no threshold still has a
-    // callout -- the join marker alone -- so the auto-clipboard must copy it.
-    #[test]
-    fn auto_clipboard_copies_name_less_callout_with_no_tags() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            dungeon_name_style: realmhound_core::settings::DungeonNameStyle::None,
-            ..Default::default()
-        });
-        // Snake Pit with no modifiers: no name, and no tag above its threshold.
-        panel.push_dungeon(7, "Snake Pit", &[], None);
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::Copy("/p j".to_string()))
-        );
-    }
-
-    #[test]
-    fn auto_clipboard_is_off_by_default() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    #[test]
-    fn auto_clipboard_skips_dungeons_that_cannot_be_called() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        // The Void is reachable only from inside another instance.
-        panel.push_dungeon(1, "The Void", &["DIMITUS".to_string()], None);
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    #[test]
-    fn auto_clipboard_clears_on_portal_switch() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        let copied = match panel.poll_clipboard() {
-            Some(ClipboardWrite::Copy(text)) => text,
-            other => panic!("expected a copy, got {other:?}"),
-        };
-
-        // Leaving the dungeon (any non-dungeon map change) releases the copy.
-        panel.deactivate_active_dungeons();
-        // The clear carries the exact callout, so the app can tell it apart from
-        // anything the user copied since.
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::ClearIfUnchanged(copied))
-        );
-        // Nothing is held any more, so no further clear is queued.
-        assert_eq!(panel.poll_clipboard(), None);
-    }
-
-    #[test]
-    fn auto_clipboard_clears_on_realm_close() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        let copied = match panel.poll_clipboard() {
-            Some(ClipboardWrite::Copy(text)) => text,
-            other => panic!("expected a copy, got {other:?}"),
-        };
-
-        panel.force_realm_closed();
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::ClearIfUnchanged(copied))
-        );
-    }
-
-    #[test]
-    fn auto_clipboard_clears_when_the_join_window_elapses() {
-        let _assets = crate::test_support::modifier_assets();
-        let mut panel = LiveFeedPanel::new();
-        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
-            auto_clipboard_dungeon_calls: true,
-            ..Default::default()
-        });
-        panel.push_dungeon(1, "Snake Pit", &[], None);
-        let copied = match panel.poll_clipboard() {
-            Some(ClipboardWrite::Copy(text)) => text,
-            other => panic!("expected a copy, got {other:?}"),
-        };
-
-        // The countdown runs out on its own, with no map change.
-        for entry in panel.entries.iter_mut() {
-            if let FeedEntry::Dungeon(dungeon) = entry {
-                dungeon.deactivate();
-            }
-        }
-        assert_eq!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::ClearIfUnchanged(copied))
-        );
-    }
-
-    #[test]
     fn push_dungeon_dimitus_suppressed_by_default_and_can_be_enabled() {
         // Default: Dimitus reward-mod entry is disabled, so a Dimitus dungeon
         // produces no callout (but is still flagged).
@@ -8222,5 +8479,76 @@ mod tests {
         // Whisper/party/guild directed messages carry a recipient.
         let whisper = text_packet("", -1, "Me", "EUWest Nexus");
         assert!(parse_server_command_packet(&whisper).is_none());
+    }
+
+    #[test]
+    fn recover_live_events_adds_only_new_events() {
+        use crate::processing::contract::{LiveEventEntry, LiveEventView, LiveEventWindow};
+
+        let mut panel = LiveFeedPanel::default();
+        panel.recover_live_events(&LiveEventWindow {
+            events: vec![LiveEventEntry {
+                seq: 1,
+                at: chrono::Utc::now(),
+                event: LiveEventView::BossCall {
+                    boss_id: 10,
+                    name: "First".to_string(),
+                    server_name: None,
+                    realm_name: None,
+                },
+            }],
+            dropped_before_seq: 0,
+            rev: 1,
+        });
+        assert_eq!(panel.entries.len(), 1);
+
+        panel.recover_live_events(&LiveEventWindow {
+            events: vec![
+                LiveEventEntry {
+                    seq: 1,
+                    at: chrono::Utc::now(),
+                    event: LiveEventView::BossCall {
+                        boss_id: 10,
+                        name: "First".to_string(),
+                        server_name: None,
+                        realm_name: None,
+                    },
+                },
+                LiveEventEntry {
+                    seq: 2,
+                    at: chrono::Utc::now(),
+                    event: LiveEventView::BossCall {
+                        boss_id: 11,
+                        name: "Second".to_string(),
+                        server_name: None,
+                        realm_name: None,
+                    },
+                },
+                LiveEventEntry {
+                    seq: 3,
+                    at: chrono::Utc::now(),
+                    event: LiveEventView::KeyPop {
+                        opener: "Popper".to_string(),
+                        key_id: 7,
+                        dungeon_name: "Dungeon".to_string(),
+                        thankable: true,
+                    },
+                },
+                LiveEventEntry {
+                    seq: 4,
+                    at: chrono::Utc::now(),
+                    event: LiveEventView::Dungeon {
+                        fp: 1,
+                        display_name: "Spider Den".to_string(),
+                        modifiers: Vec::new(),
+                        grade: None,
+                        origin: Default::default(),
+                    },
+                },
+            ],
+            dropped_before_seq: 0,
+            rev: 2,
+        });
+        assert_eq!(panel.entries.len(), 4, "seq 1 is not replayed");
     }
 }

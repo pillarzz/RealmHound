@@ -73,6 +73,71 @@ unsafe fn text_while_open() -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+extern "system" {
+    /// Declared directly: windows-sys 0.52 does not export `GlobalFree`.
+    fn GlobalFree(hmem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+/// Release a moveable block the clipboard did not take ownership of.
+///
+/// # Safety
+/// `handle` must be a block from `GlobalAlloc` that nobody else owns.
+#[cfg(windows)]
+unsafe fn free_block(handle: *mut std::ffi::c_void) {
+    GlobalFree(handle);
+}
+
+/// Put `text` on the clipboard from a worker thread. Returns whether the write
+/// succeeded; a busy clipboard is left untouched.
+#[cfg(windows)]
+pub fn set_text(text: &str) -> bool {
+    use windows_sys::Win32::Foundation::HGLOBAL;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, GetForegroundWindow};
+
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    unsafe {
+        // Allocate before emptying: a failed allocation must not destroy what
+        // the user already has on the clipboard.
+        let bytes = units.len() * std::mem::size_of::<u16>();
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if handle.is_null() {
+            return false;
+        }
+        let ptr = GlobalLock(handle as HGLOBAL) as *mut u16;
+        if ptr.is_null() {
+            free_block(handle);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(units.as_ptr(), ptr, units.len());
+        GlobalUnlock(handle as HGLOBAL);
+
+        // Emptying under a null owner leaves the clipboard owner null, which
+        // makes SetClipboardData fail after the old contents are already gone.
+        let owner = match GetForegroundWindow() {
+            0 => GetDesktopWindow(),
+            hwnd => hwnd,
+        };
+        if OpenClipboard(owner) == 0 {
+            free_block(handle);
+            return false;
+        }
+        let ok = EmptyClipboard() != 0 && SetClipboardData(CF_UNICODETEXT, handle as isize) != 0;
+        CloseClipboard();
+        if !ok {
+            free_block(handle);
+        }
+        ok
+    }
+}
+
 /// Empty the clipboard, but only while it still holds exactly `copied` -- the
 /// callout this app put there. Returns whether it was cleared.
 ///
@@ -103,13 +168,10 @@ pub fn clear_if_ours(copied: &str) -> bool {
     }
 }
 
-/// egui-winit's Wayland path drops writes while the window is unfocused, which
-/// is exactly when an automatic callout fires. X11 keeps using egui's path.
-#[cfg(target_os = "linux")]
+/// Write on a background thread (egui-winit's Wayland path drops writes while
+/// the window is unfocused, which is exactly when an automatic callout fires).
+#[cfg(not(windows))]
 pub fn set_text(text: &str) -> bool {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return false;
-    }
     match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
         Ok(()) => true,
         Err(error) => {

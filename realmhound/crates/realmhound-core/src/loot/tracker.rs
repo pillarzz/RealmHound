@@ -307,6 +307,8 @@ pub struct LootTracker {
     tomb: TombState,
     /// Attribution state for Ice Tomb soul drops.
     ice_tomb: IceTombState,
+    /// Loot insert failures not yet surfaced by the caller.
+    persistence_errors: Vec<String>,
 }
 
 impl Default for LootTracker {
@@ -333,6 +335,7 @@ impl LootTracker {
             recent_boss_fights: Vec::new(),
             tomb: TombState::default(),
             ice_tomb: IceTombState::default(),
+            persistence_errors: Vec::new(),
         }
     }
 
@@ -1568,6 +1571,12 @@ impl LootTracker {
             .collect()
     }
 
+    /// Take loot insert failures since the last call, so the caller can surface
+    /// them in health.
+    pub fn drain_persistence_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.persistence_errors)
+    }
+
     /// Store a drop to recent list and database.
     fn store_drop(&mut self, drop: &ProcessedLootDrop) {
         // Add to recent drops
@@ -1598,6 +1607,7 @@ impl LootTracker {
 
             if let Err(e) = db.insert_loot_drop(&new_drop) {
                 tracing::error!("Failed to write loot drop to database: {}", e);
+                self.persistence_errors.push(e.to_string());
             }
         }
     }
@@ -3099,6 +3109,45 @@ mod tests {
                 super::super::TAVERN_BARKEEP_NAME.to_string()
             ))
         );
+    }
+
+    #[test]
+    fn failed_loot_insert_is_reported_for_health() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("loot_history.db");
+        drop(LootDatabase::open_writer(&path, None).unwrap());
+        let mut tracker = LootTracker::new();
+        tracker.database = Some(LootDatabase::open_reader_at(&path).unwrap());
+
+        tracker.store_drop(&ProcessedLootDrop {
+            timestamp: 1,
+            player: PlayerSnapshot {
+                char_id: 1,
+                object_id: 2,
+                class_id: 768,
+                name: "TestPlayer".to_string(),
+                skin_id: 0,
+                tex1: 0,
+                tex2: 0,
+                fame: 0,
+                is_seasonal: false,
+                exalt_bonus: 0,
+                loot_drop_active: false,
+                loot_tier_active: false,
+                dungeon: "Realm".to_string(),
+                map_seed: 1,
+            },
+            bag_type: LootBagType::White,
+            mob_type: 1,
+            mob_name: "Test".to_string(),
+            fabricated_attribution: false,
+            items: Vec::new(),
+        });
+
+        let errors = tracker.drain_persistence_errors();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].to_lowercase().contains("readonly"));
+        assert!(tracker.drain_persistence_errors().is_empty());
     }
 
     #[test]

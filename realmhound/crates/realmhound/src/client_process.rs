@@ -552,6 +552,10 @@ pub enum ClientStart {
     Earliest(i64),
     /// A candidate could not be inspected. Its start time may well predate the
     /// reset, so the scan proves nothing and must not stand in for a relaunch.
+    #[cfg_attr(
+        windows,
+        allow(dead_code, reason = "Constructed by Unix process scans")
+    )]
     Indeterminate,
 }
 

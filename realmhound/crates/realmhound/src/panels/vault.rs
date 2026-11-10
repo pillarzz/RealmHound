@@ -1567,24 +1567,6 @@ impl Panel for VaultPanel {
         );
         vec![]
     }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        _session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        if let realmhound_core::GameEvent::VaultContentReceived {
-            ref packet,
-            vault_type,
-        } = event
-        {
-            // Note: VaultContentReceived also updates app-level live_vault_data.
-            // That wiring remains in dispatch_event() since the panel receives
-            // the data via set_live_vault_data() after the app updates it.
-            let _ = (packet, vault_type); // Handled by app-level dispatch
-        }
-        vec![]
-    }
 }
 
 #[cfg(test)]

@@ -11,7 +11,6 @@
 //! fire a flurry of identical sounds.
 
 use std::collections::HashMap;
-#[cfg(feature = "latency-diagnostics")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 #[cfg(feature = "latency-diagnostics")]
@@ -32,6 +31,22 @@ use crate::sound::{
 /// Bound on the audio command channel. Small: audio is latency-tolerant and we
 /// coalesce duplicates anyway, so a backlog should never accumulate.
 const AUDIO_CHANNEL_BOUND: usize = 64;
+
+/// Separate lane for alert sounds (realm events, custom chat pings, social
+/// pings), so a loot-sound backlog cannot starve them.
+const ALERT_CHANNEL_BOUND: usize = 16;
+
+/// Commands that are user-facing alerts rather than ambient/loot sounds.
+fn is_alert(cmd: &AudioCommand) -> bool {
+    match cmd {
+        AudioCommand::PlayEvent { .. } | AudioCommand::PlayCustomChat { .. } => true,
+        AudioCommand::Play(sound) => matches!(
+            sound,
+            SoundType::Pm | SoundType::Party | SoundType::Guild | SoundType::IgnMention
+        ),
+        _ => false,
+    }
+}
 
 /// Window within which a duplicate `Play(same resolved sound)` is suppressed.
 const COALESCE_WINDOW: Duration = Duration::from_millis(150);
@@ -62,10 +77,19 @@ impl TimedCommand {
     }
 }
 
-#[cfg(feature = "latency-diagnostics")]
+/// Always-on audio drop counters (stale, channel-full).
+static STALE_DROPS: AtomicU64 = AtomicU64::new(0);
 static FULL_DROPS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "latency-diagnostics")]
 static LAST_FULL_WARN: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Cumulative `(stale, full)` audio command drops for health reporting.
+pub fn drop_counts() -> (u64, u64) {
+    (
+        STALE_DROPS.load(Ordering::Relaxed),
+        FULL_DROPS.load(Ordering::Relaxed),
+    )
+}
 
 #[cfg(feature = "latency-diagnostics")]
 #[derive(Default)]
@@ -160,6 +184,7 @@ impl QueueLatencyDiagnostics {
 /// Handle to the audio thread: a cloneable sender plus the join handle.
 pub struct AudioHandle {
     sender: SyncSender<TimedCommand>,
+    alerts: SyncSender<TimedCommand>,
     /// Set to `false` by the thread if the `SoundEngine` failed to initialise.
     available: Arc<std::sync::atomic::AtomicBool>,
     /// Kept so the thread stays owned; detached on drop (the audio thread is a
@@ -173,6 +198,7 @@ impl AudioHandle {
     pub fn sender(&self) -> AudioSender {
         AudioSender {
             tx: self.sender.clone(),
+            alerts: self.alerts.clone(),
         }
     }
 
@@ -186,39 +212,46 @@ impl AudioHandle {
 #[derive(Clone)]
 pub struct AudioSender {
     tx: SyncSender<TimedCommand>,
+    alerts: SyncSender<TimedCommand>,
 }
 
 impl AudioSender {
     /// Send a command without blocking. Drops the command if the channel is full
     /// (audio is non-critical) or the thread has exited.
     pub fn send(&self, cmd: AudioCommand) {
+        let alert = is_alert(&cmd);
         let timed = TimedCommand {
             cmd,
             sent: SystemTime::now(),
             #[cfg(feature = "latency-diagnostics")]
             dispatched_at: Instant::now(),
         };
-        match self.tx.try_send(timed) {
+        let channel = if alert { &self.alerts } else { &self.tx };
+        match channel.try_send(timed) {
             Ok(()) => {}
-            Err(TrySendError::Full(_timed)) => {
+            Err(TrySendError::Full(timed)) => {
+                #[cfg(feature = "latency-diagnostics")]
+                record_audio_channel_full();
+                let _total = FULL_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
                 #[cfg(feature = "latency-diagnostics")]
                 {
-                    record_audio_channel_full();
                     let now = Instant::now();
-                    let total = FULL_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
                     let mut last = LAST_FULL_WARN.lock().unwrap_or_else(|e| e.into_inner());
                     if last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(2)) {
                         *last = Some(now);
                         tracing::warn!(
                             "[LATENCY][AUDIO] stage=channel_full command_kind={} \
                              dropped_total={}",
-                            _timed.command_kind(),
-                            total
+                            timed.command_kind(),
+                            _total
                         );
                     }
                 }
                 #[cfg(not(feature = "latency-diagnostics"))]
-                tracing::trace!("[AUDIO] command channel full, dropping sound");
+                tracing::trace!(
+                    "[AUDIO] command channel full ({}), dropping sound",
+                    timed.command_kind()
+                );
             }
             Err(TrySendError::Disconnected(_)) => {}
         }
@@ -229,7 +262,8 @@ impl AudioSender {
     #[cfg(test)]
     pub fn disconnected() -> Self {
         let (tx, _rx) = sync_channel::<TimedCommand>(1);
-        Self { tx }
+        let (alerts, _alert_rx) = sync_channel::<TimedCommand>(1);
+        Self { tx, alerts }
     }
 }
 
@@ -237,16 +271,18 @@ impl AudioSender {
 /// shared settings to resolve `PlayForBag` and to initialise the volume.
 pub fn spawn(settings: Arc<RwLock<Settings>>) -> AudioHandle {
     let (tx, rx) = sync_channel::<TimedCommand>(AUDIO_CHANNEL_BOUND);
+    let (alerts, alert_rx) = sync_channel::<TimedCommand>(ALERT_CHANNEL_BOUND);
     let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let available_thread = available.clone();
 
     let join = std::thread::Builder::new()
         .name("realmhound-audio".into())
-        .spawn(move || run(rx, settings, available_thread))
+        .spawn(move || run(rx, alert_rx, settings, available_thread))
         .expect("failed to spawn audio thread");
 
     AudioHandle {
         sender: tx,
+        alerts,
         available,
         _join: join,
     }
@@ -254,6 +290,7 @@ pub fn spawn(settings: Arc<RwLock<Settings>>) -> AudioHandle {
 
 fn run(
     rx: std::sync::mpsc::Receiver<TimedCommand>,
+    alert_rx: std::sync::mpsc::Receiver<TimedCommand>,
     settings: Arc<RwLock<Settings>>,
     _available: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -276,7 +313,18 @@ fn run(
     #[cfg(feature = "latency-diagnostics")]
     let mut queue_latency = QueueLatencyDiagnostics::default();
 
-    for timed in rx.iter() {
+    loop {
+        let timed = match alert_rx.try_recv() {
+            Ok(timed) => timed,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(timed) => timed,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        };
         // Skip notifications that went stale while the thread was suspended
         // (sleep); `elapsed` errs only on backwards clock, treat as fresh.
         let age = timed.sent.elapsed().unwrap_or(Duration::ZERO);
@@ -288,6 +336,7 @@ fn run(
         #[cfg(feature = "latency-diagnostics")]
         record_audio_command(command_kind, queue_age, is_stale);
         if is_stale {
+            STALE_DROPS.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "latency-diagnostics")]
             if let Some(warning) = stale_drops.record(Instant::now(), age, Duration::from_secs(2)) {
                 tracing::warn!(
@@ -524,6 +573,24 @@ mod tests {
             dispatched_at: Instant::now(),
         };
         assert_eq!(timed.command_kind(), "play_event");
+    }
+
+    #[test]
+    fn alert_commands_use_the_alert_lane() {
+        assert!(is_alert(&AudioCommand::PlayEvent {
+            sound: crate::sound::EventSound::Seasonal,
+            custom_key: "event:seasonal:1".to_string(),
+            instance_id: None,
+            volume: 1.0,
+        }));
+        assert!(is_alert(&AudioCommand::PlayCustomChat {
+            custom_key: "custom_chat:1".to_string(),
+            volume: 1.0,
+        }));
+        assert!(is_alert(&AudioCommand::Play(SoundType::Pm)));
+        assert!(!is_alert(&AudioCommand::PlayForBag(
+            realmhound_core::loot::LootBagType::White
+        )));
     }
 
     #[cfg(feature = "latency-diagnostics")]

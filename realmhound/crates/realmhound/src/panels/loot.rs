@@ -2465,6 +2465,7 @@ mod fight_link_tests {
             .insert_death_broadcast(
                 "Unmatched player",
                 "Test",
+                0,
                 chrono::Utc::now().timestamp_millis(),
             )
             .unwrap();

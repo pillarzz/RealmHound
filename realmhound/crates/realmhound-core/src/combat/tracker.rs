@@ -256,13 +256,14 @@ const SENTINEL_ATTACKER_ID: i32 = 0x00FF_FFFF;
 /// Max fights kept in memory for later UI consumption.
 const MAX_RECENT_FIGHTS: usize = 200;
 
-/// Death/nexus detection. A departed participant is marked dead when
-/// a gravestone spawned within this many tiles of their last-seen position.
+/// Death/nexus detection. After a PlayerDeath notification confirms a death,
+/// a nearby gravestone supplies the missing grave type when the announcement
+/// carried none. Proximity alone does not prove a death.
 const GRAVE_MATCH_RADIUS: f32 = 3.0;
-/// ...and within this time window of their removal (covers a grave that arrives
-/// slightly before or after the removal packet in the same/adjacent tick). Also
-/// used by the combat-history database when applying a stored death broadcast to
-/// a fight that was already written.
+/// The window around a departure in which a grave may supply that missing type
+/// (covers a grave that arrives slightly before or after the removal packet in
+/// the same/adjacent tick). Also used by the combat-history database when
+/// applying a stored death notification to a fight that was already written.
 pub(crate) const GRAVE_MATCH_WINDOW_MS: i64 = 15_000;
 /// A departure only counts for a fight if it happened no earlier than this before
 /// the fight's start (guards against correlating a much older, unrelated exit).
@@ -293,6 +294,16 @@ struct Departure {
     time: i64,
 }
 
+/// An authoritative remote death observed from a `PlayerDeath` notification.
+#[derive(Debug, Clone, Copy)]
+struct RemoteDeath {
+    /// When the notification was received (unix ms).
+    time: i64,
+    /// Gravestone object type carried by the notification's `picture_type`.
+    /// 0 when a legacy/text fallback supplied no type.
+    grave_type: i32,
+}
+
 /// A server death broadcast observed for another player, handed to the caller to
 /// persist so a death announced after its fight was written can still be applied.
 #[derive(Debug, Clone)]
@@ -301,6 +312,9 @@ pub struct DeathBroadcast {
     pub player: String,
     /// Who killed them (best-effort context from the broadcast).
     pub killer: String,
+    /// Gravestone object type carried by the death notification, or 0 when the
+    /// announcement carried no type.
+    pub grave_type: i32,
     /// When the broadcast was received (unix ms).
     pub time: i64,
 }
@@ -1503,24 +1517,24 @@ pub struct CombatTracker {
     /// Opaque run id for the current map instance (see `CompletedFight`). Minted
     /// on map change; stamped onto member fights of a curated encounter.
     current_run_id: Option<String>,
-    /// Gravestones observed spawning this run, newest last. Correlated with a
-    /// participant's departure position/time to detect deaths.
+    /// Gravestones observed spawning this run, newest last. Used only to fill in
+    /// a missing grave type after a death notification confirms the death; a
+    /// grave on its own never proves one.
     recent_graves: VecDeque<GraveSpawn>,
     /// Last-seen position/time of participants whose object left an active fight,
-    /// keyed by object id. Resolved at finalize into Died (grave nearby) or
-    /// Nexused (no grave).
+    /// keyed by object id. Resolved at finalize into Nexused unless a PlayerDeath
+    /// notification also confirms them dead.
     departures: HashMap<i32, Departure>,
     /// Authoritative local-player death from `CharacterDied`
     /// (char_id, gravestone_type, time). Overrides presence at finalize because
     /// the local object is still in `objects` when a map-change finalize runs.
     pending_local_grave: Option<(i32, i32, i64)>,
-    /// Authoritative remote-player deaths parsed from the server death-broadcast
-    /// text ("<name> died at level N, killed by <killer>"). Keyed by the
-    /// lowercased player name -> death time. This is the reliable death signal
-    /// (position-based grave correlation mis-assigns graves when several players
-    /// die in a tight cluster), so it overrides a Nexused verdict at finalize.
-    /// Cleared on map change / disconnect like the other correlation buffers.
-    remote_deaths: HashMap<String, i64>,
+    /// Authoritative remote-player deaths parsed from the server `PlayerDeath`
+    /// notification (`s.death`). Keyed by the lowercased player name. This is
+    /// the only remote death signal: position-based grave correlation supplies
+    /// a fallback sprite only after a death is confirmed, never the status
+    /// itself. Cleared on map change / disconnect like the other run buffers.
+    remote_deaths: HashMap<String, RemoteDeath>,
     /// Death broadcasts observed since the last drain, for the caller to persist.
     /// Never cleared on map change: the caller persists them and the persisted row
     /// is what lets a death announced after its fight was written be applied.
@@ -1937,7 +1951,8 @@ impl CombatTracker {
                 }
             }
         }
-        // Buffer gravestone spawns for death correlation at finalize.
+        // Buffer gravestone spawns as a fallback grave type after a death
+        // notification confirms the participant.
         if get_asset_manager().is_gravestone(object_type) {
             self.recent_graves.push_back(GraveSpawn {
                 grave_type: object_type,
@@ -2756,10 +2771,10 @@ impl CombatTracker {
         // [`Self::note_shatters_hm_unlock_object`]).
         // The Source needs no removal handling either: it only ever exists in
         // hard mode, so having it in view latched the route already.
-        // Record a participant departure for death/nexus detection:
-        // an object that is currently an attacker in some active fight is leaving
-        // view. Snapshot its last-seen position BEFORE it is dropped so a
-        // gravestone that spawns at that tile can be correlated at finalize.
+        // Record a participant departure for nexus detection: an object that is
+        // currently an attacker in some active fight is leaving view. Snapshot
+        // its last-seen position BEFORE it is dropped so a confirmed death can
+        // use a gravestone that spawned at that tile as its fallback type.
         if let Some(obj) = &last {
             if self.is_active_attacker(object_id) {
                 self.departures.insert(
@@ -6209,11 +6224,11 @@ impl CombatTracker {
     /// grave at all (and mark them Nexused despite having died).
     fn match_graves_nearest_first(
         &mut self,
-        departures: &[(usize, Departure, bool)],
+        departures: &[(usize, Departure)],
     ) -> Vec<Option<i32>> {
         let r2 = GRAVE_MATCH_RADIUS * GRAVE_MATCH_RADIUS;
         let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
-        for (di, (_, d, _)) in departures.iter().enumerate() {
+        for (di, (_, d)) in departures.iter().enumerate() {
             for (gi, g) in self.recent_graves.iter().enumerate() {
                 if (g.time - d.time).abs() > GRAVE_MATCH_WINDOW_MS {
                     continue;
@@ -6248,8 +6263,14 @@ impl CombatTracker {
         assigned
     }
 
-    /// Resolve each participant's end status (present / died / nexused), consuming
-    /// matched gravestone spawns so no grave is claimed by two participants.
+    /// Resolve each participant's end status (present / died / nexused).
+    ///
+    /// A remote `Died` verdict requires an authoritative `PlayerDeath`
+    /// notification (or the local `Death` packet). A departure on its own is
+    /// only ever a nexus/out-of-range verdict: a grave near the departure tile
+    /// is never enough to declare someone dead. Once a death is confirmed, an
+    /// actual grave spawn is used only to fill in a missing grave type; the
+    /// notification normally supplies the exact type itself.
     fn resolve_end_statuses(
         &mut self,
         participants: &mut [FightParticipant],
@@ -6258,11 +6279,10 @@ impl CombatTracker {
         local_char_id: i32,
         local_left: bool,
     ) {
-        // Participants that left the fight and may still own a gravestone, with
-        // their departure and whether the death broadcast confirmed them. Graves
-        // are assigned after the loop so the matching can run nearest-first across
-        // the whole roster instead of in roster order (see `match_graves_nearest_first`).
-        let mut departed: Vec<(usize, Departure, bool)> = Vec::new();
+        // Confirmed deaths that left the fight, with their departure and the
+        // grave type carried by the death notification (0 when unknown). Graves
+        // are matched after the loop, and only for entries whose type is unknown.
+        let mut departed: Vec<(usize, Departure, i32)> = Vec::new();
 
         for (idx, p) in participants.iter_mut().enumerate() {
             // The local player's death is authoritative (from `CharacterDied`), and
@@ -6294,36 +6314,49 @@ impl CombatTracker {
                 p.end_status = ParticipantEndStatus::Present;
                 continue;
             }
-            // The server death broadcast ("<name> died at level N, killed by ...")
-            // is the authoritative death signal, matched by name within this
-            // fight's window. Position-based grave correlation is only used to
-            // supply the exact grave-tier sprite; when no grave can be matched
-            // (one was stolen by a nearby simultaneous death, or none was seen)
-            // a name-confirmed death is still recorded with a generic grave
-            // (type 0, which the UI renders as the default gravestone).
-            let name_died = self.remote_death_in_window(&p.name, started, ended);
-            // Only a departure inside this fight's lifetime can carry a grave.
+            // The `PlayerDeath` notification (matched by name inside this fight's
+            // window) is the only remote death signal. Its picture_type is the
+            // exact grave type. A departure without this signal is a nexus /
+            // out-of-range, not a death.
+            let death_grave = self.remote_death_in_window(&p.name, started, ended);
             match self
                 .departures
                 .get(&p.object_id)
                 .copied()
                 .filter(|d| d.time >= started - DEPARTURE_GRACE_MS)
             {
-                Some(dep) => departed.push((idx, dep, name_died)),
-                None if name_died => p.end_status = ParticipantEndStatus::Died { grave_type: 0 },
-                None => p.end_status = ParticipantEndStatus::Present,
+                Some(dep) => match death_grave {
+                    Some(grave_type) => departed.push((idx, dep, grave_type)),
+                    None => p.end_status = ParticipantEndStatus::Nexused,
+                },
+                None => {
+                    p.end_status = match death_grave {
+                        Some(grave_type) => ParticipantEndStatus::Died { grave_type },
+                        None => ParticipantEndStatus::Present,
+                    }
+                }
             }
         }
 
-        let graves = self.match_graves_nearest_first(&departed);
-        for (i, (idx, _, name_died)) in departed.iter().enumerate() {
-            participants[*idx].end_status = match (graves[i], name_died) {
-                (Some(grave_type), _) => ParticipantEndStatus::Died { grave_type },
-                (None, true) => ParticipantEndStatus::Died { grave_type: 0 },
-                // No death evidence: a departure inside the fight means they left
-                // (nexused); no departure means they were simply present.
-                (None, false) => ParticipantEndStatus::Nexused,
+        // Only death-notification rows with no grave type need a spatial fallback.
+        let unknown: Vec<(usize, Departure)> = departed
+            .iter()
+            .filter(|(_, _, grave_type)| *grave_type == 0)
+            .map(|(idx, dep, _)| (*idx, *dep))
+            .collect();
+        let matched: HashMap<usize, i32> = self
+            .match_graves_nearest_first(&unknown)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, grave_type)| grave_type.map(|g| (unknown[i].0, g)))
+            .collect();
+        for (idx, _, grave_type) in departed {
+            let grave_type = if grave_type > 0 {
+                grave_type
+            } else {
+                matched.get(&idx).copied().unwrap_or(0)
             };
+            participants[idx].end_status = ParticipantEndStatus::Died { grave_type };
         }
     }
 
@@ -6334,25 +6367,39 @@ impl CombatTracker {
         self.pending_local_grave = Some((char_id, gravestone_type, time_ms));
     }
 
-    /// Record a remote player's death from the server death broadcast (`s.death`,
-    /// rendering as "<name> died at level N, killed by <killer>"). Buffered by name
-    /// until the current fight(s) finalize; this authoritative signal is what marks
-    /// a clustered-death player as Died even when their gravestone couldn't be
-    /// position-correlated (see `resolve_end_statuses`). The raw broadcast is also
-    /// queued for the caller to persist (see `take_pending_death_broadcasts`), so a
-    /// death announced after its fight was written can still be applied to it.
-    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
+    /// Record a remote player's death from the server `PlayerDeath` notification
+    /// (`s.death`) or a legacy text announcement. Buffered by name until the
+    /// current fight(s) finalize; this authoritative signal is what marks a
+    /// player as Died. `grave_type` is the notification's `picture_type` (the
+    /// exact gravestone object type), or 0 when a legacy text path supplied none.
+    /// The raw broadcast is also queued for the caller to persist (see
+    /// `take_pending_death_broadcasts`), so a death announced after its fight was
+    /// written can still be applied to it.
+    pub fn on_remote_death(
+        &mut self,
+        player_name: &str,
+        killer: &str,
+        grave_type: i32,
+        time_ms: i64,
+    ) {
         let key = sanitize_player_name(player_name).to_ascii_lowercase();
         if key.is_empty() {
             return;
         }
-        self.remote_deaths.insert(key, time_ms);
+        self.remote_deaths.insert(
+            key,
+            RemoteDeath {
+                time: time_ms,
+                grave_type,
+            },
+        );
         if self.pending_death_broadcasts.len() >= CORRELATION_MAX_ENTRIES {
             self.pending_death_broadcasts.remove(0);
         }
         self.pending_death_broadcasts.push(DeathBroadcast {
             player: player_name.trim().to_string(),
             killer: killer.trim().to_string(),
+            grave_type,
             time: time_ms,
         });
     }
@@ -6362,20 +6409,23 @@ impl CombatTracker {
         std::mem::take(&mut self.pending_death_broadcasts)
     }
 
-    /// Whether a remote death broadcast named `name` and it landed within this
-    /// fight's window (matching the local-death gate). Gating to the fight window
-    /// keeps a death at a later sequential boss from bleeding back onto an earlier
-    /// boss the player cleared alive.
-    fn remote_death_in_window(&self, name: &str, started: i64, ended: i64) -> bool {
+    /// The grave type of a remote death notification for `name` inside this
+    /// fight's window, or `None` when no notification named them. A `Some(0)`
+    /// means the death is confirmed but the announcement carried no grave type.
+    /// Gating to the fight window keeps a death at a later sequential boss from
+    /// bleeding back onto an earlier boss the player cleared alive.
+    fn remote_death_in_window(&self, name: &str, started: i64, ended: i64) -> Option<i32> {
         if self.remote_deaths.is_empty() {
-            return false;
+            return None;
         }
         let key = sanitize_player_name(name).to_ascii_lowercase();
         if key.is_empty() {
-            return false;
+            return None;
         }
-        self.remote_deaths.get(&key).is_some_and(|&t| {
-            t >= started - GRAVE_MATCH_WINDOW_MS && t <= ended + GRAVE_MATCH_WINDOW_MS
+        self.remote_deaths.get(&key).and_then(|death| {
+            (death.time >= started - GRAVE_MATCH_WINDOW_MS
+                && death.time <= ended + GRAVE_MATCH_WINDOW_MS)
+                .then_some(death.grave_type)
         })
     }
 }
@@ -7507,7 +7557,9 @@ mod tests {
         let mut t = CombatTracker::new();
         // Participant 3 is still in view -> Present.
         t.objects.insert(3, TrackedObject::default());
-        // Participant 1 left near (10,10); a grave spawned close by -> Died.
+        // Participant 1 left near (10,10) and was confirmed dead by the
+        // PlayerDeath notification, which carried no type; a nearby grave then
+        // supplies the sprite -> Died.
         t.departures.insert(
             1,
             Departure {
@@ -7531,12 +7583,11 @@ mod tests {
             y: 9.7,
             time: 1_300,
         });
+        t.on_remote_death("One", "a Spider", 0, 1_000);
 
-        let mut ps = vec![
-            participant(1, false),
-            participant(2, false),
-            participant(3, false),
-        ];
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut ps = vec![p1, participant(2, false), participant(3, false)];
         t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
 
         assert_eq!(
@@ -7585,8 +7636,14 @@ mod tests {
             y: 12.1,
             time: 1_100,
         });
+        t.on_remote_death("One", "a Spider", 0, 1_000);
+        t.on_remote_death("Two", "a Spider", 0, 1_000);
 
-        let mut ps = vec![participant(1, false), participant(2, false)];
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut p2 = participant(2, false);
+        p2.name = "Two".into();
+        let mut ps = vec![p1, p2];
         t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
 
         assert_eq!(
@@ -7631,9 +7688,11 @@ mod tests {
             y: 10.0,
             time: 1_100,
         });
-        // Both deaths were broadcast during the fight window.
-        t.on_remote_death("Zannmp", "Oryx the Mad God", 1_050);
-        t.on_remote_death("Yumiho", "Oryx the Mad God", 1_050);
+        // Both deaths were broadcast during the fight window. Neither packet
+        // carried a type in this legacy-style case, so the one available grave
+        // supplies the sprite for one of them.
+        t.on_remote_death("Zannmp", "Oryx the Mad God", 0, 1_050);
+        t.on_remote_death("Yumiho", "Oryx the Mad God", 0, 1_050);
 
         let mut p1 = participant(1, false);
         p1.name = "Zannmp".into();
@@ -7669,13 +7728,14 @@ mod tests {
     #[test]
     fn remote_death_broadcasts_are_queued_for_persistence() {
         let mut t = CombatTracker::new();
-        t.on_remote_death("Pillar", "Oryx the Mad God", 1_234);
+        t.on_remote_death("Pillar", "Oryx the Mad God", 1837, 1_234);
         // A broadcast carrying no player name persists nothing.
-        t.on_remote_death("   ", "a Spider", 2_000);
+        t.on_remote_death("   ", "a Spider", 0, 2_000);
         let queued = t.take_pending_death_broadcasts();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].player, "Pillar");
         assert_eq!(queued[0].killer, "Oryx the Mad God");
+        assert_eq!(queued[0].grave_type, 1837);
         assert_eq!(queued[0].time, 1_234);
         assert!(t.take_pending_death_broadcasts().is_empty());
     }
@@ -7693,12 +7753,99 @@ mod tests {
                 time: 1_000,
             },
         );
-        t.on_remote_death("Later", "Oryx the Mad God", 500_000);
+        t.on_remote_death("Later", "Oryx the Mad God", 1837, 500_000);
         let mut p1 = participant(1, false);
         p1.name = "Later".into();
         let mut ps = vec![p1];
         t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
         assert_eq!(ps[0].end_status, ParticipantEndStatus::Nexused);
+    }
+
+    #[test]
+    fn departure_without_death_notification_near_grave_stays_nexused() {
+        // The Aifumi case: a living player's object leaves the observer's view
+        // (a desync, teleport, or simply walking out of range) just as another
+        // player's grave is nearby. Proximity alone must never mark them dead.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 1_000,
+            },
+        );
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1837,
+            x: 10.1,
+            y: 10.0,
+            time: 1_100,
+        });
+
+        let mut ps = vec![participant(1, false)];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(ps[0].end_status, ParticipantEndStatus::Nexused);
+        assert_eq!(
+            t.recent_graves.len(),
+            1,
+            "the unknown grave stays unclaimed"
+        );
+    }
+
+    #[test]
+    fn notification_grave_type_wins_over_nearby_grave() {
+        // The PlayerDeath notification's picture_type is the exact grave. A
+        // nearby grave belonging to another player must not override it.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 1_000,
+            },
+        );
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1830,
+            x: 10.1,
+            y: 10.0,
+            time: 1_100,
+        });
+        t.on_remote_death("One", "a Spider", 1837, 1_000);
+
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
+        assert_eq!(
+            t.recent_graves.len(),
+            1,
+            "the notification supplied the type, so the nearby grave was not claimed"
+        );
+    }
+
+    #[test]
+    fn notification_without_departure_is_died_with_exact_grave() {
+        // A PlayerDeath notification is enough on its own even when the object
+        // removal was never observed as a departure.
+        let mut t = CombatTracker::new();
+        t.on_remote_death("One", "a Spider", 1837, 1_000);
+
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
     }
 
     #[test]

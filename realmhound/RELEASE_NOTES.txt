@@ -2,6 +2,7 @@
 * Reduced startup time, optimized Loot/Combat History searching.
 
 # Combat History
+* Remote deaths now use the server's PlayerDeath notification and display its exact gravestone type.
 * Fixed healed and phase-gated bosses deflating the whole team's damage through the overkill trim.
 * My Performance card now differentiates weapon native shots, enchantment and other additional projectiles.
 * Fixed enchantment sub-attack and proc projectiles missing from damage attribution.

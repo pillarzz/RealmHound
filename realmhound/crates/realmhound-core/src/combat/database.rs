@@ -21,7 +21,7 @@ mod maintenance;
 pub use maintenance::RepairBatch;
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 70;
+pub const SCHEMA_VERSION: i32 = 71;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -842,6 +842,11 @@ impl CombatDatabase {
                 "INTEGER NOT NULL DEFAULT 0",
             ),
             ("stat_awards", "most", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "death_broadcasts",
+                "grave_type",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
             (
                 "death_broadcasts",
                 "processed",
@@ -2955,6 +2960,7 @@ impl CombatDatabase {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 player TEXT NOT NULL,
                 killer TEXT NOT NULL DEFAULT '',
+                grave_type INTEGER NOT NULL DEFAULT 0,
                 occurred_at INTEGER NOT NULL,
                 processed INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at INTEGER NOT NULL DEFAULT 0
@@ -2979,13 +2985,16 @@ impl CombatDatabase {
         Ok(())
     }
 
-    /// Record an observed server death broadcast (`s.death`) so a death confirmed
-    /// after its fight was already stored can still be applied to that fight, and
-    /// so the raw signal survives for diagnosing a death that was never captured.
+    /// Record an observed server PlayerDeath notification (`s.death`) so a death
+    /// confirmed after its fight was already stored can still be applied to that
+    /// fight, and so the raw signal survives for diagnosing a death that was never
+    /// captured. `grave_type` is the notification's `picture_type` (0 when a
+    /// legacy text announcement supplied none).
     pub fn insert_death_broadcast(
         &mut self,
         player: &str,
         killer: &str,
+        grave_type: i32,
         occurred_at: i64,
     ) -> SqlResult<()> {
         let player = player.trim();
@@ -2993,8 +3002,9 @@ impl CombatDatabase {
             return Ok(());
         }
         self.conn.execute(
-            "INSERT INTO death_broadcasts (player, killer, occurred_at) VALUES (?1, ?2, ?3)",
-            params![player, killer.trim(), occurred_at],
+            "INSERT INTO death_broadcasts (player, killer, grave_type, occurred_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![player, killer.trim(), grave_type, occurred_at],
         )?;
         Ok(())
     }
@@ -3010,9 +3020,10 @@ impl CombatDatabase {
     /// corrected here.
     ///
     /// Only a `nexused` row with no grave is touched -- exactly the rule the live
-    /// pass applies (death evidence beats a departure, but never presence) -- and
-    /// the grave tier is left at 0, which the UI renders as the default
-    /// gravestone. Idempotent: repaired rows no longer match.
+    /// pass applies (death evidence beats a departure, but never presence). The
+    /// broadcast's `grave_type` (the PlayerDeath `picture_type`) is written onto
+    /// the row; 0 keeps the UI's generic gravestone. Idempotent: repaired rows no
+    /// longer match.
     pub fn repair_remote_deaths(&mut self) -> SqlResult<usize> {
         /// How long a broadcast that matched nothing is retried. A fight is
         /// normally written on the next tick after it ends; this window covers a
@@ -3026,20 +3037,20 @@ impl CombatDatabase {
         const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
         let now = chrono::Utc::now().timestamp_millis();
-        let broadcasts: Vec<(i64, String, i64)> = {
+        let broadcasts: Vec<(i64, String, i32, i64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, player, occurred_at FROM death_broadcasts
+                "SELECT id, player, grave_type, occurred_at FROM death_broadcasts
                  WHERE processed = 0 AND next_attempt_at<=?1
                  ORDER BY next_attempt_at, occurred_at, id LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![now, BATCH], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             rows.collect::<SqlResult<Vec<_>>>()?
         };
 
         let mut repaired = 0usize;
-        for (id, player, occurred_at) in broadcasts {
+        for (id, player, grave_type, occurred_at) in broadcasts {
             let key = super::tracker::sanitize_player_name(&player).to_ascii_lowercase();
             let mut repaired_for_broadcast = 0usize;
             if !key.is_empty() {
@@ -3059,9 +3070,9 @@ impl CombatDatabase {
                         continue;
                     }
                     repaired_for_broadcast += self.conn.execute(
-                        "UPDATE fight_participants SET end_status = 'died'
+                        "UPDATE fight_participants SET end_status = 'died', grave_type = ?2
                          WHERE id = ?1 AND end_status = 'nexused'",
-                        params![participant_id],
+                        params![participant_id, grave_type],
                     )?;
                 }
             }
@@ -7797,7 +7808,7 @@ mod tests {
     }
 
     #[test]
-    fn schema70_upgrades_main_and_pr_databases_without_resetting_repairs() {
+    fn schema71_upgrades_main_and_pr_databases_without_resetting_repairs() {
         let checkpoints = |db: &CombatDatabase| {
             db.conn
                 .prepare(
@@ -7885,13 +7896,14 @@ mod tests {
                     db.conn
                         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                         .unwrap(),
-                    70,
+                    SCHEMA_VERSION,
                     "upgrading v{version}, reopen {reopen}",
                 );
                 assert!(db.column_exists("fights", "mods").unwrap());
                 assert!(db
                     .column_exists("death_broadcasts", "next_attempt_at")
                     .unwrap());
+                assert!(db.column_exists("death_broadcasts", "grave_type").unwrap());
                 assert_eq!(db.fight_count().unwrap(), 2 + reopen);
                 let loaded = db.fight_detail(original).unwrap().unwrap();
                 assert_eq!(loaded.boss_name, fight.boss_name);
@@ -7929,18 +7941,19 @@ mod tests {
     }
 
     #[test]
-    fn schema70_fresh_database_has_modifiers_and_maintenance_without_legacy_jobs() {
+    fn schema71_fresh_database_has_modifiers_and_maintenance_without_legacy_jobs() {
         let db = CombatDatabase::open_in_memory().unwrap();
         assert_eq!(
             db.conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            70,
+            SCHEMA_VERSION,
         );
         assert!(db.column_exists("fights", "mods").unwrap());
         assert!(db
             .column_exists("death_broadcasts", "next_attempt_at")
             .unwrap());
+        assert!(db.column_exists("death_broadcasts", "grave_type").unwrap());
         assert_eq!(db.fight_count().unwrap(), 0);
         assert!(!db.has_legacy_repairs().unwrap());
         assert_eq!(
@@ -11989,12 +12002,13 @@ mod tests {
         db.insert_fight(&fight).unwrap();
 
         // The broadcast for a death inside the fight's window arrives afterwards.
-        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_020_000)
+        // picture_type 1837 is the 8/8 default gravestone.
+        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1837, 1_020_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 1);
 
-        // The named participant is corrected with a generic grave (the tier was
-        // never captured); everyone else keeps the nexus verdict.
+        // The named participant is corrected with the exact grave carried by the
+        // notification; everyone else keeps the nexus verdict.
         let repaired: (String, i64) = db
             .conn
             .query_row(
@@ -12003,7 +12017,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(repaired, ("died".to_string(), 0));
+        assert_eq!(repaired, ("died".to_string(), 1837));
         let bystander: String = db
             .conn
             .query_row(
@@ -12020,7 +12034,7 @@ mod tests {
     fn death_broadcast_waits_for_a_late_stored_fight_then_retires() {
         let mut db = CombatDatabase::open_in_memory().unwrap();
         let now = chrono::Utc::now().timestamp_millis();
-        db.insert_death_broadcast("Late", "Oryx the Mad God", now)
+        db.insert_death_broadcast("Late", "Oryx the Mad God", 0, now)
             .unwrap();
 
         // The fight has not been written yet: the broadcast must stay pending.
@@ -12057,14 +12071,14 @@ mod tests {
         let mut db = CombatDatabase::open_writer(&path).unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         for n in 0..16 {
-            db.insert_death_broadcast(&format!("Missing{n}"), "a Spider", now)
+            db.insert_death_broadcast(&format!("Missing{n}"), "a Spider", 0, now)
                 .unwrap();
         }
         let mut fight = fight_with_players("Mad Lab", now - 5_000, &["Found"]);
         fight.ended_at = now + 5_000;
         fight.participants[0].end_status = ParticipantEndStatus::Nexused;
         db.insert_fight(&fight).unwrap();
-        db.insert_death_broadcast("Found", "a Spider", now + 1)
+        db.insert_death_broadcast("Found", "a Spider", 0, now + 1)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         drop(db);
@@ -12131,7 +12145,7 @@ mod tests {
         recent.ended_at = now + 60_000;
         recent.participants[0].end_status = ParticipantEndStatus::Nexused;
         db.insert_fight(&recent).unwrap();
-        db.insert_death_broadcast("Pillar", "a Spider", now)
+        db.insert_death_broadcast("Pillar", "a Spider", 0, now)
             .unwrap();
 
         assert_eq!(db.repair_remote_deaths().unwrap(), 1);
@@ -12159,6 +12173,7 @@ mod tests {
         db.insert_death_broadcast(
             "Late",
             "a Spider",
+            0,
             chrono::Utc::now().timestamp_millis() - 16 * 60 * 1000,
         )
         .unwrap();
@@ -12166,6 +12181,7 @@ mod tests {
         assert!(db
             .column_exists("death_broadcasts", "next_attempt_at")
             .unwrap());
+        assert!(db.column_exists("death_broadcasts", "grave_type").unwrap());
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         let processed: i64 = db
             .conn
@@ -12202,11 +12218,11 @@ mod tests {
         fight.participants[0].end_status = ParticipantEndStatus::Nexused;
         db.insert_fight(&fight).unwrap();
         // Ten minutes later: outside the fight window.
-        db.insert_death_broadcast("Pillar", "a Spider", 610_000)
+        db.insert_death_broadcast("Pillar", "a Spider", 0, 610_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         // In the window, but another player died.
-        db.insert_death_broadcast("Someone", "a Spider", 20_000)
+        db.insert_death_broadcast("Someone", "a Spider", 0, 20_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         let status: String = db
@@ -12227,7 +12243,7 @@ mod tests {
         let mut db = CombatDatabase::open_in_memory().unwrap();
         let fight = fight_with_players("Mad Lab", 1_000, &["Present"]);
         db.insert_fight(&fight).unwrap();
-        db.insert_death_broadcast("Present", "a Spider", 20_000)
+        db.insert_death_broadcast("Present", "a Spider", 0, 20_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
     }
@@ -12243,7 +12259,7 @@ mod tests {
             db.insert_fight(&fight).unwrap();
             // Stored, but not applied yet: only the open pass (or the live drain)
             // repairs stored rows.
-            db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_030_000)
+            db.insert_death_broadcast("Pillar", "Oryx the Mad God", 0, 1_030_000)
                 .unwrap();
             let before: String = db
                 .conn

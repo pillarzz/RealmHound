@@ -512,12 +512,20 @@ impl CombatManager {
         self.flush_dungeon_timer(time_ms);
     }
 
-    /// A remote player died, parsed from the server death broadcast (`s.death`).
-    /// Buffers the death by name so the finalizing fight marks that participant as
-    /// dead even when their gravestone couldn't be position-correlated; the raw
-    /// broadcast is persisted on the next tick (see `persist_death_broadcasts`).
-    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
-        self.tracker.on_remote_death(player_name, killer, time_ms);
+    /// A remote player died, parsed from the server `PlayerDeath` notification
+    /// (`s.death`). `grave_type` is the notification's `picture_type`. Buffers
+    /// the death by name so the finalizing fight marks that participant as dead;
+    /// the raw notification is persisted on the next tick (see
+    /// `persist_death_broadcasts`).
+    pub fn on_remote_death(
+        &mut self,
+        player_name: &str,
+        killer: &str,
+        grave_type: i32,
+        time_ms: i64,
+    ) {
+        self.tracker
+            .on_remote_death(player_name, killer, grave_type, time_ms);
     }
 
     /// Incoming `DamagePacket`: `attacker_id` dealt `amount` to `target_id`.
@@ -662,9 +670,12 @@ impl CombatManager {
         };
         let pending = self.tracker.take_pending_death_broadcasts();
         for broadcast in &pending {
-            if let Err(e) =
-                db.insert_death_broadcast(&broadcast.player, &broadcast.killer, broadcast.time)
-            {
+            if let Err(e) = db.insert_death_broadcast(
+                &broadcast.player,
+                &broadcast.killer,
+                broadcast.grave_type,
+                broadcast.time,
+            ) {
                 tracing::error!("[COMBAT] Failed to persist death broadcast: {}", e);
                 return;
             }
@@ -1182,7 +1193,7 @@ mod tests {
         let id = m.database.as_ref().unwrap().recent_fights(1).unwrap()[0].id;
 
         // The broadcast for a death inside the fight's window lands afterwards.
-        m.on_remote_death("Ally", "Oryx the Mad God", 1_030_000);
+        m.on_remote_death("Ally", "Oryx the Mad God", 1837, 1_030_000);
         m.on_tick(1_040_000);
 
         let record = m
@@ -1199,8 +1210,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             ally.end_status,
-            ParticipantEndStatus::Died { grave_type: 0 },
-            "the stored row is corrected from the broadcast"
+            ParticipantEndStatus::Died { grave_type: 1837 },
+            "the stored row is corrected from the broadcast's exact grave"
         );
     }
 

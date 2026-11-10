@@ -532,7 +532,7 @@ impl CompletedFight {
 }
 
 /// A read-only view of the boss fight that is currently in progress, published
-/// for the live DPS overlay.
+/// for the Live Combat overlay.
 ///
 /// Unlike [`CompletedFight`] this is a best-effort mid-fight projection: the
 /// local player's damage may still be `SelfPending`/`SelfEstimated` and the

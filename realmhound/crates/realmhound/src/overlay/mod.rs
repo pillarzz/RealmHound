@@ -1,6 +1,6 @@
 //! Floating, always-on-top overlay windows drawn over the game client.
 //!
-//! Two overlays are provided: a live DPS meter for the boss fight currently in
+//! Two overlays are provided: Live Combat, showing the boss fight currently in
 //! progress, and a loot tracker tallying the bags that have dropped this
 //! session. Both are separate native windows (egui *immediate viewports*) so
 //! they can sit over a fullscreen game client while the main RealmHound window
@@ -12,7 +12,7 @@
 //!   game stays visible underneath.
 //! - **Locked** overlays pass every mouse event straight through to the game, so
 //!   the user can shoot "through" the panel. The title bar, the tab strips, the
-//!   scrollbars and the DPS rows' name labels are the exceptions: they stay live
+//!   scrollbars and the Live Combat rows' name labels are the exceptions: they stay live
 //!   so a locked overlay can still be unlocked, navigated, scrolled and copied
 //!   from. A locked overlay is also made
 //!   non-resizable, because the window manager would otherwise resize it from
@@ -36,14 +36,14 @@ use realmhound_core::settings::{OverlayWindowSettings, Settings};
 use crate::panels::loot_filters::{LootFilters, PropertyFilters};
 use crate::rendering::SpriteRenderer;
 
-mod dps;
+mod live_combat;
 mod loot;
 pub mod platform;
 
 /// Window title prefixes. [`platform`] uses them to tell one overlay's windows
 /// from the other's, so they must stay unique and stable. The title actually
 /// given to a window appends [`next_generation`].
-const DPS_TITLE: &str = "RealmHound DPS Overlay";
+const LIVE_COMBAT_TITLE: &str = "RealmHound Live Combat";
 const LOOT_TITLE: &str = "RealmHound Loot Overlay";
 
 /// Source of the per-window suffix that makes every native overlay title
@@ -285,8 +285,8 @@ impl WindowRuntime {
 
 /// Owns both overlay windows and the state they render from.
 pub struct OverlayManager {
-    dps_window: WindowRuntime,
-    dps: dps::DpsOverlay,
+    live_combat_window: WindowRuntime,
+    live_combat: live_combat::LiveCombatOverlay,
     loot_window: WindowRuntime,
     loot: loot::LootOverlay,
     /// Mirrors "at least one overlay is open" for the packet worker, which uses
@@ -306,8 +306,8 @@ impl Default for OverlayManager {
 impl OverlayManager {
     pub fn new() -> Self {
         Self {
-            dps_window: WindowRuntime::new(DPS_TITLE),
-            dps: dps::DpsOverlay::default(),
+            live_combat_window: WindowRuntime::new(LIVE_COMBAT_TITLE),
+            live_combat: live_combat::LiveCombatOverlay::default(),
             loot_window: WindowRuntime::new(LOOT_TITLE),
             loot: loot::LootOverlay::default(),
             active: Arc::new(AtomicBool::new(false)),
@@ -316,7 +316,7 @@ impl OverlayManager {
     }
 
     /// Shared flag the worker reads to decide whether overlay-only data (live
-    /// DPS, loot) still needs to wake the UI on a background tab.
+    /// combat, loot) still needs to wake the UI on a background tab.
     pub fn active_signal(&self) -> Arc<AtomicBool> {
         self.active.clone()
     }
@@ -357,7 +357,7 @@ impl OverlayManager {
         };
         self.active.store(cfg.any_visible(), Ordering::Relaxed);
         if !cfg.any_visible() {
-            self.dps_window.closed();
+            self.live_combat_window.closed();
             self.loot_window.closed();
             return;
         }
@@ -373,7 +373,8 @@ impl OverlayManager {
         // The rate is deliberate, not "as fast as the display will go": the
         // main window is demand-driven everywhere else, and each overlay frame
         // drags its entire UI along.
-        let animating = cfg.dps.visible && !cfg.dps.minimized && live.iter().any(|f| !f.ended);
+        let animating =
+            cfg.live_combat.visible && !cfg.live_combat.minimized && live.iter().any(|f| !f.ended);
         ctx.request_repaint_after(if animating {
             ACTIVE_FRAME_INTERVAL
         } else {
@@ -384,24 +385,24 @@ impl OverlayManager {
         let opacity = cfg.clamped_opacity();
         let max_rows = cfg.max_rows();
 
-        if cfg.dps.visible {
-            let mut content = dps::DpsContent {
-                overlay: &mut self.dps,
+        if cfg.live_combat.visible {
+            let mut content = live_combat::LiveCombatContent {
+                overlay: &mut self.live_combat,
                 fights: live,
-                follow: &mut cfg.dps_follow_me,
+                follow: &mut cfg.live_combat_follow_me,
                 max_rows,
             };
             let embedded = show_window(
                 ctx,
-                &mut self.dps_window,
-                &mut cfg.dps,
+                &mut self.live_combat_window,
+                &mut cfg.live_combat,
                 opacity,
                 sprites,
                 &mut content,
             );
             self.warn_if_embedded(embedded);
         } else {
-            self.dps_window.closed();
+            self.live_combat_window.closed();
         }
 
         if cfg.loot.visible {
@@ -423,17 +424,17 @@ impl OverlayManager {
             self.loot_window.closed();
         }
 
-        if cfg.dps != before.dps
+        if cfg.live_combat != before.live_combat
             || cfg.loot != before.loot
-            || cfg.dps_follow_me != before.dps_follow_me
+            || cfg.live_combat_follow_me != before.live_combat_follow_me
         {
             if let Ok(mut s) = settings.write() {
                 // Only the state the windows themselves own. Writing the whole
                 // struct back would clobber a preference the settings tab
                 // changed after this clone was taken.
-                s.overlays.dps = cfg.dps.clone();
+                s.overlays.live_combat = cfg.live_combat.clone();
                 s.overlays.loot = cfg.loot.clone();
-                s.overlays.dps_follow_me = cfg.dps_follow_me;
+                s.overlays.live_combat_follow_me = cfg.live_combat_follow_me;
             }
         }
     }
@@ -965,7 +966,7 @@ fn thousands(value: i64) -> String {
 mod tests {
     use super::{
         chrome_strip, perceptual_alpha, scrollbar_hit, short_title, thousands, HitRegions,
-        WindowRuntime, CHROME_HIT_H, CLOSE_GLYPH, DPS_TITLE, MINIMIZE_GLYPH, RESET_GLYPH,
+        WindowRuntime, CHROME_HIT_H, CLOSE_GLYPH, LIVE_COMBAT_TITLE, MINIMIZE_GLYPH, RESET_GLYPH,
         RESTORE_GLYPH,
     };
     use eframe::egui;
@@ -973,8 +974,8 @@ mod tests {
 
     #[test]
     fn reopening_an_overlay_gives_its_window_a_fresh_native_title() {
-        let cfg = OverlaySettings::default().dps;
-        let mut runtime = WindowRuntime::new(DPS_TITLE);
+        let cfg = OverlaySettings::default().live_combat;
+        let mut runtime = WindowRuntime::new(LIVE_COMBAT_TITLE);
 
         runtime.builder_for(&cfg);
         let first = runtime.native_title.clone();
@@ -990,8 +991,8 @@ mod tests {
             "a replacement window must be distinguishable from the one it replaced"
         );
         // `dismiss_stale` finds leftovers by prefix, so both have to carry it.
-        assert!(first.starts_with(DPS_TITLE));
-        assert!(runtime.native_title.starts_with(DPS_TITLE));
+        assert!(first.starts_with(LIVE_COMBAT_TITLE));
+        assert!(runtime.native_title.starts_with(LIVE_COMBAT_TITLE));
     }
 
     #[test]
@@ -1027,9 +1028,9 @@ mod tests {
 
     #[test]
     fn window_titles_drop_the_product_prefix() {
-        assert_eq!(short_title("RealmHound DPS Overlay"), "DPS Overlay");
+        assert_eq!(short_title("RealmHound Live Combat"), "Live Combat");
         // A title without the prefix is left alone.
-        assert_eq!(short_title("DPS Overlay"), "DPS Overlay");
+        assert_eq!(short_title("Live Combat"), "Live Combat");
     }
 
     #[test]

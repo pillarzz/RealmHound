@@ -833,7 +833,7 @@ impl PacketProcessor {
         self.live_char_id
     }
 
-    /// Project every boss fight of the current map instance for the live DPS
+    /// Project every boss fight of the current map instance for the Live Combat
     /// overlay, oldest engagement first.
     ///
     /// The list only empties when the player leaves the instance, so a

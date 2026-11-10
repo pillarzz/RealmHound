@@ -1,4 +1,4 @@
-//! Live DPS overlay body.
+//! Live Combat overlay body.
 //!
 //! Shows one boss fight of the map instance the player is in, with a tab per
 //! boss (phases included, since each phase is its own fight). The list is
@@ -52,7 +52,7 @@ const TAB_LABEL_CHARS: usize = 12;
 const SWITCH_MARGIN_MS: i64 = 1_500;
 
 #[derive(Default)]
-pub(super) struct DpsOverlay {
+pub(super) struct LiveCombatOverlay {
     /// Boss whose tab the user clicked, which overrides auto-follow until they
     /// click it again or change zone.
     pinned: Option<i32>,
@@ -64,15 +64,15 @@ pub(super) struct DpsOverlay {
     last_ids: Vec<i32>,
 }
 
-/// Borrows everything one frame of the DPS overlay needs.
-pub(super) struct DpsContent<'a> {
-    pub overlay: &'a mut DpsOverlay,
+/// Borrows everything one frame of the Live Combat overlay needs.
+pub(super) struct LiveCombatContent<'a> {
+    pub overlay: &'a mut LiveCombatOverlay,
     pub fights: &'a [Arc<LiveFightSnapshot>],
     pub follow: &'a mut bool,
     pub max_rows: usize,
 }
 
-impl OverlayContent for DpsContent<'_> {
+impl OverlayContent for LiveCombatContent<'_> {
     fn title_extras(&mut self, ui: &mut egui::Ui) {
         let color = if *self.follow {
             LOCAL_COLOR
@@ -96,7 +96,7 @@ impl OverlayContent for DpsContent<'_> {
     }
 }
 
-impl DpsOverlay {
+impl LiveCombatOverlay {
     fn body(
         &mut self,
         ui: &mut egui::Ui,
@@ -150,7 +150,7 @@ impl DpsOverlay {
         }
 
         let output = egui::ScrollArea::vertical()
-            .id_salt("dps_rows")
+            .id_salt("live_combat_rows")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let Some(fight) = fight else {
@@ -246,7 +246,7 @@ impl DpsOverlay {
     ) {
         let top = ui.cursor().top();
         egui::ScrollArea::horizontal()
-            .id_salt("dps_tabs")
+            .id_salt("live_combat_tabs")
             .auto_shrink([false, true])
             .max_height(TAB_HEIGHT)
             .show(ui, |ui| {
@@ -486,7 +486,7 @@ fn callout(participant: &FightParticipant, rank: usize, share: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        callout, elapsed, is_uncertain, row_color, truncate, Arc, DpsOverlay, NORMAL_COLOR,
+        callout, elapsed, is_uncertain, row_color, truncate, Arc, LiveCombatOverlay, NORMAL_COLOR,
     };
     use realmhound_core::combat::{
         DamageProvenance, FightParticipant, LiveFightSnapshot, ParticipantEndStatus,
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn the_tab_follows_whichever_boss_the_player_is_hitting() {
-        let mut overlay = DpsOverlay::default();
+        let mut overlay = LiveCombatOverlay::default();
         overlay.sync_instance(&[hit(10, 1_000), hit(11, 0)]);
         assert_eq!(overlay.followed, Some(10));
 
@@ -615,7 +615,7 @@ mod tests {
             hit(10, 0),
             fight(11, 0, 1_000, vec![participant(2, "Other", 400, false)]),
         ];
-        let mut overlay = DpsOverlay::default();
+        let mut overlay = LiveCombatOverlay::default();
         overlay.sync_instance(&fights);
         assert_eq!(overlay.followed, None, "nothing to follow yet");
     }
@@ -624,7 +624,7 @@ mod tests {
     fn alternating_between_two_bosses_does_not_swap_the_tab_every_batch() {
         // Both bosses are being hit continuously; without the margin the tab
         // would flip on whichever packet batch landed last.
-        let mut overlay = DpsOverlay::default();
+        let mut overlay = LiveCombatOverlay::default();
         overlay.sync_instance(&[hit(10, 10_000), hit(11, 0)]);
         assert_eq!(overlay.followed, Some(10));
 
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn a_pinned_tab_outranks_auto_follow() {
-        let mut overlay = DpsOverlay::default();
+        let mut overlay = LiveCombatOverlay::default();
         overlay.sync_instance(&[hit(10, 1_000), hit(11, 0)]);
         overlay.toggle_pin(10);
 
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn changing_zone_drops_the_pin_and_the_followed_boss() {
-        let mut overlay = DpsOverlay::default();
+        let mut overlay = LiveCombatOverlay::default();
         overlay.sync_instance(&[hit(10, 1_000)]);
         overlay.toggle_pin(10);
 
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn a_new_boss_in_the_same_zone_keeps_the_pin() {
-        let mut overlay = DpsOverlay::default();
+        let mut overlay = LiveCombatOverlay::default();
         overlay.sync_instance(&[hit(10, 1_000)]);
         overlay.toggle_pin(10);
 

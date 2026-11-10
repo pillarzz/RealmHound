@@ -267,7 +267,7 @@ pub fn spawn(
         pub_vault_gen: u64::MAX,
         pub_view: None,
         pub_mission_gen: u64::MAX,
-        pub_had_live_dps: false,
+        pub_had_live_fight: false,
         pub_token_gen: u64::MAX,
         pub_party_rev: u64::MAX,
         pub_encounter_rev: u64::MAX,
@@ -313,7 +313,7 @@ struct Worker {
     /// Coalesced repaint requests from worker traffic.
     wake: WakeThrottle,
     ctx: egui::Context,
-    /// Set by the UI while at least one overlay window is open. Live DPS is only
+    /// Set by the UI while at least one overlay window is open. Live Combat is only
     /// projected into the snapshot (and keeps waking the UI) while it is set.
     overlays_open: Arc<AtomicBool>,
     /// Shared immutable account context. Held so the exclusive profile lock
@@ -336,7 +336,7 @@ struct Worker {
     pub_mission_gen: u64,
     /// Whether the last publication carried a live fight. Lets the transition
     /// back to "no fight" wake the UI once so the overlay clears.
-    pub_had_live_dps: bool,
+    pub_had_live_fight: bool,
     pub_token_gen: u64,
     pub_party_rev: u64,
     pub_encounter_rev: u64,
@@ -1265,13 +1265,13 @@ impl Worker {
         } else {
             Vec::new()
         };
-        // DPS is time-derived, so a live fight is "changed" every batch even
+        // The fight timer is time-derived, so a live fight is "changed" every batch even
         // when no new damage landed; an idle one must not keep waking the UI.
         // A frozen (ended) fight never changes again, so it only earns the one
         // repaint that puts its final numbers on screen.
         let live_running = live_fights.iter().any(|fight| !fight.ended);
-        let dps_changed = live_running || self.pub_had_live_dps;
-        self.pub_had_live_dps = live_running;
+        let live_combat_changed = live_running || self.pub_had_live_fight;
+        self.pub_had_live_fight = live_running;
 
         let lock_started = Instant::now();
         let previous = match self.snapshot.lock() {
@@ -1332,7 +1332,7 @@ impl Worker {
         self.pub_live_event_rev = live_event_rev;
         self.pub_feed_rev = feed_rev;
         self.pub_view = Some(view);
-        view_changed || (overlays_open && dps_changed)
+        view_changed || (overlays_open && live_combat_changed)
     }
 }
 

@@ -205,9 +205,9 @@ impl OverlayWindowSettings {
 /// Floating always-on-top overlay windows drawn over the game client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverlaySettings {
-    /// Live DPS overlay window.
-    #[serde(default = "default_dps_overlay")]
-    pub dps: OverlayWindowSettings,
+    /// Live Combat overlay window.
+    #[serde(default = "default_live_combat_overlay", alias = "dps")]
+    pub live_combat: OverlayWindowSettings,
 
     /// Loot tracker overlay window.
     #[serde(default = "default_loot_overlay")]
@@ -217,21 +217,24 @@ pub struct OverlaySettings {
     #[serde(default = "default_overlay_opacity")]
     pub opacity: f32,
 
-    /// Pin the local player's DPS row above the scrolling list.
-    #[serde(default = "default_true")]
-    pub dps_follow_me: bool,
+    /// Pin the local player's Live Combat row above the scrolling list.
+    #[serde(default = "default_true", alias = "dps_follow_me")]
+    pub live_combat_follow_me: bool,
 
-    /// Maximum number of DPS rows rendered (0 = unlimited).
+    /// Maximum number of Live Combat rows rendered (0 = unlimited).
     ///
     /// Stored as the raw slider value so the settings UI can bind it directly.
     /// Round-tripping through an integer would feed the slider a value it did
     /// not produce, which makes it report a change every frame and walk the
     /// setting to the end of its range.
-    #[serde(default = "default_dps_rows")]
-    pub dps_rows: f32,
+    #[serde(default = "default_live_combat_rows", alias = "dps_rows")]
+    pub live_combat_rows: f32,
 }
 
-fn default_dps_overlay() -> OverlayWindowSettings {
+/// Highest non-zero value of the Live Combat "combatants shown" slider.
+pub const MAX_LIVE_COMBAT_ROWS: f32 = 25.0;
+
+fn default_live_combat_overlay() -> OverlayWindowSettings {
     OverlayWindowSettings::at(320.0, 240.0)
 }
 
@@ -243,18 +246,18 @@ fn default_overlay_opacity() -> f32 {
     0.9
 }
 
-fn default_dps_rows() -> f32 {
+fn default_live_combat_rows() -> f32 {
     8.0
 }
 
 impl Default for OverlaySettings {
     fn default() -> Self {
         Self {
-            dps: default_dps_overlay(),
+            live_combat: default_live_combat_overlay(),
             loot: default_loot_overlay(),
             opacity: default_overlay_opacity(),
-            dps_follow_me: true,
-            dps_rows: default_dps_rows(),
+            live_combat_follow_me: true,
+            live_combat_rows: default_live_combat_rows(),
         }
     }
 }
@@ -266,17 +269,16 @@ impl OverlaySettings {
         self.opacity.clamp(0.2, 1.0)
     }
 
-    /// Maximum DPS rows to render (0 = every participant).
-    ///
-    /// The ceiling is a full dungeon instance: 85 players can be in one at once,
-    /// so anything lower would silently hide part of the roster.
+    /// Maximum Live Combat rows to render (0 = every participant).
     pub fn max_rows(&self) -> usize {
-        self.dps_rows.round().clamp(0.0, 85.0) as usize
+        self.live_combat_rows
+            .round()
+            .clamp(0.0, MAX_LIVE_COMBAT_ROWS) as usize
     }
 
     /// Whether any overlay window is currently shown.
     pub fn any_visible(&self) -> bool {
-        self.dps.visible || self.loot.visible
+        self.live_combat.visible || self.loot.visible
     }
 
     /// Copy the user-editable preferences from `other`, leaving window geometry
@@ -286,13 +288,13 @@ impl OverlaySettings {
     /// user drags, so the settings UI must not write back a stale copy it read
     /// several frames ago.
     pub fn apply_preferences(&mut self, other: &Self) {
-        self.dps.visible = other.dps.visible;
-        self.dps.locked = other.dps.locked;
+        self.live_combat.visible = other.live_combat.visible;
+        self.live_combat.locked = other.live_combat.locked;
         self.loot.visible = other.loot.visible;
         self.loot.locked = other.loot.locked;
         self.opacity = other.opacity;
-        self.dps_follow_me = other.dps_follow_me;
-        self.dps_rows = other.dps_rows;
+        self.live_combat_follow_me = other.live_combat_follow_me;
+        self.live_combat_rows = other.live_combat_rows;
     }
 }
 
@@ -3198,6 +3200,21 @@ mod tests {
         assert_eq!(back.realm_events.veteran.overrides.len(), 1);
         assert_eq!(back.realm_events.veteran.overrides[0].boss_id, 22146);
         assert_eq!(back.realm_events.veteran.overrides[0].volume, 0.8);
+    }
+
+    #[test]
+    fn live_combat_overlay_loads_pre_rename_keys_and_caps_rows() {
+        let legacy = r#"{
+            "dps": { "visible": true, "locked": true, "width": 400.0, "height": 300.0 },
+            "loot": { "visible": false, "width": 320.0, "height": 180.0 },
+            "dps_follow_me": false,
+            "dps_rows": 60.0
+        }"#;
+        let parsed: OverlaySettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.live_combat.visible && parsed.live_combat.locked);
+        assert_eq!(parsed.live_combat.width, 400.0);
+        assert!(!parsed.live_combat_follow_me);
+        assert_eq!(parsed.max_rows(), 25, "rows saved under the old 85 cap");
     }
 
     #[test]

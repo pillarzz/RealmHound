@@ -605,10 +605,10 @@ pub struct RealmHoundApp {
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
-    /// The floating DPS / loot overlay windows drawn over the game client.
+    /// The floating Live Combat / loot overlay windows drawn over the game client.
     overlays: crate::overlay::OverlayManager,
     /// Owned snapshot of every boss fight of the current map instance,
-    /// refreshed from the worker each frame and rendered by the DPS overlay.
+    /// refreshed from the worker each frame and rendered by the Live Combat overlay.
     live_fights: Vec<Arc<realmhound_core::combat::LiveFightSnapshot>>,
     /// Audio thread handle (owns the `!Send` `SoundEngine`). Kept alive so the
     /// thread isn't torn down; dropped on app exit.
@@ -1609,7 +1609,7 @@ impl RealmHoundApp {
         };
         self.view_state = snap.view.clone();
         self.live_char_id = snap.live_char_id;
-        // Cloned unconditionally: DPS is time-derived, so the figures move
+        // Cloned unconditionally: the fight timer is time-derived, so the figures move
         // between publications even when the roster is unchanged.
         self.live_fights = snap.live_fights.clone();
         // Remember the last-seen live character (persisted) so the
@@ -7522,8 +7522,10 @@ impl RealmHoundApp {
         }
     }
 
-    /// Settings for the floating DPS / loot overlay windows.
+    /// Settings for the floating Live Combat / loot overlay windows.
     fn render_overlay_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
+        use realmhound_core::settings::MAX_LIVE_COMBAT_ROWS;
+
         ui.add_space(10.0);
         ui.heading("Overlays");
         ui.add_space(5.0);
@@ -7584,7 +7586,11 @@ impl RealmHoundApp {
 
         shadcn.card(ui, "overlay_windows", "Windows", |ui| {
             changed |= shadcn
-                .switch(ui, &mut overlays.dps.visible, "Show the live DPS overlay")
+                .switch(
+                    ui,
+                    &mut overlays.live_combat.visible,
+                    "Show the Live Combat overlay",
+                )
                 .changed();
             ui.add_space(4.0);
             changed |= shadcn
@@ -7608,7 +7614,11 @@ impl RealmHoundApp {
             );
             ui.add_space(6.0);
             changed |= shadcn
-                .switch(ui, &mut overlays.dps.locked, "Lock the DPS overlay")
+                .switch(
+                    ui,
+                    &mut overlays.live_combat.locked,
+                    "Lock the Live Combat overlay",
+                )
                 .changed();
             ui.add_space(4.0);
             changed |= shadcn
@@ -7631,23 +7641,31 @@ impl RealmHoundApp {
 
         ui.add_space(10.0);
 
-        shadcn.card(ui, "overlay_dps", "DPS overlay", |ui| {
+        shadcn.card(ui, "overlay_live_combat", "Live Combat overlay", |ui| {
             changed |= shadcn
                 .switch(
                     ui,
-                    &mut overlays.dps_follow_me,
+                    &mut overlays.live_combat_follow_me,
                     "Pin my own row above the list",
                 )
                 .changed();
             ui.add_space(6.0);
-            ui.label("Rows shown");
+            ui.label("Combatants shown");
+            // Settings saved before the cap may hold a larger value.
+            overlays.live_combat_rows = overlays.live_combat_rows.min(MAX_LIVE_COMBAT_ROWS);
             changed |= shadcn
-                .slider_value(ui, "overlay_dps_rows", &mut overlays.dps_rows, 0.0, 85.0)
+                .slider_value(
+                    ui,
+                    "overlay_live_combat_rows",
+                    &mut overlays.live_combat_rows,
+                    0.0,
+                    MAX_LIVE_COMBAT_ROWS,
+                )
                 .changed();
             let caption = if overlays.max_rows() == 0 {
-                "Every participant".to_string()
+                "All combatants".to_string()
             } else {
-                format!("Top {}", overlays.max_rows())
+                format!("Up to {} combatants", overlays.max_rows())
             };
             ui.label(RichText::new(caption).weak());
         });

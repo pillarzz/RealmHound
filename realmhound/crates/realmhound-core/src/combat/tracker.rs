@@ -258,7 +258,7 @@ const SENTINEL_ATTACKER_ID: i32 = 0x00FF_FFFF;
 /// Max fights kept in memory for later UI consumption.
 const MAX_RECENT_FIGHTS: usize = 200;
 
-/// Max per-instance fights retained for the live DPS overlay's tab strip.
+/// Max per-instance fights retained for the Live Combat overlay's tab strip.
 /// Generous enough for the longest multi-phase encounter while bounding what a
 /// run of realm trash can accumulate.
 const MAX_INSTANCE_FIGHTS: usize = 16;
@@ -1230,7 +1230,7 @@ struct FightState {
     ///
     /// Distinct from `last_activity`, which any status packet from a boss merely
     /// standing in view refreshes. Only this clock says "the user is fighting
-    /// this one", which is what the DPS overlay follows when several bosses are
+    /// this one", which is what the Live Combat overlay follows when several bosses are
     /// engaged at once.
     last_local_hit_at: i64,
     killed: bool,
@@ -1387,7 +1387,7 @@ pub struct CombatTracker {
     /// Active fights keyed by boss object id.
     fights: HashMap<i32, FightState>,
     /// Frozen projections of every displayable fight that has already left
-    /// `fights` in the current map instance, oldest first. The DPS overlay lists
+    /// `fights` in the current map instance, oldest first. The Live Combat overlay lists
     /// one tab per entry, so a multi-phase or multi-boss encounter keeps every
     /// phase's numbers instead of the newest one wiping the display. Cleared at
     /// map change / disconnect, which is the only point the overlay resets.
@@ -1729,7 +1729,7 @@ impl CombatTracker {
     }
 
     /// Project every displayable boss fight of the current map instance for the
-    /// live DPS overlay, oldest engagement first.
+    /// Live Combat overlay, oldest engagement first.
     ///
     /// Aggregated aux rows are skipped: they span the whole run and have no
     /// meaningful live timer. Fights that have ended are replayed frozen
@@ -7145,7 +7145,7 @@ mod tests {
 
     #[test]
     fn the_overlay_list_keeps_every_boss_until_the_zone_changes() {
-        // The DPS overlay draws one tab per entry, so a second boss must *add*
+        // The Live Combat overlay draws one tab per entry, so a second boss must *add*
         // to the list rather than replace the first one's numbers.
         let mut t = CombatTracker::new();
         t.on_map_change("Mad Lab", 1, 0, &[]);

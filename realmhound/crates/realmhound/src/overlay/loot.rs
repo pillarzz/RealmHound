@@ -1,16 +1,19 @@
 //! Loot tracker overlay body.
 //!
 //! Tallies the loot bags that have dropped this session, in the same
-//! colour order the Loot tab uses, and lists the most recent drops with their
-//! item names. Boosted bags are counted against their base colour -- a boosted
-//! white is still a white -- which is what makes the counters match how players
-//! actually talk about a run.
+//! colour order the Loot tab uses, and lists the most recent drops as a compact
+//! row of bag, dungeon and source icons followed by the items the Live Feed's
+//! toggles single out. Boosted bags are counted against their base
+//! colour -- a boosted white is still a white -- which is what makes the
+//! counters match how players actually talk about a run.
 
 use std::collections::{HashMap, VecDeque};
 
 use eframe::egui::{self, Color32, RichText};
-use realmhound_core::loot::{LootBagType, ProcessedLootDrop, ProcessedLootItem};
+use realmhound_core::loot::{LootBagType, LootDropRecord, ProcessedLootDrop};
 
+use crate::panels::live_feed::LootEntry;
+use crate::panels::loot::LootPanel;
 use crate::panels::loot_filters::{LootFilters, PropertyFilters};
 use crate::rendering::SpriteRenderer;
 
@@ -20,8 +23,8 @@ use super::{
 
 /// Side of a bag sprite in the counter strip.
 const BAG_ICON: f32 = 18.0;
-/// Side of the smaller bag sprite in the recent-drops list.
-const ROW_ICON: f32 = 14.0;
+/// Side of every icon in a drop row.
+const ROW_ICON: f32 = 26.0;
 /// Hard cap on retained drops. All of them are listed; the scroll area is what
 /// bounds how many are on screen at once.
 const MAX_RECENT: usize = 100;
@@ -42,14 +45,10 @@ const BAG_ORDER: &[(LootBagType, LootBagType)] = &[
     (LootBagType::Brown, LootBagType::BoostedBrown),
 ];
 
-/// One retained drop, flattened to exactly what the overlay renders.
+/// One retained drop.
 struct RecentDrop {
-    bag_id: i32,
     bag_type: LootBagType,
-    /// Kept structured (not pre-joined) because the Live Feed's item filters can
-    /// change after the drop was recorded.
-    items: Vec<ProcessedLootItem>,
-    mob_name: String,
+    record: LootDropRecord,
 }
 
 #[derive(Default)]
@@ -74,8 +73,8 @@ struct RowCache {
     bags: LootFilters,
     properties: PropertyFilters,
     revision: u64,
-    /// Index into `recent`, plus the comma-joined item names that passed.
-    rows: Vec<(usize, String)>,
+    /// Index into `recent`, plus the indices of the items that passed.
+    rows: Vec<(usize, Vec<usize>)>,
 }
 
 /// Borrows everything one frame of the loot overlay needs.
@@ -84,8 +83,8 @@ pub(super) struct LootContent<'a> {
     /// The Live Feed's bag toggles, which the overlay shares rather than
     /// duplicating as a second place to configure the same thing.
     pub filters: &'a LootFilters,
-    /// The Live Feed's UT/ST/shiny and rarity toggles, used to list only the
-    /// items worth reading rather than every bag's full contents.
+    /// The Live Feed's UT/ST/shiny and rarity toggles, which pick the items
+    /// shown in each row.
     pub properties: &'a PropertyFilters,
 }
 
@@ -106,10 +105,8 @@ impl LootOverlay {
         *self.counts.entry(base.id()).or_insert(0) += 1;
 
         self.recent.push_front(RecentDrop {
-            bag_id: drop.bag_type.id(),
             bag_type: drop.bag_type,
-            items: drop.items.clone(),
-            mob_name: drop.mob_name.clone(),
+            record: LootEntry::from_drop(drop).to_drop_record(),
         });
         self.recent.truncate(MAX_RECENT);
         self.revision = self.revision.wrapping_add(1);
@@ -162,10 +159,10 @@ impl LootOverlay {
             })
             .collect();
 
-        // Only drops with something worth reading: a bag whose items are all
-        // filtered out contributes to its counter and nothing more. Every
-        // retained drop is offered, not a fixed handful -- the scroll area is
-        // what bounds the list, so a taller window simply shows more.
+        // A hidden bag colour, or a bag with no item passing the item filters,
+        // only adds to its counter, exactly as in the Live Feed.
+        // Every retained drop is offered, not a fixed handful -- the scroll area
+        // is what bounds the list, so a taller window simply shows more.
         self.refresh_rows(filters, properties);
         let Some(cache) = self.cache.as_ref() else {
             return;
@@ -199,9 +196,28 @@ impl LootOverlay {
                     ui.label(row_text(message, Color32::from_gray(120)));
                     return;
                 }
-                for (index, names) in &cache.rows {
+                for (index, items) in &cache.rows {
                     if let Some(drop) = self.recent.get(*index) {
-                        recent_row(ui, sprites, drop, names);
+                        LootPanel::render_compact_drop_row(
+                            ui,
+                            &drop.record,
+                            sprites,
+                            ROW_ICON,
+                            |ui, sprites| {
+                                for item in items.iter().filter_map(|i| drop.record.items.get(*i)) {
+                                    // The full item breakdown dwarfs the overlay and
+                                    // cannot leave it, so only the name is shown.
+                                    let (response, name) = sprites.render_item_tile_plain(
+                                        ui,
+                                        item.item_id,
+                                        Some(&item.item_name),
+                                        &item.parsed_enchant_ids,
+                                        ROW_ICON,
+                                    );
+                                    overlay_tooltip(ui, &response, &name);
+                                }
+                            },
+                        );
                     }
                 }
             });
@@ -226,8 +242,8 @@ impl LootOverlay {
             .enumerate()
             .filter(|(_, drop)| filters.is_visible(drop.bag_type))
             .filter_map(|(index, drop)| {
-                let names = notable_items(drop, properties);
-                (!names.is_empty()).then_some((index, names))
+                let items = notable_items(drop, properties);
+                (!items.is_empty()).then_some((index, items))
             })
             .collect();
         self.cache = Some(RowCache {
@@ -239,14 +255,15 @@ impl LootOverlay {
     }
 }
 
-/// Item names in `drop` that pass the Live Feed's item filters, comma-joined.
-fn notable_items(drop: &RecentDrop, properties: &PropertyFilters) -> String {
-    drop.items
+/// Indices of the items in `drop` that pass the Live Feed's item filters.
+fn notable_items(drop: &RecentDrop, properties: &PropertyFilters) -> Vec<usize> {
+    drop.record
+        .items
         .iter()
-        .filter(|item| properties.matches_item(*item))
-        .map(|item| item.item_name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
+        .enumerate()
+        .filter(|(_, item)| properties.matches_item(*item))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// A bag sprite with its count, e.g. the white-bag icon followed by `x3`.
@@ -262,19 +279,6 @@ fn counter(ui: &mut egui::Ui, sprites: &mut SpriteRenderer, bag: LootBagType, co
         })
         .response;
     overlay_tooltip_with(ui, &response, || format!("{}: {count}", bag.name()));
-}
-
-fn recent_row(ui: &mut egui::Ui, sprites: &mut SpriteRenderer, drop: &RecentDrop, names: &str) {
-    let response = ui
-        .horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            bag_sprite(ui, sprites, drop.bag_id, drop.bag_type, ROW_ICON);
-            ui.label(row_text(names, Color32::from_gray(205)));
-        })
-        .response;
-    if !drop.mob_name.is_empty() {
-        overlay_tooltip_with(ui, &response, || format!("Dropped by {}", drop.mob_name));
-    }
 }
 
 /// Draw a bag sprite, falling back to a flat colour chip when the asset is
@@ -427,15 +431,14 @@ mod tests {
         assert_eq!(overlay.recent.len(), super::MAX_RECENT);
         let newest = overlay.recent.front().expect("a retained drop");
         assert_eq!(
-            newest.items[0].item_name,
+            newest.record.items[0].item_name,
             format!("Item {}", super::MAX_RECENT + 9)
         );
     }
 
     #[test]
     fn only_items_passing_the_live_feed_filters_are_listed() {
-        // A bag's full contents are clutter; the overlay lists the items the
-        // Live Feed's rarity toggles say are worth reading.
+        // The row shows just the items that made the bag worth showing.
         let mut drop = drop_of(LootBagType::White, "Plain");
         drop.items.push(ProcessedLootItem {
             slot: 1,
@@ -445,7 +448,7 @@ mod tests {
         });
         let mut overlay = LootOverlay::default();
         overlay.push(&drop);
-        let retained = overlay.recent.front().expect("a retained drop");
+        overlay.push(&drop_of(LootBagType::White, "Other plain"));
 
         // Rarity narrowed to 2-enchant items only.
         let properties = PropertyFilters {
@@ -456,13 +459,13 @@ mod tests {
             r_divine: false,
             ..PropertyFilters::default()
         };
-        assert_eq!(super::notable_items(retained, &properties), "Enchanted");
+        overlay.refresh_rows(&LootFilters::default(), &properties);
+        let rows = &overlay.cache.as_ref().expect("a cache").rows;
+        assert_eq!(rows, &vec![(1, vec![1])], "only the enchanted item");
 
-        // With nothing narrowing, every item is listed.
-        assert_eq!(
-            super::notable_items(retained, &PropertyFilters::default()),
-            "Plain, Enchanted"
-        );
+        overlay.refresh_rows(&LootFilters::default(), &PropertyFilters::default());
+        let rows = &overlay.cache.as_ref().expect("a cache").rows;
+        assert_eq!(rows, &vec![(0, vec![0]), (1, vec![0, 1])], "no narrowing");
     }
 
     #[test]

@@ -554,7 +554,7 @@ impl LootPanel {
         dungeon: &str,
         sprite_renderer: &mut SpriteRenderer,
     ) -> Option<String> {
-        if Self::render_dungeon_sprite_impl(ui, dungeon, sprite_renderer, true) {
+        if Self::render_dungeon_sprite_impl(ui, dungeon, sprite_renderer, true, 38.0) {
             Some(dungeon.to_string())
         } else {
             None
@@ -567,13 +567,14 @@ impl LootPanel {
         dungeon: &str,
         sprite_renderer: &mut SpriteRenderer,
         clickable: bool,
+        size: f32,
     ) -> bool {
         let sense = if clickable {
             egui::Sense::click()
         } else {
             egui::Sense::hover()
         };
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), sense);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), sense);
 
         if !ui.is_rect_visible(rect) {
             return false;
@@ -597,7 +598,7 @@ impl LootPanel {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "🚪",
-                egui::FontId::proportional(22.0),
+                egui::FontId::proportional(size * 0.58),
                 Color32::from_rgb(150, 180, 200),
             );
         }
@@ -632,7 +633,7 @@ impl LootPanel {
         mob_name: &str,
         sprite_renderer: &mut SpriteRenderer,
     ) -> Option<(i32, String)> {
-        if Self::render_mob_sprite_impl(ui, mob_type, mob_name, sprite_renderer, true) {
+        if Self::render_mob_sprite_impl(ui, mob_type, mob_name, sprite_renderer, true, 38.0) {
             Some((mob_type, mob_name.to_string()))
         } else {
             None
@@ -646,6 +647,7 @@ impl LootPanel {
         mob_name: &str,
         sprite_renderer: &mut SpriteRenderer,
         clickable: bool,
+        size: f32,
     ) -> bool {
         // Never render an environmental structure (wall/gate/pillar) as a drop
         // source, even if a legacy row stored one; fall back to the "?" marker.
@@ -656,7 +658,7 @@ impl LootPanel {
         } else {
             egui::Sense::hover()
         };
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), sense);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), sense);
 
         // Only draw if visible
         if !ui.is_rect_visible(rect) {
@@ -676,7 +678,7 @@ impl LootPanel {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "?",
-                egui::FontId::monospace(24.0),
+                egui::FontId::monospace(size * 0.63),
                 Color32::from_rgb(180, 150, 200),
             );
         }
@@ -1408,7 +1410,7 @@ impl LootPanel {
                 click_action = Some(HistoryClickAction::FilterDungeon(dungeon));
             }
         } else {
-            Self::render_dungeon_sprite_impl(ui, &drop.dungeon, sprite_renderer, false);
+            Self::render_dungeon_sprite_impl(ui, &drop.dungeon, sprite_renderer, false, 38.0);
         }
 
         ui.add_space(4.0);
@@ -1433,6 +1435,7 @@ impl LootPanel {
                 &drop.mob_name,
                 sprite_renderer,
                 false,
+                38.0,
             );
         }
 
@@ -1495,6 +1498,32 @@ impl LootPanel {
                 COMPACT_SIZE,
             );
         }
+    }
+
+    /// Compact drop row for the loot overlay: bag, dungeon and source icons,
+    /// then whatever `items` draws.
+    pub(crate) fn render_compact_drop_row(
+        ui: &mut egui::Ui,
+        drop: &LootDropRecord,
+        sprite_renderer: &mut SpriteRenderer,
+        size: f32,
+        items: impl FnOnce(&mut egui::Ui, &mut SpriteRenderer),
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let bag_type = LootBagType::from_id(drop.bag_type);
+            Self::render_bag_icon_by_id(ui, drop.bag_type, bag_type, sprite_renderer, size);
+            Self::render_dungeon_sprite_impl(ui, &drop.dungeon, sprite_renderer, false, size);
+            Self::render_mob_sprite_impl(
+                ui,
+                drop.display_object_type,
+                &drop.mob_name,
+                sprite_renderer,
+                false,
+                size,
+            );
+            items(ui, sprite_renderer);
+        });
     }
 
     /// Render a full loot card (background, optional select checkbox, drop row,

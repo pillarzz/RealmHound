@@ -121,8 +121,18 @@ pub struct LethalStrikeParams {
     /// `OnConditionEndActivate` `duration` attribute).
     pub duration: f32,
     /// Number of extra projectiles fired per weapon shot during the LS window
-    /// (count of `OnPlayerShootActivate BulletCreate` entries on this item).
+    /// (sum of `numShots` across the item's `OnPlayerShootActivate BulletCreate`
+    /// entries).
     pub extra_shots: i32,
+    /// True when the item grants LS on every shot (`OnPlayerShootActivate
+    /// LethalStrike`), rather than only after exiting sneak
+    /// (`OnConditionEndActivate LethalStrike`). The on-shoot form is active for
+    /// as long as its required condition is held, so it has no separate window.
+    pub on_shoot: bool,
+    /// Primary condition bit the on-shoot LS requires (`0` = none). Cloak of
+    /// the Deep requires Stasis Immune, which is only set while the ability key
+    /// is held.
+    pub required_condition_bit: i32,
 }
 
 /// The player stat that scales an ability effect, from the equip.xml
@@ -2372,6 +2382,10 @@ impl ObjectList {
         let mut pending_dash_damage: Option<i32> = None;
         let mut in_on_player_shoot = false;
         let mut on_player_shoot_is_ls = false;
+        // Set while parsing an `OnPlayerShootActivate` that itself declares
+        // `LethalStrike` (Cloak of the Deep), so its BulletCreate entries are
+        // counted as LS projectiles too.
+        let mut on_player_shoot_grants_ls = false;
         // Native damaging procs (OnPlayerShootActivate / OnEnemyHitActivate) for
         // the current object, committed to `obj.weapon_procs` at Object end.
         let mut current_weapon_procs: Vec<WeaponProc> = Vec::new();
@@ -2407,6 +2421,7 @@ impl ObjectList {
                             proj_ap = false;
                             pending_bursts.clear();
                             ls_extra_shots = 0;
+                            on_player_shoot_grants_ls = false;
                             pending_shuriken = None;
                             pending_dash_damage = None;
                             current_weapon_procs.clear();
@@ -2572,6 +2587,14 @@ impl ObjectList {
                         start_value: au(&attrs, "startValue", 0),
                     });
                 }
+                // Self-closing projectile flags (`<ArmorPiercing />`) are `Empty`
+                // events too; without this every such projectile was treated as
+                // mitigated by the target's defense.
+                Ok(Event::Empty(ref e))
+                    if e.name().as_ref() == b"ArmorPiercing" && in_projectile =>
+                {
+                    proj_ap = true;
+                }
                 Ok(Event::Text(ref e)) => {
                     let text = e.unescape().unwrap_or_default();
                     if in_tier {
@@ -2662,6 +2685,25 @@ impl ObjectList {
                         }
                     } else if in_cond_end_activate && text.as_ref() == "LethalStrike" {
                         current_lethal_strike = pending_lethal_strike;
+                    } else if in_on_player_shoot && text.as_ref() == "LethalStrike" {
+                        // On-shoot LS (Cloak of the Deep): every shot while the
+                        // required condition holds deals the bonus. Its own
+                        // BulletCreate entries are LS projectiles, not the two
+                        // invisible side procs of a post-sneak cloak.
+                        let mut params = parse_lethal_strike_params(&pending_attrs);
+                        params.on_shoot = true;
+                        params.required_condition_bit = pending_attrs
+                            .get("requiredConditions")
+                            .and_then(|v| condition_bit(v))
+                            .unwrap_or(0);
+                        // The on-shoot XML stores half the tooltip's per-WIS
+                        // scaling: Cloak of the Deep lists statModFlat=0.5 and
+                        // statModPerc=0.005, while the in-game tooltip is +1 flat
+                        // and +1% defense per WIS over 34.
+                        params.stat_mod_flat *= 2.0;
+                        params.stat_mod_perc *= 2.0;
+                        current_lethal_strike = Some(params);
+                        on_player_shoot_grants_ls = true;
                     } else if in_switch_activate {
                         // Effects on a meter-gated switch ability (a sigil's
                         // animal form). These are what the switch grants, so
@@ -3017,9 +3059,18 @@ impl ObjectList {
                             }
                         }
                     } else if in_activate && text.as_ref() == "ShurikenAbility" {
-                        // Mechanic-only stars (e.g. Bubbly) use ShurikenAbility
-                        // for hold-state conditions, not projectile damage.
-                        let is_mechanic_only = pending_attrs.contains_key("effect");
+                        // Some hold-state items (Bubbly, Rain Maker) use
+                        // ShurikenAbility only for the condition it applies and
+                        // deal no projectile damage. Others (Cloak of the Deep,
+                        // the Armored/Berserk stars) apply a condition *and*
+                        // fire real projectiles; dropping those lost their whole
+                        // damage. Keep them when the item has projectile damage
+                        // or fires more than one projectile.
+                        let fires_projectiles = pending_proj
+                            .is_some_and(|(min, max, _)| min > 0.0 || max > 0.0)
+                            || current_num_projectiles > 1;
+                        let is_mechanic_only =
+                            pending_attrs.contains_key("effect") && !fires_projectiles;
                         if !is_mechanic_only {
                             pending_shuriken = Some(pending_attrs.clone());
                         }
@@ -3076,10 +3127,13 @@ impl ObjectList {
                     {
                         current_ability.applies_hex = true;
                     } else if in_on_player_shoot
-                        && on_player_shoot_is_ls
+                        && (on_player_shoot_is_ls || on_player_shoot_grants_ls)
                         && text.as_ref() == "BulletCreate"
                     {
-                        ls_extra_shots += 1;
+                        ls_extra_shots += pending_attrs
+                            .get("numShots")
+                            .and_then(|v| v.parse::<i32>().ok())
+                            .unwrap_or(1);
                     }
                 }
                 Ok(Event::End(ref e)) => {
@@ -3836,6 +3890,8 @@ fn parse_lethal_strike_params(m: &HashMap<String, String>) -> LethalStrikeParams
         scaling_stat: ScalingStat::Wisdom,
         duration: 0.0,
         extra_shots: 0,
+        on_shoot: false,
+        required_condition_bit: 0,
     };
     for (key, value) in m {
         match key.as_str() {
@@ -3854,6 +3910,21 @@ fn parse_lethal_strike_params(m: &HashMap<String, String>) -> LethalStrikeParams
         }
     }
     p
+}
+
+/// Primary condition bit for a `requiredConditions` name. Only the bits that
+/// gate an on-shoot Lethal Strike need to be mapped; unknown names return
+/// `None`, leaving the buff ungated rather than silently disabling it.
+fn condition_bit(name: &str) -> Option<i32> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "stasis immune" | "stasisimmune" => Some(0x0040_0000),
+        "invisible" => Some(0x0000_1000),
+        "speedy" => Some(0x0000_4000),
+        "damaging" => Some(0x0004_0000),
+        "berserk" => Some(0x0008_0000),
+        "armored" => Some(0x0200_0000),
+        _ => None,
+    }
 }
 
 /// Parse one `FillMeter` element's attributes.
@@ -5029,6 +5100,75 @@ mod tests {
     }
 
     #[test]
+    fn cloak_of_the_deep_parses_bubbles_and_on_shoot_lethal_strike() {
+        // Cloak of the Deep hides its projectile behind a ShurikenAbility that
+        // also applies Stasis Immune. Treating every `effect` attribute as
+        // mechanic-only dropped the bubbles entirely, and the item's LS comes
+        // from OnPlayerShootActivate (not the post-sneak OnConditionEnd form),
+        // so neither its damage nor its bonus was modelled.
+        let mut list = ObjectList::new();
+        let xml = r#"<Objects>
+  <Object type="0x5193" id="Cloak of the Deep">
+    <Class>Equipment</Class>
+    <SlotType>13</SlotType>
+    <Projectile>
+      <ObjectId>Bubble</ObjectId>
+      <MinDamage>55</MinDamage>
+      <MaxDamage>75</MaxDamage>
+      <ArmorPiercing />
+      <MultiHit />
+    </Projectile>
+    <NumProjectiles>4</NumProjectiles>
+    <Activate effect="Stasis Immune">ShurikenAbility</Activate>
+    <OnPlayerShootActivate proc="1" requiredConditions="Stasis Immune" duration="1.4" ignoreFlat="60" ignorePerc="0.10" scalingStat="WIS" statModScalingMin="34" statModFlat="0.5" statModPerc="0.005">LethalStrike</OnPlayerShootActivate>
+    <OnPlayerShootActivate proc="1" numShots="2" type="0x5193">BulletCreate</OnPlayerShootActivate>
+    <OnPlayerShootActivate proc="1" numShots="2" type="0x5193">BulletCreate</OnPlayerShootActivate>
+    <OnPlayerShootActivate proc="1" numShots="2" type="0x51ad">BulletCreate</OnPlayerShootActivate>
+    <OnPlayerShootActivate proc="1" numShots="3" type="0x51ae">BulletCreate</OnPlayerShootActivate>
+  </Object>
+</Objects>"#;
+        let dir = std::env::temp_dir().join(format!("rh_deep_cloak_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("equip.xml");
+        std::fs::write(&path, xml).unwrap();
+        // Real loads pre-populate the object list from ObjectID.list; merge only
+        // attaches equipment data to an existing object.
+        list.objects
+            .insert(0x5193, weapon_shell(0x5193, "Cloak of the Deep"));
+        list.merge_equipment_xml(&path).unwrap();
+
+        let eff = list.ability_effects(0x5193).expect("bubble ability parsed");
+        let sh = eff
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                AbilityEffect::Shuriken(sh) => Some(sh),
+                _ => None,
+            })
+            .expect("Shuriken despite the effect attribute");
+        assert_eq!(sh.min_damage, 55.0);
+        assert_eq!(sh.max_damage, 75.0);
+        assert_eq!(sh.num_projectiles, 4);
+        assert!(sh.armor_piercing);
+
+        let ls = list
+            .get(0x5193)
+            .and_then(|o| o.lethal_strike)
+            .expect("on-shoot Lethal Strike parsed");
+        assert!(ls.on_shoot);
+        assert_eq!(ls.required_condition_bit, 0x0040_0000);
+        assert_eq!(ls.duration, 1.4);
+        assert_eq!(ls.ignore_flat, 60.0);
+        assert_eq!(ls.ignore_perc, 0.10);
+        assert_eq!(ls.stat_mod_flat, 1.0);
+        assert_eq!(ls.stat_mod_perc, 0.01);
+        assert_eq!(ls.stat_mod_scaling_min, 34.0);
+        assert_eq!(ls.extra_shots, 9, "2 + 2 + 2 + 3 BulletCreate shots");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn depthchaser_trap_declares_its_server_applied_window() {
         // Trap damage arrives as owner-credited DamagePackets (bulletId 0),
         // after the throw delay, at trigger time and again when the delayed bomb
@@ -5071,6 +5211,34 @@ mod tests {
         assert_eq!(eff.server_applied_damage_window_ms(), Some(10_000));
         assert_eq!(trap.trap_damage_for(100), 855);
         assert_eq!(trap.bomb_damage_for(100), 1145);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mechanic_only_shuriken_ability_is_still_ignored() {
+        // A hold-state item with no projectile damage and a single projectile
+        // must stay out of the ability list.
+        let mut list = ObjectList::new();
+        let xml = r#"<Objects>
+  <Object type="0x9999" id="Mechanic Only">
+    <Class>Equipment</Class>
+    <SlotType>13</SlotType>
+    <Projectile>
+      <ObjectId>Bubble</ObjectId>
+      <MinDamage>0</MinDamage>
+      <MaxDamage>0</MaxDamage>
+    </Projectile>
+    <NumProjectiles>1</NumProjectiles>
+    <Activate effect="Stasis Immune">ShurikenAbility</Activate>
+  </Object>
+</Objects>"#;
+        let dir = std::env::temp_dir().join(format!("rh_mechanic_only_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("equip.xml");
+        std::fs::write(&path, xml).unwrap();
+        list.merge_equipment_xml(&path).unwrap();
+        assert!(list.ability_effects(0x9999).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

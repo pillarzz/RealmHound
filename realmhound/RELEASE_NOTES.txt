@@ -4,6 +4,8 @@
 # Combat History
 * Remote deaths now use the server's PlayerDeath notification and display its exact gravestone type.
 * Fixed trap damage staying in the generic packet total instead of being credited to the trap ability.
+* Fixed Cloak of the Deep bubble damage and Lethal Strike being left out of self-computed damage.
+* Fixed armor-piercing self-closed projectile flags (`<ArmorPiercing />`) being ignored.
 * Fixed healed and phase-gated bosses deflating the whole team's damage through the overkill trim.
 * My Performance card now differentiates weapon native shots, enchantment and other additional projectiles.
 * Fixed enchantment sub-attack and proc projectiles missing from damage attribution.

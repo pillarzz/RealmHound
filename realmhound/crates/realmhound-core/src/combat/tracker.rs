@@ -53,6 +53,12 @@ const BOSS_RESUME_WINDOW_MS: i64 = 180_000;
 /// Duration of the rogue Lethal Strike buff after exiting sneak (equip.xml
 /// `duration="2.4"`), during which shots get the LS bonus + 2 side procs.
 const LETHAL_STRIKE_WINDOW_MS: i64 = 2_400;
+/// How recently the Lethal Strike cloak must have been activated for an
+/// on-shoot Lethal Strike to apply. The server does not send the cloak's
+/// Stasis Immune bit to the owner, so a recent activation is the observable
+/// signal that the key is held; every cloak shot and its bubble stream lands
+/// within this window.
+const ON_SHOOT_LS_WINDOW_MS: i64 = 1_500;
 /// The shot that cancels sneak (and thus opens the window) can be sent just
 /// before the Invisible-off stat update is observed. Back-date the window start
 /// by this guard so that boundary shot is still credited.
@@ -106,6 +112,10 @@ const COND_INVISIBLE: i32 = 0x0000_1000;
 /// Primary condition bit (id 29) for Invulnerable: the target takes no damage,
 /// so no Lethal Strike bonus is attributed either.
 const COND_INVULNERABLE: i32 = 0x0100_0000;
+/// Primary condition bit (id 29) for Stasis Immune. Cloak of the Deep's
+/// on-shoot Lethal Strike only applies while this is held.
+#[cfg(test)]
+const COND_STASIS_IMMUNE: i32 = 0x0040_0000;
 /// Primary condition bits surfaced in the local player's boost log. Only bits
 /// whose meaning is known here are named; any other bit change is ignored rather
 /// than shown as a raw mask.
@@ -1498,6 +1508,10 @@ pub struct CombatTracker {
     /// packet. Kept disjoint from `pending_shots` (newest registration owns an
     /// id). Cleared on map change.
     pending_server_shots: HashMap<i16, (i32, bool, i32)>,
+    /// Lethal Strike snapshot for the local player's server-fired bullets, keyed
+    /// by bullet id. Parallel to `pending_server_shots` (same ids, same
+    /// lifetime); it is kept separate so the packet damage tuple stays small.
+    pending_server_ls: HashMap<i16, (LethalStrikeParams, i32)>,
     /// Object ids of every player-class object seen in the current map instance.
     /// Used at finalize to prove a fight was effectively solo (no *other* player
     /// present) before crediting unattributed boss-HP loss to the local player.
@@ -1699,6 +1713,7 @@ impl CombatTracker {
             summon_owners: HashMap::new(),
             pending_summon_shots: HashMap::new(),
             pending_server_shots: HashMap::new(),
+            pending_server_ls: HashMap::new(),
             seen_player_ids: std::collections::HashSet::new(),
             pending_enemy_shots: HashMap::new(),
             session_nonce: rand::random(),
@@ -1840,6 +1855,7 @@ impl CombatTracker {
         self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
+        self.pending_server_ls.clear();
         self.seen_player_ids.clear();
         self.pending_enemy_shots.clear();
         self.recent_graves.clear();
@@ -1893,6 +1909,7 @@ impl CombatTracker {
         self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
+        self.pending_server_ls.clear();
         self.seen_player_ids.clear();
         self.pending_enemy_shots.clear();
         // A different character may log in next; identity is re-set on CreateSuccess.
@@ -4020,6 +4037,7 @@ impl CombatTracker {
         // the same id (newest registration owns an id). Done before the guards so
         // the maps stay disjoint even when self-damage is disabled for this map.
         self.pending_server_shots.remove(&bullet_id);
+        self.pending_server_ls.remove(&bullet_id);
         // On-shoot procs (an "OnShoot Attack Boost IV" enchantment, say) apply with
         // the shot that fired them, so the moment of the last shot is what tells a
         // proc from an ally's buff landing at the same time.
@@ -4099,14 +4117,12 @@ impl CombatTracker {
         // *all* shots (Sharktooth Sigil's shark form): then its own volley is
         // empowered too, with the switch's own duration.
         let ability_grants_ls = ability_item
-            .and_then(|id| get_asset_manager().ability_effects(id))
-            .and_then(|e| e.switch)
-            .and_then(|s| s.lethal_strike)
+            .and_then(|id| get_asset_manager().lethal_strike_params(id))
             .is_some();
         let lethal_strike = if ability_item.is_some() && !ability_grants_ls {
             None
         } else {
-            self.lethal_strike_snapshot()
+            self.lethal_strike_snapshot(Some(time_ms))
         };
         let ls_cloak = if lethal_strike.is_some() {
             local_equipment[ABILITY_SLOT]
@@ -4279,13 +4295,36 @@ impl CombatTracker {
     /// equipped cloak's params + effective WIS. `None` unless the ability slot
     /// holds a cloak that grants Lethal Strike and a base Wisdom stat has been
     /// observed (so non-rogues and unknown-WIS shots are unaffected).
-    fn lethal_strike_snapshot(&self) -> Option<(LethalStrikeParams, i32)> {
+    fn lethal_strike_snapshot(&self, now: Option<i64>) -> Option<(LethalStrikeParams, i32)> {
         let local = self.objects.get(&self.local_object_id)?;
         let cloak = local.equipment[ABILITY_SLOT];
         if cloak < 0 {
             return None;
         }
         let params = get_asset_manager().lethal_strike_params(cloak)?;
+        if params.on_shoot {
+            // The server does not always send Stasis Immune back to the owner,
+            // so the condition bit can be clear even while the cloak is held.
+            // Accept either the condition (when it is observable) or a recent
+            // cloak activation; without one of those, a normal weapon shot must
+            // not be empowered.
+            if let Some(now) = now {
+                let condition_active = params.required_condition_bit != 0
+                    && local.condition & params.required_condition_bit != 0;
+                let recently_used = self.local_ability_uses.iter().any(|u| {
+                    u.item_id == cloak
+                        && now >= u.time_ms
+                        && now - u.time_ms <= ON_SHOOT_LS_WINDOW_MS
+                });
+                if !condition_active && !recently_used {
+                    return None;
+                }
+            }
+        } else if params.required_condition_bit != 0
+            && local.condition & params.required_condition_bit == 0
+        {
+            return None;
+        }
         let stat_val = local.effective_scaling_stat(params.scaling_stat)?;
         Some((params, stat_val))
     }
@@ -4367,6 +4406,11 @@ impl CombatTracker {
             } else {
                 None
             };
+            // Snapshot Lethal Strike once per volley. For Cloak of the Deep the
+            // server-fired extra bubbles are real shots: their damage is in this
+            // packet, so the bonus has to be carried to each hit here (there is
+            // no PlayerShoot to snapshot it from).
+            let ls = self.lethal_strike_snapshot(Some(self.last_shot_ms));
             for i in 0..count {
                 let bid = bullet_id.wrapping_add(i);
                 self.pending_shots.remove(&bid);
@@ -4374,9 +4418,18 @@ impl CombatTracker {
                     Some(ap) => {
                         self.pending_server_shots
                             .insert(bid, (damage as i32, ap, container_type));
+                        match ls {
+                            Some(snapshot) => {
+                                self.pending_server_ls.insert(bid, snapshot);
+                            }
+                            None => {
+                                self.pending_server_ls.remove(&bid);
+                            }
+                        }
                     }
                     None => {
                         self.pending_server_shots.remove(&bid);
+                        self.pending_server_ls.remove(&bid);
                     }
                 }
             }
@@ -4520,19 +4573,22 @@ impl CombatTracker {
                     // the client), so add all of it here. Skip Invulnerable targets.
                     if cond0 & COND_INVULNERABLE == 0 {
                         if let Some((params, wis)) = shot.lethal_strike {
-                            if self.in_lethal_strike_window(shot.shot_time) {
+                            if params.on_shoot || self.in_lethal_strike_window(shot.shot_time) {
                                 let bonus = damage::lethal_strike_bonus(&params, wis, defense);
                                 // Main-shot bonus: once per resolved hit (so a
                                 // piercing bullet's several hits each get it).
                                 dmg += bonus as i32;
                                 ls_extra += bonus as i64;
                                 ls_empowered = true;
-                                // Side procs: fire once per trigger, so credit
-                                // them on the first hit only to avoid piercing
-                                // duplication, and only on the primary projectile
-                                // so a multi-projectile weapon does not credit the
-                                // two procs once per projectile.
-                                if !shot.procs_credited && !shot.extra_projectile {
+                                // Post-sneak LS spawns two invisible side procs
+                                // that must be simulated. An on-shoot LS (Cloak
+                                // of the Deep) instead fires real BulletCreate
+                                // bullets, observed as their own shots, so
+                                // simulating side procs here would double-count.
+                                if !params.on_shoot
+                                    && !shot.procs_credited
+                                    && !shot.extra_projectile
+                                {
                                     // Each side proc spawns 4.6 tiles from the
                                     // player along the shot angle +/- 9 degrees
                                     // and flies outward, so a proc only lands if
@@ -4580,6 +4636,7 @@ impl CombatTracker {
                 Some(dmg) => Some(dmg),
                 None => {
                     let volley = self.pending_server_shots.get(&bullet_id).copied();
+                    let volley_ls = self.pending_server_ls.get(&bullet_id).copied();
                     // The packet named the item that fired this bullet. When that
                     // item is one the local player activated, the hit is that
                     // ability's own damage (a spell volley), not the weapon's, so
@@ -4605,7 +4662,29 @@ impl CombatTracker {
                     }
                     match volley {
                         Some((base, ap, _)) => {
-                            Some(damage::damage_with_defense(base, ap, defense, cond0, cond1))
+                            let mut dmg =
+                                damage::damage_with_defense(base, ap, defense, cond0, cond1);
+                            // On-shoot Lethal Strike (Cloak of the Deep) is
+                            // carried from the ServerPlayerShoot that spawned
+                            // this bullet; each observed bubble gets its own
+                            // bonus rather than a simulated side proc.
+                            if cond0 & COND_INVULNERABLE == 0 {
+                                if let Some((params, wis)) = volley_ls {
+                                    if params.on_shoot || self.in_lethal_strike_window(time_ms) {
+                                        let bonus =
+                                            damage::lethal_strike_bonus(&params, wis, defense);
+                                        dmg += bonus as i32;
+                                        ls_extra += bonus as i64;
+                                        ls_empowered = true;
+                                        ls_cloak = self
+                                            .objects
+                                            .get(&self.local_object_id)
+                                            .map(|o| o.equipment[ABILITY_SLOT])
+                                            .unwrap_or(0);
+                                    }
+                                }
+                            }
+                            Some(dmg)
                         }
                         // No shoot packet behind this hit. A meter-gated ability
                         // (a sigil's burst/nova) fires bullets whose damage the
@@ -7942,6 +8021,8 @@ mod tests {
             scaling_stat: ScalingStat::Wisdom,
             duration: 2.4,
             extra_shots: 2,
+            on_shoot: false,
+            required_condition_bit: 0,
         };
         let mut t = CombatTracker::new();
         t.on_map_change("Mad Lab", 42, 0, &[]);
@@ -11899,6 +11980,8 @@ mod tests {
             scaling_stat: ScalingStat::Vitality,
             duration: 2.4,
             extra_shots: 2,
+            on_shoot: false,
+            required_condition_bit: 0,
         };
         let mut t = CombatTracker::new();
         t.on_map_change("Mad Lab", 42, 0, &[]);
@@ -11964,6 +12047,106 @@ mod tests {
             .expect("local");
         // weapon 1000 - 65 DEF = 935, plus the main bonus and both side procs.
         assert_eq!(local.damage, 935 + 3 * 476);
+    }
+
+    #[test]
+    fn on_shoot_lethal_strike_applies_without_a_post_sneak_window() {
+        // Cloak of the Deep grants LS on every shot while Stasis Immune is
+        // held, not from a post-decloak window. It also fires real BulletCreate
+        // projectiles, so no invisible side procs may be simulated here.
+        use crate::assets::ScalingStat;
+        let params = LethalStrikeParams {
+            ignore_flat: 100.0,
+            ignore_perc: 0.0,
+            stat_mod_flat: 0.0,
+            stat_mod_perc: 0.0,
+            stat_mod_scaling_min: 0.0,
+            scaling_stat: ScalingStat::Wisdom,
+            duration: 1.4,
+            extra_shots: 9,
+            on_shoot: true,
+            required_condition_bit: COND_STASIS_IMMUNE,
+        };
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0, &[]);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        // No window is opened: on-shoot LS must not depend on one.
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                shot_time: 100,
+                lethal_strike: Some((params, 0)),
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 100);
+        let done = t.on_map_change("Nexus", 0, 200, &[]);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local");
+        // 1000 base + 100 main bonus; the nine real bubbles are separate hits.
+        assert_eq!(local.damage, 1100);
+    }
+
+    #[test]
+    fn server_fired_on_shoot_lethal_strike_bubbles_get_the_bonus() {
+        // The cloak's extra bubbles arrive as ServerPlayerShoot: their base is
+        // in the packet and the LS snapshot is carried alongside it.
+        use crate::assets::ScalingStat;
+        let params = LethalStrikeParams {
+            ignore_flat: 100.0,
+            ignore_perc: 0.0,
+            stat_mod_flat: 0.0,
+            stat_mod_perc: 0.0,
+            stat_mod_scaling_min: 0.0,
+            scaling_stat: ScalingStat::Wisdom,
+            duration: 1.4,
+            extra_shots: 9,
+            on_shoot: true,
+            required_condition_bit: COND_STASIS_IMMUNE,
+        };
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0, &[]);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.pending_server_shots.insert(5, (1000, false, 0x51ad));
+        t.pending_server_ls.insert(5, (params, 0));
+        t.on_local_hit(500, 5, 1000, 1000, 100);
+        let done = t.on_map_change("Nexus", 0, 200, &[]);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local");
+        assert_eq!(local.damage, 1100);
     }
 
     #[test]

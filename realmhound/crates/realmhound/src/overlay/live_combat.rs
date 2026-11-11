@@ -74,6 +74,50 @@ pub(super) struct LiveCombatOverlay {
     /// Boss ids of the last instance rendered. A zone change swaps the whole set
     /// out, which is the one moment the overlay resets its selection.
     last_ids: Vec<i32>,
+    /// Width the row list's scrollbar took last frame, so the header timer and
+    /// the pinned row, which sit above the scroll area, line up with the rows.
+    gutter: f32,
+}
+
+/// Fixed column widths shared by every row of a fight (pinned row included),
+/// so ranks, icons, damage and percentages line up vertically.
+#[derive(Clone, Copy)]
+struct Columns {
+    /// Rank column, sized for the largest rank; ranks are right-aligned in it.
+    rank: f32,
+    /// Percentage column, sized for the widest share label.
+    pct: f32,
+}
+
+impl Columns {
+    fn for_fight(ui: &egui::Ui, fight: &LiveFightSnapshot, total: i64) -> Self {
+        let rank_chars = format!("{}.", fight.participants.len().max(1)).len();
+        let pct_chars = fight
+            .participants
+            .iter()
+            .map(|p| share_label(share(p.damage, total)).len())
+            .max()
+            .unwrap_or(0)
+            .max(3);
+        let char_w = ui
+            .painter()
+            .layout_no_wrap(
+                "0".to_owned(),
+                egui::FontId::monospace(12.0),
+                Color32::WHITE,
+            )
+            .size()
+            .x;
+        Self {
+            rank: char_w * rank_chars as f32,
+            pct: char_w * pct_chars as f32,
+        }
+    }
+
+    /// Offset from the row's left edge to the icon column.
+    fn icon_left(&self, ui: &egui::Ui) -> f32 {
+        self.rank + ui.spacing().item_spacing.x
+    }
 }
 
 /// Borrows everything one frame of the Live Combat overlay needs.
@@ -164,35 +208,41 @@ impl LiveCombatOverlay {
             .flatten()
             .filter(|&d| d > 0);
         let mut pinned = None;
-        if let Some(fight) = fight {
+        let columns = fight.map(|f| Columns::for_fight(ui, f, total));
+        if let (Some(fight), Some(columns)) = (fight, columns) {
             if fights.len() > 1 {
                 self.tab_strip(ui, fights, fight.boss_object_id, hits);
                 ui.add_space(2.0);
             }
 
-            header(ui, sprites, fight);
+            header(ui, sprites, fight, columns, self.gutter);
             ui.add_space(2.0);
 
             pinned = follow
                 .then(|| fight.participants.iter().position(|p| p.is_local))
                 .flatten();
             if let Some(index) = pinned {
-                row(
-                    ui,
-                    sprites,
-                    &fight.participants[index],
-                    index + 1,
-                    total,
-                    top,
-                    class_icons,
-                    hits,
-                );
+                let size = egui::vec2((ui.available_width() - self.gutter).max(0.0), ICON);
+                ui.allocate_ui(size, |ui| {
+                    row(
+                        ui,
+                        sprites,
+                        &fight.participants[index],
+                        index + 1,
+                        total,
+                        top,
+                        columns,
+                        class_icons,
+                        hits,
+                    );
+                });
                 ui.add_space(2.0);
             }
         }
 
+        let outer_width = ui.available_width();
         let output = super::scroll_rows(ui, "live_combat_rows", |ui| {
-            let Some(fight) = fight else {
+            let (Some(fight), Some(columns)) = (fight, columns) else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
                     if tracking_any {
@@ -227,6 +277,7 @@ impl LiveCombatOverlay {
                     index + 1,
                     total,
                     top,
+                    columns,
                     class_icons,
                     hits,
                 );
@@ -236,6 +287,12 @@ impl LiveCombatOverlay {
                 ui.label(row_text(format!("+{hidden} more"), Color32::from_gray(110)));
             }
         });
+        let gutter = (outer_width - output.inner_rect.width()).max(0.0);
+        if (gutter - self.gutter).abs() > 0.5 {
+            // The header and pinned row were laid out with last frame's width.
+            self.gutter = gutter;
+            ui.ctx().request_repaint();
+        }
         if let Some(bar) = scrollbar_hit(&output) {
             hits.add(bar);
         }
@@ -442,15 +499,26 @@ fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, live: bool) -> egu
 
 /// One bar holding the boss icon, name and elapsed timer, filled by the boss's
 /// remaining HP. A name too long for one line wraps and the bar grows to fit.
-fn header(ui: &mut egui::Ui, sprites: &mut SpriteRenderer, fight: &LiveFightSnapshot) {
+///
+/// The name starts on the rows' icon column and the timer ends on their
+/// percentage column, `inset` short of the right edge to clear the scrollbar.
+fn header(
+    ui: &mut egui::Ui,
+    sprites: &mut SpriteRenderer,
+    fight: &LiveFightSnapshot,
+    columns: Columns,
+    inset: f32,
+) {
     const PAD: f32 = 4.0;
     let width = ui.available_width();
+    let name_offset = columns.icon_left(ui).max(PAD * 2.0 + BOSS_ICON);
+    let timer_offset = inset.max(PAD);
     let timer = ui.painter().layout_no_wrap(
         elapsed(fight.elapsed_ms),
         egui::FontId::monospace(12.0),
         Color32::from_gray(235),
     );
-    let name_wrap = (width - PAD * 4.0 - BOSS_ICON - timer.size().x).max(1.0);
+    let name_wrap = (width - name_offset - PAD - timer_offset - timer.size().x).max(1.0);
     let name = ui.painter().layout(
         fight.boss_name.clone(),
         egui::FontId::proportional(12.0),
@@ -482,11 +550,14 @@ fn header(ui: &mut egui::Ui, sprites: &mut SpriteRenderer, fight: &LiveFightSnap
 
     let painter = ui.painter();
     let timer_pos = egui::pos2(
-        rect.right() - PAD - timer.size().x,
+        rect.right() - timer_offset - timer.size().x,
         rect.center().y - timer.size().y * 0.5,
     );
     painter.galley(timer_pos, timer, Color32::from_gray(235));
-    let name_pos = egui::pos2(icon.right() + PAD, rect.center().y - name.size().y * 0.5);
+    let name_pos = egui::pos2(
+        rect.left() + name_offset,
+        rect.center().y - name.size().y * 0.5,
+    );
     painter.galley(name_pos, name, Color32::from_gray(245));
 }
 
@@ -500,10 +571,11 @@ fn row(
     rank: usize,
     total: i64,
     top: Option<i64>,
+    columns: Columns,
     class_icons: bool,
     hits: &mut HitRegions,
 ) {
-    let share = (participant.damage as f32 / total as f32).clamp(0.0, 1.0);
+    let share = share(participant.damage, total);
     let color = row_color(participant);
 
     ui.horizontal(|ui| {
@@ -512,7 +584,12 @@ fn row(
         // Reserved now so the bar sits beneath the text laid out after it.
         let bar_slot = ui.painter().add(egui::Shape::Noop);
 
-        ui.label(row_text(format!("{rank}."), Color32::from_gray(130)));
+        right_aligned_text(
+            ui,
+            columns.rank,
+            format!("{rank}."),
+            Color32::from_gray(130),
+        );
 
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::hover());
         let bar_left = rect.left();
@@ -547,12 +624,14 @@ fn row(
 
         let pct_left = ui
             .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let pct = ui.label(row_text(
-                    format!("{:>3.0}%", share * 100.0),
+                let pct = right_aligned_text(
+                    ui,
+                    columns.pct,
+                    share_label(share),
                     Color32::from_gray(150),
-                ));
+                );
                 ui.label(row_text(thousands(participant.damage), color));
-                pct.rect.left()
+                pct.left()
             })
             .inner;
 
@@ -569,6 +648,31 @@ fn row(
             );
         }
     });
+}
+
+/// A fixed-width cell with `text` right-aligned in it, in the row font.
+fn right_aligned_text(ui: &mut egui::Ui, width: f32, text: String, color: Color32) -> egui::Rect {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, egui::FontId::monospace(12.0), color);
+    let width = width.max(galley.size().x);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ICON), egui::Sense::hover());
+    let pos = egui::pos2(
+        rect.right() - galley.size().x,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(pos, galley, color);
+    rect
+}
+
+/// A participant's share of the fight's total damage, in `0.0..=1.0`.
+fn share(damage: i64, total: i64) -> f32 {
+    (damage as f32 / total.max(1) as f32).clamp(0.0, 1.0)
+}
+
+/// Whole-percent label for a share, e.g. `15%`.
+fn share_label(share: f32) -> String {
+    format!("{:.0}%", share * 100.0)
 }
 
 /// Bar length relative to the top dealer, in `0.0..=1.0`.

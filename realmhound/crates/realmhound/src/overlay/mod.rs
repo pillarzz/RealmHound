@@ -1,7 +1,7 @@
 //! Floating, always-on-top overlay windows drawn over the game client.
 //!
 //! Two overlays are provided: Live Combat, showing the boss fight currently in
-//! progress, and a loot tracker tallying the bags that have dropped this
+//! progress, and Live Loot, tallying the bags that have dropped this
 //! session. Both are separate native windows (egui *immediate viewports*) so
 //! they can sit over a fullscreen game client while the main RealmHound window
 //! stays on another monitor or minimized.
@@ -37,14 +37,14 @@ use crate::panels::loot_filters::{LootFilters, PropertyFilters};
 use crate::rendering::SpriteRenderer;
 
 mod live_combat;
-mod loot;
+mod live_loot;
 pub mod platform;
 
 /// Window title prefixes. [`platform`] uses them to tell one overlay's windows
 /// from the other's, so they must stay unique and stable. The title actually
 /// given to a window appends [`next_generation`].
 const LIVE_COMBAT_TITLE: &str = "RealmHound Live Combat";
-const LOOT_TITLE: &str = "RealmHound Loot Overlay";
+const LIVE_LOOT_TITLE: &str = "RealmHound Live Loot";
 
 /// Source of the per-window suffix that makes every native overlay title
 /// unique.
@@ -126,11 +126,65 @@ const TOOLTIP_MARGIN: f32 = 6.0;
 const CLOSE_GLYPH: &str = "\u{2716}";
 const MINIMIZE_GLYPH: &str = "\u{2212}";
 const RESTORE_GLYPH: &str = "+";
-/// The loot overlay's reset button, guarded by the same test.
+/// The Live Loot overlay's reset button, guarded by the same test.
 pub(super) const RESET_GLYPH: &str = "\u{1F504}";
 
 /// Backdrop color of every overlay, before opacity is applied.
 const BACKDROP: Color32 = Color32::from_rgb(15, 15, 18);
+/// Divider colour: a faint white wash, so the rule reads as a lift off the
+/// backdrop rather than a line drawn on it.
+const DIVIDER: Color32 = Color32::from_rgba_premultiplied(20, 20, 20, 20);
+/// Scrollbar track and handle. The app theme draws both in the same grey, which
+/// is invisible against the overlay's near-black backdrop.
+const SCROLL_TRACK: Color32 = Color32::from_rgb(32, 32, 38);
+const SCROLL_HANDLE: Color32 = Color32::from_gray(95);
+const SCROLL_HANDLE_HOVER: Color32 = Color32::from_gray(130);
+const SCROLL_HANDLE_DRAG: Color32 = Color32::from_gray(160);
+
+/// The vertical list every overlay body scrolls.
+pub(super) fn scroll_rows<R>(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    let area = egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .auto_shrink([false, false]);
+    styled_scroll(ui, area, add_contents)
+}
+
+/// Show `area` with a scrollbar that is visible against the backdrop. Only the
+/// bar is restyled; `add_contents` runs with the caller's style.
+pub(super) fn styled_scroll<R>(
+    ui: &mut egui::Ui,
+    area: egui::ScrollArea,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    let content_style = ui.style().clone();
+    ui.scope(|ui| {
+        let visuals = &mut ui.style_mut().visuals;
+        visuals.extreme_bg_color = SCROLL_TRACK;
+        visuals.widgets.inactive.bg_fill = SCROLL_HANDLE;
+        visuals.widgets.hovered.bg_fill = SCROLL_HANDLE_HOVER;
+        visuals.widgets.active.bg_fill = SCROLL_HANDLE_DRAG;
+        area.show(ui, |ui| {
+            ui.set_style(content_style);
+            add_contents(ui)
+        })
+    })
+    .inner
+}
+
+/// A thin, low-contrast horizontal rule spanning the overlay's width.
+pub(super) fn divider(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        egui::Stroke::new(1.0_f32, DIVIDER),
+    );
+}
 
 /// Per-window runtime state that is deliberately *not* persisted.
 struct WindowRuntime {
@@ -287,8 +341,8 @@ impl WindowRuntime {
 pub struct OverlayManager {
     live_combat_window: WindowRuntime,
     live_combat: live_combat::LiveCombatOverlay,
-    loot_window: WindowRuntime,
-    loot: loot::LootOverlay,
+    live_loot_window: WindowRuntime,
+    live_loot: live_loot::LiveLootOverlay,
     /// Mirrors "at least one overlay is open" for the packet worker, which uses
     /// it to keep waking the UI while a background tab is selected.
     active: Arc<AtomicBool>,
@@ -308,8 +362,8 @@ impl OverlayManager {
         Self {
             live_combat_window: WindowRuntime::new(LIVE_COMBAT_TITLE),
             live_combat: live_combat::LiveCombatOverlay::default(),
-            loot_window: WindowRuntime::new(LOOT_TITLE),
-            loot: loot::LootOverlay::default(),
+            live_loot_window: WindowRuntime::new(LIVE_LOOT_TITLE),
+            live_loot: live_loot::LiveLootOverlay::default(),
             active: Arc::new(AtomicBool::new(false)),
             embedded_warned: false,
         }
@@ -321,18 +375,18 @@ impl OverlayManager {
         self.active.clone()
     }
 
-    /// Record a loot drop for the loot overlay's counters and recent list.
+    /// Record a loot drop for the Live Loot overlay's counters and recent list.
     ///
     /// Called for every drop regardless of whether the overlay is open, so
     /// opening it mid-session shows the totals so far rather than starting from
     /// zero.
-    pub fn push_loot(&mut self, drop: &ProcessedLootDrop) {
-        self.loot.push(drop);
+    pub fn push_live_loot(&mut self, drop: &ProcessedLootDrop) {
+        self.live_loot.push(drop);
     }
 
-    /// Clear the loot tallies (new session / user reset).
-    pub fn reset_loot(&mut self) {
-        self.loot.reset();
+    /// Clear the Live Loot tallies (new session / user reset).
+    pub fn reset_live_loot(&mut self) {
+        self.live_loot.reset();
     }
 
     /// Render whichever overlays are enabled. Call once per frame from the root
@@ -344,13 +398,14 @@ impl OverlayManager {
         sprites: &mut SpriteRenderer,
         live: &[Arc<LiveFightSnapshot>],
     ) {
-        // The loot overlay shares the Live Feed's bag and item toggles rather
+        // The Live Loot overlay shares the Live Feed's bag and item toggles rather
         // than offering a second place to configure the same thing.
-        let Ok((mut cfg, bag_filters, item_filters)) = settings.read().map(|s| {
+        let Ok((mut cfg, bag_filters, item_filters, tracking_any)) = settings.read().map(|s| {
             (
                 s.overlays.clone(),
                 LootFilters::from_live_feed_settings(&s.live_feed.filters),
                 PropertyFilters::from_live_feed_settings(&s.live_feed.filters),
+                s.combat_history.tracks_any_group(),
             )
         }) else {
             return;
@@ -358,7 +413,7 @@ impl OverlayManager {
         self.active.store(cfg.any_visible(), Ordering::Relaxed);
         if !cfg.any_visible() {
             self.live_combat_window.closed();
-            self.loot_window.closed();
+            self.live_loot_window.closed();
             return;
         }
 
@@ -390,6 +445,8 @@ impl OverlayManager {
                 overlay: &mut self.live_combat,
                 fights: live,
                 follow: &mut cfg.live_combat_follow_me,
+                class_icons: cfg.live_combat_class_icons,
+                tracking_any,
                 max_rows,
             };
             let embedded = show_window(
@@ -405,27 +462,27 @@ impl OverlayManager {
             self.live_combat_window.closed();
         }
 
-        if cfg.loot.visible {
-            let mut content = loot::LootContent {
-                overlay: &mut self.loot,
+        if cfg.live_loot.visible {
+            let mut content = live_loot::LiveLootContent {
+                overlay: &mut self.live_loot,
                 filters: &bag_filters,
                 properties: &item_filters,
             };
             let embedded = show_window(
                 ctx,
-                &mut self.loot_window,
-                &mut cfg.loot,
+                &mut self.live_loot_window,
+                &mut cfg.live_loot,
                 opacity,
                 sprites,
                 &mut content,
             );
             self.warn_if_embedded(embedded);
         } else {
-            self.loot_window.closed();
+            self.live_loot_window.closed();
         }
 
         if cfg.live_combat != before.live_combat
-            || cfg.loot != before.loot
+            || cfg.live_loot != before.live_loot
             || cfg.live_combat_follow_me != before.live_combat_follow_me
         {
             if let Ok(mut s) = settings.write() {
@@ -433,7 +490,7 @@ impl OverlayManager {
                 // struct back would clobber a preference the settings tab
                 // changed after this clone was taken.
                 s.overlays.live_combat = cfg.live_combat.clone();
-                s.overlays.loot = cfg.loot.clone();
+                s.overlays.live_loot = cfg.live_loot.clone();
                 s.overlays.live_combat_follow_me = cfg.live_combat_follow_me;
             }
         }
@@ -536,7 +593,7 @@ fn show_window(
             ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
             chrome(ui, title, cfg, content);
             if !cfg.minimized {
-                ui.separator();
+                divider(ui);
                 content.body(ui, sprites, &mut hits);
                 resize_grip(ui, cfg.locked);
             }

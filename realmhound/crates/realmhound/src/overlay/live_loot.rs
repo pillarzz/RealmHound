@@ -1,9 +1,10 @@
-//! Loot tracker overlay body.
+//! Live Loot overlay body.
 //!
 //! Tallies the loot bags that have dropped this session, in the same
-//! colour order the Loot tab uses, and lists the most recent drops as a compact
-//! row of bag, dungeon and source icons followed by the items the Live Feed's
-//! toggles single out. Boosted bags are counted against their base
+//! colour order the Loot tab uses, and lists the drops the Live Feed's toggles
+//! let through as a compact row: bag, dungeon and source icons followed by the
+//! bag's full contents, as in the Live Feed and Loot History.
+//! Boosted bags are counted against their base
 //! colour -- a boosted white is still a white -- which is what makes the
 //! counters match how players actually talk about a run.
 
@@ -23,8 +24,11 @@ use super::{
 
 /// Side of a bag sprite in the counter strip.
 const BAG_ICON: f32 = 18.0;
-/// Side of every icon in a drop row.
+/// Side of every item tile in a drop row.
 const ROW_ICON: f32 = 26.0;
+/// Side of the bag, dungeon and source icons. These fill their rect, while an
+/// item sprite sits inset in its tile, so they are drawn smaller to match.
+const SOURCE_ICON: f32 = 20.0;
 /// Hard cap on retained drops. All of them are listed; the scroll area is what
 /// bounds how many are on screen at once.
 const MAX_RECENT: usize = 100;
@@ -52,7 +56,7 @@ struct RecentDrop {
 }
 
 #[derive(Default)]
-pub(super) struct LootOverlay {
+pub(super) struct LiveLootOverlay {
     /// Base bag id -> count, boosted variants folded into their base.
     counts: HashMap<i32, u32>,
     recent: VecDeque<RecentDrop>,
@@ -66,29 +70,29 @@ pub(super) struct LootOverlay {
 
 /// The drop list as rendered, kept across frames.
 ///
-/// Building it runs [`PropertyFilters::matches_item`] per item, which takes the
-/// asset manager's lock and does a map lookup each time. Redoing that for every
+/// Building it runs [`PropertyFilters::matches_items`], which takes the
+/// asset manager's lock and does a map lookup per item. Redoing that for every
 /// retained drop on every repaint is what this exists to avoid.
 struct RowCache {
     bags: LootFilters,
     properties: PropertyFilters,
     revision: u64,
-    /// Index into `recent`, plus the indices of the items that passed.
-    rows: Vec<(usize, Vec<usize>)>,
+    /// Indices into `recent` of the drops the Live Feed would show.
+    rows: Vec<usize>,
 }
 
-/// Borrows everything one frame of the loot overlay needs.
-pub(super) struct LootContent<'a> {
-    pub overlay: &'a mut LootOverlay,
+/// Borrows everything one frame of the Live Loot overlay needs.
+pub(super) struct LiveLootContent<'a> {
+    pub overlay: &'a mut LiveLootOverlay,
     /// The Live Feed's bag toggles, which the overlay shares rather than
     /// duplicating as a second place to configure the same thing.
     pub filters: &'a LootFilters,
-    /// The Live Feed's UT/ST/shiny and rarity toggles, which pick the items
-    /// shown in each row.
+    /// The Live Feed's UT/ST/shiny and rarity toggles, which decide whether a
+    /// bag is listed.
     pub properties: &'a PropertyFilters,
 }
 
-impl OverlayContent for LootContent<'_> {
+impl OverlayContent for LiveLootContent<'_> {
     fn title_extras(&mut self, ui: &mut egui::Ui) {
         self.overlay.title_extras(ui);
     }
@@ -99,7 +103,7 @@ impl OverlayContent for LootContent<'_> {
     }
 }
 
-impl LootOverlay {
+impl LiveLootOverlay {
     pub(super) fn push(&mut self, drop: &ProcessedLootDrop) {
         let base = base_bag(drop.bag_type);
         *self.counts.entry(base.id()).or_insert(0) += 1;
@@ -178,49 +182,46 @@ impl LootOverlay {
                 }
             });
             ui.add_space(4.0);
-            ui.separator();
+            super::divider(ui);
         }
 
-        let output = egui::ScrollArea::vertical()
-            .id_salt("loot_history")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if cache.rows.is_empty() {
-                    // Nothing counted at all reads as "nothing has dropped";
-                    // bags counted but no rows means the filters hid them.
-                    let message = if visible.is_empty() {
-                        "No drops yet"
-                    } else {
-                        "No items match your filters"
-                    };
-                    ui.label(row_text(message, Color32::from_gray(120)));
-                    return;
+        let output = super::scroll_rows(ui, "loot_history", |ui| {
+            if cache.rows.is_empty() {
+                // Nothing counted at all reads as "nothing has dropped";
+                // bags counted but no rows means the filters hid them.
+                let message = if visible.is_empty() {
+                    "No drops yet"
+                } else {
+                    "No items match your filters"
+                };
+                ui.label(row_text(message, Color32::from_gray(120)));
+                return;
+            }
+            for index in &cache.rows {
+                if let Some(drop) = self.recent.get(*index) {
+                    LootPanel::render_compact_drop_row(
+                        ui,
+                        &drop.record,
+                        sprites,
+                        SOURCE_ICON,
+                        |ui, sprites| {
+                            for item in &drop.record.items {
+                                // The full item breakdown dwarfs the overlay and
+                                // cannot leave it, so only the name is shown.
+                                let (response, name) = sprites.render_item_tile_plain(
+                                    ui,
+                                    item.item_id,
+                                    Some(&item.item_name),
+                                    &item.parsed_enchant_ids,
+                                    ROW_ICON,
+                                );
+                                overlay_tooltip(ui, &response, &name);
+                            }
+                        },
+                    );
                 }
-                for (index, items) in &cache.rows {
-                    if let Some(drop) = self.recent.get(*index) {
-                        LootPanel::render_compact_drop_row(
-                            ui,
-                            &drop.record,
-                            sprites,
-                            ROW_ICON,
-                            |ui, sprites| {
-                                for item in items.iter().filter_map(|i| drop.record.items.get(*i)) {
-                                    // The full item breakdown dwarfs the overlay and
-                                    // cannot leave it, so only the name is shown.
-                                    let (response, name) = sprites.render_item_tile_plain(
-                                        ui,
-                                        item.item_id,
-                                        Some(&item.item_name),
-                                        &item.parsed_enchant_ids,
-                                        ROW_ICON,
-                                    );
-                                    overlay_tooltip(ui, &response, &name);
-                                }
-                            },
-                        );
-                    }
-                }
-            });
+            }
+        });
         if let Some(bar) = scrollbar_hit(&output) {
             hits.add(bar);
         }
@@ -240,11 +241,10 @@ impl LootOverlay {
             .recent
             .iter()
             .enumerate()
-            .filter(|(_, drop)| filters.is_visible(drop.bag_type))
-            .filter_map(|(index, drop)| {
-                let items = notable_items(drop, properties);
-                (!items.is_empty()).then_some((index, items))
+            .filter(|(_, drop)| {
+                filters.is_visible(drop.bag_type) && properties.matches_items(&drop.record.items)
             })
+            .map(|(index, _)| index)
             .collect();
         self.cache = Some(RowCache {
             bags: filters.clone(),
@@ -253,17 +253,6 @@ impl LootOverlay {
             rows,
         });
     }
-}
-
-/// Indices of the items in `drop` that pass the Live Feed's item filters.
-fn notable_items(drop: &RecentDrop, properties: &PropertyFilters) -> Vec<usize> {
-    drop.record
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| properties.matches_item(*item))
-        .map(|(index, _)| index)
-        .collect()
 }
 
 /// A bag sprite with its count, e.g. the white-bag icon followed by `x3`.
@@ -335,7 +324,7 @@ fn fallback_color(bag: LootBagType) -> Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{base_bag, LootFilters, LootOverlay, PropertyFilters, BAG_ORDER};
+    use super::{base_bag, LiveLootOverlay, LootFilters, PropertyFilters, BAG_ORDER};
     use realmhound_core::loot::{
         LootBagType, PlayerSnapshot, ProcessedLootDrop, ProcessedLootItem,
     };
@@ -408,14 +397,14 @@ mod tests {
     fn drops_are_tallied_even_while_their_colour_is_hidden() {
         // Counting is independent of the filter so re-enabling a colour in the
         // Live Feed reveals the drops that already happened.
-        let mut overlay = LootOverlay::default();
+        let mut overlay = LiveLootOverlay::default();
         overlay.push(&drop_of(LootBagType::Brown, "Trash"));
         assert_eq!(overlay.counts.get(&LootBagType::Brown.id()), Some(&1));
     }
 
     #[test]
     fn a_boosted_drop_increments_the_base_counter() {
-        let mut overlay = LootOverlay::default();
+        let mut overlay = LiveLootOverlay::default();
         overlay.push(&drop_of(LootBagType::White, "Sword"));
         overlay.push(&drop_of(LootBagType::BoostedWhite, "Robe"));
         assert_eq!(overlay.counts.get(&LootBagType::White.id()), Some(&2));
@@ -424,7 +413,7 @@ mod tests {
 
     #[test]
     fn recent_drops_are_newest_first_and_bounded() {
-        let mut overlay = LootOverlay::default();
+        let mut overlay = LiveLootOverlay::default();
         for index in 0..super::MAX_RECENT + 10 {
             overlay.push(&drop_of(LootBagType::Blue, &format!("Item {index}")));
         }
@@ -437,8 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn only_items_passing_the_live_feed_filters_are_listed() {
-        // The row shows just the items that made the bag worth showing.
+    fn bags_are_listed_whole_when_any_item_passes_the_live_feed_filters() {
         let mut drop = drop_of(LootBagType::White, "Plain");
         drop.items.push(ProcessedLootItem {
             slot: 1,
@@ -446,7 +434,7 @@ mod tests {
             item_name: "Enchanted".to_string(),
             enchant_ids: vec![10, 11],
         });
-        let mut overlay = LootOverlay::default();
+        let mut overlay = LiveLootOverlay::default();
         overlay.push(&drop);
         overlay.push(&drop_of(LootBagType::White, "Other plain"));
 
@@ -461,16 +449,87 @@ mod tests {
         };
         overlay.refresh_rows(&LootFilters::default(), &properties);
         let rows = &overlay.cache.as_ref().expect("a cache").rows;
-        assert_eq!(rows, &vec![(1, vec![1])], "only the enchanted item");
+        assert_eq!(rows, &vec![1], "only the bag holding the enchanted item");
+    }
+
+    #[test]
+    fn an_overflow_bag_dropped_alongside_the_first_gets_its_own_row() {
+        // A boss with more than 8 items drops a second bag at the same instant.
+        let mut first = drop_of(LootBagType::White, "Marble Seal");
+        first.items.extend((1..8).map(|slot| ProcessedLootItem {
+            slot,
+            item_id: 100 + slot,
+            item_name: format!("Potion {slot}"),
+            enchant_ids: Vec::new(),
+        }));
+        let overflow = drop_of(LootBagType::White, "Overflow item");
+        let mut overlay = LiveLootOverlay::default();
+        overlay.push(&first);
+        overlay.push(&overflow);
 
         overlay.refresh_rows(&LootFilters::default(), &PropertyFilters::default());
         let rows = &overlay.cache.as_ref().expect("a cache").rows;
-        assert_eq!(rows, &vec![(0, vec![0]), (1, vec![0, 1])], "no narrowing");
+        assert_eq!(rows, &vec![0, 1]);
+        assert_eq!(overlay.counts.get(&LootBagType::White.id()), Some(&2));
+    }
+
+    #[test]
+    fn many_rows_stay_inside_the_window_with_a_visible_scrollbar() {
+        let _assets = crate::test_support::asset_manager_guard();
+        let mut overlay = LiveLootOverlay::default();
+        for index in 0..40 {
+            overlay.push(&drop_of(LootBagType::White, &format!("Item {index}")));
+        }
+        let mut sprites = crate::rendering::SpriteRenderer::new();
+        let ctx = eframe::egui::Context::default();
+        // Mirror the app: dark theme with handle and track in the same grey, and
+        // the solid bars the overlay window switches on.
+        ctx.style_mut(|style| {
+            let grey = eframe::egui::Color32::from_rgb(39, 39, 42);
+            style.visuals.extreme_bg_color = grey;
+            style.visuals.widgets.inactive.bg_fill = grey;
+            style.spacing.scroll = eframe::egui::style::ScrollStyle::solid();
+        });
+        let screen = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(320.0, 180.0),
+        );
+        let mut used = eframe::egui::Rect::NOTHING;
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run(input, |ctx| {
+                    eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut hits = super::HitRegions::default();
+                        overlay.body(
+                            ui,
+                            &mut sprites,
+                            &LootFilters::default(),
+                            &PropertyFilters::default(),
+                            &mut hits,
+                        );
+                        used = ui.min_rect();
+                    });
+                })
+                .shapes;
+        }
+        assert!(
+            used.bottom() <= screen.bottom() + 1.0,
+            "rows grew past the window: {used:?}"
+        );
+        let handle_painted = shapes.iter().any(|clipped| {
+            matches!(&clipped.shape, eframe::egui::Shape::Rect(rect) if rect.fill == super::super::SCROLL_HANDLE)
+        });
+        assert!(handle_painted, "no visible scrollbar handle was painted");
     }
 
     #[test]
     fn reset_clears_counts_and_history() {
-        let mut overlay = LootOverlay::default();
+        let mut overlay = LiveLootOverlay::default();
         overlay.push(&drop_of(LootBagType::Red, "Ring"));
         overlay.reset();
         assert!(overlay.counts.is_empty());
@@ -481,7 +540,7 @@ mod tests {
     fn the_row_cache_follows_new_drops_and_filter_changes() {
         let bags = LootFilters::default();
         let mut properties = PropertyFilters::default();
-        let mut overlay = LootOverlay::default();
+        let mut overlay = LiveLootOverlay::default();
         overlay.push(&drop_of(LootBagType::Red, "Ring"));
         overlay.refresh_rows(&bags, &properties);
         assert_eq!(overlay.cache.as_ref().map(|c| c.rows.len()), Some(1));

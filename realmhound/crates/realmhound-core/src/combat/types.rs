@@ -560,12 +560,18 @@ pub struct LiveFightSnapshot {
     pub last_local_hit_at: i64,
     /// Milliseconds since the first damage was attributed to this fight.
     pub elapsed_ms: i64,
+    /// Epoch millis the boss object came into view, which tells a boss that was
+    /// present all along from the next phase of one that just died.
+    pub boss_seen_at: i64,
     /// Participants sorted by damage descending.
     pub participants: Vec<FightParticipant>,
     /// True once the boss died or left view: the figures are final and the
     /// snapshot is held for display until another boss is engaged or the map
     /// changes.
     pub ended: bool,
+    /// Ended because the boss object left the world (died, transformed or
+    /// despawned), rather than the fight going idle with the boss still there.
+    pub boss_gone: bool,
 }
 
 impl LiveFightSnapshot {

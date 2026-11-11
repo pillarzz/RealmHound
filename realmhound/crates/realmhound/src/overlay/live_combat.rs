@@ -1,12 +1,9 @@
 //! Live Combat overlay body.
 //!
-//! Shows one boss fight of the map instance the player is in, with a tab per
-//! boss (phases included, since each phase is its own fight). The list is
-//! produced by
-//! [`realmhound_core::combat::CombatTracker::live_snapshots`]. In a dungeon it
-//! only empties on a zone change, so hitting a second boss adds a tab instead
-//! of wiping the numbers that were on screen; in the realm, where bosses never
-//! run out, it is narrowed to the encounter the player is currently on.
+//! Shows the boss fight the player is currently on. The list is produced by
+//! [`realmhound_core::combat::CombatTracker::live_snapshots`]: a single boss,
+//! or one tab per boss when several are fought in parallel (Stone Guardians,
+//! Tomb of the Ancients, ...). Engaging any other boss replaces it.
 //!
 //! Each tab is a mid-fight projection, so the local player's own damage can
 //! still be an estimate (see [`DamageProvenance`]) -- their row is tinted to say
@@ -26,6 +23,8 @@ use super::{
 
 /// Side of the per-row class sprite.
 const ICON: f32 = 16.0;
+/// Side of the boss sprite beside the HP bar.
+const BOSS_ICON: f32 = 14.0;
 /// Facing used for every character sprite, matching the Combat History rows.
 const SPRITE_DIRECTION: i32 = 6;
 /// Fill behind a row, scaled by that participant's share of total damage.
@@ -37,15 +36,19 @@ const LOCAL_COLOR: Color32 = Color32::from_rgb(120, 215, 130);
 /// reads as a warning about *that player*, which it is not.
 const UNCERTAIN_COLOR: Color32 = Color32::from_rgb(230, 190, 110);
 const NORMAL_COLOR: Color32 = Color32::from_rgb(225, 225, 230);
-/// Tint of the selected tab in the strip, and of the rest.
-const TAB_ACTIVE: Color32 = Color32::from_rgb(200, 215, 240);
-const TAB_IDLE: Color32 = Color32::from_gray(120);
-/// Underline under a tab whose fight is still running.
-const TAB_LIVE: Color32 = Color32::from_rgb(180, 70, 70);
-/// Height reserved for the tab strip.
-const TAB_HEIGHT: f32 = 18.0;
-/// Longest boss name rendered on a tab before it is ellipsized.
-const TAB_LABEL_CHARS: usize = 12;
+/// Boss tab text, fill and border: idle, hovered and selected.
+const TAB_TEXT_IDLE: Color32 = Color32::from_gray(165);
+const TAB_TEXT_HOVER: Color32 = Color32::from_gray(215);
+const TAB_TEXT_ACTIVE: Color32 = Color32::from_rgb(220, 230, 250);
+const TAB_FILL_IDLE: Color32 = Color32::from_gray(32);
+const TAB_FILL_HOVER: Color32 = Color32::from_gray(48);
+const TAB_FILL_ACTIVE: Color32 = Color32::from_rgb(42, 58, 88);
+const TAB_STROKE_IDLE: Color32 = Color32::from_gray(62);
+const TAB_STROKE_ACTIVE: Color32 = Color32::from_rgb(110, 145, 200);
+/// Dot on a tab whose fight is still running.
+const TAB_LIVE: Color32 = Color32::from_rgb(210, 80, 80);
+/// Height of one boss tab.
+const TAB_HEIGHT: f32 = 20.0;
 /// How far ahead a boss's last local hit must be before auto-follow moves to it.
 /// Without the margin, hitting two bosses in alternation swaps the tab on every
 /// packet batch.
@@ -69,6 +72,10 @@ pub(super) struct LiveCombatContent<'a> {
     pub overlay: &'a mut LiveCombatOverlay,
     pub fights: &'a [Arc<LiveFightSnapshot>],
     pub follow: &'a mut bool,
+    pub class_icons: bool,
+    /// False when Combat History records no boss groups, which leaves the
+    /// overlay nothing to show.
+    pub tracking_any: bool,
     pub max_rows: usize,
 }
 
@@ -91,8 +98,16 @@ impl OverlayContent for LiveCombatContent<'_> {
     }
 
     fn body(&mut self, ui: &mut egui::Ui, sprites: &mut SpriteRenderer, hits: &mut HitRegions) {
-        self.overlay
-            .body(ui, sprites, self.fights, self.max_rows, *self.follow, hits);
+        self.overlay.body(
+            ui,
+            sprites,
+            self.fights,
+            self.max_rows,
+            *self.follow,
+            self.class_icons,
+            self.tracking_any,
+            hits,
+        );
     }
 }
 
@@ -104,6 +119,8 @@ impl LiveCombatOverlay {
         fights: &[Arc<LiveFightSnapshot>],
         max_rows: usize,
         follow: bool,
+        class_icons: bool,
+        tracking_any: bool,
         hits: &mut HitRegions,
     ) {
         let fight: Option<&LiveFightSnapshot> = if fights.is_empty() {
@@ -130,7 +147,7 @@ impl LiveCombatOverlay {
                 ui.add_space(2.0);
             }
 
-            header(ui, fight);
+            header(ui, sprites, fight);
             ui.add_space(2.0);
 
             pinned = follow
@@ -143,40 +160,57 @@ impl LiveCombatOverlay {
                     &fight.participants[index],
                     index + 1,
                     total,
+                    class_icons,
                     hits,
                 );
                 ui.add_space(2.0);
             }
         }
 
-        let output = egui::ScrollArea::vertical()
-            .id_salt("live_combat_rows")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let Some(fight) = fight else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(8.0);
+        let output = super::scroll_rows(ui, "live_combat_rows", |ui| {
+            let Some(fight) = fight else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    if tracking_any {
                         ui.label(row_text("No fight in progress", Color32::from_gray(120)));
-                    });
-                    return;
-                };
-                let rows: &[FightParticipant] = if max_rows == 0 {
-                    &fight.participants
-                } else {
-                    let end = max_rows.min(fight.participants.len());
-                    &fight.participants[..end]
-                };
-                for (index, participant) in rows.iter().enumerate() {
-                    if pinned == Some(index) {
-                        continue;
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "Combat History is not tracking any boss groups. Enable \
+                                 them in Settings > Combat History to see fights here.",
+                            )
+                            .size(11.0)
+                            .color(Color32::from_gray(150)),
+                        );
                     }
-                    row(ui, sprites, participant, index + 1, total, hits);
+                });
+                return;
+            };
+            let rows: &[FightParticipant] = if max_rows == 0 {
+                &fight.participants
+            } else {
+                let end = max_rows.min(fight.participants.len());
+                &fight.participants[..end]
+            };
+            for (index, participant) in rows.iter().enumerate() {
+                if pinned == Some(index) {
+                    continue;
                 }
-                if max_rows > 0 && fight.participants.len() > rows.len() {
-                    let hidden = fight.participants.len() - rows.len();
-                    ui.label(row_text(format!("+{hidden} more"), Color32::from_gray(110)));
-                }
-            });
+                row(
+                    ui,
+                    sprites,
+                    participant,
+                    index + 1,
+                    total,
+                    class_icons,
+                    hits,
+                );
+            }
+            if max_rows > 0 && fight.participants.len() > rows.len() {
+                let hidden = fight.participants.len() - rows.len();
+                ui.label(row_text(format!("+{hidden} more"), Color32::from_gray(110)));
+            }
+        });
         if let Some(bar) = scrollbar_hit(&output) {
             hits.add(bar);
         }
@@ -245,37 +279,35 @@ impl LiveCombatOverlay {
         hits: &mut HitRegions,
     ) {
         let top = ui.cursor().top();
-        egui::ScrollArea::horizontal()
+        let strip = egui::ScrollArea::horizontal()
             .id_salt("live_combat_tabs")
-            .auto_shrink([false, true])
-            .max_height(TAB_HEIGHT)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let pinned = self.pinned.is_some();
+            .auto_shrink([false, true]);
+        super::styled_scroll(ui, strip, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let pinned = self.pinned.is_some();
 
-                    for fight in fights {
-                        let boss = fight.boss_object_id;
-                        let active = boss == selected;
-                        let label = truncate(&fight.boss_name, TAB_LABEL_CHARS);
-                        let response = tab_button(ui, &label, active, !fight.ended);
-                        if response.clicked() {
-                            self.toggle_pin(boss);
-                        }
-                        overlay_tooltip_with(ui, &response, || {
-                            pin_hint(
-                                &format!(
-                                    "{}\n{} damage over {}",
-                                    fight.boss_name,
-                                    thousands(fight.total_damage()),
-                                    elapsed(fight.elapsed_ms),
-                                ),
-                                pinned && active,
-                            )
-                        });
+                for fight in fights {
+                    let boss = fight.boss_object_id;
+                    let active = boss == selected;
+                    let response = tab_button(ui, &fight.boss_name, active, !fight.ended);
+                    if response.clicked() {
+                        self.toggle_pin(boss);
                     }
-                });
+                    overlay_tooltip_with(ui, &response, || {
+                        pin_hint(
+                            &format!(
+                                "{}\n{} damage over {}",
+                                fight.boss_name,
+                                thousands(fight.total_damage()),
+                                elapsed(fight.elapsed_ms),
+                            ),
+                            pinned && active,
+                        )
+                    });
+                }
             });
+        });
 
         // The whole strip, bar included: a locked overlay has to stay able to
         // switch boss and to scroll to a tab that is off the right edge.
@@ -305,40 +337,60 @@ fn pin_hint(body: &str, pinned: bool) -> String {
     }
 }
 
-/// One tab: a flat label, underlined in red while its fight is still running.
+/// One boss tab: a bordered pill with the full boss name, marked with a red dot
+/// while its fight is still running.
 fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, live: bool) -> egui::Response {
-    let color = if selected { TAB_ACTIVE } else { TAB_IDLE };
-    let text = RichText::new(label).size(11.0).color(color);
-    let text = if selected { text.strong() } else { text };
-    let response = ui.add(
-        egui::Button::new(text)
-            .frame(false)
-            .min_size(egui::vec2(0.0, TAB_HEIGHT)),
+    const PAD_X: f32 = 7.0;
+    const DOT_R: f32 = 2.5;
+    let dot_w = if live { DOT_R * 2.0 + 5.0 } else { 0.0 };
+    let font = egui::FontId::proportional(11.0);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x;
+    let size = egui::vec2(text_w + dot_w + PAD_X * 2.0, TAB_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let hovered = response.hovered();
+    let (fill, stroke, text) = if selected {
+        (TAB_FILL_ACTIVE, TAB_STROKE_ACTIVE, TAB_TEXT_ACTIVE)
+    } else if hovered {
+        (TAB_FILL_HOVER, TAB_STROKE_IDLE, TAB_TEXT_HOVER)
+    } else {
+        (TAB_FILL_IDLE, TAB_STROKE_IDLE, TAB_TEXT_IDLE)
+    };
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        4.0,
+        fill,
+        egui::Stroke::new(1.0_f32, stroke),
+        egui::StrokeKind::Inside,
     );
+    let mut x = rect.left() + PAD_X;
     if live {
-        let rect = response.rect;
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.left(), rect.bottom() - 1.0),
-                egui::pos2(rect.right(), rect.bottom() - 1.0),
-            ],
-            egui::Stroke::new(1.5_f32, TAB_LIVE),
-        );
+        painter.circle_filled(egui::pos2(x + DOT_R, rect.center().y), DOT_R, TAB_LIVE);
+        x += dot_w;
+    }
+    painter.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        text,
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response
 }
 
-/// Shorten a boss name to fit a tab, keeping a trailing ellipsis.
-fn truncate(name: &str, max_chars: usize) -> String {
-    if name.chars().count() <= max_chars {
-        return name.to_string();
-    }
-    let kept: String = name.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{}\u{2026}", kept.trim_end())
-}
-
-/// Boss name, elapsed timer and HP bar.
-fn header(ui: &mut egui::Ui, fight: &LiveFightSnapshot) {
+/// Boss name, elapsed timer, and the boss's icon beside its HP bar.
+fn header(ui: &mut egui::Ui, sprites: &mut SpriteRenderer, fight: &LiveFightSnapshot) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(fight.boss_name.clone())
@@ -358,13 +410,22 @@ fn header(ui: &mut egui::Ui, fight: &LiveFightSnapshot) {
         return;
     }
     let fraction = (fight.boss_hp as f32 / fight.boss_max_hp as f32).clamp(0.0, 1.0);
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, 2.0, Color32::from_rgb(40, 40, 46));
-    let mut filled = rect;
-    filled.set_width(rect.width() * fraction);
-    painter.rect_filled(filled, 2.0, Color32::from_rgb(180, 70, 70));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (icon, _) =
+            ui.allocate_exact_size(egui::vec2(BOSS_ICON, BOSS_ICON), egui::Sense::hover());
+        sprites.draw_outlined_sprite_in_rect(ui, fight.boss_object_type, icon);
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), BOSS_ICON),
+            egui::Sense::hover(),
+        );
+        let rect = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 6.0));
+        let painter = ui.painter();
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(40, 40, 46));
+        let mut filled = rect;
+        filled.set_width(rect.width() * fraction);
+        painter.rect_filled(filled, 2.0, Color32::from_rgb(180, 70, 70));
+    });
 }
 
 /// One participant row, with a share-of-damage bar painted behind it.
@@ -374,6 +435,7 @@ fn row(
     participant: &FightParticipant,
     rank: usize,
     total: i64,
+    class_icons: bool,
     hits: &mut HitRegions,
 ) {
     let share = (participant.damage as f32 / total as f32).clamp(0.0, 1.0);
@@ -390,19 +452,15 @@ fn row(
         ui.label(row_text(format!("{rank}."), Color32::from_gray(130)));
 
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::hover());
-        let icon_id = if participant.skin_id > 0 {
-            participant.skin_id
-        } else {
-            participant.object_type
-        };
+        let (icon_id, tex1, tex2) = icon_for(participant, class_icons);
         if icon_id > 0 {
             sprites.draw_dyed_outlined_character_sprite(
                 ui,
                 icon_id,
                 rect,
                 SPRITE_DIRECTION,
-                participant.tex1,
-                participant.tex2,
+                tex1,
+                tex2,
             );
         }
 
@@ -431,6 +489,20 @@ fn row(
             ui.label(row_text(thousands(participant.damage), color));
         });
     });
+}
+
+/// Sprite id and dyes for a row: the bare class sprite when `class_icons` is on,
+/// otherwise the player's skin and dyes.
+fn icon_for(participant: &FightParticipant, class_icons: bool) -> (i32, u32, u32) {
+    if class_icons || participant.skin_id <= 0 {
+        let (tex1, tex2) = if class_icons {
+            (0, 0)
+        } else {
+            (participant.tex1, participant.tex2)
+        };
+        return (participant.object_type, tex1, tex2);
+    }
+    (participant.skin_id, participant.tex1, participant.tex2)
 }
 
 /// Green for the local player, amber when their own figure is not exact.
@@ -486,7 +558,7 @@ fn callout(participant: &FightParticipant, rank: usize, share: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        callout, elapsed, is_uncertain, row_color, truncate, Arc, LiveCombatOverlay, NORMAL_COLOR,
+        callout, elapsed, icon_for, is_uncertain, row_color, Arc, LiveCombatOverlay, NORMAL_COLOR,
     };
     use realmhound_core::combat::{
         DamageProvenance, FightParticipant, LiveFightSnapshot, ParticipantEndStatus,
@@ -539,6 +611,8 @@ mod tests {
             started_at,
             last_local_hit_at: 0,
             elapsed_ms,
+            boss_seen_at: started_at,
+            boss_gone: true,
             participants: who,
             ended: true,
         })
@@ -591,9 +665,16 @@ mod tests {
     }
 
     #[test]
-    fn tab_labels_are_ellipsized_not_truncated_silently() {
-        assert_eq!(truncate("Oryx", 12), "Oryx");
-        assert_eq!(truncate("Oryx the Mad God 3", 12), "Oryx the Ma\u{2026}");
+    fn class_icons_drop_skins_and_dyes() {
+        let mut who = participant(1, "Nicky", 10, true);
+        who.skin_id = 0x1234;
+        who.tex1 = 7;
+        who.tex2 = 9;
+        assert_eq!(icon_for(&who, false), (0x1234, 7, 9));
+        assert_eq!(icon_for(&who, true), (0x0300, 0, 0));
+
+        who.skin_id = 0;
+        assert_eq!(icon_for(&who, false), (0x0300, 7, 9));
     }
 
     #[test]

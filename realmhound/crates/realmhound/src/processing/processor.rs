@@ -833,15 +833,11 @@ impl PacketProcessor {
         self.live_char_id
     }
 
-    /// Project every boss fight of the current map instance for the Live Combat
-    /// overlay, oldest engagement first.
-    ///
-    /// The list only empties when the player leaves the instance, so a
-    /// multi-phase or multi-boss encounter keeps each boss's numbers on screen
-    /// instead of the newest engagement wiping the display. Finished fights stay
-    /// in the list frozen (`LiveFightSnapshot::ended`).
+    /// Project the current encounter's boss fights for the Live Combat overlay,
+    /// oldest engagement first, limited to the boss groups Combat History is
+    /// set to record.
     pub fn live_fights(&self) -> Vec<std::sync::Arc<LiveFightSnapshot>> {
-        self.combat.tracker().live_snapshots(now_ms())
+        self.combat.live_snapshots(now_ms())
     }
 
     /// The socket of the verified main game-client connection, if one is

@@ -1500,7 +1500,7 @@ impl LootPanel {
         }
     }
 
-    /// Compact drop row for the loot overlay: bag, dungeon and source icons,
+    /// Compact drop row for the Live Loot overlay: bag, dungeon and source icons,
     /// then whatever `items` draws.
     pub(crate) fn render_compact_drop_row(
         ui: &mut egui::Ui,

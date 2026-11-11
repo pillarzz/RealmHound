@@ -605,7 +605,7 @@ pub struct RealmHoundApp {
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
-    /// The floating Live Combat / loot overlay windows drawn over the game client.
+    /// The floating Live Combat / Live Loot overlay windows drawn over the game client.
     overlays: crate::overlay::OverlayManager,
     /// Owned snapshot of every boss fight of the current map instance,
     /// refreshed from the worker each frame and rendered by the Live Combat overlay.
@@ -1555,7 +1555,7 @@ impl RealmHoundApp {
             UiPayload::PushLoot(drop) => {
                 // The worker's live-event window drives the feed entry; the loot
                 // overlay tally and history view still consume the drop here.
-                self.overlays.push_loot(&drop);
+                self.overlays.push_live_loot(&drop);
                 self.loot_panel.mark_history_dirty();
             }
             UiPayload::LootBatchAdded => {
@@ -7522,7 +7522,7 @@ impl RealmHoundApp {
         }
     }
 
-    /// Settings for the floating Live Combat / loot overlay windows.
+    /// Settings for the floating Live Combat / Live Loot overlay windows.
     fn render_overlay_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
         use realmhound_core::settings::MAX_LIVE_COMBAT_ROWS;
 
@@ -7596,8 +7596,8 @@ impl RealmHoundApp {
             changed |= shadcn
                 .switch(
                     ui,
-                    &mut overlays.loot.visible,
-                    "Show the loot tracker overlay",
+                    &mut overlays.live_loot.visible,
+                    "Show the Live Loot overlay",
                 )
                 .changed();
         });
@@ -7622,7 +7622,11 @@ impl RealmHoundApp {
                 .changed();
             ui.add_space(4.0);
             changed |= shadcn
-                .switch(ui, &mut overlays.loot.locked, "Lock the loot overlay")
+                .switch(
+                    ui,
+                    &mut overlays.live_loot.locked,
+                    "Lock the Live Loot overlay",
+                )
                 .changed();
         });
 
@@ -7649,8 +7653,16 @@ impl RealmHoundApp {
                     "Pin my own row above the list",
                 )
                 .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_class_icons,
+                    "Use default class icons (ignore skins and dyes)",
+                )
+                .changed();
             ui.add_space(6.0);
-            ui.label("Combatants shown");
+            ui.label("Teammates shown");
             // Settings saved before the cap may hold a larger value.
             overlays.live_combat_rows = overlays.live_combat_rows.min(MAX_LIVE_COMBAT_ROWS);
             changed |= shadcn
@@ -7663,16 +7675,16 @@ impl RealmHoundApp {
                 )
                 .changed();
             let caption = if overlays.max_rows() == 0 {
-                "All combatants".to_string()
+                "All teammates".to_string()
             } else {
-                format!("Up to {} combatants", overlays.max_rows())
+                format!("Up to {} teammates", overlays.max_rows())
             };
             ui.label(RichText::new(caption).weak());
         });
 
         ui.add_space(10.0);
 
-        shadcn.card(ui, "overlay_loot", "Loot overlay", |ui| {
+        shadcn.card(ui, "overlay_live_loot", "Live Loot overlay", |ui| {
             ui.label(
                 RichText::new(
                     "Which bag colours the overlay counts follows the Live Feed's bag \
@@ -7682,7 +7694,7 @@ impl RealmHoundApp {
             );
             ui.add_space(8.0);
             if shadcn.btn(ui, "🔄 Reset session tally").clicked() {
-                self.overlays.reset_loot();
+                self.overlays.reset_live_loot();
             }
         });
 

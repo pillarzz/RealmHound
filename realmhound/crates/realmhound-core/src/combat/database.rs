@@ -41,8 +41,12 @@ pub const LOOT_LINK_PRE_MS: i64 = 60_000;
 pub const LOOT_LINK_POST_MS: i64 = 600_000;
 
 // CROSS JOIN keeps SQLite from starting with every historical departure.
-const REMOTE_DEATH_CANDIDATES_SQL: &str =
-    "SELECT fp.id, fp.name FROM fights f INDEXED BY idx_fights_ended
+// Returns every participant row whose fight was active when the death happened.
+// The caller updates all of them: a death belongs to every concurrently tracked
+// fight card (main boss, minion, phase), but never to an earlier card that had
+// already ended.
+const REMOTE_DEATH_CANDIDATES_SQL: &str = "SELECT fp.id, fp.name
+     FROM fights f INDEXED BY idx_fights_ended
      CROSS JOIN fight_participants fp ON fp.fight_id = f.id
      WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
        AND f.started_at <= ?2 AND f.ended_at >= ?1";
@@ -3058,8 +3062,8 @@ impl CombatDatabase {
                     let mut stmt = self.conn.prepare(REMOTE_DEATH_CANDIDATES_SQL)?;
                     let rows = stmt.query_map(
                         params![
-                            occurred_at - super::tracker::GRAVE_MATCH_WINDOW_MS,
-                            occurred_at + super::tracker::GRAVE_MATCH_WINDOW_MS
+                            occurred_at - super::tracker::DEATH_MATCH_GRACE_MS,
+                            occurred_at
                         ],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )?;
@@ -12028,6 +12032,67 @@ mod tests {
             .unwrap();
         assert_eq!(bystander, "nexused");
         assert_eq!(db.repair_remote_deaths().unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn death_broadcast_does_not_repair_an_earlier_encounter() {
+        // Zlenkku/Gunaj case at the database level: the player cleared the
+        // Gemsbok encounter alive, then died in the Oryx encounter seconds
+        // later. The repair must mark every fight card active at the death --
+        // both Oryx phase rows and a separately tracked minion card -- and
+        // leave the already-finished Gemsbok roster untouched.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut gemsbok = fight_with_players("Oryx's Sanctuary", 1_000_000, &["Pillar"]);
+        gemsbok.ended_at = 1_030_000;
+        gemsbok.encounter_id = Some("dungeon_run".into());
+        gemsbok.encounter_run_id = Some("run-1".into());
+        gemsbok.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let gemsbok_id = db.insert_fight(&gemsbok).unwrap();
+
+        let mut oryx = fight_with_players("Oryx's Sanctuary", 1_035_000, &["Pillar"]);
+        oryx.ended_at = 1_060_000;
+        oryx.encounter_id = Some("o3_oryx".into());
+        oryx.encounter_run_id = Some("run-1".into());
+        oryx.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let oryx_id = db.insert_fight(&oryx).unwrap();
+
+        let mut messengers = fight_with_players("Oryx's Sanctuary", 1_036_000, &["Pillar"]);
+        messengers.ended_at = 1_060_000;
+        messengers.encounter_id = Some("o3_oryx".into());
+        messengers.encounter_run_id = Some("run-1".into());
+        messengers.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let messengers_id = db.insert_fight(&messengers).unwrap();
+
+        // A separately tracked minion card, under a different encounter id.
+        let mut minion = fight_with_players("Oryx's Sanctuary", 1_036_500, &["Pillar"]);
+        minion.ended_at = 1_060_000;
+        minion.encounter_id = Some("o3_minions".into());
+        minion.encounter_run_id = Some("run-1".into());
+        minion.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let minion_id = db.insert_fight(&minion).unwrap();
+
+        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1837, 1_040_000)
+            .unwrap();
+        assert_eq!(
+            db.repair_remote_deaths().unwrap(),
+            3,
+            "all fight cards active at the death are repaired"
+        );
+
+        let status = |fight_id: i64| -> (String, i64) {
+            db.conn
+                .query_row(
+                    "SELECT end_status, grave_type FROM fight_participants
+                     WHERE fight_id = ?1 AND name = 'Pillar'",
+                    params![fight_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(status(gemsbok_id), ("nexused".to_string(), 0));
+        assert_eq!(status(oryx_id), ("died".to_string(), 1837));
+        assert_eq!(status(messengers_id), ("died".to_string(), 1837));
+        assert_eq!(status(minion_id), ("died".to_string(), 1837));
     }
 
     #[test]

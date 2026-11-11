@@ -275,6 +275,12 @@ const GRAVE_MATCH_RADIUS: f32 = 3.0;
 /// the same/adjacent tick). Also used by the combat-history database when
 /// applying a stored death notification to a fight that was already written.
 pub(crate) const GRAVE_MATCH_WINDOW_MS: i64 = 15_000;
+/// How far outside a fight's span a death event may still belong to it. This is
+/// deliberately much tighter than the grave-correlation window: a death at the
+/// next sequential boss must not mark the previous, already-finished fight.
+/// The small tail covers a PlayerDeath notification that arrives a packet or
+/// two after the boss-death event that finalized the fight.
+pub(crate) const DEATH_MATCH_GRACE_MS: i64 = 1_000;
 /// A departure only counts for a fight if it happened no earlier than this before
 /// the fight's start (guards against correlating a much older, unrelated exit).
 const DEPARTURE_GRACE_MS: i64 = 5_000;
@@ -6371,10 +6377,7 @@ impl CombatTracker {
                 if let Some((char_id, grave, gtime)) = self.pending_local_grave {
                     let matches_char =
                         char_id == 0 || local_char_id == 0 || char_id == local_char_id;
-                    if matches_char
-                        && gtime >= started - GRAVE_MATCH_WINDOW_MS
-                        && gtime <= ended + GRAVE_MATCH_WINDOW_MS
-                    {
+                    if matches_char && gtime >= started && gtime <= ended + DEATH_MATCH_GRACE_MS {
                         p.end_status = ParticipantEndStatus::Died { grave_type: grave };
                         continue;
                     }
@@ -6502,8 +6505,7 @@ impl CombatTracker {
             return None;
         }
         self.remote_deaths.get(&key).and_then(|death| {
-            (death.time >= started - GRAVE_MATCH_WINDOW_MS
-                && death.time <= ended + GRAVE_MATCH_WINDOW_MS)
+            (death.time >= started && death.time <= ended + DEATH_MATCH_GRACE_MS)
                 .then_some(death.grave_type)
         })
     }
@@ -7838,6 +7840,53 @@ mod tests {
         let mut ps = vec![p1];
         t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
         assert_eq!(ps[0].end_status, ParticipantEndStatus::Nexused);
+    }
+
+    #[test]
+    fn end_status_death_at_next_boss_does_not_mark_the_previous_fight() {
+        // The reported Zlenkku/Gunaj case: they cleared an earlier boss alive,
+        // then died at the next boss a few seconds later. The next death must
+        // not be applied to the previous fight's roster even though both are
+        // within the old 15s grave-correlation window.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 4_000,
+            },
+        );
+        t.on_remote_death("NextBoss", "Oryx the Mad God", 1837, 12_000);
+        let mut p1 = participant(1, false);
+        p1.name = "NextBoss".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+        assert_eq!(ps[0].end_status, ParticipantEndStatus::Nexused);
+    }
+
+    #[test]
+    fn end_status_death_just_after_finalize_still_counts() {
+        // A PlayerDeath notification can trail the boss-death event by a packet
+        // or two. The small tail keeps that same-fight death.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 4_000,
+            },
+        );
+        t.on_remote_death("SameFight", "Oryx the Mad God", 1837, 5_500);
+        let mut p1 = participant(1, false);
+        p1.name = "SameFight".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
     }
 
     #[test]

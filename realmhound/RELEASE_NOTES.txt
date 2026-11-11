@@ -3,6 +3,7 @@
 
 # Combat History
 * Remote deaths now use the server's PlayerDeath notification and display its exact gravestone type.
+* Fixed a later boss death being applied to an earlier, already-completed boss fight.
 * Fixed trap damage staying in the generic packet total instead of being credited to the trap ability.
 * Fixed Cloak of the Deep bubble damage and Lethal Strike being left out of self-computed damage.
 * Fixed armor-piercing self-closed projectile flags (`<ArmorPiercing />`) being ignored.

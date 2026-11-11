@@ -48,6 +48,20 @@ const CARD_HEIGHT: f32 = 52.0;
 /// excluded since guard damage is only tracked on the main O3 body.
 const O3_BOSS_TYPE: i32 = 45363;
 
+/// Boss HP bar fill for a remaining-HP fraction: green, then orange below half,
+/// then red below a quarter. `None` once empty, leaving the grey track bare.
+pub(crate) fn boss_hp_fill_color(frac: f32) -> Option<Color32> {
+    if frac <= 0.0 {
+        None
+    } else if frac >= 0.5 {
+        Some(Color32::from_rgb(0x7b, 0xbf, 0x34))
+    } else if frac >= 0.25 {
+        Some(Color32::from_rgb(0xde, 0x73, 0x00))
+    } else {
+        Some(Color32::from_rgb(0xc0, 0x38, 0x34))
+    }
+}
+
 /// The overlaid text on a boss HP bar. An uncapped boss (Moonlight Village
 /// mechanics boss) has no finite pool, so it reads `<party damage> / ∞`;
 /// ordinary bosses read `<start HP> / <max HP>`, or nothing when no HP was ever
@@ -4597,9 +4611,6 @@ impl CombatHistoryPanel {
     ) -> f32 {
         const YELLOW: Color32 = Color32::from_rgb(0xff, 0xc1, 0x00);
         const DARK_YELLOW: Color32 = Color32::from_rgb(0xab, 0x83, 0x00);
-        const GREEN: Color32 = Color32::from_rgb(0x7b, 0xbf, 0x34);
-        const ORANGE: Color32 = Color32::from_rgb(0xde, 0x73, 0x00);
-        const RED: Color32 = Color32::from_rgb(0xc0, 0x38, 0x34);
         const DARK_BG: Color32 = Color32::from_rgb(0x0b, 0x0a, 0x10);
 
         const PORTAL: f32 = 40.0;
@@ -4646,14 +4657,7 @@ impl CombatHistoryPanel {
         } else {
             0.0
         };
-        if frac > 0.0 {
-            let fill_color = if frac >= 0.5 {
-                GREEN
-            } else if frac >= 0.25 {
-                ORANGE
-            } else {
-                RED
-            };
+        if let Some(fill_color) = boss_hp_fill_color(frac) {
             let fill_rect = egui::Rect::from_min_max(
                 bar_rect.min,
                 egui::pos2(bar_rect.left() + bar_rect.width() * frac, bar_rect.bottom()),

@@ -14,11 +14,12 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32, RichText};
 use realmhound_core::combat::{DamageProvenance, FightParticipant, LiveFightSnapshot};
 
+use crate::panels::combat_history::boss_hp_fill_color;
 use crate::rendering::SpriteRenderer;
 
 use super::{
     overlay_tooltip, overlay_tooltip_with, row_text, scrollbar_hit, thousands, HitRegions,
-    OverlayContent,
+    OverlayContent, ROW_FONT,
 };
 
 /// Side of the per-row class sprite.
@@ -33,8 +34,7 @@ const SHARE_FILL: Color32 = Color32::from_rgb(60, 90, 150);
 const BARS_ICON_ON: Color32 = Color32::from_rgb(120, 160, 230);
 /// Height of the boss header bar.
 const HEADER_H: f32 = 18.0;
-/// Remaining boss HP in the header bar, and the track behind it.
-const BOSS_HP_FILL: Color32 = Color32::from_rgb(180, 70, 70);
+/// Track behind the boss HP fill, left bare (grey) once the boss is down.
 const BOSS_HP_TRACK: Color32 = Color32::from_rgb(40, 40, 46);
 /// Gap between the end of a full-length bar and the percentage column.
 const BAR_GAP: f32 = 4.0;
@@ -91,26 +91,20 @@ struct Columns {
 
 impl Columns {
     fn for_fight(ui: &egui::Ui, fight: &LiveFightSnapshot, total: i64) -> Self {
-        let rank_chars = format!("{}.", fight.participants.len().max(1)).len();
-        let pct_chars = fight
+        let width = |text: String| {
+            ui.painter()
+                .layout_no_wrap(text, ROW_FONT, Color32::WHITE)
+                .size()
+                .x
+        };
+        let pct = fight
             .participants
             .iter()
-            .map(|p| share_label(share(p.damage, total)).len())
-            .max()
-            .unwrap_or(0)
-            .max(3);
-        let char_w = ui
-            .painter()
-            .layout_no_wrap(
-                "0".to_owned(),
-                egui::FontId::monospace(12.0),
-                Color32::WHITE,
-            )
-            .size()
-            .x;
+            .map(|p| width(share_label(share(p.damage, total))))
+            .fold(width("00%".to_owned()), f32::max);
         Self {
-            rank: char_w * rank_chars as f32,
-            pct: char_w * pct_chars as f32,
+            rank: width(format!("{}.", fight.participants.len().max(1))),
+            pct,
         }
     }
 
@@ -515,7 +509,7 @@ fn header(
     let timer_offset = inset.max(PAD);
     let timer = ui.painter().layout_no_wrap(
         elapsed(fight.elapsed_ms),
-        egui::FontId::monospace(12.0),
+        ROW_FONT,
         Color32::from_gray(235),
     );
     let name_wrap = (width - name_offset - PAD - timer_offset - timer.size().x).max(1.0);
@@ -536,10 +530,17 @@ fn header(
     // Only filled once the server has reported a pool; a boss with no known
     // stats would otherwise show a full-or-empty bar that means nothing.
     if fight.boss_max_hp > 0 && fight.boss_hp >= 0 {
-        let fraction = (fight.boss_hp as f32 / fight.boss_max_hp as f32).clamp(0.0, 1.0);
-        let mut filled = rect;
-        filled.set_width(rect.width() * fraction);
-        painter.rect_filled(filled, 2.0, BOSS_HP_FILL);
+        // The last HP report before a kill is rarely zero.
+        let fraction = if fight.boss_gone {
+            0.0
+        } else {
+            (fight.boss_hp as f32 / fight.boss_max_hp as f32).clamp(0.0, 1.0)
+        };
+        if let Some(fill) = boss_hp_fill_color(fraction) {
+            let mut filled = rect;
+            filled.set_width(rect.width() * fraction);
+            painter.rect_filled(filled, 2.0, fill);
+        }
     }
 
     let icon = egui::Rect::from_min_size(
@@ -654,7 +655,7 @@ fn row(
 fn right_aligned_text(ui: &mut egui::Ui, width: f32, text: String, color: Color32) -> egui::Rect {
     let galley = ui
         .painter()
-        .layout_no_wrap(text, egui::FontId::monospace(12.0), color);
+        .layout_no_wrap(text, ROW_FONT, color);
     let width = width.max(galley.size().x);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ICON), egui::Sense::hover());
     let pos = egui::pos2(

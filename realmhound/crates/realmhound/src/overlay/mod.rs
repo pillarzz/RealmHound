@@ -1008,12 +1008,12 @@ fn perceptual_alpha(opacity: f32) -> f32 {
     1.0 - linear
 }
 
-/// Shared row helper: a compact label in the overlay's monospace scale.
+/// Row font, the proportional face the app's panels use.
+const ROW_FONT: egui::FontId = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+
+/// Shared row helper: a compact label in the overlay's row font.
 fn row_text(text: impl Into<String>, color: Color32) -> RichText {
-    RichText::new(text.into())
-        .size(12.0)
-        .monospace()
-        .color(color)
+    RichText::new(text.into()).font(ROW_FONT).color(color)
 }
 
 /// Format a damage figure with thousands separators, which is what makes a

@@ -1805,16 +1805,9 @@ impl CombatTracker {
             .iter()
             .map(|(&aid, accum)| self.build_participant(aid, accum, fight.joined_late))
             .collect();
-        collapse_unresolved(&mut participants);
+        drop_unresolved(&mut participants);
         if ended && fight.killed {
-            // Combat History drops unresolved damage before trimming; keep the
-            // Unknown row on screen but out of the trim so players match it.
-            let (mut resolved, unresolved): (Vec<_>, Vec<_>) = participants
-                .into_iter()
-                .partition(|p| p.is_local || p.provenance != DamageProvenance::Unresolved);
-            trim_plausible_overkill(fight, &mut resolved);
-            resolved.extend(unresolved);
-            participants = resolved;
+            trim_plausible_overkill(fight, &mut participants);
         }
         participants.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
 
@@ -6821,54 +6814,6 @@ fn drop_unresolved(participants: &mut Vec<FightParticipant>) {
     participants.retain(|p| !(p.provenance == DamageProvenance::Unresolved && !p.is_local));
 }
 
-/// Fold every unresolved attacker into a single "Unknown" row.
-///
-/// A completed fight drops them outright ([`drop_unresolved`]), but the live
-/// overlay is a running total of what is actually landing on the boss, so the
-/// damage stays on screen. What it must not do is show one row per
-/// unattributable source id: those ids are ground hazards, status ticks and
-/// ownerless bullets, they churn constantly, and a handful of them pushes the
-/// real players off a row-capped list. Only the damage total survives the merge;
-/// every identity and per-source detail field is cleared, because none of them
-/// describes anything but whichever id happened to come first.
-fn collapse_unresolved(participants: &mut Vec<FightParticipant>) {
-    let mut merged: Option<FightParticipant> = None;
-    participants.retain(|p| {
-        if p.is_local || p.provenance != DamageProvenance::Unresolved {
-            return true;
-        }
-        match &mut merged {
-            Some(row) => {
-                row.damage = row.damage.saturating_add(p.damage);
-                row.hits = row.hits.saturating_add(p.hits);
-            }
-            None => {
-                let mut row = p.clone();
-                row.object_id = 0;
-                row.object_type = 0;
-                row.skin_id = 0;
-                row.tex1 = 0;
-                row.tex2 = 0;
-                row.equipment = [-1; 4];
-                row.equipment_enchants = Default::default();
-                row.pet = None;
-                row.damage_taken = None;
-                row.damage_taken_hits = None;
-                row.damage_blocked = None;
-                row.summon_damage = 0;
-                row.summon_hits = 0;
-                row.summons = Vec::new();
-                row.weapons = Vec::new();
-                merged = Some(row);
-            }
-        }
-        false
-    });
-    if let Some(row) = merged {
-        participants.push(row);
-    }
-}
-
 /// How far above the effective damage pool a raw total may sit before it stops
 /// looking like a final-volley overshoot. The death tick can add a whole volley
 /// (or several), but not multiples of the boss's pool. Past this bound the
@@ -7203,11 +7148,9 @@ mod tests {
     }
 
     #[test]
-    fn live_overlay_kill_trim_leaves_out_unresolved_damage() {
-        // Combat History drops unresolved damage before trimming, so 100k of
-        // player damage on a 100k pool is not trimmed at all. The overlay keeps
-        // its Unknown row on screen but must not scale the players to share
-        // the pool with it.
+    fn live_overlay_hides_unresolved_damage() {
+        // Unattributable damage gets no row, and like Combat History it is
+        // dropped before trimming so players are not scaled to share the pool.
         let mut t = overlay_kill_tracker();
         t.on_damage(500, 600, 60_000, 20);
         t.on_damage(500, 601, 40_000, 21);
@@ -7229,7 +7172,10 @@ mod tests {
         };
         assert_eq!(damage("Bob"), Some(60_000));
         assert_eq!(damage("Al"), Some(40_000));
-        assert_eq!(damage("Unknown"), Some(10_000));
+        assert!(fight
+            .participants
+            .iter()
+            .all(|p| p.provenance != DamageProvenance::Unresolved));
     }
 
     #[test]
@@ -7603,31 +7549,6 @@ mod tests {
             packet_damage: 0,
             packet_hits: 0,
         }
-    }
-
-    #[test]
-    fn live_snapshot_folds_every_unresolved_attacker_into_one_row() {
-        let mut ps = vec![participant(1, false), participant(9, true)];
-        for id in [2, 3, 4] {
-            let mut ghost = participant(id, false);
-            ghost.name = "Unknown".into();
-            ghost.provenance = DamageProvenance::Unresolved;
-            ghost.damage = 50 * id as i64;
-            ghost.hits = 2;
-            ps.push(ghost);
-        }
-        collapse_unresolved(&mut ps);
-
-        let unknown: Vec<&FightParticipant> = ps
-            .iter()
-            .filter(|p| p.provenance == DamageProvenance::Unresolved)
-            .collect();
-        assert_eq!(unknown.len(), 1, "unresolved attackers share one row");
-        assert_eq!(unknown[0].damage, 450);
-        assert_eq!(unknown[0].hits, 6);
-        assert_eq!(unknown[0].object_id, 0, "merged row keeps no identity");
-        assert_eq!(unknown[0].object_type, 0);
-        assert_eq!(ps.len(), 3, "named and local rows are untouched");
     }
 
     #[test]

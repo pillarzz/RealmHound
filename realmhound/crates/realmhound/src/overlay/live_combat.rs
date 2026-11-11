@@ -27,8 +27,17 @@ const ICON: f32 = 16.0;
 const BOSS_ICON: f32 = 14.0;
 /// Facing used for every character sprite, matching the Combat History rows.
 const SPRITE_DIRECTION: i32 = 6;
-/// Fill behind a row, scaled by that participant's share of total damage.
+/// Fill behind a row, scaled against the top dealer's damage.
 const SHARE_FILL: Color32 = Color32::from_rgb(60, 90, 150);
+/// Damage-bar toggle icon while the bars are shown.
+const BARS_ICON_ON: Color32 = Color32::from_rgb(120, 160, 230);
+/// Height of the boss header bar.
+const HEADER_H: f32 = 18.0;
+/// Remaining boss HP in the header bar, and the track behind it.
+const BOSS_HP_FILL: Color32 = Color32::from_rgb(180, 70, 70);
+const BOSS_HP_TRACK: Color32 = Color32::from_rgb(40, 40, 46);
+/// Gap between the end of a full-length bar and the percentage column.
+const BAR_GAP: f32 = 4.0;
 /// Row tint for the local player.
 const LOCAL_COLOR: Color32 = Color32::from_rgb(120, 215, 130);
 /// Row tint for the local player when their own figure is still an estimate or
@@ -72,6 +81,7 @@ pub(super) struct LiveCombatContent<'a> {
     pub overlay: &'a mut LiveCombatOverlay,
     pub fights: &'a [Arc<LiveFightSnapshot>],
     pub follow: &'a mut bool,
+    pub share_bars: &'a mut bool,
     pub class_icons: bool,
     /// False when Combat History records no boss groups, which leaves the
     /// overlay nothing to show.
@@ -95,6 +105,12 @@ impl OverlayContent for LiveCombatContent<'_> {
         if response.clicked() {
             *self.follow = !*self.follow;
         }
+
+        let response = bars_button(ui, *self.share_bars);
+        overlay_tooltip(ui, &response, "Show damage bars behind each row");
+        if response.clicked() {
+            *self.share_bars = !*self.share_bars;
+        }
     }
 
     fn body(&mut self, ui: &mut egui::Ui, sprites: &mut SpriteRenderer, hits: &mut HitRegions) {
@@ -104,6 +120,7 @@ impl OverlayContent for LiveCombatContent<'_> {
             self.fights,
             self.max_rows,
             *self.follow,
+            *self.share_bars,
             self.class_icons,
             self.tracking_any,
             hits,
@@ -119,6 +136,7 @@ impl LiveCombatOverlay {
         fights: &[Arc<LiveFightSnapshot>],
         max_rows: usize,
         follow: bool,
+        share_bars: bool,
         class_icons: bool,
         tracking_any: bool,
         hits: &mut HitRegions,
@@ -140,6 +158,11 @@ impl LiveCombatOverlay {
         };
 
         let total = fight.map_or(1, |f| f.total_damage().max(1));
+        // Bars are drawn against the top dealer so close ranks stay readable.
+        let top = share_bars
+            .then(|| fight.and_then(|f| f.participants.iter().map(|p| p.damage).max()))
+            .flatten()
+            .filter(|&d| d > 0);
         let mut pinned = None;
         if let Some(fight) = fight {
             if fights.len() > 1 {
@@ -160,6 +183,7 @@ impl LiveCombatOverlay {
                     &fight.participants[index],
                     index + 1,
                     total,
+                    top,
                     class_icons,
                     hits,
                 );
@@ -202,6 +226,7 @@ impl LiveCombatOverlay {
                     participant,
                     index + 1,
                     total,
+                    top,
                     class_icons,
                     hits,
                 );
@@ -328,6 +353,32 @@ impl LiveCombatOverlay {
     }
 }
 
+/// Title-bar toggle for the damage bars, drawn as three ranked bars.
+fn bars_button(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(16.0, super::TITLE_BAR_H), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let color = match (on, response.hovered()) {
+            (true, _) => BARS_ICON_ON,
+            (false, true) => Color32::from_gray(160),
+            (false, false) => Color32::from_gray(110),
+        };
+        let left = rect.center().x - 5.0;
+        let top = rect.center().y - 4.5;
+        for (i, len) in [10.0, 7.0, 4.0].into_iter().enumerate() {
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(left, top + i as f32 * 3.5),
+                egui::vec2(len, 2.0),
+            );
+            ui.painter().rect_filled(bar, 0.5, color);
+        }
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
 /// Append the pin state to a tab's hover text.
 fn pin_hint(body: &str, pinned: bool) -> String {
     if pinned {
@@ -389,52 +440,66 @@ fn tab_button(ui: &mut egui::Ui, label: &str, selected: bool, live: bool) -> egu
     response
 }
 
-/// Boss name, elapsed timer, and the boss's icon beside its HP bar.
+/// One bar holding the boss icon, name and elapsed timer, filled by the boss's
+/// remaining HP. A name too long for one line wraps and the bar grows to fit.
 fn header(ui: &mut egui::Ui, sprites: &mut SpriteRenderer, fight: &LiveFightSnapshot) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(fight.boss_name.clone())
-                .size(12.0)
-                .strong()
-                .color(Color32::from_gray(235)),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(row_text(elapsed(fight.elapsed_ms), Color32::from_gray(170)));
-        });
-    });
-
-    // HP is only drawn once the server has actually reported a pool; a boss we
-    // have never seen a stat for would otherwise render as a full-or-empty bar
-    // that means nothing.
-    if fight.boss_max_hp <= 0 || fight.boss_hp < 0 {
+    const PAD: f32 = 4.0;
+    let width = ui.available_width();
+    let timer = ui.painter().layout_no_wrap(
+        elapsed(fight.elapsed_ms),
+        egui::FontId::monospace(12.0),
+        Color32::from_gray(235),
+    );
+    let name_wrap = (width - PAD * 4.0 - BOSS_ICON - timer.size().x).max(1.0);
+    let name = ui.painter().layout(
+        fight.boss_name.clone(),
+        egui::FontId::proportional(12.0),
+        Color32::from_gray(245),
+        name_wrap,
+    );
+    let height = HEADER_H.max(name.size().y + PAD);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
         return;
     }
-    let fraction = (fight.boss_hp as f32 / fight.boss_max_hp as f32).clamp(0.0, 1.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let (icon, _) =
-            ui.allocate_exact_size(egui::vec2(BOSS_ICON, BOSS_ICON), egui::Sense::hover());
-        sprites.draw_outlined_sprite_in_rect(ui, fight.boss_object_type, icon);
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), BOSS_ICON),
-            egui::Sense::hover(),
-        );
-        let rect = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 6.0));
-        let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, Color32::from_rgb(40, 40, 46));
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, BOSS_HP_TRACK);
+    // Only filled once the server has reported a pool; a boss with no known
+    // stats would otherwise show a full-or-empty bar that means nothing.
+    if fight.boss_max_hp > 0 && fight.boss_hp >= 0 {
+        let fraction = (fight.boss_hp as f32 / fight.boss_max_hp as f32).clamp(0.0, 1.0);
         let mut filled = rect;
         filled.set_width(rect.width() * fraction);
-        painter.rect_filled(filled, 2.0, Color32::from_rgb(180, 70, 70));
-    });
+        painter.rect_filled(filled, 2.0, BOSS_HP_FILL);
+    }
+
+    let icon = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + PAD, rect.center().y - BOSS_ICON * 0.5),
+        egui::vec2(BOSS_ICON, BOSS_ICON),
+    );
+    sprites.draw_outlined_sprite_in_rect(ui, fight.boss_object_type, icon);
+
+    let painter = ui.painter();
+    let timer_pos = egui::pos2(
+        rect.right() - PAD - timer.size().x,
+        rect.center().y - timer.size().y * 0.5,
+    );
+    painter.galley(timer_pos, timer, Color32::from_gray(235));
+    let name_pos = egui::pos2(icon.right() + PAD, rect.center().y - name.size().y * 0.5);
+    painter.galley(name_pos, name, Color32::from_gray(245));
 }
 
-/// One participant row, with a share-of-damage bar painted behind it.
+/// One participant row. With `top` set (the highest damage in the fight), a bar
+/// is painted behind it from the icon to the percentage column, scaled so the
+/// top dealer fills it.
 fn row(
     ui: &mut egui::Ui,
     sprites: &mut SpriteRenderer,
     participant: &FightParticipant,
     rank: usize,
     total: i64,
+    top: Option<i64>,
     class_icons: bool,
     hits: &mut HitRegions,
 ) {
@@ -444,14 +509,13 @@ fn row(
     ui.horizontal(|ui| {
         ui.set_height(ICON);
         let full = ui.available_rect_before_wrap();
-        let mut bar = full;
-        bar.set_width(full.width() * share);
-        ui.painter()
-            .rect_filled(bar, 2.0, SHARE_FILL.gamma_multiply(0.35));
+        // Reserved now so the bar sits beneath the text laid out after it.
+        let bar_slot = ui.painter().add(egui::Shape::Noop);
 
         ui.label(row_text(format!("{rank}."), Color32::from_gray(130)));
 
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::hover());
+        let bar_left = rect.left();
         let (icon_id, tex1, tex2) = icon_for(participant, class_icons);
         if icon_id > 0 {
             sprites.draw_dyed_outlined_character_sprite(
@@ -481,14 +545,38 @@ fn row(
             ui.ctx().copy_text(callout(participant, rank, share));
         }
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(row_text(
-                format!("{:>3.0}%", share * 100.0),
-                Color32::from_gray(150),
-            ));
-            ui.label(row_text(thousands(participant.damage), color));
-        });
+        let pct_left = ui
+            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let pct = ui.label(row_text(
+                    format!("{:>3.0}%", share * 100.0),
+                    Color32::from_gray(150),
+                ));
+                ui.label(row_text(thousands(participant.damage), color));
+                pct.rect.left()
+            })
+            .inner;
+
+        if let Some(top) = top {
+            let span = (pct_left - BAR_GAP - bar_left).max(0.0);
+            let width = span * bar_length(participant.damage, top);
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(bar_left, full.top()),
+                egui::vec2(width, ICON),
+            );
+            ui.painter().set(
+                bar_slot,
+                egui::Shape::rect_filled(bar, 2.0, SHARE_FILL.gamma_multiply(0.6)),
+            );
+        }
     });
+}
+
+/// Bar length relative to the top dealer, in `0.0..=1.0`.
+fn bar_length(damage: i64, top: i64) -> f32 {
+    if top <= 0 {
+        return 0.0;
+    }
+    (damage as f32 / top as f32).clamp(0.0, 1.0)
 }
 
 /// Sprite id and dyes for a row: the bare class sprite when `class_icons` is on,
@@ -558,7 +646,8 @@ fn callout(participant: &FightParticipant, rank: usize, share: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        callout, elapsed, icon_for, is_uncertain, row_color, Arc, LiveCombatOverlay, NORMAL_COLOR,
+        bar_length, callout, elapsed, icon_for, is_uncertain, row_color, Arc, LiveCombatOverlay,
+        NORMAL_COLOR,
     };
     use realmhound_core::combat::{
         DamageProvenance, FightParticipant, LiveFightSnapshot, ParticipantEndStatus,
@@ -632,6 +721,13 @@ mod tests {
         assert_eq!(elapsed(9_000), "0:09");
         assert_eq!(elapsed(83_000), "1:23");
         assert_eq!(elapsed(3_723_000), "1:02:03");
+    }
+
+    #[test]
+    fn bars_are_scaled_against_the_top_dealer() {
+        assert_eq!(bar_length(56_165, 56_165), 1.0);
+        assert!((bar_length(28_000, 56_000) - 0.5).abs() < 1e-6);
+        assert_eq!(bar_length(10, 0), 0.0);
     }
 
     #[test]

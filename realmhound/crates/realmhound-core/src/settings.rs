@@ -226,6 +226,10 @@ pub struct OverlaySettings {
     #[serde(default)]
     pub live_combat_class_icons: bool,
 
+    /// Paint each Live Combat row's damage bar, scaled against the top dealer.
+    #[serde(default = "default_true")]
+    pub live_combat_share_bars: bool,
+
     /// Maximum number of Live Combat rows rendered (0 = unlimited).
     ///
     /// Stored as the raw slider value so the settings UI can bind it directly.
@@ -263,6 +267,7 @@ impl Default for OverlaySettings {
             opacity: default_overlay_opacity(),
             live_combat_follow_me: true,
             live_combat_class_icons: false,
+            live_combat_share_bars: true,
             live_combat_rows: default_live_combat_rows(),
         }
     }
@@ -301,6 +306,7 @@ impl OverlaySettings {
         self.opacity = other.opacity;
         self.live_combat_follow_me = other.live_combat_follow_me;
         self.live_combat_class_icons = other.live_combat_class_icons;
+        self.live_combat_share_bars = other.live_combat_share_bars;
         self.live_combat_rows = other.live_combat_rows;
     }
 }

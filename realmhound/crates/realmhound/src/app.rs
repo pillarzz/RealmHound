@@ -7661,6 +7661,14 @@ impl RealmHoundApp {
                     "Use default class icons (ignore skins and dyes)",
                 )
                 .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_share_bars,
+                    "Show damage bars behind each row",
+                )
+                .changed();
             ui.add_space(6.0);
             ui.label("Teammates shown");
             // Settings saved before the cap may hold a larger value.

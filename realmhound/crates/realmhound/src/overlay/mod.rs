@@ -65,7 +65,7 @@ fn next_generation() -> u64 {
 }
 
 /// Height of the chrome row holding the title and its buttons.
-const TITLE_BAR_H: f32 = 20.0;
+pub(super) const TITLE_BAR_H: f32 = 20.0;
 /// Side of the square bottom-right resize grip.
 const GRIP: f32 = 12.0;
 /// Smallest useful overlay size; below this the rows stop being readable.
@@ -445,6 +445,7 @@ impl OverlayManager {
                 overlay: &mut self.live_combat,
                 fights: live,
                 follow: &mut cfg.live_combat_follow_me,
+                share_bars: &mut cfg.live_combat_share_bars,
                 class_icons: cfg.live_combat_class_icons,
                 tracking_any,
                 max_rows,
@@ -484,6 +485,7 @@ impl OverlayManager {
         if cfg.live_combat != before.live_combat
             || cfg.live_loot != before.live_loot
             || cfg.live_combat_follow_me != before.live_combat_follow_me
+            || cfg.live_combat_share_bars != before.live_combat_share_bars
         {
             if let Ok(mut s) = settings.write() {
                 // Only the state the windows themselves own. Writing the whole
@@ -492,6 +494,7 @@ impl OverlayManager {
                 s.overlays.live_combat = cfg.live_combat.clone();
                 s.overlays.live_loot = cfg.live_loot.clone();
                 s.overlays.live_combat_follow_me = cfg.live_combat_follow_me;
+                s.overlays.live_combat_share_bars = cfg.live_combat_share_bars;
             }
         }
     }
@@ -877,18 +880,30 @@ pub(super) fn overlay_tooltip(ui: &egui::Ui, response: &egui::Response, text: &s
     }
     let window = ui.ctx().content_rect();
     let width = (window.width() - TOOLTIP_MARGIN * 2.0).max(MIN_W * 0.5);
-    let anchor = egui::pos2(
-        window.left() + TOOLTIP_MARGIN,
-        response.rect.bottom() + TOOLTIP_MARGIN,
-    );
+    // egui still hit-tests widgets in a non-interactable area, so a tooltip
+    // pushed back over its widget steals the hover. Open on the roomier side.
+    let room_below = window.bottom() - response.rect.bottom();
+    let room_above = response.rect.top() - window.top();
+    let (anchor, pivot) = if room_below >= room_above {
+        (
+            egui::pos2(window.left() + TOOLTIP_MARGIN, response.rect.bottom() + TOOLTIP_MARGIN),
+            egui::Align2::LEFT_TOP,
+        )
+    } else {
+        (
+            egui::pos2(window.left() + TOOLTIP_MARGIN, response.rect.top() - TOOLTIP_MARGIN),
+            egui::Align2::LEFT_BOTTOM,
+        )
+    };
     egui::Area::new(response.id.with("overlay_tooltip"))
         .order(egui::Order::Tooltip)
+        .pivot(pivot)
         .fixed_pos(anchor)
         .interactable(false)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_max_width(width);
-                ui.label(RichText::new(text).size(11.0));
+                ui.add(egui::Label::new(RichText::new(text).size(11.0)).selectable(false));
             });
         });
 }

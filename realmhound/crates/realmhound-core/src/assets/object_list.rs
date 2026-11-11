@@ -637,6 +637,16 @@ pub struct TrapEffect {
     pub stat_mod_scaling_min: f32,
     pub stat_mod_trap_damage: f32,
     pub stat_mod_bomb_damage: f32,
+    /// Delay from activation to the trap being placed (`throwTime`).
+    pub throw_time_s: f32,
+    /// How long the placed trap can remain active (`duration`).
+    pub duration_s: f32,
+    /// Delay after a trigger before the bomb lands (`bombDelay`).
+    pub bomb_delay_s: f32,
+    /// How many bomb pulses a trigger can produce (`bombTriggerCount`).
+    pub bomb_trigger_count: i32,
+    /// Spacing between bomb pulses (`bombTriggerPeriod`).
+    pub bomb_trigger_period_s: f32,
 }
 
 impl TrapEffect {
@@ -652,6 +662,19 @@ impl TrapEffect {
         (self.bomb_damage + self.stat_mod_bomb_damage * self.sb(s))
             .round()
             .max(0.0) as i32
+    }
+
+    /// How long after activation the trap's last server-applied damage packet
+    /// can arrive. The trap is thrown after `throwTime`, remains placed for
+    /// `duration`, and its bomb lands `bombDelay` after a trigger; additional
+    /// bomb pulses are spaced by `bombTriggerPeriod`.
+    pub fn server_applied_window_ms(&self) -> i64 {
+        let pulses = self.bomb_trigger_count.max(1) as f32 - 1.0;
+        let span = self.throw_time_s.max(0.0)
+            + self.duration_s.max(0.0)
+            + self.bomb_delay_s.max(0.0)
+            + (pulses * self.bomb_trigger_period_s.max(0.0));
+        (span * 1000.0).round().max(0.0) as i64
     }
 }
 
@@ -1113,11 +1136,19 @@ impl AbilityEffects {
 
         let mut window: Option<i64> = None;
         for effect in &self.effects {
-            let AbilityEffect::DamageNova(nova) = effect else {
-                continue;
+            let span = match effect {
+                AbilityEffect::DamageNova(nova) => {
+                    (nova.activation_count.max(1.0) * nova.time.max(0.0) * 1000.0) as i64
+                }
+                // A trap's damage is owner-credited packet damage too: the
+                // placed trap explodes when an enemy steps on it and its bomb
+                // lands later, both as bulletless `DamagePacket`s.
+                AbilityEffect::Trap(trap) => trap.server_applied_window_ms(),
+                _ => 0,
             };
-            let span = (nova.activation_count.max(1.0) * nova.time.max(0.0) * 1000.0) as i64;
-            window = Some(window.unwrap_or(0).max(span));
+            if span > 0 {
+                window = Some(window.unwrap_or(0).max(span));
+            }
         }
         for grenade in &self.poison_grenades {
             let span = (grenade.duration_s.max(0.0) * 1000.0) as i64;
@@ -3936,6 +3967,11 @@ fn parse_trap(m: &HashMap<String, String>) -> TrapEffect {
         stat_mod_scaling_min: af(m, "statModScalingMin", 0.0),
         stat_mod_trap_damage: af(m, "statModTrapDamage", 0.0),
         stat_mod_bomb_damage: af(m, "statModBombDamage", 0.0),
+        throw_time_s: af(m, "throwTime", 0.0),
+        duration_s: af(m, "duration", 0.0),
+        bomb_delay_s: af(m, "bombDelay", 0.0),
+        bomb_trigger_count: af(m, "bombTriggerCount", 1.0).round().max(1.0) as i32,
+        bomb_trigger_period_s: af(m, "bombTriggerPeriod", 0.0),
     }
 }
 
@@ -4988,6 +5024,53 @@ mod tests {
         assert!((det.radius_for(1000) - 8.5).abs() < 1e-4);
         // Below the scaling floor, no negative bonus.
         assert_eq!(det.damage_for(100, 10), 50);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn depthchaser_trap_declares_its_server_applied_window() {
+        // Trap damage arrives as owner-credited DamagePackets (bulletId 0),
+        // after the throw delay, at trigger time and again when the delayed bomb
+        // lands. Without a declared window those packets stay in packet_damage
+        // and the ability row reads zero.
+        let mut list = ObjectList::new();
+        let xml = r#"<Objects>
+  <Object type="0x205e" id="Depthchaser Trap">
+    <Class>Equipment</Class>
+    <SlotType>20</SlotType>
+    <Activate radius="5.0" totalDamage="525" scalingStat="WIS" statModScalingMin="34"
+              statModTrapDamage="5" throwTime="0.6" duration="8" bombDelay="0.8"
+              bombDamage="815" bombCount="1" bombTriggerCount="1" bombTriggerPeriod="2.0"
+              statModBombDamage="5">Trap</Activate>
+  </Object>
+</Objects>"#;
+        let dir = std::env::temp_dir().join(format!("rh_trap_window_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("equip.xml");
+        std::fs::write(&path, xml).unwrap();
+        list.objects
+            .insert(0x205e, weapon_shell(0x205e, "Depthchaser Trap"));
+        list.merge_equipment_xml(&path).unwrap();
+
+        let eff = list.ability_effects(0x205e).expect("trap parsed");
+        let trap = eff
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                AbilityEffect::Trap(t) => Some(*t),
+                _ => None,
+            })
+            .expect("Trap effect");
+        assert_eq!(trap.throw_time_s, 0.6);
+        assert_eq!(trap.duration_s, 8.0);
+        assert_eq!(trap.bomb_delay_s, 0.8);
+        assert_eq!(trap.bomb_trigger_count, 1);
+        // throw 0.6 + lifetime 8.0 + bomb delay 0.8 = 9.4s, plus the 0.6s grace
+        // shared by every server-applied ability.
+        assert_eq!(eff.server_applied_damage_window_ms(), Some(10_000));
+        assert_eq!(trap.trap_damage_for(100), 855);
+        assert_eq!(trap.bomb_damage_for(100), 1145);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

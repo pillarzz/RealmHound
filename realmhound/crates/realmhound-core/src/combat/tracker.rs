@@ -10526,6 +10526,58 @@ mod tests {
     }
 
     #[test]
+    fn trap_packet_damage_is_credited_to_the_trap_activation() {
+        // Trap damage is owner-credited DamagePacket (bulletId 0), not a shot.
+        // Once the trap declares a server-applied window, both the trigger hit
+        // and the delayed bomb belong to the activation instead of staying in
+        // packet_damage.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![name_stat("You"), stat(StatType::Inventory1, 0x205e)],
+            ),
+            10,
+        );
+        // The activation and the window its item declares (Depthchaser Trap:
+        // throw 0.6s + lifetime 8s + bomb 0.8s + grace).
+        t.local_ability_uses.push_back(LocalAbilityUse {
+            time_ms: 100,
+            item_id: 0x205e,
+            enchants: Vec::new(),
+            server_effect_window_ms: Some(10_000),
+            form_skin: None,
+        });
+        // Trigger hit, then the delayed bomb.
+        t.on_damage(500, 1000, 700, 1_000);
+        t.on_damage(500, 1000, 900, 1_500);
+
+        let acts = t.ability_activations_for(0, 2_000, FightDestination::Boss(500));
+        assert_eq!(acts.len(), 1);
+        assert_eq!((acts[0].damage, acts[0].hits), (1_600, 2));
+        // The packets are still the fight's packet-borne figure; crediting them
+        // to the activation must not remove or duplicate them.
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!((p.packet_damage, p.packet_hits), (1_600, 2));
+    }
+
+    #[test]
     fn ability_activations_ignore_packets_that_belong_to_another_fight() {
         // Two bosses were damaged inside one activation window. The packet log is
         // session-wide, so without a destination filter each fight's activation

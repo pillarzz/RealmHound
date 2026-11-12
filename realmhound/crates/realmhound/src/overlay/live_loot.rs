@@ -204,6 +204,7 @@ impl LiveLootOverlay {
                         &drop.record,
                         sprites,
                         SOURCE_ICON,
+                        ROW_ICON,
                         |ui, sprites| {
                             for item in &drop.record.items {
                                 // The full item breakdown dwarfs the overlay and

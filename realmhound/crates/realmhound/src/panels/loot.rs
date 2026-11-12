@@ -1507,20 +1507,36 @@ impl LootPanel {
         drop: &LootDropRecord,
         sprite_renderer: &mut SpriteRenderer,
         size: f32,
+        row_height: f32,
         items: impl FnOnce(&mut egui::Ui, &mut SpriteRenderer),
     ) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let bag_type = LootBagType::from_id(drop.bag_type);
-            Self::render_bag_icon_by_id(ui, drop.bag_type, bag_type, sprite_renderer, size);
-            Self::render_dungeon_sprite_impl(ui, &drop.dungeon, sprite_renderer, false, size);
-            Self::render_mob_sprite_impl(
-                ui,
-                drop.display_object_type,
-                &drop.mob_name,
-                sprite_renderer,
-                false,
-                size,
+            let spacing = ui.spacing().item_spacing.x;
+            let band = egui::vec2(size * 3.0 + spacing * 2.0, row_height.max(size));
+            ui.allocate_ui_with_layout(
+                band,
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_height(band.y);
+                    let bag_type = LootBagType::from_id(drop.bag_type);
+                    Self::render_bag_icon_by_id(ui, drop.bag_type, bag_type, sprite_renderer, size);
+                    Self::render_dungeon_sprite_impl(
+                        ui,
+                        &drop.dungeon,
+                        sprite_renderer,
+                        false,
+                        size,
+                    );
+                    Self::render_mob_sprite_impl(
+                        ui,
+                        drop.display_object_type,
+                        &drop.mob_name,
+                        sprite_renderer,
+                        false,
+                        size,
+                    );
+                },
             );
             items(ui, sprite_renderer);
         });

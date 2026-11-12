@@ -3901,20 +3901,7 @@ impl SpriteRenderer {
         enchant_ids: &[i32],
         size: f32,
     ) -> egui::Response {
-        let display_name = match raw_name {
-            // Re-resolve if name is unknown or is an unresolved localization key like {textiles.X}
-            Some(name)
-                if !name.starts_with("Unknown (")
-                    && !(name.starts_with('{') && name.ends_with('}')) =>
-            {
-                name.to_string()
-            }
-            _ => self.item_name(item_id).unwrap_or_else(|| {
-                raw_name
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| format!("Item 0x{:04X}", item_id))
-            }),
-        };
+        let display_name = self.tile_display_name(item_id, raw_name);
         let (item_name, stack_count) = Self::extract_stack_from_name(&display_name);
         let is_shiny = self.is_shiny(item_id);
 
@@ -3927,6 +3914,55 @@ impl SpriteRenderer {
             size,
             stack_count,
         )
+    }
+
+    /// [`Self::render_item_tile_sized`] without the detailed hover tooltip, for
+    /// callers that show their own. Returns the tile's response and item name.
+    pub fn render_item_tile_plain(
+        &mut self,
+        ui: &mut egui::Ui,
+        item_id: i32,
+        raw_name: Option<&str>,
+        enchant_ids: &[i32],
+        size: f32,
+    ) -> (egui::Response, String) {
+        let display_name = self.tile_display_name(item_id, raw_name);
+        let (item_name, stack_count) = Self::extract_stack_from_name(&display_name);
+        let is_shiny = self.is_shiny(item_id);
+        let slot_id = ui.next_auto_id();
+        let response = ui
+            .push_id(slot_id, |ui| {
+                self.render_item_slot_inner_no_tooltip(
+                    ui,
+                    item_id,
+                    &item_name,
+                    enchant_ids,
+                    is_shiny,
+                    size,
+                    stack_count,
+                    egui::Sense::hover(),
+                )
+            })
+            .inner;
+        (response, item_name)
+    }
+
+    /// `raw_name` unless it is missing or unresolved, else the asset name.
+    fn tile_display_name(&self, item_id: i32, raw_name: Option<&str>) -> String {
+        match raw_name {
+            // Re-resolve if name is unknown or is an unresolved localization key like {textiles.X}
+            Some(name)
+                if !name.starts_with("Unknown (")
+                    && !(name.starts_with('{') && name.ends_with('}')) =>
+            {
+                name.to_string()
+            }
+            _ => self.item_name(item_id).unwrap_or_else(|| {
+                raw_name
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| format!("Item 0x{:04X}", item_id))
+            }),
+        }
     }
 
     /// Flexible item tile renderer: `highlight` paints the bright-yellow search

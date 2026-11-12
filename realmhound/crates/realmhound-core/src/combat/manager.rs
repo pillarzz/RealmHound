@@ -6,7 +6,7 @@
 
 use super::database::CombatDatabase;
 use super::tracker::{is_groupable_dungeon, normalize_dungeon, CombatTracker};
-use super::types::{CompletedFight, FightSelection};
+use super::types::{CompletedFight, FightParticipant, FightSelection, LiveFightSnapshot};
 use crate::assets::boss_group;
 use crate::protocol::data::ObjectStatusData;
 use crate::settings::CombatHistorySettings;
@@ -264,18 +264,45 @@ impl CombatManager {
     /// with a curated boss group is gated by that group's toggle. Fights that map
     /// to no group are always recorded.
     fn should_record(&self, fight: &CompletedFight) -> bool {
+        self.tracks_fight(
+            &fight.dungeon,
+            fight.boss_object_type,
+            &fight.boss_name,
+            &fight.participants,
+        )
+    }
+
+    fn tracks_fight(
+        &self,
+        dungeon: &str,
+        boss_object_type: i32,
+        boss_name: &str,
+        participants: &[FightParticipant],
+    ) -> bool {
         let s = &self.history_settings;
-        let has_others = fight
-            .participants
+        let has_others = participants
             .iter()
             .any(|p| !p.is_local && !p.name.trim().is_empty());
         if !has_others && !s.track_solo {
             return false;
         }
-        match boss_group(&fight.dungeon, fight.boss_object_type, &fight.boss_name) {
+        match boss_group(dungeon, boss_object_type, boss_name) {
             Some(group) => s.tracks(group),
             None => true,
         }
+    }
+
+    /// The Live Combat overlay's fights: only those Combat History would record
+    /// under the current settings.
+    pub fn live_snapshots(&self, now_ms: i64) -> Vec<std::sync::Arc<LiveFightSnapshot>> {
+        self.tracker.live_snapshots_where(now_ms, |fight| {
+            self.tracks_fight(
+                &fight.dungeon,
+                fight.boss_object_type,
+                &fight.boss_name,
+                &fight.participants,
+            )
+        })
     }
 
     // --- Event hooks (mirrors the loot tracker call sites in the processor) ---
@@ -924,6 +951,28 @@ mod tests {
         assert!(!m.should_record(&fight("Undead Lair", "Septavius", false)));
         // Exaltation stays enabled.
         assert!(m.should_record(&fight("The Shatters", "The Forgotten King", false)));
+    }
+
+    #[test]
+    fn the_live_overlay_follows_the_recording_settings() {
+        let mut m = CombatManager::new();
+        let mut s = CombatHistorySettings::default();
+        s.track_adept = false;
+        m.set_history_settings(s);
+        let lair = fight("Undead Lair", "Septavius", false);
+        assert!(!m.tracks_fight(
+            &lair.dungeon,
+            lair.boss_object_type,
+            &lair.boss_name,
+            &lair.participants
+        ));
+        let shatters = fight("The Shatters", "The Forgotten King", false);
+        assert!(m.tracks_fight(
+            &shatters.dungeon,
+            shatters.boss_object_type,
+            &shatters.boss_name,
+            &shatters.participants
+        ));
     }
 
     #[test]

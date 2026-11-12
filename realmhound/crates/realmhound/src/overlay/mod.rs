@@ -886,12 +886,18 @@ pub(super) fn overlay_tooltip(ui: &egui::Ui, response: &egui::Response, text: &s
     let room_above = response.rect.top() - window.top();
     let (anchor, pivot) = if room_below >= room_above {
         (
-            egui::pos2(window.left() + TOOLTIP_MARGIN, response.rect.bottom() + TOOLTIP_MARGIN),
+            egui::pos2(
+                window.left() + TOOLTIP_MARGIN,
+                response.rect.bottom() + TOOLTIP_MARGIN,
+            ),
             egui::Align2::LEFT_TOP,
         )
     } else {
         (
-            egui::pos2(window.left() + TOOLTIP_MARGIN, response.rect.top() - TOOLTIP_MARGIN),
+            egui::pos2(
+                window.left() + TOOLTIP_MARGIN,
+                response.rect.top() - TOOLTIP_MARGIN,
+            ),
             egui::Align2::LEFT_BOTTOM,
         )
     };

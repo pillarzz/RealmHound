@@ -507,11 +507,9 @@ fn header(
     let width = ui.available_width();
     let name_offset = columns.icon_left(ui).max(PAD * 2.0 + BOSS_ICON);
     let timer_offset = inset.max(PAD);
-    let timer = ui.painter().layout_no_wrap(
-        elapsed(fight.elapsed_ms),
-        ROW_FONT,
-        Color32::from_gray(235),
-    );
+    let timer =
+        ui.painter()
+            .layout_no_wrap(elapsed(fight.elapsed_ms), ROW_FONT, Color32::from_gray(235));
     let name_wrap = (width - name_offset - PAD - timer_offset - timer.size().x).max(1.0);
     let name = ui.painter().layout(
         fight.boss_name.clone(),
@@ -670,9 +668,7 @@ fn row(
 
 /// A fixed-width cell with `text` right-aligned in it, in the row font.
 fn right_aligned_text(ui: &mut egui::Ui, width: f32, text: String, color: Color32) -> egui::Rect {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text, ROW_FONT, color);
+    let galley = ui.painter().layout_no_wrap(text, ROW_FONT, color);
     let width = width.max(galley.size().x);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ICON), egui::Sense::hover());
     let pos = egui::pos2(

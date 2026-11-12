@@ -6573,25 +6573,37 @@ fn unify_phase_end_statuses(
 /// Bee Nest / Red Beehemoth add phase -- leaves the main boss's range
 /// with no gravestone correlated to the boss fight, so the boss phase records
 /// them as `Nexused`. Their death IS captured on the concurrent aux phase, so
-/// once a `Died` is seen on any aux phase we mark that player `Died` on every
-/// phase they appear in (death is terminal within a run).
+/// once a `Died` is seen on an aux phase we mark that player `Died` on every
+/// phase that overlaps that aux phase in wall-clock.
 ///
-/// Scope is deliberately aux-*sourced* only: a death at a sequential real boss
-/// (e.g. Oryx fought after a completed Chancellor Dammah miniboss) must never
-/// bleed backward into the earlier boss the player actually cleared alive.
+/// Scope is deliberately aux-*sourced* and wall-clock-scoped: a death at a
+/// sequential real boss (e.g. Oryx fought after a completed Treasurer Gemsbok
+/// or Chancellor Dammah) must never bleed backward into an earlier boss the
+/// player actually cleared alive, even when the death was first seen on an
+/// add-on phase belonging to that later fight.
 fn propagate_aux_deaths(phases: &mut [FightRecord]) {
     use std::collections::HashMap;
-    let mut deaths: HashMap<(bool, i32, String), ParticipantEndStatus> = HashMap::new();
+    const OVERLAP_GRACE_MS: i64 = 1_000;
+
+    // Keep the aux phase's active window with each death: a later aux phase must
+    // not rewrite the status of an earlier sequential boss that never overlapped
+    // it.
+    let mut deaths: HashMap<(bool, i32, String), Vec<(ParticipantEndStatus, i64, i64)>> =
+        HashMap::new();
     for phase in phases.iter() {
         if crate::assets::aux_target_for_type(phase.boss_object_type).is_none() {
             continue;
         }
         for p in &phase.participants {
             if matches!(p.end_status, ParticipantEndStatus::Died { .. }) {
-                deaths
-                    .entry(participant_key(p))
-                    .and_modify(|s| *s = combine_end_status(*s, p.end_status))
-                    .or_insert(p.end_status);
+                let entries = deaths.entry(participant_key(p)).or_default();
+                if let Some(existing) = entries.iter_mut().find(|(_, started, ended)| {
+                    *started == phase.started_at && *ended == phase.ended_at
+                }) {
+                    existing.0 = combine_end_status(existing.0, p.end_status);
+                } else {
+                    entries.push((p.end_status, phase.started_at, phase.ended_at));
+                }
             }
         }
     }
@@ -6603,8 +6615,15 @@ fn propagate_aux_deaths(phases: &mut [FightRecord]) {
             if matches!(p.end_status, ParticipantEndStatus::Died { .. }) {
                 continue;
             }
-            if let Some(status) = deaths.get(&participant_key(p)).copied() {
-                p.end_status = status;
+            let Some(entries) = deaths.get(&participant_key(p)) else {
+                continue;
+            };
+            for &(status, aux_started, aux_ended) in entries {
+                if phase.started_at <= aux_ended + OVERLAP_GRACE_MS
+                    && phase.ended_at >= aux_started - OVERLAP_GRACE_MS
+                {
+                    p.end_status = combine_end_status(p.end_status, status);
+                }
             }
         }
     }
@@ -12830,6 +12849,93 @@ mod tests {
             carol_r.end_status,
             ParticipantEndStatus::Died { .. }
         ));
+    }
+
+    #[test]
+    fn later_addon_death_does_not_bleed_into_earlier_boss_245() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Treasurer Gemsbok is completed alive, then the run moves on to Oryx.
+        // Carol later dies while the O3 Messengers add-on is up. The Messengers
+        // death may propagate to the concurrent Oryx phase, but it must not
+        // rewrite the already-finished Gemsbok phase: that boss was cleared while
+        // Carol was present.
+        let mut gemsbok = o3_fight(
+            8700,
+            "Treasurer Gemsbok",
+            1_000,
+            true,
+            vec![
+                o3_participant(700, "Bob", false, ParticipantEndStatus::Present),
+                o3_participant(701, "Carol", false, ParticipantEndStatus::Present),
+            ],
+        );
+        gemsbok.ended_at = 5_000;
+        db.insert_fight(&gemsbok).unwrap();
+
+        db.insert_fight(&o3_fight(
+            45363,
+            "Oryx the Mad God",
+            10_000,
+            true,
+            vec![
+                o3_participant(700, "Bob", false, ParticipantEndStatus::Present),
+                o3_participant(701, "Carol", false, ParticipantEndStatus::Nexused),
+            ],
+        ))
+        .unwrap();
+        db.insert_fight(&o3_fight(
+            45365,
+            "Messengers",
+            10_000,
+            false,
+            vec![
+                o3_participant(700, "Bob", false, ParticipantEndStatus::Present),
+                o3_participant(
+                    701,
+                    "Carol",
+                    false,
+                    ParticipantEndStatus::Died { grave_type: 1830 },
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let enc = db.encounter_detail("run-o3").unwrap().unwrap();
+        let gemsbok = enc
+            .phases
+            .iter()
+            .find(|p| p.boss_object_type == 8700)
+            .expect("gemsbok phase");
+        let carol = gemsbok
+            .participants
+            .iter()
+            .find(|p| p.name == "Carol")
+            .unwrap();
+        assert!(
+            matches!(carol.end_status, ParticipantEndStatus::Present),
+            "Gemsbok was cleared alive; a later O3 add-on death must not bleed back, got {:?}",
+            carol.end_status,
+        );
+
+        // The concurrent Oryx phase still inherits the death.
+        let oryx = enc
+            .phases
+            .iter()
+            .find(|p| p.boss_object_type == 45363)
+            .expect("oryx phase");
+        let carol = oryx
+            .participants
+            .iter()
+            .find(|p| p.name == "Carol")
+            .unwrap();
+        assert!(
+            matches!(
+                carol.end_status,
+                ParticipantEndStatus::Died { grave_type: 1830 }
+            ),
+            "Oryx overlaps the add-on and must inherit the death, got {:?}",
+            carol.end_status,
+        );
     }
 
     #[test]

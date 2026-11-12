@@ -6,7 +6,7 @@
 use eframe::egui::{self, Color32, RichText};
 use realmhound_core::assets::{get_asset_manager, ScalingStat};
 use realmhound_core::stats::derived::{
-    self, AbilityReadout, AbilitySegment, Attribute, BaseStats, DerivedStats, Loadout,
+    self, AbilityLine, AbilityReadout, AbilitySegment, Attribute, BaseStats, DerivedStats, Loadout,
     PetAbilityContribution, Provenance, WeaponDamage,
 };
 use realmhound_core::vault::{CachedCharacter, CharacterCache, CharacterItem};
@@ -409,8 +409,20 @@ fn ability_damage_row(
     scaled: &[(ScalingStat, i32)],
     note: &str,
 ) -> egui::Response {
+    ability_damage_row_named(ui, "Avg dmg/use:", total, scaled, note)
+}
+
+/// Same row with a caller-chosen label, used to show a meter-gated item's
+/// charging-mode and transformed-mode damage separately.
+fn ability_damage_row_named(
+    ui: &mut egui::Ui,
+    label: &str,
+    total: i32,
+    scaled: &[(ScalingStat, i32)],
+    note: &str,
+) -> egui::Response {
     let inner = ui.horizontal(|ui| {
-        ui.label(RichText::new("Avg dmg/use:").color(LABEL_COLOR));
+        ui.label(RichText::new(label).color(LABEL_COLOR));
         ui.add_space(8.0);
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.label(
@@ -429,8 +441,29 @@ fn ability_damage_row(
             ui.label(RichText::new(format!("  {}", note)).color(NOTE_COLOR));
         }
     });
-    let id = ui.make_persistent_id(("ability_dmg_row", note));
+    let id = ui.make_persistent_id(("ability_dmg_row", label, note));
     ui.interact(inner.response.rect, id, egui::Sense::hover())
+}
+
+/// Hover breakdown for the transformed row: the form's own volleys (e.g. the
+/// 2x DEX forward shots and 4x ATT around shots for Swarmlord's Sigil).
+fn ability_transformed_hover(ui: &mut egui::Ui, ab: &AbilityReadout) {
+    if ab.transformed_lines.is_empty() {
+        ui.label(
+            RichText::new("No transformed volley breakdown is available.")
+                .color(NOTE_COLOR)
+                .size(11.0),
+        );
+        return;
+    }
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(2)
+        .spacing([12.0, 3.0])
+        .show(ui, |ui| {
+            for line in &ab.transformed_lines {
+                label_row_segments(ui, &line.label, &line.segments);
+            }
+        });
 }
 
 /// Detailed damage breakdown (scales-off + each damage line) for the summary's
@@ -1392,7 +1425,13 @@ pub fn render_readout(
             } else {
                 ""
             };
-            let r1 = ability_damage_row(ui, dmg.total, &dmg.scaled, multi_note);
+            let charging_label = if ab.transformed_damage_per_use.is_some() {
+                "Avg dmg/use (charging):"
+            } else {
+                "Avg dmg/use:"
+            };
+            let r1 =
+                ability_damage_row_named(ui, charging_label, dmg.total, &dmg.scaled, multi_note);
             if hover_breakdown {
                 r1.on_hover_ui(|ui| ability_breakdown_hover(ui, ab));
             }
@@ -1404,9 +1443,22 @@ pub fn render_readout(
                 }
             }
         }
+        if let Some(dmg) = &ab.transformed_damage_per_use {
+            let r = ability_damage_row_named(
+                ui,
+                "Avg dmg/use (transformed):",
+                dmg.total,
+                &dmg.scaled,
+                "",
+            );
+            if hover_breakdown {
+                r.on_hover_ui(|ui| ability_transformed_hover(ui, ab));
+            }
+        }
         // Hex-blast damage is folded into the max-potential estimate above (it
         // needs weapon-built stacks); the per-stack detail, formula, and note
         // live in the summary's hover tooltip.
+        let mut buffs_line: Option<&AbilityLine> = None;
         egui::Grid::new(ui.next_auto_id())
             .num_columns(2)
             .spacing([12.0, 3.0])
@@ -1419,9 +1471,25 @@ pub fn render_readout(
                     if ab.damage_per_use.is_some() && line.is_damage {
                         continue;
                     }
+                    // The buffs line is rendered on its own, without the grid's
+                    // label column gap.
+                    if line.label == "Buffs" {
+                        buffs_line = Some(line);
+                        continue;
+                    }
                     label_row_segments(ui, &line.label, &line.segments);
                 }
             });
+        if let Some(line) = buffs_line {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(RichText::new("Buffs: ").color(LABEL_COLOR));
+                for seg in &line.segments {
+                    let color = seg.stat.map(stat_color).unwrap_or(VALUE_COLOR);
+                    ui.label(RichText::new(&seg.text).color(color).strong());
+                }
+            });
+        }
         // The hex-stacking note lives in the summary hover; only show it inline
         // as a fallback when there is no damage tooltip to hold it.
         if has_hex_blast && !dmg_has_hover {

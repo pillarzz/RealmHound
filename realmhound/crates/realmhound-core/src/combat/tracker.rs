@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
-use crate::api::character::parse_enchant_ids;
+use crate::api::character::{parse_enchant_ids, parse_enchant_slots};
 use crate::assets::get_asset_manager;
 use crate::assets::LethalStrikeParams;
 use crate::assets::SummonTrigger;
@@ -53,6 +53,12 @@ const BOSS_RESUME_WINDOW_MS: i64 = 180_000;
 /// Duration of the rogue Lethal Strike buff after exiting sneak (equip.xml
 /// `duration="2.4"`), during which shots get the LS bonus + 2 side procs.
 const LETHAL_STRIKE_WINDOW_MS: i64 = 2_400;
+/// How recently the Lethal Strike cloak must have been activated for an
+/// on-shoot Lethal Strike to apply. The server does not send the cloak's
+/// Stasis Immune bit to the owner, so a recent activation is the observable
+/// signal that the key is held; every cloak shot and its bubble stream lands
+/// within this window.
+const ON_SHOOT_LS_WINDOW_MS: i64 = 1_500;
 /// The shot that cancels sneak (and thus opens the window) can be sent just
 /// before the Invisible-off stat update is observed. Back-date the window start
 /// by this guard so that boundary shot is still credited.
@@ -106,6 +112,10 @@ const COND_INVISIBLE: i32 = 0x0000_1000;
 /// Primary condition bit (id 29) for Invulnerable: the target takes no damage,
 /// so no Lethal Strike bonus is attributed either.
 const COND_INVULNERABLE: i32 = 0x0100_0000;
+/// Primary condition bit (id 29) for Stasis Immune. Cloak of the Deep's
+/// on-shoot Lethal Strike only applies while this is held.
+#[cfg(test)]
+const COND_STASIS_IMMUNE: i32 = 0x0040_0000;
 /// Primary condition bits surfaced in the local player's boost log. Only bits
 /// whose meaning is known here are named; any other bit change is ignored rather
 /// than shown as a raw mask.
@@ -256,14 +266,21 @@ const SENTINEL_ATTACKER_ID: i32 = 0x00FF_FFFF;
 /// Max fights kept in memory for later UI consumption.
 const MAX_RECENT_FIGHTS: usize = 200;
 
-/// Death/nexus detection. A departed participant is marked dead when
-/// a gravestone spawned within this many tiles of their last-seen position.
+/// Death/nexus detection. After a PlayerDeath notification confirms a death,
+/// a nearby gravestone supplies the missing grave type when the announcement
+/// carried none. Proximity alone does not prove a death.
 const GRAVE_MATCH_RADIUS: f32 = 3.0;
-/// ...and within this time window of their removal (covers a grave that arrives
-/// slightly before or after the removal packet in the same/adjacent tick). Also
-/// used by the combat-history database when applying a stored death broadcast to
-/// a fight that was already written.
+/// The window around a departure in which a grave may supply that missing type
+/// (covers a grave that arrives slightly before or after the removal packet in
+/// the same/adjacent tick). Also used by the combat-history database when
+/// applying a stored death notification to a fight that was already written.
 pub(crate) const GRAVE_MATCH_WINDOW_MS: i64 = 15_000;
+/// How far outside a fight's span a death event may still belong to it. This is
+/// deliberately much tighter than the grave-correlation window: a death at the
+/// next sequential boss must not mark the previous, already-finished fight.
+/// The small tail covers a PlayerDeath notification that arrives a packet or
+/// two after the boss-death event that finalized the fight.
+pub(crate) const DEATH_MATCH_GRACE_MS: i64 = 1_000;
 /// A departure only counts for a fight if it happened no earlier than this before
 /// the fight's start (guards against correlating a much older, unrelated exit).
 const DEPARTURE_GRACE_MS: i64 = 5_000;
@@ -293,6 +310,16 @@ struct Departure {
     time: i64,
 }
 
+/// An authoritative remote death observed from a `PlayerDeath` notification.
+#[derive(Debug, Clone, Copy)]
+struct RemoteDeath {
+    /// When the notification was received (unix ms).
+    time: i64,
+    /// Gravestone object type carried by the notification's `picture_type`.
+    /// 0 when a legacy/text fallback supplied no type.
+    grave_type: i32,
+}
+
 /// A server death broadcast observed for another player, handed to the caller to
 /// persist so a death announced after its fight was written can still be applied.
 #[derive(Debug, Clone)]
@@ -301,6 +328,9 @@ pub struct DeathBroadcast {
     pub player: String,
     /// Who killed them (best-effort context from the broadcast).
     pub killer: String,
+    /// Gravestone object type carried by the death notification, or 0 when the
+    /// announcement carried no type.
+    pub grave_type: i32,
     /// When the broadcast was received (unix ms).
     pub time: i64,
 }
@@ -394,6 +424,11 @@ struct TrackedObject {
     /// Per-slot enchant ids (weapon, ability, armor, ring) decoded from the
     /// `UniqueDataString` stat; empty when none/unknown.
     equipment_enchants: [Vec<u16>; 4],
+    /// Live meter value of the ability-slot item (druid sigils), decoded from
+    /// the same `UniqueDataString` stat. `ability_meter_seen` distinguishes a
+    /// real 0 from "this item has no meter / the stat has not arrived".
+    ability_meter: i32,
+    ability_meter_seen: bool,
     /// Attack stat (id 20); relevant for the local player's damage multiplier.
     attack: i32,
     /// AttackBoost stat (id 48). Not part of the damage math (stat 20 already
@@ -473,6 +508,8 @@ impl Default for TrackedObject {
             tex2: 0,
             equipment: [-1; 4],
             equipment_enchants: Default::default(),
+            ability_meter: 0,
+            ability_meter_seen: false,
             attack: 0,
             attack_boost: 0,
             defense: 0,
@@ -815,6 +852,35 @@ struct LocalAbilityUse {
     /// activation time. `None` when the item declares no such effect, i.e. when a
     /// bulletless packet could not have come from it.
     server_effect_window_ms: Option<i64>,
+    /// Animal form the activation was fired in (`SelfTransform` skin), or
+    /// `None` for the normal ability. Captured at activation time so a volley
+    /// that lands after the form ends stays attributed to the mode it was fired
+    /// in.
+    form_skin: Option<i32>,
+}
+
+/// Live meter and animal-form state of the local player's meter-gated ability
+/// item (a druid sigil). The meter itself is authoritative on the wire (stat
+/// 80's ability-slot segment); the form is identified by the switch ability's
+/// `SelfTransform` skin, and timed by its declared duration.
+#[derive(Debug, Clone)]
+struct SigilState {
+    item_id: i32,
+    max_value: i32,
+    value: i32,
+    /// Last activation of the item (normal ability or switch).
+    last_use_ms: i64,
+    /// The active animal form, if the switch is currently up.
+    form: Option<SigilForm>,
+}
+
+/// One animal-form window opened by a sigil switch.
+#[derive(Debug, Clone)]
+struct SigilForm {
+    skin: i32,
+    ends_ms: i64,
+    /// Whether the animal-form ability was used before the form ended.
+    animal_ability_used: bool,
 }
 
 /// One item in the local player's loadout that declares a summon of the creature
@@ -1427,6 +1493,10 @@ pub struct CombatTracker {
     /// on map change. A local weapon shot fired within a window gets the LS
     /// bonus + 2 side procs attributed at hit time.
     lethal_strike_windows: VecDeque<(i64, i64)>,
+    /// Live meter and animal-form state for the local player's meter-gated
+    /// ability item (a druid sigil). Cleared when the item leaves the slot, on
+    /// map change and on disconnect.
+    sigil_state: Option<SigilState>,
     /// Summon entity id -> its summoner (owning player) id, learned from
     /// `ServerPlayerShoot`. Covers both local and remote summons; used to
     /// redirect remote summon `DamagePacket`s to the owning player.
@@ -1444,6 +1514,10 @@ pub struct CombatTracker {
     /// packet. Kept disjoint from `pending_shots` (newest registration owns an
     /// id). Cleared on map change.
     pending_server_shots: HashMap<i16, (i32, bool, i32)>,
+    /// Lethal Strike snapshot for the local player's server-fired bullets, keyed
+    /// by bullet id. Parallel to `pending_server_shots` (same ids, same
+    /// lifetime); it is kept separate so the packet damage tuple stays small.
+    pending_server_ls: HashMap<i16, (LethalStrikeParams, i32)>,
     /// Object ids of every player-class object seen in the current map instance.
     /// Used at finalize to prove a fight was effectively solo (no *other* player
     /// present) before crediting unattributed boss-HP loss to the local player.
@@ -1463,24 +1537,24 @@ pub struct CombatTracker {
     /// Opaque run id for the current map instance (see `CompletedFight`). Minted
     /// on map change; stamped onto member fights of a curated encounter.
     current_run_id: Option<String>,
-    /// Gravestones observed spawning this run, newest last. Correlated with a
-    /// participant's departure position/time to detect deaths.
+    /// Gravestones observed spawning this run, newest last. Used only to fill in
+    /// a missing grave type after a death notification confirms the death; a
+    /// grave on its own never proves one.
     recent_graves: VecDeque<GraveSpawn>,
     /// Last-seen position/time of participants whose object left an active fight,
-    /// keyed by object id. Resolved at finalize into Died (grave nearby) or
-    /// Nexused (no grave).
+    /// keyed by object id. Resolved at finalize into Nexused unless a PlayerDeath
+    /// notification also confirms them dead.
     departures: HashMap<i32, Departure>,
     /// Authoritative local-player death from `CharacterDied`
     /// (char_id, gravestone_type, time). Overrides presence at finalize because
     /// the local object is still in `objects` when a map-change finalize runs.
     pending_local_grave: Option<(i32, i32, i64)>,
-    /// Authoritative remote-player deaths parsed from the server death-broadcast
-    /// text ("<name> died at level N, killed by <killer>"). Keyed by the
-    /// lowercased player name -> death time. This is the reliable death signal
-    /// (position-based grave correlation mis-assigns graves when several players
-    /// die in a tight cluster), so it overrides a Nexused verdict at finalize.
-    /// Cleared on map change / disconnect like the other correlation buffers.
-    remote_deaths: HashMap<String, i64>,
+    /// Authoritative remote-player deaths parsed from the server `PlayerDeath`
+    /// notification (`s.death`). Keyed by the lowercased player name. This is
+    /// the only remote death signal: position-based grave correlation supplies
+    /// a fallback sprite only after a death is confirmed, never the status
+    /// itself. Cleared on map change / disconnect like the other run buffers.
+    remote_deaths: HashMap<String, RemoteDeath>,
     /// Death broadcasts observed since the last drain, for the caller to persist.
     /// Never cleared on map change: the caller persists them and the persisted row
     /// is what lets a death announced after its fight was written be applied.
@@ -1641,9 +1715,11 @@ impl CombatTracker {
             pending_shots: HashMap::new(),
             last_shot_trigger: None,
             lethal_strike_windows: VecDeque::new(),
+            sigil_state: None,
             summon_owners: HashMap::new(),
             pending_summon_shots: HashMap::new(),
             pending_server_shots: HashMap::new(),
+            pending_server_ls: HashMap::new(),
             seen_player_ids: std::collections::HashSet::new(),
             pending_enemy_shots: HashMap::new(),
             session_nonce: rand::random(),
@@ -1772,6 +1848,7 @@ impl CombatTracker {
         self.objects.clear();
         self.fights.clear();
         self.aux_instances.clear();
+        self.sigil_state = None;
         // Re-seed the damage RNG for the new instance and re-enable self-damage.
         self.rng = Rng::new(map_seed);
         self.rng_seeded = true;
@@ -1784,6 +1861,7 @@ impl CombatTracker {
         self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
+        self.pending_server_ls.clear();
         self.seen_player_ids.clear();
         self.pending_enemy_shots.clear();
         self.recent_graves.clear();
@@ -1822,6 +1900,7 @@ impl CombatTracker {
         self.objects.clear();
         self.fights.clear();
         self.aux_instances.clear();
+        self.sigil_state = None;
         // Leaving the world clears the current dungeon; the next map change stamps
         // a fresh entry time if it loads a dungeon.
         self.dungeon_entered_at = None;
@@ -1836,6 +1915,7 @@ impl CombatTracker {
         self.object_removals.clear();
         self.pending_summon_shots.clear();
         self.pending_server_shots.clear();
+        self.pending_server_ls.clear();
         self.seen_player_ids.clear();
         self.pending_enemy_shots.clear();
         // A different character may log in next; identity is re-set on CreateSuccess.
@@ -1894,7 +1974,8 @@ impl CombatTracker {
                 }
             }
         }
-        // Buffer gravestone spawns for death correlation at finalize.
+        // Buffer gravestone spawns as a fallback grave type after a death
+        // notification confirms the participant.
         if get_asset_manager().is_gravestone(object_type) {
             self.recent_graves.push_back(GraveSpawn {
                 grave_type: object_type,
@@ -2169,6 +2250,9 @@ impl CombatTracker {
             if let Some(after) = self.objects.get(&object_id).map(BoostSnapshot::of) {
                 self.note_local_stat_changes(&before, &after, time_ms);
             }
+        }
+        if object_id == self.local_object_id && self.local_object_id != 0 {
+            self.note_sigil_state(time_ms);
         }
         if self.fights.contains_key(&object_id) {
             let vulnerable_before = old_boss_condition & COND_INVULNERABLE == 0;
@@ -2710,10 +2794,10 @@ impl CombatTracker {
         // [`Self::note_shatters_hm_unlock_object`]).
         // The Source needs no removal handling either: it only ever exists in
         // hard mode, so having it in view latched the route already.
-        // Record a participant departure for death/nexus detection:
-        // an object that is currently an attacker in some active fight is leaving
-        // view. Snapshot its last-seen position BEFORE it is dropped so a
-        // gravestone that spawns at that tile can be correlated at finalize.
+        // Record a participant departure for nexus detection: an object that is
+        // currently an attacker in some active fight is leaving view. Snapshot
+        // its last-seen position BEFORE it is dropped so a confirmed death can
+        // use a gravestone that spawned at that tile as its fallback type.
         if let Some(obj) = &last {
             if self.is_active_attacker(object_id) {
                 self.departures.insert(
@@ -3154,13 +3238,64 @@ impl CombatTracker {
     /// damage-reduction window. Non-shield activations are ignored.
     /// `UseItem` is an outgoing packet, so it only ever reflects the local
     /// player.
-    pub fn on_use_item(&mut self, item_id: i32, _x: f32, _y: f32, time_ms: i64) {
+    pub fn on_use_item(
+        &mut self,
+        item_id: i32,
+        _x: f32,
+        _y: f32,
+        use_item_flag: i32,
+        time_ms: i64,
+    ) {
         if self.local_object_id == 0 || item_id < 0 {
             return;
         }
         if let Some(pct) = get_asset_manager().shield_reduction_pct(item_id) {
             self.shield_dr_until = time_ms + SHIELD_ACTIVE_MS;
             self.shield_dr_pct = pct;
+        }
+        // Meter-gated item (a sigil): a use while the animal form is up is the
+        // form's own ability (flag 1); otherwise it is the normal ability,
+        // whose declared on-use fill is applied here for immediate feedback.
+        // The wire's meter stat stays authoritative and overwrites this.
+        if let Some(effects) = get_asset_manager().ability_effects(item_id) {
+            if effects.has_meter() {
+                if self.sigil_state.as_ref().map(|s| s.item_id) != Some(item_id) {
+                    if let Some(def) = effects.meter().copied() {
+                        let (value, seen) = self
+                            .objects
+                            .get(&self.local_object_id)
+                            .map(|o| (o.ability_meter, o.ability_meter_seen))
+                            .unwrap_or((def.start_value as i32, false));
+                        self.sigil_state = Some(SigilState {
+                            item_id,
+                            max_value: def.max_value as i32,
+                            value: if seen { value } else { def.start_value as i32 },
+                            last_use_ms: 0,
+                            form: None,
+                        });
+                    }
+                }
+                if let Some(st) = self.sigil_state.as_mut().filter(|s| s.item_id == item_id) {
+                    st.last_use_ms = time_ms;
+                    match st.form.as_mut() {
+                        Some(form) if use_item_flag != 0 => {
+                            form.animal_ability_used = true;
+                        }
+                        Some(_) => {}
+                        None => {
+                            let fill: f32 = effects
+                                .fills
+                                .iter()
+                                .filter(|f| {
+                                    f.trigger == crate::assets::MeterFillTrigger::AbilityUse
+                                })
+                                .map(|f| f.amount_worn())
+                                .sum();
+                            st.value = (st.value + fill as i32).clamp(0, st.max_value.max(0));
+                        }
+                    }
+                }
+            }
         }
         // Two facts are all the performance sections need from a use: what the
         // local player used, and when. The item is remembered as the proposed
@@ -3173,12 +3308,29 @@ impl CombatTracker {
             .filter(|o| o.equipment[ABILITY_SLOT] == item_id)
             .map(|o| o.equipment_enchants[ABILITY_SLOT].clone());
         if let Some(enchants) = ability_enchants {
+            // Capture the mode at activation time: a volley fired in the form
+            // stays transformed even if it lands after the form ends. Flag 1 is
+            // the form's own ability, so fall back to the switch skin when the
+            // skin update has not arrived yet.
+            let form_skin = self
+                .sigil_state
+                .as_ref()
+                .filter(|s| s.item_id == item_id)
+                .and_then(|s| s.form.as_ref().map(|f| f.skin))
+                .or_else(|| {
+                    (use_item_flag != 0)
+                        .then(|| get_asset_manager().ability_effects(item_id))
+                        .flatten()
+                        .and_then(|e| e.switch)
+                        .and_then(|s| s.transform_skin)
+                });
             self.local_ability_uses.push_back(LocalAbilityUse {
                 time_ms,
                 item_id,
                 enchants,
                 server_effect_window_ms: get_asset_manager()
                     .server_applied_damage_window_ms(item_id),
+                form_skin,
             });
             self.trim_local_event_logs();
         }
@@ -3208,6 +3360,154 @@ impl CombatTracker {
             });
         }
         self.trim_local_event_logs();
+    }
+
+    /// Record the live meter and animal-form state of the local player's
+    /// meter-gated ability item (a druid sigil) from the stats just applied.
+    ///
+    /// The meter is authoritative on the wire (the ability slot's segment of
+    /// `UniqueDataString`). The animal form is identified by the switch
+    /// ability's `SelfTransform` skin -- the server sends it in the same update
+    /// that drops the meter to 0 -- and timed by the switch's declared
+    /// duration. Using the skin (rather than only the meter drop) also catches
+    /// a form that begins before any meter sample has been seen.
+    fn note_sigil_state(&mut self, time_ms: i64) {
+        if self.local_object_id == 0 {
+            return;
+        }
+        let Some((item_id, meter, meter_seen, skin)) =
+            self.objects.get(&self.local_object_id).map(|o| {
+                (
+                    o.equipment[ABILITY_SLOT],
+                    o.ability_meter,
+                    o.ability_meter_seen,
+                    o.skin_id,
+                )
+            })
+        else {
+            return;
+        };
+        let Some(effects) = get_asset_manager().ability_effects(item_id) else {
+            self.sigil_state = None;
+            return;
+        };
+        let Some(def) = effects.meter().copied() else {
+            self.sigil_state = None;
+            return;
+        };
+        if self.sigil_state.as_ref().map(|s| s.item_id) != Some(item_id) {
+            self.sigil_state = Some(SigilState {
+                item_id,
+                max_value: def.max_value as i32,
+                value: if meter_seen {
+                    meter
+                } else {
+                    def.start_value as i32
+                },
+                last_use_ms: 0,
+                form: None,
+            });
+        }
+        let switch = effects.switch.as_ref();
+        let form_skin = switch.and_then(|s| s.transform_skin);
+        let switch_duration_ms = effects.switch_duration_ms().unwrap_or(0);
+        let lethal_strike_duration_ms = switch
+            .and_then(|s| s.lethal_strike)
+            .map(|ls| (ls.duration.max(0.0) * 1000.0) as i64)
+            .unwrap_or(0);
+        let mut open_ls_ms: Option<i64> = None;
+        if let Some(st) = self.sigil_state.as_mut() {
+            let previous_value = st.value;
+            if meter_seen {
+                st.value = meter.clamp(0, st.max_value.max(0));
+            }
+            // The switch spends a full meter. Requiring that drop (rather than
+            // the skin alone) keeps a player who merely wears the same skin as
+            // the form from being read as transformed.
+            let meter_spent =
+                meter_seen && st.max_value > 0 && previous_value >= st.max_value && st.value <= 0;
+            // Start: the transform skin is the form's identity.
+            if st.form.is_none() && meter_spent {
+                if let Some(skin_id) = form_skin.filter(|&s| s == skin) {
+                    st.form = Some(SigilForm {
+                        skin: skin_id,
+                        ends_ms: time_ms + switch_duration_ms,
+                        animal_ability_used: false,
+                    });
+                    if lethal_strike_duration_ms > 0 {
+                        open_ls_ms = Some(lethal_strike_duration_ms);
+                    }
+                }
+            }
+            // End: the skin left the form, or the declared duration elapsed.
+            // The duration matters when a revert is missed (no status update
+            // while out of view); the skin check covers an early end.
+            if let Some((form_skin, ends_ms)) = st.form.as_ref().map(|f| (f.skin, f.ends_ms)) {
+                let skin_left = skin != 0 && skin != form_skin;
+                if skin_left || time_ms >= ends_ms {
+                    st.form = None;
+                }
+            }
+        }
+        if let Some(duration_ms) = open_ls_ms {
+            self.open_lethal_strike_window_for(time_ms, duration_ms);
+        }
+    }
+
+    /// Price one landed hit from a meter-gated ability item when no shoot packet
+    /// explains it (see the fallback in `on_local_hit`).
+    ///
+    /// The hit carries no projectile variant, so the burst with the most
+    /// projectiles -- the main volley -- is used, at the midpoint of its
+    /// declared damage. Only a hit inside the active animal form or within the
+    /// normal ability's attribution window is claimed, so an unrelated
+    /// unresolved hit is not silently rewritten.
+    fn sigil_hit_damage(
+        &self,
+        defense: i32,
+        cond0: i32,
+        cond1: i32,
+        time_ms: i64,
+    ) -> Option<(i32, i32)> {
+        let local = self.objects.get(&self.local_object_id)?;
+        let item = local.equipment[ABILITY_SLOT];
+        let effects = get_asset_manager().ability_effects(item)?;
+        if !effects.has_meter() {
+            return None;
+        }
+        let state = self.sigil_state.as_ref().filter(|s| s.item_id == item)?;
+        let in_form = state.form.is_some();
+        if !in_form && time_ms.saturating_sub(state.last_use_ms) > ABILITY_ATTRIBUTION_WINDOW_MS {
+            return None;
+        }
+        let bursts = if in_form {
+            effects
+                .switch
+                .as_ref()
+                .map(|s| s.bursts.as_slice())
+                .unwrap_or(&[])
+        } else {
+            effects.normal_bursts.as_slice()
+        };
+        let burst = bursts.iter().max_by_key(|b| {
+            let stat = b
+                .scaling_stat
+                .and_then(|s| local.effective_scaling_stat(s))
+                .unwrap_or(0);
+            b.shots_for(stat)
+        })?;
+        let stat = burst
+            .scaling_stat
+            .and_then(|s| local.effective_scaling_stat(s))
+            .unwrap_or(0);
+        let base = (burst.min_for(stat) + burst.max_for(stat)) / 2;
+        if base <= 0 {
+            return None;
+        }
+        Some((
+            damage::damage_with_defense(base, burst.armor_piercing, defense, cond0, cond1),
+            item,
+        ))
     }
 
     /// Record the live character's Blood Ritual, Crucible and pet as they stand
@@ -3609,6 +3909,7 @@ impl CombatTracker {
                 window_ms: (until - use_.time_ms).max(0),
                 damage: credited[i].0,
                 hits: credited[i].1,
+                form_skin: use_.form_skin,
             });
         }
         out
@@ -3742,6 +4043,7 @@ impl CombatTracker {
         // the same id (newest registration owns an id). Done before the guards so
         // the maps stay disjoint even when self-damage is disabled for this map.
         self.pending_server_shots.remove(&bullet_id);
+        self.pending_server_ls.remove(&bullet_id);
         // On-shoot procs (an "OnShoot Attack Boost IV" enchantment, say) apply with
         // the shot that fired them, so the moment of the last shot is what tells a
         // proc from an ally's buff landing at the same time.
@@ -3817,10 +4119,16 @@ impl CombatTracker {
         };
         // A weapon shot can benefit from the weapon's Lethal Strike cloak; an
         // ability's own shot cannot, and its bonus would otherwise be invented.
-        let lethal_strike = if ability_item.is_some() {
+        // The exception is a meter-gated ability that grants Lethal Strike to
+        // *all* shots (Sharktooth Sigil's shark form): then its own volley is
+        // empowered too, with the switch's own duration.
+        let ability_grants_ls = ability_item
+            .and_then(|id| get_asset_manager().lethal_strike_params(id))
+            .is_some();
+        let lethal_strike = if ability_item.is_some() && !ability_grants_ls {
             None
         } else {
-            self.lethal_strike_snapshot()
+            self.lethal_strike_snapshot(Some(time_ms))
         };
         let ls_cloak = if lethal_strike.is_some() {
             local_equipment[ABILITY_SLOT]
@@ -3993,13 +4301,36 @@ impl CombatTracker {
     /// equipped cloak's params + effective WIS. `None` unless the ability slot
     /// holds a cloak that grants Lethal Strike and a base Wisdom stat has been
     /// observed (so non-rogues and unknown-WIS shots are unaffected).
-    fn lethal_strike_snapshot(&self) -> Option<(LethalStrikeParams, i32)> {
+    fn lethal_strike_snapshot(&self, now: Option<i64>) -> Option<(LethalStrikeParams, i32)> {
         let local = self.objects.get(&self.local_object_id)?;
         let cloak = local.equipment[ABILITY_SLOT];
         if cloak < 0 {
             return None;
         }
         let params = get_asset_manager().lethal_strike_params(cloak)?;
+        if params.on_shoot {
+            // The server does not always send Stasis Immune back to the owner,
+            // so the condition bit can be clear even while the cloak is held.
+            // Accept either the condition (when it is observable) or a recent
+            // cloak activation; without one of those, a normal weapon shot must
+            // not be empowered.
+            if let Some(now) = now {
+                let condition_active = params.required_condition_bit != 0
+                    && local.condition & params.required_condition_bit != 0;
+                let recently_used = self.local_ability_uses.iter().any(|u| {
+                    u.item_id == cloak
+                        && now >= u.time_ms
+                        && now - u.time_ms <= ON_SHOOT_LS_WINDOW_MS
+                });
+                if !condition_active && !recently_used {
+                    return None;
+                }
+            }
+        } else if params.required_condition_bit != 0
+            && local.condition & params.required_condition_bit == 0
+        {
+            return None;
+        }
         let stat_val = local.effective_scaling_stat(params.scaling_stat)?;
         Some((params, stat_val))
     }
@@ -4015,8 +4346,15 @@ impl CombatTracker {
     /// a small guard so the shot that canceled sneak is still credited. Keeps the
     /// window list small and prunes stale entries.
     fn open_lethal_strike_window(&mut self, time_ms: i64) {
+        self.open_lethal_strike_window_for(time_ms, LETHAL_STRIKE_WINDOW_MS);
+    }
+
+    /// Open a Lethal Strike window of the caller's own duration (a sigil's
+    /// `OnSwitchAbilityActivate` declares its form's duration rather than the
+    /// cloak's fixed 2.4s sneak window).
+    fn open_lethal_strike_window_for(&mut self, time_ms: i64, duration_ms: i64) {
         let start = time_ms - LETHAL_STRIKE_GUARD_MS;
-        let end = time_ms + LETHAL_STRIKE_WINDOW_MS;
+        let end = time_ms + duration_ms.max(0);
         self.lethal_strike_windows.push_back((start, end));
         self.lethal_strike_windows
             .retain(|&(_, w_end)| w_end >= time_ms - 10_000);
@@ -4074,6 +4412,11 @@ impl CombatTracker {
             } else {
                 None
             };
+            // Snapshot Lethal Strike once per volley. For Cloak of the Deep the
+            // server-fired extra bubbles are real shots: their damage is in this
+            // packet, so the bonus has to be carried to each hit here (there is
+            // no PlayerShoot to snapshot it from).
+            let ls = self.lethal_strike_snapshot(Some(self.last_shot_ms));
             for i in 0..count {
                 let bid = bullet_id.wrapping_add(i);
                 self.pending_shots.remove(&bid);
@@ -4081,9 +4424,18 @@ impl CombatTracker {
                     Some(ap) => {
                         self.pending_server_shots
                             .insert(bid, (damage as i32, ap, container_type));
+                        match ls {
+                            Some(snapshot) => {
+                                self.pending_server_ls.insert(bid, snapshot);
+                            }
+                            None => {
+                                self.pending_server_ls.remove(&bid);
+                            }
+                        }
                     }
                     None => {
                         self.pending_server_shots.remove(&bid);
+                        self.pending_server_ls.remove(&bid);
                     }
                 }
             }
@@ -4227,19 +4579,22 @@ impl CombatTracker {
                     // the client), so add all of it here. Skip Invulnerable targets.
                     if cond0 & COND_INVULNERABLE == 0 {
                         if let Some((params, wis)) = shot.lethal_strike {
-                            if self.in_lethal_strike_window(shot.shot_time) {
+                            if params.on_shoot || self.in_lethal_strike_window(shot.shot_time) {
                                 let bonus = damage::lethal_strike_bonus(&params, wis, defense);
                                 // Main-shot bonus: once per resolved hit (so a
                                 // piercing bullet's several hits each get it).
                                 dmg += bonus as i32;
                                 ls_extra += bonus as i64;
                                 ls_empowered = true;
-                                // Side procs: fire once per trigger, so credit
-                                // them on the first hit only to avoid piercing
-                                // duplication, and only on the primary projectile
-                                // so a multi-projectile weapon does not credit the
-                                // two procs once per projectile.
-                                if !shot.procs_credited && !shot.extra_projectile {
+                                // Post-sneak LS spawns two invisible side procs
+                                // that must be simulated. An on-shoot LS (Cloak
+                                // of the Deep) instead fires real BulletCreate
+                                // bullets, observed as their own shots, so
+                                // simulating side procs here would double-count.
+                                if !params.on_shoot
+                                    && !shot.procs_credited
+                                    && !shot.extra_projectile
+                                {
                                     // Each side proc spawns 4.6 tiles from the
                                     // player along the shot angle +/- 9 degrees
                                     // and flies outward, so a proc only lands if
@@ -4287,6 +4642,7 @@ impl CombatTracker {
                 Some(dmg) => Some(dmg),
                 None => {
                     let volley = self.pending_server_shots.get(&bullet_id).copied();
+                    let volley_ls = self.pending_server_ls.get(&bullet_id).copied();
                     // The packet named the item that fired this bullet. When that
                     // item is one the local player activated, the hit is that
                     // ability's own damage (a spell volley), not the weapon's, so
@@ -4310,9 +4666,52 @@ impl CombatTracker {
                             volley_item = Some(item_id);
                         }
                     }
-                    volley.map(|(base, ap, _)| {
-                        damage::damage_with_defense(base, ap, defense, cond0, cond1)
-                    })
+                    match volley {
+                        Some((base, ap, _)) => {
+                            let mut dmg =
+                                damage::damage_with_defense(base, ap, defense, cond0, cond1);
+                            // On-shoot Lethal Strike (Cloak of the Deep) is
+                            // carried from the ServerPlayerShoot that spawned
+                            // this bullet; each observed bubble gets its own
+                            // bonus rather than a simulated side proc.
+                            if cond0 & COND_INVULNERABLE == 0 {
+                                if let Some((params, wis)) = volley_ls {
+                                    if params.on_shoot || self.in_lethal_strike_window(time_ms) {
+                                        let bonus =
+                                            damage::lethal_strike_bonus(&params, wis, defense);
+                                        dmg += bonus as i32;
+                                        ls_extra += bonus as i64;
+                                        ls_empowered = true;
+                                        ls_cloak = self
+                                            .objects
+                                            .get(&self.local_object_id)
+                                            .map(|o| o.equipment[ABILITY_SLOT])
+                                            .unwrap_or(0);
+                                    }
+                                }
+                            }
+                            Some(dmg)
+                        }
+                        // No shoot packet behind this hit. A meter-gated ability
+                        // (a sigil's burst/nova) fires bullets whose damage the
+                        // client never receives, so price it from the item's own
+                        // XML instead of leaving the boss's HP loss unattributed.
+                        None => {
+                            // Only when self-compute is healthy: with it disabled
+                            // every weapon hit is unresolved, and claiming those
+                            // as ability damage would be a misattribution.
+                            if self.self_damage_available {
+                                self.sigil_hit_damage(defense, cond0, cond1, time_ms).map(
+                                    |(dmg, item)| {
+                                        volley_item = Some(item);
+                                        dmg
+                                    },
+                                )
+                            } else {
+                                None
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -5910,11 +6309,11 @@ impl CombatTracker {
     /// grave at all (and mark them Nexused despite having died).
     fn match_graves_nearest_first(
         &mut self,
-        departures: &[(usize, Departure, bool)],
+        departures: &[(usize, Departure)],
     ) -> Vec<Option<i32>> {
         let r2 = GRAVE_MATCH_RADIUS * GRAVE_MATCH_RADIUS;
         let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
-        for (di, (_, d, _)) in departures.iter().enumerate() {
+        for (di, (_, d)) in departures.iter().enumerate() {
             for (gi, g) in self.recent_graves.iter().enumerate() {
                 if (g.time - d.time).abs() > GRAVE_MATCH_WINDOW_MS {
                     continue;
@@ -5949,8 +6348,14 @@ impl CombatTracker {
         assigned
     }
 
-    /// Resolve each participant's end status (present / died / nexused), consuming
-    /// matched gravestone spawns so no grave is claimed by two participants.
+    /// Resolve each participant's end status (present / died / nexused).
+    ///
+    /// A remote `Died` verdict requires an authoritative `PlayerDeath`
+    /// notification (or the local `Death` packet). A departure on its own is
+    /// only ever a nexus/out-of-range verdict: a grave near the departure tile
+    /// is never enough to declare someone dead. Once a death is confirmed, an
+    /// actual grave spawn is used only to fill in a missing grave type; the
+    /// notification normally supplies the exact type itself.
     fn resolve_end_statuses(
         &mut self,
         participants: &mut [FightParticipant],
@@ -5959,11 +6364,10 @@ impl CombatTracker {
         local_char_id: i32,
         local_left: bool,
     ) {
-        // Participants that left the fight and may still own a gravestone, with
-        // their departure and whether the death broadcast confirmed them. Graves
-        // are assigned after the loop so the matching can run nearest-first across
-        // the whole roster instead of in roster order (see `match_graves_nearest_first`).
-        let mut departed: Vec<(usize, Departure, bool)> = Vec::new();
+        // Confirmed deaths that left the fight, with their departure and the
+        // grave type carried by the death notification (0 when unknown). Graves
+        // are matched after the loop, and only for entries whose type is unknown.
+        let mut departed: Vec<(usize, Departure, i32)> = Vec::new();
 
         for (idx, p) in participants.iter_mut().enumerate() {
             // The local player's death is authoritative (from `CharacterDied`), and
@@ -5973,10 +6377,7 @@ impl CombatTracker {
                 if let Some((char_id, grave, gtime)) = self.pending_local_grave {
                     let matches_char =
                         char_id == 0 || local_char_id == 0 || char_id == local_char_id;
-                    if matches_char
-                        && gtime >= started - GRAVE_MATCH_WINDOW_MS
-                        && gtime <= ended + GRAVE_MATCH_WINDOW_MS
-                    {
+                    if matches_char && gtime >= started && gtime <= ended + DEATH_MATCH_GRACE_MS {
                         p.end_status = ParticipantEndStatus::Died { grave_type: grave };
                         continue;
                     }
@@ -5995,36 +6396,49 @@ impl CombatTracker {
                 p.end_status = ParticipantEndStatus::Present;
                 continue;
             }
-            // The server death broadcast ("<name> died at level N, killed by ...")
-            // is the authoritative death signal, matched by name within this
-            // fight's window. Position-based grave correlation is only used to
-            // supply the exact grave-tier sprite; when no grave can be matched
-            // (one was stolen by a nearby simultaneous death, or none was seen)
-            // a name-confirmed death is still recorded with a generic grave
-            // (type 0, which the UI renders as the default gravestone).
-            let name_died = self.remote_death_in_window(&p.name, started, ended);
-            // Only a departure inside this fight's lifetime can carry a grave.
+            // The `PlayerDeath` notification (matched by name inside this fight's
+            // window) is the only remote death signal. Its picture_type is the
+            // exact grave type. A departure without this signal is a nexus /
+            // out-of-range, not a death.
+            let death_grave = self.remote_death_in_window(&p.name, started, ended);
             match self
                 .departures
                 .get(&p.object_id)
                 .copied()
                 .filter(|d| d.time >= started - DEPARTURE_GRACE_MS)
             {
-                Some(dep) => departed.push((idx, dep, name_died)),
-                None if name_died => p.end_status = ParticipantEndStatus::Died { grave_type: 0 },
-                None => p.end_status = ParticipantEndStatus::Present,
+                Some(dep) => match death_grave {
+                    Some(grave_type) => departed.push((idx, dep, grave_type)),
+                    None => p.end_status = ParticipantEndStatus::Nexused,
+                },
+                None => {
+                    p.end_status = match death_grave {
+                        Some(grave_type) => ParticipantEndStatus::Died { grave_type },
+                        None => ParticipantEndStatus::Present,
+                    }
+                }
             }
         }
 
-        let graves = self.match_graves_nearest_first(&departed);
-        for (i, (idx, _, name_died)) in departed.iter().enumerate() {
-            participants[*idx].end_status = match (graves[i], name_died) {
-                (Some(grave_type), _) => ParticipantEndStatus::Died { grave_type },
-                (None, true) => ParticipantEndStatus::Died { grave_type: 0 },
-                // No death evidence: a departure inside the fight means they left
-                // (nexused); no departure means they were simply present.
-                (None, false) => ParticipantEndStatus::Nexused,
+        // Only death-notification rows with no grave type need a spatial fallback.
+        let unknown: Vec<(usize, Departure)> = departed
+            .iter()
+            .filter(|(_, _, grave_type)| *grave_type == 0)
+            .map(|(idx, dep, _)| (*idx, *dep))
+            .collect();
+        let matched: HashMap<usize, i32> = self
+            .match_graves_nearest_first(&unknown)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, grave_type)| grave_type.map(|g| (unknown[i].0, g)))
+            .collect();
+        for (idx, _, grave_type) in departed {
+            let grave_type = if grave_type > 0 {
+                grave_type
+            } else {
+                matched.get(&idx).copied().unwrap_or(0)
             };
+            participants[idx].end_status = ParticipantEndStatus::Died { grave_type };
         }
     }
 
@@ -6035,25 +6449,39 @@ impl CombatTracker {
         self.pending_local_grave = Some((char_id, gravestone_type, time_ms));
     }
 
-    /// Record a remote player's death from the server death broadcast (`s.death`,
-    /// rendering as "<name> died at level N, killed by <killer>"). Buffered by name
-    /// until the current fight(s) finalize; this authoritative signal is what marks
-    /// a clustered-death player as Died even when their gravestone couldn't be
-    /// position-correlated (see `resolve_end_statuses`). The raw broadcast is also
-    /// queued for the caller to persist (see `take_pending_death_broadcasts`), so a
-    /// death announced after its fight was written can still be applied to it.
-    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
+    /// Record a remote player's death from the server `PlayerDeath` notification
+    /// (`s.death`) or a legacy text announcement. Buffered by name until the
+    /// current fight(s) finalize; this authoritative signal is what marks a
+    /// player as Died. `grave_type` is the notification's `picture_type` (the
+    /// exact gravestone object type), or 0 when a legacy text path supplied none.
+    /// The raw broadcast is also queued for the caller to persist (see
+    /// `take_pending_death_broadcasts`), so a death announced after its fight was
+    /// written can still be applied to it.
+    pub fn on_remote_death(
+        &mut self,
+        player_name: &str,
+        killer: &str,
+        grave_type: i32,
+        time_ms: i64,
+    ) {
         let key = sanitize_player_name(player_name).to_ascii_lowercase();
         if key.is_empty() {
             return;
         }
-        self.remote_deaths.insert(key, time_ms);
+        self.remote_deaths.insert(
+            key,
+            RemoteDeath {
+                time: time_ms,
+                grave_type,
+            },
+        );
         if self.pending_death_broadcasts.len() >= CORRELATION_MAX_ENTRIES {
             self.pending_death_broadcasts.remove(0);
         }
         self.pending_death_broadcasts.push(DeathBroadcast {
             player: player_name.trim().to_string(),
             killer: killer.trim().to_string(),
+            grave_type,
             time: time_ms,
         });
     }
@@ -6063,20 +6491,22 @@ impl CombatTracker {
         std::mem::take(&mut self.pending_death_broadcasts)
     }
 
-    /// Whether a remote death broadcast named `name` and it landed within this
-    /// fight's window (matching the local-death gate). Gating to the fight window
-    /// keeps a death at a later sequential boss from bleeding back onto an earlier
-    /// boss the player cleared alive.
-    fn remote_death_in_window(&self, name: &str, started: i64, ended: i64) -> bool {
+    /// The grave type of a remote death notification for `name` inside this
+    /// fight's window, or `None` when no notification named them. A `Some(0)`
+    /// means the death is confirmed but the announcement carried no grave type.
+    /// Gating to the fight window keeps a death at a later sequential boss from
+    /// bleeding back onto an earlier boss the player cleared alive.
+    fn remote_death_in_window(&self, name: &str, started: i64, ended: i64) -> Option<i32> {
         if self.remote_deaths.is_empty() {
-            return false;
+            return None;
         }
         let key = sanitize_player_name(name).to_ascii_lowercase();
         if key.is_empty() {
-            return false;
+            return None;
         }
-        self.remote_deaths.get(&key).is_some_and(|&t| {
-            t >= started - GRAVE_MATCH_WINDOW_MS && t <= ended + GRAVE_MATCH_WINDOW_MS
+        self.remote_deaths.get(&key).and_then(|death| {
+            (death.time >= started && death.time <= ended + DEATH_MATCH_GRACE_MS)
+                .then_some(death.grave_type)
         })
     }
 }
@@ -6108,8 +6538,22 @@ fn apply_stats(obj: &mut TrackedObject, status: &ObjectStatusData, time_ms: i64)
             x if x == StatType::Texture1 as u8 => obj.tex1 = stat.stat_value as u32,
             x if x == StatType::Texture2 as u8 => obj.tex2 = stat.stat_value as u32,
             x if x == StatType::UniqueDataString as u8 => {
-                obj.equipment_enchants =
-                    parse_equipment_enchants(stat.string_stat_value.as_deref());
+                let data = stat.string_stat_value.as_deref();
+                obj.equipment_enchants = parse_equipment_enchants(data);
+                // Ability-slot meter (slot 1): the first `<Meter>` value.
+                // The same segment carries the slot's enchants, so this is
+                // decoded alongside them rather than with a second pass.
+                let meters = data
+                    .and_then(|d| d.split(',').nth(ABILITY_SLOT))
+                    .map(|seg| parse_enchant_slots(seg).meters)
+                    .unwrap_or_default();
+                if let Some(&value) = meters.first() {
+                    obj.ability_meter = value as i32;
+                    obj.ability_meter_seen = true;
+                } else {
+                    obj.ability_meter = 0;
+                    obj.ability_meter_seen = false;
+                }
             }
             x if x == StatType::Attack as u8 => {
                 obj.attack = stat.stat_value;
@@ -6620,6 +7064,150 @@ mod tests {
         assert_eq!(ls_proc_hits(0.0, 0.0, 0.0, 40.0, 0.0, 2.0), 0);
     }
 
+    #[test]
+    fn sigil_meter_charges_and_animal_form_tracks_its_declared_duration() {
+        // Sharktooth Sigil: 425 meter, 7s shark form. The wire is authoritative
+        // for the meter; the form is the switch's `SelfTransform` skin.
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        if get_asset_manager().ability_effects(0x7b73).is_none() {
+            return; // installed game assets are not available here
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Guild Hall", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Inventory1, 0x7b73),
+                    stat(StatType::SkinId, 40912),
+                    stat(StatType::Attack, 100),
+                    stat(StatType::Speed, 60),
+                    stat(StatType::Dexterity, 60),
+                ],
+            ),
+            10,
+        );
+        // The meter arrives in the ability slot's UniqueDataString segment; the
+        // decoder is covered in `storage`, so set the decoded value directly.
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 425;
+            obj.ability_meter_seen = true;
+        }
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::SkinId, 40912)]), 20);
+        assert_eq!(
+            t.sigil_state.as_ref().expect("sigil state").value,
+            425,
+            "full meter is observed"
+        );
+
+        // Switch: the form skin appears and the meter is spent in the same
+        // update, which is the server's shape for the activation.
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 0;
+            obj.ability_meter_seen = true;
+        }
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::SkinId, 0x7b17),
+                    stat(StatType::Inventory1, 0x7b73),
+                ],
+            ),
+            30,
+        );
+        let state = t.sigil_state.as_ref().expect("sigil state");
+        let form = state.form.as_ref().expect("animal form");
+        assert_eq!(form.ends_ms, 30 + 7_000, "form uses the declared duration");
+        assert_eq!(state.value, 0, "the switch spends the meter");
+        assert!(t.in_lethal_strike_window(31));
+        assert!(t.in_lethal_strike_window(7_029));
+        assert!(!t.in_lethal_strike_window(7_031));
+
+        // Flag 1 is the animal-form ability.
+        t.on_use_item(0x7b73, 0.0, 0.0, 1, 40);
+        assert_eq!(
+            t.local_ability_uses.back().and_then(|u| u.form_skin),
+            Some(0x7b17),
+            "the activation is tagged with the form it was fired in"
+        );
+        assert!(
+            t.sigil_state
+                .as_ref()
+                .unwrap()
+                .form
+                .as_ref()
+                .unwrap()
+                .animal_ability_used,
+            "the form's own ability is distinguished from a normal use"
+        );
+
+        // Back to the normal skin ends the form.
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::SkinId, 40912)]), 50);
+        assert!(
+            t.sigil_state.as_ref().unwrap().form.is_none(),
+            "reverting the skin ends the form"
+        );
+    }
+
+    #[test]
+    fn sigil_form_ends_at_its_duration_when_the_revert_is_missed() {
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        if get_asset_manager().ability_effects(0x7b73).is_none() {
+            return;
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Guild Hall", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        // Full meter first, so the switch has something to spend.
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    stat(StatType::Inventory1, 0x7b73),
+                    stat(StatType::SkinId, 40912),
+                ],
+            ),
+            5,
+        );
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 425;
+            obj.ability_meter_seen = true;
+        }
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::SkinId, 40912)]), 6);
+        {
+            let obj = t.objects.get_mut(&1000).expect("local object");
+            obj.ability_meter = 0;
+        }
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::SkinId, 0x7b17)]),
+            10,
+        );
+        assert!(t.sigil_state.as_ref().unwrap().form.is_some());
+        // A later status with no skin change (the revert was never observed).
+        t.on_object_status(
+            1000,
+            &status(1000, vec![stat(StatType::Speed, 60)]),
+            10 + 7_001,
+        );
+        assert!(
+            t.sigil_state.as_ref().unwrap().form.is_none(),
+            "the declared duration closes a form whose revert was missed"
+        );
+    }
+
     fn stat(id: StatType, value: i32) -> StatData {
         StatData {
             stat_type_id: id as u8,
@@ -7050,7 +7638,9 @@ mod tests {
         let mut t = CombatTracker::new();
         // Participant 3 is still in view -> Present.
         t.objects.insert(3, TrackedObject::default());
-        // Participant 1 left near (10,10); a grave spawned close by -> Died.
+        // Participant 1 left near (10,10) and was confirmed dead by the
+        // PlayerDeath notification, which carried no type; a nearby grave then
+        // supplies the sprite -> Died.
         t.departures.insert(
             1,
             Departure {
@@ -7074,12 +7664,11 @@ mod tests {
             y: 9.7,
             time: 1_300,
         });
+        t.on_remote_death("One", "a Spider", 0, 1_000);
 
-        let mut ps = vec![
-            participant(1, false),
-            participant(2, false),
-            participant(3, false),
-        ];
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut ps = vec![p1, participant(2, false), participant(3, false)];
         t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
 
         assert_eq!(
@@ -7128,8 +7717,14 @@ mod tests {
             y: 12.1,
             time: 1_100,
         });
+        t.on_remote_death("One", "a Spider", 0, 1_000);
+        t.on_remote_death("Two", "a Spider", 0, 1_000);
 
-        let mut ps = vec![participant(1, false), participant(2, false)];
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut p2 = participant(2, false);
+        p2.name = "Two".into();
+        let mut ps = vec![p1, p2];
         t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
 
         assert_eq!(
@@ -7174,9 +7769,11 @@ mod tests {
             y: 10.0,
             time: 1_100,
         });
-        // Both deaths were broadcast during the fight window.
-        t.on_remote_death("Zannmp", "Oryx the Mad God", 1_050);
-        t.on_remote_death("Yumiho", "Oryx the Mad God", 1_050);
+        // Both deaths were broadcast during the fight window. Neither packet
+        // carried a type in this legacy-style case, so the one available grave
+        // supplies the sprite for one of them.
+        t.on_remote_death("Zannmp", "Oryx the Mad God", 0, 1_050);
+        t.on_remote_death("Yumiho", "Oryx the Mad God", 0, 1_050);
 
         let mut p1 = participant(1, false);
         p1.name = "Zannmp".into();
@@ -7212,13 +7809,14 @@ mod tests {
     #[test]
     fn remote_death_broadcasts_are_queued_for_persistence() {
         let mut t = CombatTracker::new();
-        t.on_remote_death("Pillar", "Oryx the Mad God", 1_234);
+        t.on_remote_death("Pillar", "Oryx the Mad God", 1837, 1_234);
         // A broadcast carrying no player name persists nothing.
-        t.on_remote_death("   ", "a Spider", 2_000);
+        t.on_remote_death("   ", "a Spider", 0, 2_000);
         let queued = t.take_pending_death_broadcasts();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].player, "Pillar");
         assert_eq!(queued[0].killer, "Oryx the Mad God");
+        assert_eq!(queued[0].grave_type, 1837);
         assert_eq!(queued[0].time, 1_234);
         assert!(t.take_pending_death_broadcasts().is_empty());
     }
@@ -7236,12 +7834,146 @@ mod tests {
                 time: 1_000,
             },
         );
-        t.on_remote_death("Later", "Oryx the Mad God", 500_000);
+        t.on_remote_death("Later", "Oryx the Mad God", 1837, 500_000);
         let mut p1 = participant(1, false);
         p1.name = "Later".into();
         let mut ps = vec![p1];
         t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
         assert_eq!(ps[0].end_status, ParticipantEndStatus::Nexused);
+    }
+
+    #[test]
+    fn end_status_death_at_next_boss_does_not_mark_the_previous_fight() {
+        // The reported Zlenkku/Gunaj case: they cleared an earlier boss alive,
+        // then died at the next boss a few seconds later. The next death must
+        // not be applied to the previous fight's roster even though both are
+        // within the old 15s grave-correlation window.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 4_000,
+            },
+        );
+        t.on_remote_death("NextBoss", "Oryx the Mad God", 1837, 12_000);
+        let mut p1 = participant(1, false);
+        p1.name = "NextBoss".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+        assert_eq!(ps[0].end_status, ParticipantEndStatus::Nexused);
+    }
+
+    #[test]
+    fn end_status_death_just_after_finalize_still_counts() {
+        // A PlayerDeath notification can trail the boss-death event by a packet
+        // or two. The small tail keeps that same-fight death.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 4_000,
+            },
+        );
+        t.on_remote_death("SameFight", "Oryx the Mad God", 1837, 5_500);
+        let mut p1 = participant(1, false);
+        p1.name = "SameFight".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
+    }
+
+    #[test]
+    fn departure_without_death_notification_near_grave_stays_nexused() {
+        // The Aifumi case: a living player's object leaves the observer's view
+        // (a desync, teleport, or simply walking out of range) just as another
+        // player's grave is nearby. Proximity alone must never mark them dead.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 1_000,
+            },
+        );
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1837,
+            x: 10.1,
+            y: 10.0,
+            time: 1_100,
+        });
+
+        let mut ps = vec![participant(1, false)];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(ps[0].end_status, ParticipantEndStatus::Nexused);
+        assert_eq!(
+            t.recent_graves.len(),
+            1,
+            "the unknown grave stays unclaimed"
+        );
+    }
+
+    #[test]
+    fn notification_grave_type_wins_over_nearby_grave() {
+        // The PlayerDeath notification's picture_type is the exact grave. A
+        // nearby grave belonging to another player must not override it.
+        let mut t = CombatTracker::new();
+        t.departures.insert(
+            1,
+            Departure {
+                x: 10.0,
+                y: 10.0,
+                time: 1_000,
+            },
+        );
+        t.recent_graves.push_back(GraveSpawn {
+            grave_type: 1830,
+            x: 10.1,
+            y: 10.0,
+            time: 1_100,
+        });
+        t.on_remote_death("One", "a Spider", 1837, 1_000);
+
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
+        assert_eq!(
+            t.recent_graves.len(),
+            1,
+            "the notification supplied the type, so the nearby grave was not claimed"
+        );
+    }
+
+    #[test]
+    fn notification_without_departure_is_died_with_exact_grave() {
+        // A PlayerDeath notification is enough on its own even when the object
+        // removal was never observed as a departure.
+        let mut t = CombatTracker::new();
+        t.on_remote_death("One", "a Spider", 1837, 1_000);
+
+        let mut p1 = participant(1, false);
+        p1.name = "One".into();
+        let mut ps = vec![p1];
+        t.resolve_end_statuses(&mut ps, 0, 5_000, 0, false);
+
+        assert_eq!(
+            ps[0].end_status,
+            ParticipantEndStatus::Died { grave_type: 1837 }
+        );
     }
 
     #[test]
@@ -7338,6 +8070,8 @@ mod tests {
             scaling_stat: ScalingStat::Wisdom,
             duration: 2.4,
             extra_shots: 2,
+            on_shoot: false,
+            required_condition_bit: 0,
         };
         let mut t = CombatTracker::new();
         t.on_map_change("Mad Lab", 42, 0, &[]);
@@ -9775,7 +10509,7 @@ mod tests {
         // A consumable use immediately before the jump, so the change is sourced
         // to it (the item name may be unresolvable in tests, so only the inferred
         // marker is asserted).
-        t.on_use_item(0x0B50, 0.0, 0.0, 15);
+        t.on_use_item(0x0B50, 0.0, 0.0, 0, 15);
         t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 80)]), 20);
 
         let changes: Vec<(&str, i32, i32)> = t
@@ -9895,11 +10629,11 @@ mod tests {
             10,
         );
 
-        t.on_use_item(999, 0.0, 0.0, 100);
+        t.on_use_item(999, 0.0, 0.0, 0, 100);
         // Damage the server itself attributed to the local player afterwards.
         t.on_damage(500, 1000, 700, 120);
         // A second activation with no packet-borne damage in its window.
-        t.on_use_item(999, 0.0, 0.0, 400);
+        t.on_use_item(999, 0.0, 0.0, 0, 400);
 
         let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
         assert_eq!(acts.len(), 2);
@@ -9919,6 +10653,58 @@ mod tests {
         // The packet is still the fight's own packet-borne figure.
         let p = &t.fights.get(&500).unwrap().attackers[&1000];
         assert_eq!((p.packet_damage, p.packet_hits), (700, 1));
+    }
+
+    #[test]
+    fn trap_packet_damage_is_credited_to_the_trap_activation() {
+        // Trap damage is owner-credited DamagePacket (bulletId 0), not a shot.
+        // Once the trap declares a server-applied window, both the trigger hit
+        // and the delayed bomb belong to the activation instead of staying in
+        // packet_damage.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 12_000),
+                    stat(StatType::HP, 12_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![name_stat("You"), stat(StatType::Inventory1, 0x205e)],
+            ),
+            10,
+        );
+        // The activation and the window its item declares (Depthchaser Trap:
+        // throw 0.6s + lifetime 8s + bomb 0.8s + grace).
+        t.local_ability_uses.push_back(LocalAbilityUse {
+            time_ms: 100,
+            item_id: 0x205e,
+            enchants: Vec::new(),
+            server_effect_window_ms: Some(10_000),
+            form_skin: None,
+        });
+        // Trigger hit, then the delayed bomb.
+        t.on_damage(500, 1000, 700, 1_000);
+        t.on_damage(500, 1000, 900, 1_500);
+
+        let acts = t.ability_activations_for(0, 2_000, FightDestination::Boss(500));
+        assert_eq!(acts.len(), 1);
+        assert_eq!((acts[0].damage, acts[0].hits), (1_600, 2));
+        // The packets are still the fight's packet-borne figure; crediting them
+        // to the activation must not remove or duplicate them.
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!((p.packet_damage, p.packet_hits), (1_600, 2));
     }
 
     #[test]
@@ -9986,7 +10772,7 @@ mod tests {
             ),
             10,
         );
-        t.on_use_item(777, 0.0, 0.0, 100);
+        t.on_use_item(777, 0.0, 0.0, 0, 100);
         // The volley's per-bullet pre-defense damage, as on_ally_shot registers it
         // for the local player's own server-fired bullets.
         t.pending_server_shots.insert(5, (300, false, 777));
@@ -10374,7 +11160,7 @@ mod tests {
             ),
             10,
         );
-        t.on_use_item(0x04b3, 0.0, 0.0, 1_000);
+        t.on_use_item(0x04b3, 0.0, 0.0, 0, 1_000);
         // Nova pulses 0.28s and 2.5s later (inside the mushroom's life)...
         t.on_damage(500, 1000, 1_088, 1_280);
         t.on_damage(500, 1000, 1_088, 3_500);
@@ -11243,6 +12029,8 @@ mod tests {
             scaling_stat: ScalingStat::Vitality,
             duration: 2.4,
             extra_shots: 2,
+            on_shoot: false,
+            required_condition_bit: 0,
         };
         let mut t = CombatTracker::new();
         t.on_map_change("Mad Lab", 42, 0, &[]);
@@ -11308,6 +12096,106 @@ mod tests {
             .expect("local");
         // weapon 1000 - 65 DEF = 935, plus the main bonus and both side procs.
         assert_eq!(local.damage, 935 + 3 * 476);
+    }
+
+    #[test]
+    fn on_shoot_lethal_strike_applies_without_a_post_sneak_window() {
+        // Cloak of the Deep grants LS on every shot while Stasis Immune is
+        // held, not from a post-decloak window. It also fires real BulletCreate
+        // projectiles, so no invisible side procs may be simulated here.
+        use crate::assets::ScalingStat;
+        let params = LethalStrikeParams {
+            ignore_flat: 100.0,
+            ignore_perc: 0.0,
+            stat_mod_flat: 0.0,
+            stat_mod_perc: 0.0,
+            stat_mod_scaling_min: 0.0,
+            scaling_stat: ScalingStat::Wisdom,
+            duration: 1.4,
+            extra_shots: 9,
+            on_shoot: true,
+            required_condition_bit: COND_STASIS_IMMUNE,
+        };
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0, &[]);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        // No window is opened: on-shoot LS must not depend on one.
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                shot_time: 100,
+                lethal_strike: Some((params, 0)),
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 100);
+        let done = t.on_map_change("Nexus", 0, 200, &[]);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local");
+        // 1000 base + 100 main bonus; the nine real bubbles are separate hits.
+        assert_eq!(local.damage, 1100);
+    }
+
+    #[test]
+    fn server_fired_on_shoot_lethal_strike_bubbles_get_the_bonus() {
+        // The cloak's extra bubbles arrive as ServerPlayerShoot: their base is
+        // in the packet and the LS snapshot is carried alongside it.
+        use crate::assets::ScalingStat;
+        let params = LethalStrikeParams {
+            ignore_flat: 100.0,
+            ignore_perc: 0.0,
+            stat_mod_flat: 0.0,
+            stat_mod_perc: 0.0,
+            stat_mod_scaling_min: 0.0,
+            scaling_stat: ScalingStat::Wisdom,
+            duration: 1.4,
+            extra_shots: 9,
+            on_shoot: true,
+            required_condition_bit: COND_STASIS_IMMUNE,
+        };
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0, &[]);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 500_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.pending_server_shots.insert(5, (1000, false, 0x51ad));
+        t.pending_server_ls.insert(5, (params, 0));
+        t.on_local_hit(500, 5, 1000, 1000, 100);
+        let done = t.on_map_change("Nexus", 0, 200, &[]);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local");
+        assert_eq!(local.damage, 1100);
     }
 
     #[test]
@@ -14323,6 +15211,7 @@ mod tests {
             item_id,
             enchants: Vec::new(),
             server_effect_window_ms: window_ms,
+            form_skin: None,
         }
     }
 
@@ -14969,6 +15858,7 @@ mod tests {
             item_id,
             enchants: enchants.to_vec(),
             server_effect_window_ms: None,
+            form_skin: None,
         }
     }
 

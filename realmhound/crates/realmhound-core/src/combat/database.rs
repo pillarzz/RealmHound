@@ -21,7 +21,7 @@ mod maintenance;
 pub use maintenance::RepairBatch;
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 70;
+pub const SCHEMA_VERSION: i32 = 71;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -41,8 +41,12 @@ pub const LOOT_LINK_PRE_MS: i64 = 60_000;
 pub const LOOT_LINK_POST_MS: i64 = 600_000;
 
 // CROSS JOIN keeps SQLite from starting with every historical departure.
-const REMOTE_DEATH_CANDIDATES_SQL: &str =
-    "SELECT fp.id, fp.name FROM fights f INDEXED BY idx_fights_ended
+// Returns every participant row whose fight was active when the death happened.
+// The caller updates all of them: a death belongs to every concurrently tracked
+// fight card (main boss, minion, phase), but never to an earlier card that had
+// already ended.
+const REMOTE_DEATH_CANDIDATES_SQL: &str = "SELECT fp.id, fp.name
+     FROM fights f INDEXED BY idx_fights_ended
      CROSS JOIN fight_participants fp ON fp.fight_id = f.id
      WHERE fp.end_status = 'nexused' AND fp.grave_type = 0
        AND f.started_at <= ?2 AND f.ended_at >= ?1";
@@ -842,6 +846,11 @@ impl CombatDatabase {
                 "INTEGER NOT NULL DEFAULT 0",
             ),
             ("stat_awards", "most", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "death_broadcasts",
+                "grave_type",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
             (
                 "death_broadcasts",
                 "processed",
@@ -2955,6 +2964,7 @@ impl CombatDatabase {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 player TEXT NOT NULL,
                 killer TEXT NOT NULL DEFAULT '',
+                grave_type INTEGER NOT NULL DEFAULT 0,
                 occurred_at INTEGER NOT NULL,
                 processed INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at INTEGER NOT NULL DEFAULT 0
@@ -2979,13 +2989,16 @@ impl CombatDatabase {
         Ok(())
     }
 
-    /// Record an observed server death broadcast (`s.death`) so a death confirmed
-    /// after its fight was already stored can still be applied to that fight, and
-    /// so the raw signal survives for diagnosing a death that was never captured.
+    /// Record an observed server PlayerDeath notification (`s.death`) so a death
+    /// confirmed after its fight was already stored can still be applied to that
+    /// fight, and so the raw signal survives for diagnosing a death that was never
+    /// captured. `grave_type` is the notification's `picture_type` (0 when a
+    /// legacy text announcement supplied none).
     pub fn insert_death_broadcast(
         &mut self,
         player: &str,
         killer: &str,
+        grave_type: i32,
         occurred_at: i64,
     ) -> SqlResult<()> {
         let player = player.trim();
@@ -2993,8 +3006,9 @@ impl CombatDatabase {
             return Ok(());
         }
         self.conn.execute(
-            "INSERT INTO death_broadcasts (player, killer, occurred_at) VALUES (?1, ?2, ?3)",
-            params![player, killer.trim(), occurred_at],
+            "INSERT INTO death_broadcasts (player, killer, grave_type, occurred_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![player, killer.trim(), grave_type, occurred_at],
         )?;
         Ok(())
     }
@@ -3010,9 +3024,10 @@ impl CombatDatabase {
     /// corrected here.
     ///
     /// Only a `nexused` row with no grave is touched -- exactly the rule the live
-    /// pass applies (death evidence beats a departure, but never presence) -- and
-    /// the grave tier is left at 0, which the UI renders as the default
-    /// gravestone. Idempotent: repaired rows no longer match.
+    /// pass applies (death evidence beats a departure, but never presence). The
+    /// broadcast's `grave_type` (the PlayerDeath `picture_type`) is written onto
+    /// the row; 0 keeps the UI's generic gravestone. Idempotent: repaired rows no
+    /// longer match.
     pub fn repair_remote_deaths(&mut self) -> SqlResult<usize> {
         /// How long a broadcast that matched nothing is retried. A fight is
         /// normally written on the next tick after it ends; this window covers a
@@ -3026,20 +3041,20 @@ impl CombatDatabase {
         const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
         let now = chrono::Utc::now().timestamp_millis();
-        let broadcasts: Vec<(i64, String, i64)> = {
+        let broadcasts: Vec<(i64, String, i32, i64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, player, occurred_at FROM death_broadcasts
+                "SELECT id, player, grave_type, occurred_at FROM death_broadcasts
                  WHERE processed = 0 AND next_attempt_at<=?1
                  ORDER BY next_attempt_at, occurred_at, id LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![now, BATCH], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             rows.collect::<SqlResult<Vec<_>>>()?
         };
 
         let mut repaired = 0usize;
-        for (id, player, occurred_at) in broadcasts {
+        for (id, player, grave_type, occurred_at) in broadcasts {
             let key = super::tracker::sanitize_player_name(&player).to_ascii_lowercase();
             let mut repaired_for_broadcast = 0usize;
             if !key.is_empty() {
@@ -3047,8 +3062,8 @@ impl CombatDatabase {
                     let mut stmt = self.conn.prepare(REMOTE_DEATH_CANDIDATES_SQL)?;
                     let rows = stmt.query_map(
                         params![
-                            occurred_at - super::tracker::GRAVE_MATCH_WINDOW_MS,
-                            occurred_at + super::tracker::GRAVE_MATCH_WINDOW_MS
+                            occurred_at - super::tracker::DEATH_MATCH_GRACE_MS,
+                            occurred_at
                         ],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )?;
@@ -3059,9 +3074,9 @@ impl CombatDatabase {
                         continue;
                     }
                     repaired_for_broadcast += self.conn.execute(
-                        "UPDATE fight_participants SET end_status = 'died'
+                        "UPDATE fight_participants SET end_status = 'died', grave_type = ?2
                          WHERE id = ?1 AND end_status = 'nexused'",
-                        params![participant_id],
+                        params![participant_id, grave_type],
                     )?;
                 }
             }
@@ -5883,7 +5898,9 @@ fn parse_boosts(data: Option<&str>) -> Vec<BoostWindow> {
 }
 
 /// Serialize the local player's ability activations as one compact line each:
-/// `start,window,item_id,damage,hits,enchant:enchant:...`.
+/// `start,window,item_id,damage,hits,enchant:enchant:...,form_skin` (the last
+/// field is 0 for the normal mode and for records written before sigil forms
+/// were tracked).
 fn serialize_abilities(abilities: &[AbilityActivation]) -> Option<String> {
     if abilities.is_empty() {
         return None;
@@ -5899,8 +5916,14 @@ fn serialize_abilities(abilities: &[AbilityActivation]) -> Option<String> {
                     .collect::<Vec<_>>()
                     .join(":");
                 format!(
-                    "{},{},{},{},{},{}",
-                    a.start_offset_ms, a.window_ms, a.item_id, a.damage, a.hits, enchants
+                    "{},{},{},{},{},{},{}",
+                    a.start_offset_ms,
+                    a.window_ms,
+                    a.item_id,
+                    a.damage,
+                    a.hits,
+                    enchants,
+                    a.form_skin.unwrap_or(0)
                 )
             })
             .collect::<Vec<_>>()
@@ -5928,6 +5951,12 @@ fn parse_abilities(data: Option<&str>) -> Vec<AbilityActivation> {
                 .split(':')
                 .filter_map(|e| e.trim().parse::<u16>().ok())
                 .collect();
+            // Trailing form skin (0/absent for the normal mode and for records
+            // written before sigil forms were tracked).
+            let form_skin = parts
+                .next()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .filter(|&v| v > 0);
             Some(AbilityActivation {
                 item_id,
                 enchants,
@@ -5935,6 +5964,7 @@ fn parse_abilities(data: Option<&str>) -> Vec<AbilityActivation> {
                 window_ms,
                 damage,
                 hits,
+                form_skin,
             })
         })
         .collect()
@@ -6283,6 +6313,7 @@ fn merge_ability_activations(started_at: i64, group: &[FightRecord]) -> Vec<Abil
                 window_ms: a.window_ms,
                 damage: a.damage,
                 hits: a.hits,
+                form_skin: a.form_skin,
             });
         }
     }
@@ -6542,25 +6573,37 @@ fn unify_phase_end_statuses(
 /// Bee Nest / Red Beehemoth add phase -- leaves the main boss's range
 /// with no gravestone correlated to the boss fight, so the boss phase records
 /// them as `Nexused`. Their death IS captured on the concurrent aux phase, so
-/// once a `Died` is seen on any aux phase we mark that player `Died` on every
-/// phase they appear in (death is terminal within a run).
+/// once a `Died` is seen on an aux phase we mark that player `Died` on every
+/// phase that overlaps that aux phase in wall-clock.
 ///
-/// Scope is deliberately aux-*sourced* only: a death at a sequential real boss
-/// (e.g. Oryx fought after a completed Chancellor Dammah miniboss) must never
-/// bleed backward into the earlier boss the player actually cleared alive.
+/// Scope is deliberately aux-*sourced* and wall-clock-scoped: a death at a
+/// sequential real boss (e.g. Oryx fought after a completed Treasurer Gemsbok
+/// or Chancellor Dammah) must never bleed backward into an earlier boss the
+/// player actually cleared alive, even when the death was first seen on an
+/// add-on phase belonging to that later fight.
 fn propagate_aux_deaths(phases: &mut [FightRecord]) {
     use std::collections::HashMap;
-    let mut deaths: HashMap<(bool, i32, String), ParticipantEndStatus> = HashMap::new();
+    const OVERLAP_GRACE_MS: i64 = 1_000;
+
+    // Keep the aux phase's active window with each death: a later aux phase must
+    // not rewrite the status of an earlier sequential boss that never overlapped
+    // it.
+    let mut deaths: HashMap<(bool, i32, String), Vec<(ParticipantEndStatus, i64, i64)>> =
+        HashMap::new();
     for phase in phases.iter() {
         if crate::assets::aux_target_for_type(phase.boss_object_type).is_none() {
             continue;
         }
         for p in &phase.participants {
             if matches!(p.end_status, ParticipantEndStatus::Died { .. }) {
-                deaths
-                    .entry(participant_key(p))
-                    .and_modify(|s| *s = combine_end_status(*s, p.end_status))
-                    .or_insert(p.end_status);
+                let entries = deaths.entry(participant_key(p)).or_default();
+                if let Some(existing) = entries.iter_mut().find(|(_, started, ended)| {
+                    *started == phase.started_at && *ended == phase.ended_at
+                }) {
+                    existing.0 = combine_end_status(existing.0, p.end_status);
+                } else {
+                    entries.push((p.end_status, phase.started_at, phase.ended_at));
+                }
             }
         }
     }
@@ -6572,8 +6615,15 @@ fn propagate_aux_deaths(phases: &mut [FightRecord]) {
             if matches!(p.end_status, ParticipantEndStatus::Died { .. }) {
                 continue;
             }
-            if let Some(status) = deaths.get(&participant_key(p)).copied() {
-                p.end_status = status;
+            let Some(entries) = deaths.get(&participant_key(p)) else {
+                continue;
+            };
+            for &(status, aux_started, aux_ended) in entries {
+                if phase.started_at <= aux_ended + OVERLAP_GRACE_MS
+                    && phase.ended_at >= aux_started - OVERLAP_GRACE_MS
+                {
+                    p.end_status = combine_end_status(p.end_status, status);
+                }
             }
         }
     }
@@ -6867,6 +6917,31 @@ mod tests {
     use crate::combat::types::{
         CompletedFight, DamageProvenance, FightParticipant, ParticipantEndStatus,
     };
+
+    #[test]
+    fn ability_form_skin_round_trips_and_old_rows_default_to_normal() {
+        let activation = AbilityActivation {
+            item_id: 0x7b73,
+            enchants: vec![1, 2],
+            start_offset_ms: 1_000,
+            window_ms: 2_000,
+            damage: 555,
+            hits: 3,
+            form_skin: Some(0x7b17),
+        };
+        let encoded = serialize_abilities(std::slice::from_ref(&activation)).expect("encoded");
+        let parsed = parse_abilities(Some(&encoded));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].form_skin, Some(0x7b17));
+        assert_eq!(parsed[0].damage, 555);
+        assert_eq!(parsed[0].enchants, vec![1, 2]);
+
+        // Records written before forms were tracked have six fields.
+        let old = parse_abilities(Some("1000,2000,31603,555,3,1:2"));
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].form_skin, None);
+        assert_eq!(old[0].damage, 555);
+    }
 
     #[test]
     fn legacy_combat_repairs_are_deferred_bounded_atomic_and_resumable() {
@@ -7756,7 +7831,7 @@ mod tests {
     }
 
     #[test]
-    fn schema70_upgrades_main_and_pr_databases_without_resetting_repairs() {
+    fn schema71_upgrades_main_and_pr_databases_without_resetting_repairs() {
         let checkpoints = |db: &CombatDatabase| {
             db.conn
                 .prepare(
@@ -7844,13 +7919,14 @@ mod tests {
                     db.conn
                         .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                         .unwrap(),
-                    70,
+                    SCHEMA_VERSION,
                     "upgrading v{version}, reopen {reopen}",
                 );
                 assert!(db.column_exists("fights", "mods").unwrap());
                 assert!(db
                     .column_exists("death_broadcasts", "next_attempt_at")
                     .unwrap());
+                assert!(db.column_exists("death_broadcasts", "grave_type").unwrap());
                 assert_eq!(db.fight_count().unwrap(), 2 + reopen);
                 let loaded = db.fight_detail(original).unwrap().unwrap();
                 assert_eq!(loaded.boss_name, fight.boss_name);
@@ -7888,18 +7964,19 @@ mod tests {
     }
 
     #[test]
-    fn schema70_fresh_database_has_modifiers_and_maintenance_without_legacy_jobs() {
+    fn schema71_fresh_database_has_modifiers_and_maintenance_without_legacy_jobs() {
         let db = CombatDatabase::open_in_memory().unwrap();
         assert_eq!(
             db.conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            70,
+            SCHEMA_VERSION,
         );
         assert!(db.column_exists("fights", "mods").unwrap());
         assert!(db
             .column_exists("death_broadcasts", "next_attempt_at")
             .unwrap());
+        assert!(db.column_exists("death_broadcasts", "grave_type").unwrap());
         assert_eq!(db.fight_count().unwrap(), 0);
         assert!(!db.has_legacy_repairs().unwrap());
         assert_eq!(
@@ -10267,6 +10344,66 @@ mod tests {
         assert_eq!(killed_flag(&db, id), 1);
     }
 
+    /// Ice Citadel's reported shape: Esben's own fight ends Escaped while Munin
+    /// was killed, so the run card anchors on the escaped Esben and reads
+    /// Escaped. A bag holding the Mark of Esben proves the main boss died and
+    /// must flip the whole run card, not just add another killed phase.
+    #[test]
+    fn a_mark_proof_completes_the_escaped_main_boss_of_a_multi_phase_run() {
+        const ESBEN: i32 = 40_166;
+        const MUNIN: i32 = 40_177;
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+
+        let mut esben = escaped_fight("Ice Citadel", ESBEN, 11);
+        esben.boss_name = "Esben the Neurotic".to_string();
+        esben.started_at = 1_000;
+        esben.ended_at = 61_000;
+        esben.encounter_id = Some("ice_citadel".to_string());
+        esben.encounter_run_id = Some("ic-run".to_string());
+        db.insert_fight(&esben).unwrap();
+
+        let mut munin = escaped_fight("Ice Citadel", MUNIN, 11);
+        munin.boss_name = "Munin".to_string();
+        munin.killed = true;
+        munin.started_at = 2_000;
+        munin.ended_at = 10_000;
+        munin.encounter_id = Some("ice_citadel".to_string());
+        munin.encounter_run_id = Some("ic-run".to_string());
+        db.insert_fight(&munin).unwrap();
+
+        let card = db.list_fights(&FightQuery::default(), 10).unwrap();
+        assert_eq!(card.len(), 1);
+        assert_eq!(card[0].boss_object_type, ESBEN);
+        assert!(
+            !card[0].killed,
+            "the escaped main-boss anchor starts Escaped"
+        );
+
+        // The bag lands between Munin's death and the map change.
+        assert!(db
+            .mark_boss_killed_by_loot(11, ESBEN, 55_000)
+            .unwrap()
+            .is_some());
+
+        let card = db.list_fights(&FightQuery::default(), 10).unwrap();
+        assert_eq!(card.len(), 1);
+        assert_eq!(card[0].boss_object_type, ESBEN);
+        assert!(card[0].killed, "the Mark completes the run card");
+        assert_eq!(
+            card[0]
+                .killed_bosses
+                .iter()
+                .map(|(object_type, _)| *object_type)
+                .collect::<Vec<_>>(),
+            vec![ESBEN, MUNIN],
+            "both the proven main boss and the killed phase are listed"
+        );
+        assert!(
+            db.encounter_detail("ic-run").unwrap().unwrap().killed,
+            "the detail view matches the card"
+        );
+    }
+
     /// The Head of Shaitan bags but drops no Mark, and the local player can leave
     /// the fight (nexus / disconnect) seconds before the party kills it: the fight
     /// then ends well before the bag, yet the bag proves the kill.
@@ -11888,12 +12025,13 @@ mod tests {
         db.insert_fight(&fight).unwrap();
 
         // The broadcast for a death inside the fight's window arrives afterwards.
-        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_020_000)
+        // picture_type 1837 is the 8/8 default gravestone.
+        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1837, 1_020_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 1);
 
-        // The named participant is corrected with a generic grave (the tier was
-        // never captured); everyone else keeps the nexus verdict.
+        // The named participant is corrected with the exact grave carried by the
+        // notification; everyone else keeps the nexus verdict.
         let repaired: (String, i64) = db
             .conn
             .query_row(
@@ -11902,7 +12040,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(repaired, ("died".to_string(), 0));
+        assert_eq!(repaired, ("died".to_string(), 1837));
         let bystander: String = db
             .conn
             .query_row(
@@ -11916,10 +12054,71 @@ mod tests {
     }
 
     #[test]
+    fn death_broadcast_does_not_repair_an_earlier_encounter() {
+        // Zlenkku/Gunaj case at the database level: the player cleared the
+        // Gemsbok encounter alive, then died in the Oryx encounter seconds
+        // later. The repair must mark every fight card active at the death --
+        // both Oryx phase rows and a separately tracked minion card -- and
+        // leave the already-finished Gemsbok roster untouched.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut gemsbok = fight_with_players("Oryx's Sanctuary", 1_000_000, &["Pillar"]);
+        gemsbok.ended_at = 1_030_000;
+        gemsbok.encounter_id = Some("dungeon_run".into());
+        gemsbok.encounter_run_id = Some("run-1".into());
+        gemsbok.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let gemsbok_id = db.insert_fight(&gemsbok).unwrap();
+
+        let mut oryx = fight_with_players("Oryx's Sanctuary", 1_035_000, &["Pillar"]);
+        oryx.ended_at = 1_060_000;
+        oryx.encounter_id = Some("o3_oryx".into());
+        oryx.encounter_run_id = Some("run-1".into());
+        oryx.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let oryx_id = db.insert_fight(&oryx).unwrap();
+
+        let mut messengers = fight_with_players("Oryx's Sanctuary", 1_036_000, &["Pillar"]);
+        messengers.ended_at = 1_060_000;
+        messengers.encounter_id = Some("o3_oryx".into());
+        messengers.encounter_run_id = Some("run-1".into());
+        messengers.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let messengers_id = db.insert_fight(&messengers).unwrap();
+
+        // A separately tracked minion card, under a different encounter id.
+        let mut minion = fight_with_players("Oryx's Sanctuary", 1_036_500, &["Pillar"]);
+        minion.ended_at = 1_060_000;
+        minion.encounter_id = Some("o3_minions".into());
+        minion.encounter_run_id = Some("run-1".into());
+        minion.participants[0].end_status = ParticipantEndStatus::Nexused;
+        let minion_id = db.insert_fight(&minion).unwrap();
+
+        db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1837, 1_040_000)
+            .unwrap();
+        assert_eq!(
+            db.repair_remote_deaths().unwrap(),
+            3,
+            "all fight cards active at the death are repaired"
+        );
+
+        let status = |fight_id: i64| -> (String, i64) {
+            db.conn
+                .query_row(
+                    "SELECT end_status, grave_type FROM fight_participants
+                     WHERE fight_id = ?1 AND name = 'Pillar'",
+                    params![fight_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(status(gemsbok_id), ("nexused".to_string(), 0));
+        assert_eq!(status(oryx_id), ("died".to_string(), 1837));
+        assert_eq!(status(messengers_id), ("died".to_string(), 1837));
+        assert_eq!(status(minion_id), ("died".to_string(), 1837));
+    }
+
+    #[test]
     fn death_broadcast_waits_for_a_late_stored_fight_then_retires() {
         let mut db = CombatDatabase::open_in_memory().unwrap();
         let now = chrono::Utc::now().timestamp_millis();
-        db.insert_death_broadcast("Late", "Oryx the Mad God", now)
+        db.insert_death_broadcast("Late", "Oryx the Mad God", 0, now)
             .unwrap();
 
         // The fight has not been written yet: the broadcast must stay pending.
@@ -11956,14 +12155,14 @@ mod tests {
         let mut db = CombatDatabase::open_writer(&path).unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         for n in 0..16 {
-            db.insert_death_broadcast(&format!("Missing{n}"), "a Spider", now)
+            db.insert_death_broadcast(&format!("Missing{n}"), "a Spider", 0, now)
                 .unwrap();
         }
         let mut fight = fight_with_players("Mad Lab", now - 5_000, &["Found"]);
         fight.ended_at = now + 5_000;
         fight.participants[0].end_status = ParticipantEndStatus::Nexused;
         db.insert_fight(&fight).unwrap();
-        db.insert_death_broadcast("Found", "a Spider", now + 1)
+        db.insert_death_broadcast("Found", "a Spider", 0, now + 1)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         drop(db);
@@ -12030,7 +12229,7 @@ mod tests {
         recent.ended_at = now + 60_000;
         recent.participants[0].end_status = ParticipantEndStatus::Nexused;
         db.insert_fight(&recent).unwrap();
-        db.insert_death_broadcast("Pillar", "a Spider", now)
+        db.insert_death_broadcast("Pillar", "a Spider", 0, now)
             .unwrap();
 
         assert_eq!(db.repair_remote_deaths().unwrap(), 1);
@@ -12058,6 +12257,7 @@ mod tests {
         db.insert_death_broadcast(
             "Late",
             "a Spider",
+            0,
             chrono::Utc::now().timestamp_millis() - 16 * 60 * 1000,
         )
         .unwrap();
@@ -12065,6 +12265,7 @@ mod tests {
         assert!(db
             .column_exists("death_broadcasts", "next_attempt_at")
             .unwrap());
+        assert!(db.column_exists("death_broadcasts", "grave_type").unwrap());
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         let processed: i64 = db
             .conn
@@ -12101,11 +12302,11 @@ mod tests {
         fight.participants[0].end_status = ParticipantEndStatus::Nexused;
         db.insert_fight(&fight).unwrap();
         // Ten minutes later: outside the fight window.
-        db.insert_death_broadcast("Pillar", "a Spider", 610_000)
+        db.insert_death_broadcast("Pillar", "a Spider", 0, 610_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         // In the window, but another player died.
-        db.insert_death_broadcast("Someone", "a Spider", 20_000)
+        db.insert_death_broadcast("Someone", "a Spider", 0, 20_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
         let status: String = db
@@ -12126,7 +12327,7 @@ mod tests {
         let mut db = CombatDatabase::open_in_memory().unwrap();
         let fight = fight_with_players("Mad Lab", 1_000, &["Present"]);
         db.insert_fight(&fight).unwrap();
-        db.insert_death_broadcast("Present", "a Spider", 20_000)
+        db.insert_death_broadcast("Present", "a Spider", 0, 20_000)
             .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
     }
@@ -12142,7 +12343,7 @@ mod tests {
             db.insert_fight(&fight).unwrap();
             // Stored, but not applied yet: only the open pass (or the live drain)
             // repairs stored rows.
-            db.insert_death_broadcast("Pillar", "Oryx the Mad God", 1_030_000)
+            db.insert_death_broadcast("Pillar", "Oryx the Mad God", 0, 1_030_000)
                 .unwrap();
             let before: String = db
                 .conn
@@ -12648,6 +12849,93 @@ mod tests {
             carol_r.end_status,
             ParticipantEndStatus::Died { .. }
         ));
+    }
+
+    #[test]
+    fn later_addon_death_does_not_bleed_into_earlier_boss_245() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Treasurer Gemsbok is completed alive, then the run moves on to Oryx.
+        // Carol later dies while the O3 Messengers add-on is up. The Messengers
+        // death may propagate to the concurrent Oryx phase, but it must not
+        // rewrite the already-finished Gemsbok phase: that boss was cleared while
+        // Carol was present.
+        let mut gemsbok = o3_fight(
+            8700,
+            "Treasurer Gemsbok",
+            1_000,
+            true,
+            vec![
+                o3_participant(700, "Bob", false, ParticipantEndStatus::Present),
+                o3_participant(701, "Carol", false, ParticipantEndStatus::Present),
+            ],
+        );
+        gemsbok.ended_at = 5_000;
+        db.insert_fight(&gemsbok).unwrap();
+
+        db.insert_fight(&o3_fight(
+            45363,
+            "Oryx the Mad God",
+            10_000,
+            true,
+            vec![
+                o3_participant(700, "Bob", false, ParticipantEndStatus::Present),
+                o3_participant(701, "Carol", false, ParticipantEndStatus::Nexused),
+            ],
+        ))
+        .unwrap();
+        db.insert_fight(&o3_fight(
+            45365,
+            "Messengers",
+            10_000,
+            false,
+            vec![
+                o3_participant(700, "Bob", false, ParticipantEndStatus::Present),
+                o3_participant(
+                    701,
+                    "Carol",
+                    false,
+                    ParticipantEndStatus::Died { grave_type: 1830 },
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let enc = db.encounter_detail("run-o3").unwrap().unwrap();
+        let gemsbok = enc
+            .phases
+            .iter()
+            .find(|p| p.boss_object_type == 8700)
+            .expect("gemsbok phase");
+        let carol = gemsbok
+            .participants
+            .iter()
+            .find(|p| p.name == "Carol")
+            .unwrap();
+        assert!(
+            matches!(carol.end_status, ParticipantEndStatus::Present),
+            "Gemsbok was cleared alive; a later O3 add-on death must not bleed back, got {:?}",
+            carol.end_status,
+        );
+
+        // The concurrent Oryx phase still inherits the death.
+        let oryx = enc
+            .phases
+            .iter()
+            .find(|p| p.boss_object_type == 45363)
+            .expect("oryx phase");
+        let carol = oryx
+            .participants
+            .iter()
+            .find(|p| p.name == "Carol")
+            .unwrap();
+        assert!(
+            matches!(
+                carol.end_status,
+                ParticipantEndStatus::Died { grave_type: 1830 }
+            ),
+            "Oryx overlaps the add-on and must inherit the death, got {:?}",
+            carol.end_status,
+        );
     }
 
     #[test]

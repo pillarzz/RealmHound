@@ -1003,6 +1003,35 @@ pub fn dungeon_for_mark_name(name: &str) -> Option<&'static str> {
         .map(|(_, dungeon)| *dungeon)
 }
 
+/// The canonical dungeon a boss Mark item belongs to, resolved from the Mark's
+/// display name. `None` when the item is not a Mark whose dungeon is curated.
+pub fn dungeon_for_mark_item(item_id: i32) -> Option<&'static str> {
+    let name = get_asset_manager().object_name(item_id)?;
+    dungeon_for_mark_name(&name)
+}
+
+/// The main boss of a dungeon: the single boss [`DUNGEON_BOSSES`] lists for it.
+///
+/// Returns `None` for a dungeon with no catalog entry, and for one catalogued
+/// with several *distinct* bosses (alternate forms of a shared instance, e.g.
+/// Oryx's Castle's Stone Guardians and Janus). No single object type can stand
+/// for those, so callers must keep their existing heuristics.
+pub fn main_boss_for_dungeon(dungeon: &str) -> Option<(i32, &'static str)> {
+    let dungeon = dungeon.trim();
+    let mut found: Option<(i32, &'static str)> = None;
+    for (_, _, object_type, name, catalogued_dungeon) in DUNGEON_BOSSES {
+        if !catalogued_dungeon.eq_ignore_ascii_case(dungeon) {
+            continue;
+        }
+        match found {
+            Some((known, _)) if known != *object_type => return None,
+            Some(_) => {}
+            None => found = Some((*object_type, *name)),
+        }
+    }
+    found
+}
+
 /// Realm encounters capped per realm (`PerRealmMax` in the game's
 /// `encounters.xml`): they spawn only a limited number of times over a realm's
 /// life, unlike ordinary encounters that respawn all realm long. Keyed by the
@@ -1365,6 +1394,28 @@ mod tests {
             Some("Oryx's Chamber")
         );
         assert_eq!(dungeon_for_mark_name("Concentrated Soul Fire"), None);
+    }
+
+    #[test]
+    fn dungeons_resolve_to_their_single_main_boss() {
+        // Ice Citadel's run card anchors on Esben, not on his summoned Munin.
+        assert_eq!(
+            main_boss_for_dungeon("Ice Citadel"),
+            Some((40166, "Esben the Neurotic"))
+        );
+        assert_eq!(
+            main_boss_for_dungeon("ice citadel"),
+            Some((40166, "Esben the Neurotic"))
+        );
+        assert_eq!(
+            main_boss_for_dungeon("Lost Halls"),
+            Some((45073, "Marble Colossus"))
+        );
+        // Shared instances with several distinct bosses have no single main
+        // boss; callers must keep their own heuristics for these.
+        assert_eq!(main_boss_for_dungeon("Oryx's Castle"), None);
+        assert_eq!(main_boss_for_dungeon("Abyss of Demons"), None);
+        assert_eq!(main_boss_for_dungeon("Not a Dungeon"), None);
     }
 
     #[test]

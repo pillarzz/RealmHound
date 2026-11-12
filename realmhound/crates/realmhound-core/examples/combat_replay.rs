@@ -273,6 +273,7 @@ fn main() {
                         u.slot_object.item_type,
                         u.use_item_position.x,
                         u.use_item_position.y,
+                        u.use_item_flag,
                         clock,
                     );
                 }

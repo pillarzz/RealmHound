@@ -3269,8 +3269,14 @@ impl PacketProcessor {
             } => {
                 self.combat.on_player_hit(bullet_id, enemy_id, now_ms());
             }
-            GameEvent::LocalItemUsed { item_id, x, y } => {
-                self.combat.on_use_item(item_id, x, y, now_ms());
+            GameEvent::LocalItemUsed {
+                item_id,
+                x,
+                y,
+                use_item_flag,
+            } => {
+                self.combat
+                    .on_use_item(item_id, x, y, use_item_flag, now_ms());
             }
             GameEvent::DamageDealt {
                 target_id,
@@ -3522,6 +3528,30 @@ impl PacketProcessor {
                     }
                 }
             }
+            GameEvent::PlayerDeathAnnounced {
+                ref message,
+                picture_type,
+            } => {
+                // The authoritative remote-death signal: a PlayerDeath
+                // notification carries the `s.death` payload (victim + killer) and
+                // picture_type is the exact gravestone object type.
+                if let Some((victim, killer)) = parse_remote_death("", message) {
+                    tracing::info!(
+                        "[COMBAT] Remote death notification: player='{}' killed_by='{}' grave_type={}",
+                        victim,
+                        killer,
+                        picture_type
+                    );
+                    self.combat
+                        .on_remote_death(&victim, &killer, picture_type, now_ms());
+                } else {
+                    tracing::warn!(
+                        "[COMBAT] Undecoded PlayerDeath notification: message='{}' picture_type={}",
+                        message,
+                        picture_type
+                    );
+                }
+            }
             GameEvent::TextReceived(ref text) => {
                 if let Some((server, realm)) =
                     crate::panels::live_feed::parse_server_command_packet(text)
@@ -3566,15 +3596,16 @@ impl PacketProcessor {
                     self.apply_area_unlock(msg);
                 }
 
-                // Server death broadcast ("Player died at level N, killed by ...").
-                // Authoritative remote-death signal for the combat tracker.
+                // Legacy text death announcement. The live server sends the
+                // authoritative signal as a PlayerDeath notification, but accept
+                // the rendered/stringlist form here too.
                 if let Some((victim, killer)) = parse_remote_death(&text.name, &text.text) {
                     tracing::info!(
                         "[COMBAT] Remote death broadcast: player='{}' killed_by='{}'",
                         victim,
                         killer
                     );
-                    self.combat.on_remote_death(&victim, &killer, now_ms());
+                    self.combat.on_remote_death(&victim, &killer, 0, now_ms());
                 } else if text.text.contains("\"s.death\"") {
                     // A death broadcast we could not decode: record the raw shape
                     // so a payload change can be spotted instead of silently

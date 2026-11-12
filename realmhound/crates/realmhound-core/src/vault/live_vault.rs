@@ -847,6 +847,7 @@ mod tests {
                     filled: Vec::new(),
                     empty: 1,
                     locked: 0,
+                    ..Default::default()
                 },
             ));
 
@@ -878,6 +879,7 @@ mod tests {
                 filled: vec![1458],
                 empty: 2,
                 locked: 1,
+                ..Default::default()
             },
         );
         assert_eq!(item.enchant_count(), 1);

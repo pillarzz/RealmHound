@@ -10,8 +10,8 @@
 use crate::api::blood_ritual::BloodRitualDef;
 use crate::api::crucible::CrucibleDef;
 use crate::assets::{
-    AbilityEffect, AssetManager, EnchantEffectKind, ProcEffect, ProcTrigger, ScalingStat,
-    StatBonuses, StatKind,
+    AbilityEffect, AssetManager, EnchantEffectKind, ProcEffect, ProcTrigger, ProjectileBurstEffect,
+    ScalingStat, StatBonuses, StatKind,
 };
 use crate::combat::damage::damage_with_defense;
 
@@ -517,6 +517,13 @@ pub struct AbilityReadout {
     /// Total potential damage for one use, if the ability deals self-computable
     /// damage. When set, the damage lines (`is_damage`) fold into this summary.
     pub damage_per_use: Option<AbilityDamagePerUse>,
+    /// Damage per use while a meter-gated switch form is active, when the item
+    /// declares one. Rendered as its own "transformed" row; `damage_per_use`
+    /// stays the charging-mode figure.
+    pub transformed_damage_per_use: Option<AbilityDamagePerUse>,
+    /// Per-volley damage lines for the transformed mode, used by that row's
+    /// hover breakdown (the charging row uses the damage lines in `lines`).
+    pub transformed_lines: Vec<AbilityLine>,
     /// Theoretical hex-blast max damage per use, if the ability detonates hex.
     /// When set, the "Hex blast" line folds into this summary + its hover.
     pub hex_blast: Option<HexBlastReadout>,
@@ -1514,6 +1521,7 @@ fn ability_readout_from(
         }
     };
     let mut lines: Vec<AbilityLine> = Vec::new();
+    let is_meter_item = effects.has_meter();
 
     // Build "<total> (+<bonus>)<suffix>" segments, coloring the bonus by `stat`.
     let scaled = |total: i32, bonus: i32, stat: ScalingStat, suffix: &str| -> Vec<Seg> {
@@ -1568,7 +1576,11 @@ fn ability_readout_from(
 
     // Projectile bursts (Wizard spell, orb hex-consume bursts). For orbs prefer
     // the lowest hex-threshold burst as the representative on-consume damage.
-    if let Some(pb) = effects
+    // A meter-gated item has two volleys with different stat scaling, so every
+    // distinct charging burst gets its own line for the hover breakdown.
+    if is_meter_item {
+        lines.extend(burst_lines(&effects.normal_bursts, eff));
+    } else if let Some(pb) = effects
         .effects
         .iter()
         .filter_map(|e| match e {
@@ -1827,6 +1839,36 @@ fn ability_readout_from(
         }
     }
 
+    // The switch form's buffs, in one line: which of them only apply while
+    // transformed, plus the weapon-range penalty (a sigil reduces range).
+    if let Some(switch) = &effects.switch {
+        let mut parts: Vec<String> = Vec::new();
+        for boost in &switch.stat_boosts {
+            parts.push(format!("{:+} {}", boost.amount, boost.stat));
+        }
+        if switch.lethal_strike.is_some() {
+            parts.push("Lethal Strike".to_string());
+        }
+        if let Some(range) = switch.boost_range {
+            let pct = ((1.0 - range.life_boost) * 100.0).round() as i32;
+            if pct > 0 {
+                parts.push(format!("-{}% weapon range", pct));
+            } else if pct < 0 {
+                parts.push(format!("+{}% weapon range", -pct));
+            }
+        }
+        if !parts.is_empty() {
+            lines.push(AbilityLine::plain(
+                "Buffs",
+                format!(
+                    "{} (transformed, {:.1}s)",
+                    parts.join(", "),
+                    switch.duration
+                ),
+            ));
+        }
+    }
+
     // Hex-detonation blast (orb family), reported after the burst.
     let mut hex_blast = None;
     if let Some(d) = effects.detonate_hex {
@@ -1862,23 +1904,65 @@ fn ability_readout_from(
         }
     }
 
+    // Mode-specific damage for meter-gated items: the charging ability and the
+    // transformed ability are different volleys, so report each per use instead
+    // of blending them. Other items keep the existing single figure.
+    let switch = effects.switch.as_ref();
+    if is_meter_item {
+        if let Some(switch) = switch {
+            for burst in effects.normal_bursts.iter().chain(switch.bursts.iter()) {
+                if let Some(stat) = burst.scaling_stat {
+                    note_scale(stat, &mut scales_off);
+                }
+            }
+        }
+    }
+    let mut charging_damage = is_meter_item
+        .then(|| burst_mode_damage(&effects.normal_bursts, eff))
+        .flatten();
+    let mut transformed_damage = is_meter_item
+        .then(|| switch.and_then(|sw| burst_mode_damage(&sw.bursts, eff)))
+        .flatten();
+    // Keep both rows in the same stat order (the charging volley's order), so
+    // the ATT/DEX bonuses cannot swap places between modes.
+    if let Some(damage) = charging_damage.as_mut() {
+        reorder_scaled_by(&mut damage.scaled, &scales_off);
+        reorder_scaled_by(&mut damage.single_scaled, &scales_off);
+    }
+    if let Some(damage) = transformed_damage.as_mut() {
+        reorder_scaled_by(&mut damage.scaled, &scales_off);
+        reorder_scaled_by(&mut damage.single_scaled, &scales_off);
+    }
+
     let total = ability_potential_damage(effects, eff, false);
-    let damage_per_use = if total > 0 {
-        Some(AbilityDamagePerUse {
+    let damage_per_use = charging_damage.or_else(|| {
+        (total > 0).then(|| AbilityDamagePerUse {
             total,
             scaled: ability_stat_shares(effects, eff, &scales_off, false),
             single_target: ability_potential_damage(effects, eff, true),
             single_scaled: ability_stat_shares(effects, eff, &scales_off, true),
         })
-    } else {
-        None
-    };
+    });
+
+    let mut transformed_lines = switch
+        .filter(|_| is_meter_item)
+        .map(|sw| burst_lines(&sw.bursts, eff))
+        .unwrap_or_default();
+    // Match the charging breakdown's stat order (the UI shows both rows).
+    transformed_lines.sort_by_key(|line| {
+        scales_off
+            .iter()
+            .position(|s| *s == line.label.as_str())
+            .unwrap_or(usize::MAX)
+    });
 
     AbilityReadout {
         item_id,
         scales_off,
         lines,
         damage_per_use,
+        transformed_damage_per_use: transformed_damage,
+        transformed_lines,
         hex_blast,
         lethal_strike: None,
     }
@@ -1991,6 +2075,112 @@ fn ability_potential_damage(
     }
 
     total
+}
+
+/// One hover line per distinct volley, labelled by its scaling stat (ATT/DEX),
+/// so a sigil's two charging or two transformed volleys are both visible.
+fn burst_lines(bursts: &[ProjectileBurstEffect], eff: &EffectiveStats) -> Vec<AbilityLine> {
+    let mut out = Vec::new();
+    for pb in unique_bursts(bursts) {
+        let sv = pb.scaling_stat.map(|s| scaling_value(s, eff)).unwrap_or(0);
+        let floor = pb.stat_mod_scaling_min as i32;
+        let (mn, mx, shots) = (pb.min_for(sv), pb.max_for(sv), pb.shots_for(sv));
+        if mx <= 0 || shots <= 0 {
+            continue;
+        }
+        let total = avg_i(mn, mx) * shots;
+        let ap = if pb.armor_piercing { " AP" } else { "" };
+        let mut segs = vec![AbilitySegment::plain(format!("{}-{} x{}", mn, mx, shots))];
+        if let Some(s) = pb.scaling_stat {
+            let base_total = avg_i(pb.min_for(floor), pb.max_for(floor)) * pb.shots_for(floor);
+            segs.push(AbilitySegment::plain("  (~".to_string()));
+            segs.push(AbilitySegment::plain(total.to_string()));
+            let bonus = total - base_total;
+            if bonus > 0 {
+                segs.push(AbilitySegment::scaled(format!(" (+{})", bonus), s));
+            }
+            segs.push(AbilitySegment::plain(format!(" total{})", ap)));
+        } else {
+            segs.push(AbilitySegment::plain(format!("  (~{} total{})", total, ap)));
+        }
+        out.push(AbilityLine::dmg(
+            pb.scaling_stat.map(scaling_label).unwrap_or("Damage"),
+            segs,
+        ));
+    }
+    out
+}
+
+/// De-duplicate identical bursts. The parser can see the same volley more than
+/// once (a switch block and its projectile data, or duplicate XML entries), and
+/// summing duplicates would overstate a mode's damage.
+fn unique_bursts(bursts: &[ProjectileBurstEffect]) -> Vec<ProjectileBurstEffect> {
+    let mut out: Vec<ProjectileBurstEffect> = Vec::new();
+    for &burst in bursts {
+        if !out.contains(&burst) {
+            out.push(burst);
+        }
+    }
+    out
+}
+
+/// Total per-use damage of one mode's volleys, with each scaling stat's share.
+/// Every burst is assumed to land on the same target (the boss case).
+fn burst_mode_damage(
+    bursts: &[ProjectileBurstEffect],
+    eff: &EffectiveStats,
+) -> Option<AbilityDamagePerUse> {
+    let unique = unique_bursts(bursts);
+    if unique.is_empty() {
+        return None;
+    }
+    let damage_for = |stats: &EffectiveStats| -> i32 {
+        unique
+            .iter()
+            .map(|burst| {
+                let sv = burst
+                    .scaling_stat
+                    .map(|s| scaling_value(s, stats))
+                    .unwrap_or(0);
+                avg_i(burst.min_for(sv), burst.max_for(sv)) * burst.shots_for(sv)
+            })
+            .sum()
+    };
+    let total = damage_for(eff);
+    if total <= 0 {
+        return None;
+    }
+    let mut stats: Vec<ScalingStat> = Vec::new();
+    for burst in &unique {
+        if let Some(stat) = burst.scaling_stat {
+            if !stats.contains(&stat) {
+                stats.push(stat);
+            }
+        }
+    }
+    let scaled: Vec<(ScalingStat, i32)> = stats
+        .into_iter()
+        .filter_map(|stat| {
+            let share = total - damage_for(&with_stat_zeroed(eff, stat));
+            (share > 0).then_some((stat, share))
+        })
+        .collect();
+    Some(AbilityDamagePerUse {
+        total,
+        scaled: scaled.clone(),
+        single_target: total,
+        single_scaled: scaled,
+    })
+}
+
+/// Sort a damage summary's per-stat shares into the readout's stat order.
+fn reorder_scaled_by(shares: &mut [(ScalingStat, i32)], order: &[&'static str]) {
+    shares.sort_by_key(|(stat, _)| {
+        order
+            .iter()
+            .position(|label| *label == scaling_label(*stat))
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// Reverse of `scaling_label`, mapping a scales-off label back to its stat.
@@ -2172,6 +2362,7 @@ mod tests {
             on_detonate_poison: vec![],
             condition_hex_tiers: vec![],
             effects: vec![],
+            ..Default::default()
         };
         let mut eff = EffectiveStats::default();
         eff.max_mp = 765; // sb = 465
@@ -2191,6 +2382,160 @@ mod tests {
         let effects = AbilityEffects::default();
         let ab = ability_damage_from(&effects, 1, &EffectiveStats::default());
         assert!(ab.is_none());
+    }
+
+    #[test]
+    fn sigil_readout_splits_charging_and_transformed_damage() {
+        use crate::assets::{
+            AbilityEffects, BoostRangeEffect, MeterDef, ProjectileBurstEffect, StatBoostEffect,
+            SwitchAbility,
+        };
+        let burst =
+            |min: f32, max: f32, shots: i32, stat: ScalingStat, per: f32| ProjectileBurstEffect {
+                min_damage: min,
+                max_damage: max,
+                num_shots: shots,
+                armor_piercing: false,
+                scaling_stat: Some(stat),
+                stat_mod_scaling_min: 50.0,
+                stat_mod_damage: per,
+                stat_mod_num_shots: 0.0,
+            };
+        let effects = AbilityEffects {
+            meters: vec![MeterDef {
+                id: 0,
+                max_value: 650,
+                start_value: 0,
+            }],
+            switch: Some(SwitchAbility {
+                meter_id: 0,
+                minimum_meter: 650,
+                meter_cost: 650,
+                transform_skin: Some(0x7ea7),
+                duration: 7.6,
+                stat_boosts: vec![
+                    StatBoostEffect {
+                        stat: "ATT".into(),
+                        amount: 25,
+                        duration: 7.6,
+                    },
+                    StatBoostEffect {
+                        stat: "DEX".into(),
+                        amount: 30,
+                        duration: 7.6,
+                    },
+                ],
+                lethal_strike: None,
+                boost_range: Some(BoostRangeEffect {
+                    radius: 1.0,
+                    life_boost: 0.5,
+                    speed_boost: 1.0,
+                    duration: 7.6,
+                }),
+                bursts: vec![
+                    burst(110.0, 130.0, 10, ScalingStat::Attack, 2.25),
+                    burst(680.0, 720.0, 4, ScalingStat::Dexterity, 4.5),
+                ],
+                conditions: Vec::new(),
+            }),
+            normal_bursts: vec![
+                burst(680.0, 720.0, 2, ScalingStat::Dexterity, 4.5),
+                burst(110.0, 130.0, 4, ScalingStat::Attack, 2.25),
+            ],
+            effects: Vec::new(),
+            ..Default::default()
+        };
+        let ro = ability_readout_from(&effects, 0x7b7c, &EffectiveStats::default());
+
+        // No meter or switch line; the meter's number is not useful in isolation.
+        assert!(ro
+            .lines
+            .iter()
+            .all(|l| l.label != "Meter" && l.label != "Switch"));
+
+        let charging = ro.damage_per_use.expect("charging damage");
+        assert_eq!(charging.total, 1_880, "680-720 x2 + 110-130 x4");
+        let transformed = ro.transformed_damage_per_use.expect("transformed damage");
+        assert_eq!(transformed.total, 4_000, "110-130 x10 + 680-720 x4");
+        assert_eq!(
+            charging.scaled.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            transformed
+                .scaled
+                .iter()
+                .map(|(s, _)| *s)
+                .collect::<Vec<_>>(),
+            "both rows use the same stat order"
+        );
+
+        // Both modes' stats are represented.
+        assert!(ro.scales_off.contains(&"ATT"));
+        assert!(ro.scales_off.contains(&"DEX"));
+
+        // One concise buffs line, with the range reduction (not a boost).
+        let buffs = ro
+            .lines
+            .iter()
+            .find(|l| l.label == "Buffs")
+            .expect("buffs line");
+        let text: String = buffs.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            text,
+            "+25 ATT, +30 DEX, -50% weapon range (transformed, 7.6s)"
+        );
+        assert!(
+            ro.lines.iter().all(|l| l.label != "Buff"),
+            "switch boosts must not also appear as separate Buff lines"
+        );
+    }
+
+    #[test]
+    fn real_sigil_readout_has_modes_and_no_meter_line() {
+        // Swarmlord's Sigil (0x7B7C): charging and transformed volleys, +25 ATT,
+        // +30 DEX, 50% reduced weapon range. Skipped when assets are absent.
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            crate::assets::get_asset_manager().set_assets_dir(&dir);
+        }
+        let Some(effects) = crate::assets::get_asset_manager().ability_effects(0x7b7c) else {
+            return;
+        };
+        let ro = ability_readout_from(&effects, 0x7b7c, &EffectiveStats::default());
+        assert!(ro
+            .lines
+            .iter()
+            .all(|l| l.label != "Meter" && l.label != "Switch"));
+        assert!(ro.damage_per_use.is_some(), "charging damage");
+        assert!(
+            ro.transformed_damage_per_use.is_some(),
+            "transformed damage"
+        );
+        // Both volleys appear in each mode's hover breakdown (ATT + DEX).
+        let charging_labels: Vec<&str> = ro
+            .lines
+            .iter()
+            .filter(|l| l.is_damage)
+            .map(|l| l.label.as_str())
+            .collect();
+        assert!(charging_labels.contains(&"ATT"), "got {charging_labels:?}");
+        assert!(charging_labels.contains(&"DEX"), "got {charging_labels:?}");
+        let transformed_labels: Vec<&str> = ro
+            .transformed_lines
+            .iter()
+            .map(|l| l.label.as_str())
+            .collect();
+        assert!(transformed_labels.contains(&"ATT"));
+        assert!(transformed_labels.contains(&"DEX"));
+        let buffs: String = ro
+            .lines
+            .iter()
+            .find(|l| l.label == "Buffs")
+            .expect("buffs line")
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(buffs.contains("-50% weapon range"), "got {buffs}");
+        assert!(buffs.contains("+25 ATT"));
+        assert!(buffs.contains("+30 DEX"));
     }
 
     #[test]

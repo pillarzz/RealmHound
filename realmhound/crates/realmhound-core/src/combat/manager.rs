@@ -512,12 +512,20 @@ impl CombatManager {
         self.flush_dungeon_timer(time_ms);
     }
 
-    /// A remote player died, parsed from the server death broadcast (`s.death`).
-    /// Buffers the death by name so the finalizing fight marks that participant as
-    /// dead even when their gravestone couldn't be position-correlated; the raw
-    /// broadcast is persisted on the next tick (see `persist_death_broadcasts`).
-    pub fn on_remote_death(&mut self, player_name: &str, killer: &str, time_ms: i64) {
-        self.tracker.on_remote_death(player_name, killer, time_ms);
+    /// A remote player died, parsed from the server `PlayerDeath` notification
+    /// (`s.death`). `grave_type` is the notification's `picture_type`. Buffers
+    /// the death by name so the finalizing fight marks that participant as dead;
+    /// the raw notification is persisted on the next tick (see
+    /// `persist_death_broadcasts`).
+    pub fn on_remote_death(
+        &mut self,
+        player_name: &str,
+        killer: &str,
+        grave_type: i32,
+        time_ms: i64,
+    ) {
+        self.tracker
+            .on_remote_death(player_name, killer, grave_type, time_ms);
     }
 
     /// Incoming `DamagePacket`: `attacker_id` dealt `amount` to `target_id`.
@@ -612,8 +620,9 @@ impl CombatManager {
     /// Outgoing local `UseItem`: opens a Knight-shield damage-reduction window
     /// when the used item is a shield, and self-computes orb ability damage
     /// centered on the throw position `(x, y)`.
-    pub fn on_use_item(&mut self, item_id: i32, x: f32, y: f32, time_ms: i64) {
-        self.tracker.on_use_item(item_id, x, y, time_ms);
+    pub fn on_use_item(&mut self, item_id: i32, x: f32, y: f32, use_item_flag: i32, time_ms: i64) {
+        self.tracker
+            .on_use_item(item_id, x, y, use_item_flag, time_ms);
     }
 
     /// Periodic tick: finalize killed / timed-out fights.
@@ -661,9 +670,12 @@ impl CombatManager {
         };
         let pending = self.tracker.take_pending_death_broadcasts();
         for broadcast in &pending {
-            if let Err(e) =
-                db.insert_death_broadcast(&broadcast.player, &broadcast.killer, broadcast.time)
-            {
+            if let Err(e) = db.insert_death_broadcast(
+                &broadcast.player,
+                &broadcast.killer,
+                broadcast.grave_type,
+                broadcast.time,
+            ) {
                 tracing::error!("[COMBAT] Failed to persist death broadcast: {}", e);
                 return;
             }
@@ -1022,6 +1034,61 @@ mod tests {
         );
     }
 
+    /// The live ordering that used to lose Ice Citadel's main boss: the Mark bag
+    /// lands while Esben's fight is still open, so there is nothing to complete
+    /// yet; the escaped row is persisted at the next map change and the buffered
+    /// proof must finish it then.
+    #[test]
+    fn a_buffered_mark_bag_completes_the_main_boss_persisted_later() {
+        const ESBEN: i32 = 40_166;
+        let assets = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        let _ = assets.try_load();
+        let Some(mark) = assets.object_id_for_display_name("Mark of Esben") else {
+            eprintln!("skipping: game assets not available");
+            return;
+        };
+        if !assets.boss_mark_item_ids().contains(&mark) {
+            eprintln!("skipping: Mark of Esben is not indexed");
+            return;
+        }
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+
+        // The bag proves the kill while the fight is still open: no row yet.
+        m.on_boss_loot(ESBEN, 42, 55_000, &[mark]);
+        assert!(
+            m.database
+                .as_ref()
+                .unwrap()
+                .recent_fights(10)
+                .unwrap()
+                .is_empty(),
+            "the open fight has not been persisted"
+        );
+
+        // The map change finalizes the fight as Escaped and persists it.
+        let mut esben = fight("Ice Citadel", "Esben the Neurotic", false);
+        esben.map_seed = 42;
+        esben.boss_object_type = ESBEN;
+        esben.killed = false;
+        esben.reached_zero = false;
+        esben.started_at = 1_000;
+        esben.ended_at = 61_000;
+        esben.encounter_id = Some("ice_citadel".to_string());
+        esben.encounter_run_id = Some("ic-run".to_string());
+        m.persist(vec![esben]);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(
+            fights[0].killed,
+            "the buffered Mark bag completes the escaped main boss"
+        );
+    }
+
     /// The Head of Shaitan drops no Mark, so its guaranteed bag is what completes
     /// the fight the local player left before the killing blow.
     #[test]
@@ -1126,7 +1193,7 @@ mod tests {
         let id = m.database.as_ref().unwrap().recent_fights(1).unwrap()[0].id;
 
         // The broadcast for a death inside the fight's window lands afterwards.
-        m.on_remote_death("Ally", "Oryx the Mad God", 1_030_000);
+        m.on_remote_death("Ally", "Oryx the Mad God", 1837, 1_030_000);
         m.on_tick(1_040_000);
 
         let record = m
@@ -1143,8 +1210,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             ally.end_status,
-            ParticipantEndStatus::Died { grave_type: 0 },
-            "the stored row is corrected from the broadcast"
+            ParticipantEndStatus::Died { grave_type: 1837 },
+            "the stored row is corrected from the broadcast's exact grave"
         );
     }
 

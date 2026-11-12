@@ -559,6 +559,23 @@ fn header(
         rect.left() + name_offset,
         rect.center().y - name.size().y * 0.5,
     );
+    // Black outline keeps the white name legible over the bright HP fill.
+    for (dx, dy) in [
+        (-1.0, -1.0),
+        (0.0, -1.0),
+        (1.0, -1.0),
+        (-1.0, 0.0),
+        (1.0, 0.0),
+        (-1.0, 1.0),
+        (0.0, 1.0),
+        (1.0, 1.0),
+    ] {
+        painter.galley_with_override_text_color(
+            name_pos + egui::vec2(dx, dy),
+            name.clone(),
+            Color32::BLACK,
+        );
+    }
     painter.galley(name_pos, name, Color32::from_gray(245));
 }
 

@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::api::character::parse_enchant_ids;
 use crate::assets::get_asset_manager;
@@ -29,8 +30,8 @@ use crate::stats::derived::pet_ability_deals_damage;
 use super::damage::{self, AttackerStats, Rng, DEFAULT_EXALT_BONUS};
 use super::types::{
     AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
-    FightParticipant, ItemProcContribution, LethalStrikeContribution, ParticipantEndStatus,
-    PatternContribution, PetInfo, SummonContribution, WeaponContribution,
+    FightParticipant, ItemProcContribution, LethalStrikeContribution, LiveFightSnapshot,
+    ParticipantEndStatus, PatternContribution, PetInfo, SummonContribution, WeaponContribution,
 };
 
 /// MaxHP fallback for boss classification, used only when an enemy is not tag-
@@ -256,6 +257,19 @@ const SENTINEL_ATTACKER_ID: i32 = 0x00FF_FFFF;
 /// Max fights kept in memory for later UI consumption.
 const MAX_RECENT_FIGHTS: usize = 200;
 
+/// A boss already in view while the current encounter is under way, and engaged
+/// within this long of its latest activity, is fought in parallel and gets its
+/// own Live Combat tab. Phases never reach this check (see [`PHASE_HANDOFF_MS`]).
+const PARALLEL_FIGHT_WINDOW_MS: i64 = 10_000;
+
+/// A boss that comes into view within this long of another boss dying is that
+/// boss's next phase: the server spawns the next form as the last one goes.
+const PHASE_HANDOFF_MS: i64 = 3_000;
+
+/// Max finished fights held for the Live Combat overlay, which only shows the
+/// current encounter; this just bounds memory between map changes.
+const MAX_INSTANCE_FIGHTS: usize = 32;
+
 /// Death/nexus detection. A departed participant is marked dead when
 /// a gravestone spawned within this many tiles of their last-seen position.
 const GRAVE_MATCH_RADIUS: f32 = 3.0;
@@ -447,6 +461,8 @@ struct TrackedObject {
     speed_seen: bool,
     /// Last time (epoch millis) this object's stats were updated.
     last_seen: i64,
+    /// When this object came into view (its latest spawn), epoch millis.
+    spawned_at: i64,
     /// Last-seen world position (tile coords), used to correlate a departed
     /// player with the gravestone that spawns at their death tile.
     last_x: f32,
@@ -492,6 +508,7 @@ impl Default for TrackedObject {
             vitality_seen: false,
             speed_seen: false,
             last_seen: 0,
+            spawned_at: 0,
             last_x: 0.0,
             last_y: 0.0,
             is_pet: false,
@@ -1219,6 +1236,15 @@ struct FightState {
     boss_start_hp: i32,
     started_at: i64,
     last_activity: i64,
+    /// When the boss object came into view (see `LiveFightSnapshot::boss_seen_at`).
+    boss_seen_at: i64,
+    /// When the *local player* last landed a hit on this boss (0 = never).
+    ///
+    /// Distinct from `last_activity`, which any status packet from a boss merely
+    /// standing in view refreshes. Only this clock says "the user is fighting
+    /// this one", which is what the Live Combat overlay follows when several bosses are
+    /// engaged at once.
+    last_local_hit_at: i64,
     killed: bool,
     /// Lowest HP the boss was ever observed at during this fight. Used for kill
     /// detection: transition/petrify bosses (e.g. Lair of Draconis dragons) dip
@@ -1372,6 +1398,11 @@ pub struct CombatTracker {
     objects: HashMap<i32, TrackedObject>,
     /// Active fights keyed by boss object id.
     fights: HashMap<i32, FightState>,
+    /// Frozen projections of the current encounter's fights that have already
+    /// left `fights`, so a kill keeps its final numbers on the Live Combat
+    /// overlay. Engaging a different encounter replaces them (see
+    /// [`retain_current_encounter`]); cleared outright at map change / disconnect.
+    instance_fights: Vec<Arc<LiveFightSnapshot>>,
     /// Aggregated non-boss damage summaries for the current run, keyed by aux
     /// category (e.g. "marble_core"). Accumulate across the whole run and emit as
     /// synthetic summary fights at run end.
@@ -1628,6 +1659,7 @@ impl CombatTracker {
             shot_damage_bonus: crate::stats::derived::ShotDamageBonus::none(),
             objects: HashMap::new(),
             fights: HashMap::new(),
+            instance_fights: Vec::new(),
             aux_fights: HashMap::new(),
             aux_instances: HashMap::new(),
             dormant_fights: HashMap::new(),
@@ -1705,6 +1737,151 @@ impl CombatTracker {
     /// Recently completed fights held in memory.
     pub fn recent_fights(&self) -> &[CompletedFight] {
         &self.recent_fights
+    }
+
+    /// Project the current encounter's boss fights for the Live Combat overlay,
+    /// oldest engagement first.
+    ///
+    /// Aggregated aux rows are skipped: they span the whole run and have no
+    /// meaningful live timer. Fights that have ended are replayed frozen
+    /// (`ended`) rather than dropped, so a kill leaves its final numbers up
+    /// until the next encounter. Participants are sorted by damage descending,
+    /// matching the order the overlay renders them in.
+    ///
+    /// The list holds the most recent encounter: a single boss, or every boss
+    /// fought alongside it (see [`retain_current_encounter`]).
+    ///
+    /// Frozen entries are shared rather than deep-copied: this runs on every
+    /// publish and again on every UI frame, and a finished fight never changes.
+    pub fn live_snapshots(&self, now_ms: i64) -> Vec<Arc<LiveFightSnapshot>> {
+        self.live_snapshots_where(now_ms, |_| true)
+    }
+
+    /// [`Self::live_snapshots`], limited to the fights `keep` accepts. Filtering
+    /// runs before the current encounter is picked, so an excluded fight can
+    /// never displace the ones that are shown.
+    pub fn live_snapshots_where(
+        &self,
+        now_ms: i64,
+        keep: impl Fn(&LiveFightSnapshot) -> bool,
+    ) -> Vec<Arc<LiveFightSnapshot>> {
+        let mut out = self.instance_fights.clone();
+        for (&boss_id, fight) in self
+            .fights
+            .iter()
+            .filter(|(_, f)| Self::is_displayable_fight(f))
+        {
+            // A fight that is open again (or never left) supersedes whatever was
+            // frozen for it: the live numbers are the newer ones.
+            let live = Arc::new(self.project_fight(boss_id, fight, now_ms, false));
+            match out.iter_mut().find(|held| held.boss_object_id == boss_id) {
+                Some(slot) => *slot = live,
+                None => out.push(live),
+            }
+        }
+        out.retain(|fight| keep(fight));
+        retain_current_encounter(&mut out);
+        out
+    }
+
+    /// Whether a fight is worth putting on the live overlay: a real boss (not an
+    /// aggregated aux summary row) that someone has actually attacked.
+    fn is_displayable_fight(fight: &FightState) -> bool {
+        fight.display_name_override.is_none()
+            && fight.attackers.values().any(|a| a.damage > 0 || a.hits > 0)
+    }
+
+    /// Build the overlay projection of `fight`. `ended` freezes it as the final
+    /// state of a fight that has left the active set.
+    fn project_fight(
+        &self,
+        boss_id: i32,
+        fight: &FightState,
+        now_ms: i64,
+        ended: bool,
+    ) -> LiveFightSnapshot {
+        let mut participants: Vec<FightParticipant> = fight
+            .attackers
+            .iter()
+            .map(|(&aid, accum)| self.build_participant(aid, accum, fight.joined_late))
+            .collect();
+        drop_unresolved(&mut participants);
+        if ended && fight.killed {
+            trim_plausible_overkill(fight, &mut participants);
+        }
+        participants.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
+
+        let boss = self.objects.get(&boss_id);
+        let base_name = match self.shatters_hm_revealed_name(fight.boss_object_type) {
+            Some(name) => name.to_string(),
+            None => get_asset_manager()
+                .object_name(fight.boss_object_type)
+                .or_else(|| boss.and_then(|o| o.name.clone()))
+                .unwrap_or_else(|| format!("Boss 0x{:04X}", fight.boss_object_type as u16)),
+        };
+        let boss_name = match fight.segment_label {
+            Some(label) => format!("{base_name} ({label})"),
+            None => base_name,
+        };
+
+        // A killed boss is removed from `objects` before this runs, so its HP is
+        // pinned to zero rather than falling back to "never observed".
+        let boss_hp = match (ended, fight.killed) {
+            (true, true) => 0,
+            _ => boss.filter(|o| o.hp_seen).map(|o| o.hp).unwrap_or(-1),
+        };
+
+        // Realm spawns of a dungeon's boss (Stone Guardians, Janus) classify
+        // under that dungeon, as they do in Combat History.
+        let dungeon = crate::assets::canonical_dungeon_for_boss_named(
+            fight.boss_object_type,
+            boss_name.trim(),
+        )
+        .map_or_else(|| normalize_dungeon(&self.current_map), str::to_string);
+
+        LiveFightSnapshot {
+            boss_object_id: boss_id,
+            boss_object_type: fight.boss_object_type,
+            boss_name,
+            dungeon,
+            boss_hp,
+            boss_max_hp: boss.map(|o| o.max_hp).unwrap_or(fight.boss_max_hp),
+            started_at: fight.started_at,
+            last_local_hit_at: fight.last_local_hit_at,
+            elapsed_ms: now_ms.saturating_sub(fight.started_at).max(0),
+            boss_seen_at: fight.boss_seen_at,
+            participants,
+            ended,
+            boss_gone: ended && boss.is_none(),
+        }
+    }
+
+    /// Freeze a fight leaving the active set so its final numbers stay on the
+    /// overlay until the next encounter.
+    fn remember_live_fight(&mut self, fight: &FightState) {
+        if !Self::is_displayable_fight(fight) {
+            return;
+        }
+        // Stop the timer at the last attributed activity, not at finalize time,
+        // so an idle gap before the fight is routed is not counted into it.
+        let ended_at = fight.last_activity.max(fight.started_at);
+        let frozen = Arc::new(self.project_fight(fight.boss_object_id, fight, ended_at, true));
+        let boss_id = frozen.boss_object_id;
+        match self
+            .instance_fights
+            .iter_mut()
+            .find(|held| held.boss_object_id == boss_id)
+        {
+            Some(slot) => *slot = frozen,
+            None => {
+                // Oldest first, so this drops the stalest; the display picks the
+                // current encounter, filtering by settings first.
+                if self.instance_fights.len() >= MAX_INSTANCE_FIGHTS {
+                    self.instance_fights.remove(0);
+                }
+                self.instance_fights.push(frozen);
+            }
+        }
     }
 
     /// Record the local player's object id and char id (from CreateSuccess).
@@ -1906,6 +2083,7 @@ impl CombatTracker {
         }
         let entry = self.objects.entry(object_id).or_default();
         entry.object_type = object_type;
+        entry.spawned_at = time_ms;
         entry.equipment = [-1; 4];
         // Note any player-class object for the effectively-solo test used by
         // finalize's HP-gap reconciliation. Recorded for every player id so a
@@ -2625,6 +2803,7 @@ impl CombatTracker {
             return finished;
         };
         let obj_type = first.boss_object_type;
+        let boss_seen_at = first.boss_seen_at;
         let max_hp = self
             .objects
             .get(&object_id)
@@ -2645,6 +2824,8 @@ impl CombatTracker {
                 boss_start_hp: max_hp,
                 started_at: time_ms,
                 last_activity: time_ms,
+                boss_seen_at,
+                last_local_hit_at: 0,
                 killed: false,
                 min_hp_seen: max_hp as i64,
                 healed_hp: 0,
@@ -2817,6 +2998,9 @@ impl CombatTracker {
     /// run's clear scores the kill, so type-keyed suspension folds every
     /// re-detection into one fight per boss type instead of one record per id.
     fn suspend_or_finalize(&mut self, fight: FightState, time_ms: i64) -> Option<CompletedFight> {
+        // The boss just died or left view: hold its final numbers for the live
+        // overlay, which otherwise blanks the instant the fight leaves `fights`.
+        self.remember_live_fight(&fight);
         let otype = fight.boss_object_type;
         // Moonlight Village mechanics bosses are always suspended, never finalized
         // here: they leave view repeatedly across their phases, and their run is
@@ -2964,6 +3148,9 @@ impl CombatTracker {
         };
         fight.account_uptime(time_ms, vulnerable);
         fight.last_activity = time_ms;
+        if is_local {
+            fight.last_local_hit_at = time_ms;
+        }
         let accum = fight.attackers.entry(attacker_id).or_default();
         accum.damage += amount;
         accum.hits += 1;
@@ -4409,6 +4596,7 @@ impl CombatTracker {
         };
         fight.account_uptime(time_ms, vulnerable);
         fight.last_activity = time_ms;
+        fight.last_local_hit_at = time_ms;
         let accum = fight.attackers.entry(local_id).or_default();
         accum.hits += 1;
         accum.is_local = true;
@@ -4663,6 +4851,12 @@ impl CombatTracker {
         }
 
         let carried_close_calls = std::mem::take(&mut self.run_pending_fight_close_calls);
+        let boss_seen_at = self
+            .objects
+            .get(&target_id)
+            .map(|o| o.spawned_at)
+            .filter(|&at| at > 0)
+            .unwrap_or(time_ms);
         self.fights.insert(
             target_id,
             FightState {
@@ -4673,6 +4867,8 @@ impl CombatTracker {
                 boss_start_hp: start_hp,
                 started_at: time_ms,
                 last_activity: time_ms,
+                boss_seen_at,
+                last_local_hit_at: 0,
                 killed: false,
                 min_hp_seen: start_hp as i64,
                 healed_hp: 0,
@@ -4739,6 +4935,8 @@ impl CombatTracker {
                 boss_start_hp: 0,
                 started_at: time_ms,
                 last_activity: time_ms,
+                boss_seen_at: time_ms,
+                last_local_hit_at: 0,
                 killed: false,
                 min_hp_seen: 0,
                 healed_hp: 0,
@@ -4793,6 +4991,7 @@ impl CombatTracker {
         }
         let mut fight = merged?;
         fight.killed = true;
+        self.remember_live_fight(&fight);
         self.finalize_fight(fight, time_ms)
     }
 
@@ -6186,14 +6385,146 @@ fn parse_equipment_enchants(data: Option<&str>) -> [Vec<u16>; 4] {
     })
 }
 
-/// Map a raw realm map-name token (e.g. "{s.rotmg}") to a readable label.
+/// Map a raw map-name token (e.g. "{s.rotmg}") to a readable label.
+///
+/// Real dungeons are sent as localization keys too -- Oryx's Castle is
+/// `{s.oryx_s_castle}`, the Wine Cellar `{s.wine_cellar}` -- so a blanket
+/// "anything braced is the realm" collapses them into the open world and makes
+/// [`is_groupable_dungeon`] deny them their per-boss overlay tabs. Only keys
+/// with no known display name fall back to the realm.
 pub fn normalize_dungeon(name: &str) -> String {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.starts_with('{') {
-        "Realm".to_string()
-    } else {
-        trimmed.to_string()
+    if trimmed.is_empty() {
+        return "Realm".to_string();
     }
+    if trimmed.starts_with('{') {
+        let resolved = crate::assets::get_dungeon_portal_map().normalize_dungeon_name(trimmed);
+        if resolved != trimmed {
+            return resolved;
+        }
+        return "Realm".to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Narrow a fight list down to the most recent encounter, one entry per tab.
+///
+/// Each fight, oldest first, is classified against the encounter so far:
+///
+/// - **Next phase**: its boss came into view within [`PHASE_HANDOFF_MS`] of a
+///   tab's boss leaving the world. It continues that tab, and the tab shows the
+///   phases' combined totals (see [`combine_phases`]).
+/// - **Parallel**: its boss was already in view while the encounter was under
+///   way, and it was engaged within [`PARALLEL_FIGHT_WINDOW_MS`] of the
+///   encounter's latest activity. It gets a tab of its own.
+/// - Anything else starts a new encounter, replacing the previous one.
+fn retain_current_encounter(fights: &mut Vec<Arc<LiveFightSnapshot>>) {
+    fights.sort_by_key(|fight| fight.started_at);
+    let mut tabs: Vec<Vec<Arc<LiveFightSnapshot>>> = Vec::new();
+    let mut encounter_end = i64::MIN;
+    for fight in fights.drain(..) {
+        let seen_at = if fight.boss_seen_at > 0 {
+            fight.boss_seen_at
+        } else {
+            fight.started_at
+        };
+        let end = fight_end(&fight);
+        let predecessor = tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let last = tab.last()?;
+                let last_end = fight_end(last);
+                let gap = (seen_at - last_end).abs();
+                // A boss present, or already being hit, before the last one fell
+                // is fought alongside it, not after it.
+                let follows = seen_at >= last.started_at && fight.started_at >= last_end;
+                (last.boss_gone && follows && gap <= PHASE_HANDOFF_MS).then_some((index, gap))
+            })
+            .min_by_key(|&(_, gap)| gap)
+            .map(|(index, _)| index);
+        let parallel = seen_at <= encounter_end
+            && fight.started_at <= encounter_end.saturating_add(PARALLEL_FIGHT_WINDOW_MS);
+        match predecessor {
+            Some(index) => tabs[index].push(fight),
+            None if parallel => tabs.push(vec![fight]),
+            None => {
+                tabs = vec![vec![fight]];
+                encounter_end = i64::MIN;
+            }
+        }
+        encounter_end = encounter_end.max(end);
+    }
+    fights.extend(tabs.into_iter().map(combine_phases));
+}
+
+/// When a snapshot's fight ended, or `now` for one still running.
+fn fight_end(fight: &LiveFightSnapshot) -> i64 {
+    fight.started_at.saturating_add(fight.elapsed_ms)
+}
+
+/// Fold a boss's consecutive phases into one snapshot: summed participant
+/// totals over the whole span, with the current phase's HP and state.
+fn combine_phases(mut phases: Vec<Arc<LiveFightSnapshot>>) -> Arc<LiveFightSnapshot> {
+    if phases.len() == 1 {
+        return phases.pop().expect("one phase");
+    }
+    let first = &phases[0];
+    let current = phases.last().expect("several phases");
+    let mut participants: Vec<FightParticipant> = Vec::new();
+    for phase in &phases {
+        for p in &phase.participants {
+            match participants.iter_mut().find(|q| q.object_id == p.object_id) {
+                Some(total) => add_participant(total, p),
+                None => participants.push(p.clone()),
+            }
+        }
+    }
+    participants.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
+    Arc::new(LiveFightSnapshot {
+        // The first phase's id keeps the tab stable as phases change.
+        boss_object_id: first.boss_object_id,
+        boss_object_type: first.boss_object_type,
+        boss_name: first.boss_name.clone(),
+        dungeon: first.dungeon.clone(),
+        boss_hp: current.boss_hp,
+        boss_max_hp: current.boss_max_hp,
+        started_at: first.started_at,
+        last_local_hit_at: phases
+            .iter()
+            .map(|p| p.last_local_hit_at)
+            .max()
+            .unwrap_or(0),
+        elapsed_ms: fight_end(current).saturating_sub(first.started_at).max(0),
+        boss_seen_at: first.boss_seen_at,
+        participants,
+        ended: current.ended,
+        boss_gone: current.boss_gone,
+    })
+}
+
+/// Add a later phase's figures for the same participant onto `total`. Identity
+/// and state fields follow the later phase.
+fn add_participant(total: &mut FightParticipant, later: &FightParticipant) {
+    fn add<T: std::ops::Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        }
+    }
+    let mut merged = later.clone();
+    merged.damage += total.damage;
+    merged.hits += total.hits;
+    merged.summon_damage += total.summon_damage;
+    merged.summon_hits += total.summon_hits;
+    merged.packet_damage += total.packet_damage;
+    merged.packet_hits += total.packet_hits;
+    merged.damage_taken = add(total.damage_taken, later.damage_taken);
+    merged.damage_taken_hits = add(total.damage_taken_hits, later.damage_taken_hits);
+    merged.damage_blocked = add(total.damage_blocked, later.damage_blocked);
+    merged.guarded_damage = add(total.guarded_damage, later.guarded_damage);
+    merged.guarded_hits = add(total.guarded_hits, later.guarded_hits);
+    *total = merged;
 }
 
 /// Whether a (normalized) map name is a dungeon instance whose bosses should be
@@ -6230,6 +6561,7 @@ pub fn is_groupable_dungeon(name: &str) -> bool {
 fn merge_fight_into(dst: &mut FightState, src: FightState) {
     dst.started_at = dst.started_at.min(src.started_at);
     dst.last_activity = dst.last_activity.max(src.last_activity);
+    dst.last_local_hit_at = dst.last_local_hit_at.max(src.last_local_hit_at);
     dst.min_hp_seen = dst.min_hp_seen.min(src.min_hp_seen);
     dst.healed_hp = dst.healed_hp.saturating_add(src.healed_hp);
     dst.rescale_pending |= src.rescale_pending;
@@ -6697,6 +7029,497 @@ mod tests {
         assert_eq!((dep.x, dep.y), (25.0, 30.0));
     }
 
+    #[test]
+    fn live_overlay_holds_kill_against_older_fights() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        // A trash "boss" (HP fallback) engaged early, then left alone.
+        t.on_object_spawn(
+            400,
+            0x10E5,
+            &status(
+                400,
+                vec![stat(StatType::MaxHP, 20_000), stat(StatType::HP, 20_000)],
+            ),
+            0,
+        );
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+            ),
+            0,
+        );
+        t.on_object_spawn(
+            600,
+            0x0321,
+            &status_at(600, 1.0, 1.0, vec![name_stat("Bob")]),
+            10,
+        );
+        t.on_damage(400, 600, 1_000, 15);
+        t.on_damage(500, 600, 100_000, 20);
+        let boss = |t: &CombatTracker, now: i64| {
+            t.live_snapshots(now)
+                .into_iter()
+                .find(|f| f.boss_object_id == 500)
+                .expect("the boss is listed")
+        };
+        assert!(!boss(&t, 1_000).ended, "live during fight");
+
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+        t.on_object_removed(500, 40);
+        assert!(boss(&t, 60_000).ended, "the kill is frozen");
+
+        // The trash fight times out long after the kill and is routed then; it
+        // must not evict or overwrite the kill's row.
+        t.on_tick(10_000_000);
+        assert!(boss(&t, 10_000_000).ended, "stale trash overwrote the kill");
+    }
+
+    /// A Mad Lab boss with a 100k pool and two remote attackers, ready to fight.
+    fn overlay_kill_tracker() -> CombatTracker {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 100_000), stat(StatType::HP, 100_000)],
+            ),
+            0,
+        );
+        for (id, name) in [(600, "Bob"), (601, "Al")] {
+            t.on_object_spawn(
+                id,
+                0x0321,
+                &status_at(id, 1.0, 1.0, vec![name_stat(name)]),
+                10,
+            );
+        }
+        t
+    }
+
+    fn frozen_overlay_total(t: &CombatTracker) -> i64 {
+        let fight = t
+            .live_snapshots(60_000)
+            .into_iter()
+            .find(|f| f.boss_object_id == 500)
+            .expect("the boss is listed");
+        assert!(fight.ended, "the kill is frozen");
+        fight.total_damage()
+    }
+
+    #[test]
+    fn live_overlay_trims_death_tick_overkill_on_a_kill() {
+        // The final volley overshoots a 100k pool by 10k; the frozen overlay row
+        // must match what Combat History saves, not the raw overshoot.
+        let mut t = overlay_kill_tracker();
+        t.on_damage(500, 600, 70_000, 20);
+        t.on_damage(500, 601, 40_000, 21);
+        assert_eq!(
+            t.live_snapshots(25)[0].total_damage(),
+            110_000,
+            "a fight in progress keeps its raw figures"
+        );
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+        t.on_object_removed(500, 40);
+        assert_eq!(frozen_overlay_total(&t), 100_000);
+    }
+
+    #[test]
+    fn live_overlay_counts_boss_healing_in_its_kill_pool() {
+        // The boss heals 60k back mid-fight, so 160k is the real pool and the
+        // final volley overshoots it by 10k. That overshoot is trimmed to the
+        // healed pool, not to the boss's 100k max, which would halve everyone.
+        let mut t = overlay_kill_tracker();
+        t.on_damage(500, 600, 60_000, 20);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 21);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 100_000)]), 22);
+        t.on_damage(500, 600, 55_000, 30);
+        t.on_damage(500, 601, 55_000, 31);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 32);
+        t.on_object_removed(500, 40);
+        assert_eq!(frozen_overlay_total(&t), 160_000);
+    }
+
+    #[test]
+    fn live_overlay_hides_unresolved_damage() {
+        // Unattributable damage gets no row, and like Combat History it is
+        // dropped before trimming so players are not scaled to share the pool.
+        let mut t = overlay_kill_tracker();
+        t.on_damage(500, 600, 60_000, 20);
+        t.on_damage(500, 601, 40_000, 21);
+        t.on_damage(500, 777, 10_000, 22); // never resolves to a named player
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+        t.on_object_removed(500, 40);
+
+        let fight = t
+            .live_snapshots(60_000)
+            .into_iter()
+            .find(|f| f.boss_object_id == 500)
+            .expect("the boss is listed");
+        let damage = |name: &str| {
+            fight
+                .participants
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.damage)
+        };
+        assert_eq!(damage("Bob"), Some(60_000));
+        assert_eq!(damage("Al"), Some(40_000));
+        assert!(fight
+            .participants
+            .iter()
+            .all(|p| p.provenance != DamageProvenance::Unresolved));
+    }
+
+    #[test]
+    fn the_overlay_records_when_the_local_player_last_hit_each_boss() {
+        // Drives the overlay's auto-follow: it shows whichever boss the user is
+        // attacking, which a remote player's damage must not influence. The two
+        // Stone Guardians are fought side by side, so both stay listed.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Oryx's Castle", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type) in [(500, 3448), (700, 3449)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                0,
+            );
+        }
+        t.on_object_spawn(
+            600,
+            0x0321,
+            &status_at(600, 1.0, 1.0, vec![name_stat("Bob")]),
+            10,
+        );
+        // Remote damage on 500, local damage on 700.
+        t.on_damage(500, 600, 100_000, 20);
+        t.on_damage(700, 1000, 5_000, 70);
+
+        let fights = t.live_snapshots(80);
+        let clock = |id: i32| {
+            fights
+                .iter()
+                .find(|f| f.boss_object_id == id)
+                .expect("listed")
+                .last_local_hit_at
+        };
+        assert_eq!(clock(500), 0, "a remote player's damage is not mine");
+        assert_eq!(clock(700), 70);
+    }
+
+    #[test]
+    fn a_new_dungeon_boss_replaces_the_previous_one() {
+        // A boss engaged long after the last one finished is a new encounter,
+        // so it clears the previous fight, even within the same dungeon.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            600,
+            0x0321,
+            &status_at(600, 1.0, 1.0, vec![name_stat("Bob")]),
+            0,
+        );
+        for (boss, obj_type, at) in [(500, 0x5000, 10), (700, 0x5001, 60_000)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 10);
+            if boss == 500 {
+                t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+                t.on_object_removed(500, 40);
+            }
+        }
+
+        let fights = t.live_snapshots(60_100);
+        assert_eq!(fights.len(), 1, "the previous boss kept a tab");
+        assert_eq!(fights[0].boss_object_id, 700);
+    }
+
+    #[test]
+    fn the_last_fight_survives_a_nexus_until_the_next_boss_is_hit() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Tomb of the Ancients", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        engage(&mut t, 500, 3366, 10, 100_000, Some(30));
+
+        t.on_map_change("Nexus", 2, 1_000, &[]);
+        let held = t.live_snapshots(2_000);
+        assert_eq!(held.len(), 1, "nexusing wiped the overlay");
+        assert_eq!(held[0].boss_object_id, 500);
+
+        // Merely seeing a boss does not clear it; hitting one does.
+        t.on_map_change("Tomb of the Ancients", 3, 50_000, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            900,
+            3367,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+            ),
+            60_000,
+        );
+        assert_eq!(t.live_snapshots(60_100)[0].boss_object_id, 500);
+        t.on_damage(900, 1000, 1_000, 61_000);
+        let ids: Vec<i32> = t
+            .live_snapshots(61_100)
+            .iter()
+            .map(|f| f.boss_object_id)
+            .collect();
+        assert_eq!(ids, vec![900]);
+    }
+
+    #[test]
+    fn a_killed_boss_stays_up_until_the_next_boss_is_engaged() {
+        let mut t = overlay_kill_tracker();
+        t.on_damage(500, 1000, 100_000, 20);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+        t.on_object_removed(500, 40);
+        let fights = t.live_snapshots(60_000);
+        assert_eq!(fights.len(), 1);
+        assert!(fights[0].ended, "the kill is frozen on screen");
+
+        t.on_object_spawn(
+            700,
+            0x5001,
+            &status(
+                700,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+            ),
+            70_000,
+        );
+        t.on_damage(700, 1000, 1_000, 70_010);
+        t.on_object_status(700, &status(700, vec![stat(StatType::HP, 0)]), 70_020);
+        t.on_object_removed(700, 70_030);
+        let fights = t.live_snapshots(80_000);
+        assert_eq!(fights.len(), 1, "the earlier kill was not cleared");
+        assert_eq!(fights[0].boss_object_id, 700);
+    }
+
+    #[test]
+    fn bosses_fought_in_parallel_each_keep_a_tab() {
+        // Tomb of the Ancients: Nut, Geb and Bes engaged within moments of each
+        // other. Grouping is by timing alone; none of these ids is special.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Tomb of the Ancients", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type, at) in [(500, 3366, 10), (600, 3367, 20), (700, 3368, 30)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 5);
+        }
+        // One dies while the others are still being fought.
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 40);
+        t.on_object_removed(500, 50);
+
+        let ids: Vec<i32> = t
+            .live_snapshots(100)
+            .iter()
+            .map(|f| f.boss_object_id)
+            .collect();
+        assert_eq!(ids, vec![500, 600, 700], "a parallel boss lost its tab");
+    }
+
+    #[test]
+    fn a_new_realm_boss_replaces_the_previous_one() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("{s.rotmg}", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type, at) in [(500, 0x5000, 10), (700, 0x5001, 60_000)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 10);
+            if boss == 500 {
+                t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+                t.on_object_removed(500, 40);
+            }
+        }
+
+        let fights = t.live_snapshots(60_100);
+        assert_eq!(fights.len(), 1, "the old realm boss kept its tab");
+        assert_eq!(fights[0].boss_object_id, 700);
+    }
+
+    #[test]
+    fn an_untracked_fight_never_displaces_the_shown_one() {
+        // The newer fight is excluded by the settings, so the older tracked one
+        // must stay up rather than the overlay going blank.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Tomb of the Ancients", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type, at) in [(500, 3366, 10), (700, 3367, 60_000)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 10);
+            if boss == 500 {
+                t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+                t.on_object_removed(500, 40);
+            }
+        }
+        let ids: Vec<i32> = t
+            .live_snapshots_where(60_100, |fight| fight.boss_object_id != 700)
+            .iter()
+            .map(|f| f.boss_object_id)
+            .collect();
+        assert_eq!(ids, vec![500]);
+    }
+
+    #[test]
+    fn a_realm_boss_appearing_after_the_hand_off_is_not_a_phase() {
+        // Five seconds after the kill is past the phase hand-off, and the boss
+        // was not in view during the fight, so it replaces the kill.
+        let mut t = CombatTracker::new();
+        t.on_map_change("{s.rotmg}", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type, at) in [(500, 0x5000, 10), (700, 0x5001, 5_000)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 10);
+            if boss == 500 {
+                t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+                t.on_object_removed(500, 40);
+            }
+        }
+
+        let ids: Vec<i32> = t
+            .live_snapshots(5_100)
+            .iter()
+            .map(|f| f.boss_object_id)
+            .collect();
+        assert_eq!(ids, vec![700]);
+    }
+
+    /// Spawn boss `id` of `obj_type` at `at`, hit it locally for `damage`, and
+    /// kill it when `kill_at` is given.
+    fn engage(
+        t: &mut CombatTracker,
+        id: i32,
+        obj_type: i32,
+        at: i64,
+        damage: i64,
+        kill_at: Option<i64>,
+    ) {
+        t.on_object_spawn(
+            id,
+            obj_type,
+            &status(
+                id,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+            ),
+            at,
+        );
+        t.on_damage(id, 1000, damage, at + 10);
+        if let Some(kill_at) = kill_at {
+            t.on_object_status(id, &status(id, vec![stat(StatType::HP, 0)]), kill_at);
+            t.on_object_removed(id, kill_at + 10);
+        }
+    }
+
+    #[test]
+    fn a_next_phase_continues_the_same_tab_with_combined_totals() {
+        // The next form comes into view as the last one dies.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Tomb of the Ancients", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        engage(&mut t, 500, 3366, 10, 100_000, Some(30));
+        engage(&mut t, 700, 3367, 1_000, 50_000, None);
+
+        let fights = t.live_snapshots(1_100);
+        assert_eq!(fights.len(), 1, "the next phase opened its own tab");
+        assert_eq!(fights[0].boss_object_id, 500, "the tab keeps its identity");
+        assert_eq!(fights[0].total_damage(), 150_000);
+        assert!(!fights[0].ended, "the current phase is still running");
+    }
+
+    #[test]
+    fn a_boss_appearing_well_after_a_kill_starts_a_new_encounter() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Tomb of the Ancients", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        engage(&mut t, 500, 3366, 10, 100_000, Some(30));
+        engage(&mut t, 700, 3367, 20_000, 50_000, None);
+
+        let ids: Vec<i32> = t
+            .live_snapshots(20_100)
+            .iter()
+            .map(|f| f.boss_object_id)
+            .collect();
+        assert_eq!(ids, vec![700]);
+    }
+
+    #[test]
+    fn a_multi_boss_realm_encounter_keeps_every_tab() {
+        // Two Beehemoths of the same Killer Bee Nest event are fought side by
+        // side, so neither evicts the other.
+        let mut t = CombatTracker::new();
+        t.on_map_change("{s.rotmg}", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type, at) in [(500, 4324, 10), (700, 4325, 60)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 10);
+        }
+
+        let fights = t.live_snapshots(100);
+        assert_eq!(fights.len(), 2, "a grouped encounter lost a member");
+        assert_eq!(fights[0].boss_object_id, 500);
+        assert_eq!(fights[1].boss_object_id, 700);
+    }
+
     fn participant(object_id: i32, is_local: bool) -> FightParticipant {
         FightParticipant {
             object_id,
@@ -7001,6 +7824,8 @@ mod tests {
             boss_start_hp: 300_000,
             started_at,
             last_activity: started_at,
+            boss_seen_at: started_at,
+            last_local_hit_at: 0,
             killed: false,
             min_hp_seen: 300_000,
             healed_hp: 0,
@@ -12603,6 +13428,15 @@ mod tests {
         assert_eq!(normalize_dungeon("{s.rotmg}"), "Realm");
         assert_eq!(normalize_dungeon(""), "Realm");
         assert_eq!(normalize_dungeon("Mad Lab"), "Mad Lab");
+        // Braced dungeon keys are dungeons, not the realm: collapsing them is
+        // what made Oryx's Castle show a single overlay tab for the two Stone
+        // Guardians.
+        assert_eq!(normalize_dungeon("{s.oryx_s_castle}"), "Oryx's Castle");
+        assert_eq!(normalize_dungeon("{s.wine_cellar}"), "Wine Cellar");
+        assert_eq!(normalize_dungeon("{s.nexus}"), "Nexus");
+        assert_eq!(normalize_dungeon("{s.vault}"), "Vault");
+        // An unrecognized key still falls back to the open world.
+        assert_eq!(normalize_dungeon("{s.pet_yard}"), "Realm");
     }
 
     #[test]
@@ -12611,6 +13445,12 @@ mod tests {
         assert!(is_groupable_dungeon("Mad Lab"));
         assert!(is_groupable_dungeon("Oryx's Sanctuary"));
         assert!(is_groupable_dungeon("The Nest"));
+        // Dungeons the client names with a localization key group too, once
+        // normalized.
+        assert!(is_groupable_dungeon(&normalize_dungeon(
+            "{s.oryx_s_castle}"
+        )));
+        assert!(is_groupable_dungeon(&normalize_dungeon("{s.wine_cellar}")));
         // Hubs, social spaces and the open world stay standalone.
         assert!(!is_groupable_dungeon("Realm"));
         assert!(!is_groupable_dungeon("Nexus"));

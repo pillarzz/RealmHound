@@ -82,6 +82,7 @@ impl NoUiWorker {
             processor,
             egui::Context::default(),
             AudioSender::disconnected(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             account.clone(),
         )
         .expect("worker thread spawns");

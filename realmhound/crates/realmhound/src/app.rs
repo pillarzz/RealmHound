@@ -8,6 +8,12 @@ pub const PKG_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 const PROJECT_LICENSE: &str = include_str!("../../../../LICENSE");
 const THIRD_PARTY_LICENSES: &str = include_str!("../../../../THIRD-PARTY-LICENSES.md");
 
+/// The embedded font stack. Segoe UI Symbol is layered on top at startup where
+/// it exists (Windows only), so these two are all every platform is guaranteed:
+/// a glyph outside them renders as a tofu box on macOS and Linux.
+pub(crate) const NOTO_SANS: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
+pub(crate) const NOTO_EMOJI: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+
 use crate::audio::{AudioHandle, AudioSender};
 use crate::capture_manager::CaptureManager;
 use crate::modals::{ModalState, SettingsCategory};
@@ -599,6 +605,11 @@ pub struct RealmHoundApp {
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
+    /// The floating Live Combat / Live Loot overlay windows drawn over the game client.
+    overlays: crate::overlay::OverlayManager,
+    /// Owned snapshot of every boss fight of the current map instance,
+    /// refreshed from the worker each frame and rendered by the Live Combat overlay.
+    live_fights: Vec<Arc<realmhound_core::combat::LiveFightSnapshot>>,
     /// Audio thread handle (owns the `!Send` `SoundEngine`). Kept alive so the
     /// thread isn't torn down; dropped on app exit.
     audio: AudioHandle,
@@ -802,11 +813,11 @@ fn install_fonts(ctx: &egui::Context) {
 
     fonts.font_data.insert(
         "NotoSans".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/NotoSans-Regular.ttf")).into(),
+        egui::FontData::from_static(NOTO_SANS).into(),
     );
     fonts.font_data.insert(
         "NotoEmoji".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/NotoEmoji-Regular.ttf")).into(),
+        egui::FontData::from_static(NOTO_EMOJI).into(),
     );
 
     // Noto Sans has no arrows or geometric glyphs; egui's monospace face does.
@@ -1030,10 +1041,12 @@ impl RealmHoundApp {
         // context (and its lock) but processes and persists nothing until it is
         // activated. Creating the thread must succeed before any launch metadata
         // is recorded, so a spawn failure counts no launch.
+        let overlays = crate::overlay::OverlayManager::new();
         let worker = spawn_worker(
             processor,
             egui_ctx.clone(),
             audio_tx.clone(),
+            overlays.active_signal(),
             account.clone(),
         )
         .map_err(|e| AppStartError::Worker(e.to_string()))?;
@@ -1124,6 +1137,8 @@ impl RealmHoundApp {
             owned_feed_rev: 0,
             owned_feed_seq: 0,
             worker,
+            overlays,
+            live_fights: Vec::new(),
             health,
             audio,
             audio_tx,
@@ -1537,9 +1552,10 @@ impl RealmHoundApp {
             UiPayload::CombatHistoryChanged => {
                 self.combat_panel.invalidate_cards();
             }
-            UiPayload::PushLoot(_) => {
+            UiPayload::PushLoot(drop) => {
                 // The worker's live-event window drives the feed entry; the loot
-                // history view still needs a refresh.
+                // overlay tally and history view still consume the drop here.
+                self.overlays.push_live_loot(&drop);
                 self.loot_panel.mark_history_dirty();
             }
             UiPayload::LootBatchAdded => {
@@ -1593,6 +1609,9 @@ impl RealmHoundApp {
         };
         self.view_state = snap.view.clone();
         self.live_char_id = snap.live_char_id;
+        // Cloned unconditionally: the fight timer is time-derived, so the figures move
+        // between publications even when the roster is unchanged.
+        self.live_fights = snap.live_fights.clone();
         // Remember the last-seen live character (persisted) so the
         // Current-Character widget can restore it, dimmed, after a restart.
         if let Some(id) = self.live_char_id {
@@ -2138,6 +2157,7 @@ impl RealmHoundApp {
                             ("taskbar", "🧭 Taskbar & Quests"),
                             ("loot", "🎒 Loot History"),
                             ("combat_history", "⚔ Combat History"),
+                            ("overlays", "🖥 Overlays"),
                             ("trophy_hall", "🏆 Trophy Hall"),
                             ("treasury", "💰 Treasury"),
                             ("party", "🎉 Party"),
@@ -2279,6 +2299,8 @@ impl RealmHoundApp {
                                                         SettingsCategory::Debug => {
                                                             self.render_debug_settings(ui, &shadcn)
                                                         }
+                                                        SettingsCategory::Overlays => self
+                                                            .render_overlay_settings(ui, &shadcn),
                                                     }
                                                 });
                                         });
@@ -7500,6 +7522,201 @@ impl RealmHoundApp {
         }
     }
 
+    /// Settings for the floating Live Combat / Live Loot overlay windows.
+    fn render_overlay_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
+        use realmhound_core::settings::MAX_LIVE_COMBAT_ROWS;
+
+        ui.add_space(10.0);
+        ui.heading("Overlays");
+        ui.add_space(5.0);
+        ui.label(
+            RichText::new(
+                "Floating windows drawn over the game client. Lock an overlay to freeze it \
+                 in place and pass every click straight through to the game.",
+            )
+            .weak(),
+        );
+        if !crate::overlay::platform::is_supported() {
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new(
+                    "On this platform the overlays are ordinary always-on-top windows: \
+                     showing them over a fullscreen game client is up to your compositor.",
+                )
+                .weak()
+                .italics(),
+            );
+            #[cfg(target_os = "linux")]
+            {
+                ui.label(
+                    RichText::new(
+                        "RealmHound is running natively on Wayland (REALMHOUND_WAYLAND=1 or \
+                         no XWayland), which cannot keep a window above the game. Start it \
+                         without REALMHOUND_WAYLAND to run on XWayland, where the overlays \
+                         stay over the Proton client.",
+                    )
+                    .weak()
+                    .italics(),
+                );
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new(
+                    "On macOS the game must run windowed or in windowed (borderless) \
+                     fullscreen. Native Full Screen moves the client onto its own Space, \
+                     which no other window can be drawn into, so the overlays will not \
+                     appear over it.",
+                )
+                .weak()
+                .italics(),
+            );
+        }
+        ui.add_space(15.0);
+
+        let Ok(mut overlays) = self.settings.read().map(|s| s.overlays.clone()) else {
+            return;
+        };
+        // Event-driven, never a whole-struct diff: the overlay windows write
+        // their live geometry into these same settings every frame, so a diff
+        // here would save to disk continuously.
+        let mut changed = false;
+
+        shadcn.card(ui, "overlay_windows", "Windows", |ui| {
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat.visible,
+                    "Show the Live Combat overlay",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_loot.visible,
+                    "Show the Live Loot overlay",
+                )
+                .changed();
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_lock", "Lock", |ui| {
+            ui.label(
+                RichText::new(
+                    "A locked overlay ignores the mouse, so it cannot be unlocked from its \
+                     own title bar. Unlock it here.",
+                )
+                .weak(),
+            );
+            ui.add_space(6.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat.locked,
+                    "Lock the Live Combat overlay",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_loot.locked,
+                    "Lock the Live Loot overlay",
+                )
+                .changed();
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_appearance", "Appearance", |ui| {
+            ui.label("Background opacity");
+            // Bound in place rather than via a clamped copy: feeding the slider
+            // a value it did not produce makes it report a change every frame,
+            // which walks the setting to the end of its range.
+            changed |= shadcn
+                .slider_value(ui, "overlay_opacity", &mut overlays.opacity, 0.2, 1.0)
+                .changed();
+            ui.label(RichText::new(format!("{:.0}%", overlays.opacity * 100.0)).weak());
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_live_combat", "Live Combat overlay", |ui| {
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_follow_me,
+                    "Pin my own row above the list",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_class_icons,
+                    "Use default class icons (ignore skins and dyes)",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_share_bars,
+                    "Show damage bars behind each row",
+                )
+                .changed();
+            ui.add_space(6.0);
+            ui.label("Teammates shown");
+            // Settings saved before the cap may hold a larger value.
+            overlays.live_combat_rows = overlays.live_combat_rows.min(MAX_LIVE_COMBAT_ROWS);
+            changed |= shadcn
+                .slider_value(
+                    ui,
+                    "overlay_live_combat_rows",
+                    &mut overlays.live_combat_rows,
+                    0.0,
+                    MAX_LIVE_COMBAT_ROWS,
+                )
+                .changed();
+            let caption = if overlays.max_rows() == 0 {
+                "All teammates".to_string()
+            } else {
+                format!("Up to {} teammates", overlays.max_rows())
+            };
+            ui.label(RichText::new(caption).weak());
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_live_loot", "Live Loot overlay", |ui| {
+            ui.label(
+                RichText::new(
+                    "Which bag colours the overlay counts follows the Live Feed's bag \
+                     toggles, so the two always agree.",
+                )
+                .weak(),
+            );
+            ui.add_space(8.0);
+            if shadcn.btn(ui, "🔄 Reset session tally").clicked() {
+                self.overlays.reset_live_loot();
+            }
+        });
+
+        if changed {
+            if let Ok(mut settings) = self.settings.write() {
+                // Only the fields this tab owns: the overlay windows are the
+                // authority for their own geometry and may have moved since the
+                // clone above.
+                settings.overlays.apply_preferences(&overlays);
+                settings.save();
+            }
+        }
+    }
+
     /// Persist the current treasury section order to settings.
     fn save_treasury_section_order(&self) {
         if let Ok(mut settings) = self.settings.write() {
@@ -10176,6 +10393,17 @@ impl eframe::App for RealmHoundApp {
         // Update window state in settings (will be saved on exit)
         self.update_window_state(ctx);
 
+        // The floating overlays are separate native windows, so they render
+        // before the main window's panels and are unaffected by modal blocking.
+        // They also drive their own repaints while open, which is what keeps a
+        // live fight's clock-derived numbers moving.
+        self.overlays.render(
+            ctx,
+            &self.settings,
+            &mut self.sprite_renderer,
+            &self.live_fights,
+        );
+
         // Update checker (runs on startup and every 2 hours)
         self.update_checker.update();
 
@@ -10208,8 +10436,13 @@ impl eframe::App for RealmHoundApp {
                 .send_control(ControlMsg::SetWatchlist(watchlist));
         }
 
-        // A minimized window never paints, so stop the worker waking it.
-        let live_demand = ctx.input(|input| input.viewport().minimized != Some(true));
+        // A minimized window never paints, so stop the worker waking it, unless
+        // an overlay (painted from this window's update) is still on screen.
+        let live_demand = ctx.input(|input| input.viewport().minimized != Some(true))
+            || self
+                .overlays
+                .active_signal()
+                .load(std::sync::atomic::Ordering::Relaxed);
         if self.live_demand != Some(live_demand) {
             self.live_demand = Some(live_demand);
             self.worker

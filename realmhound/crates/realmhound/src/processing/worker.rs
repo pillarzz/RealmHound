@@ -13,6 +13,7 @@
 //! - worker -> audio: an [`AudioSender`] (audio commands are routed here, never
 //!   forwarded to the UI).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -211,6 +212,7 @@ pub fn spawn(
     mut processor: PacketProcessor,
     ctx: egui::Context,
     audio_tx: AudioSender,
+    overlays_open: Arc<AtomicBool>,
     account: Arc<AccountContext>,
 ) -> std::io::Result<WorkerHandle> {
     processor.set_selected_scope(account.account_key(), account.account_id().clone());
@@ -250,6 +252,7 @@ pub fn spawn(
         exalts_fetched: false,
         wake: WakeThrottle::default(),
         ctx,
+        overlays_open,
         account,
         receiver: None,
         #[cfg(feature = "latency-diagnostics")]
@@ -264,6 +267,7 @@ pub fn spawn(
         pub_vault_gen: u64::MAX,
         pub_view: None,
         pub_mission_gen: u64::MAX,
+        pub_had_live_fight: false,
         pub_token_gen: u64::MAX,
         pub_party_rev: u64::MAX,
         pub_encounter_rev: u64::MAX,
@@ -309,6 +313,9 @@ struct Worker {
     /// Coalesced repaint requests from worker traffic.
     wake: WakeThrottle,
     ctx: egui::Context,
+    /// Set by the UI while at least one overlay window is open. Live Combat is only
+    /// projected into the snapshot (and keeps waking the UI) while it is set.
+    overlays_open: Arc<AtomicBool>,
     /// Shared immutable account context. Held so the exclusive profile lock
     /// inside it lives as long as the worker (including after a detached
     /// shutdown), keeping the selected profile owned by this process.
@@ -327,6 +334,9 @@ struct Worker {
     pub_vault_gen: u64,
     pub_view: Option<super::contract::ViewState>,
     pub_mission_gen: u64,
+    /// Whether the last publication carried a live fight. Lets the transition
+    /// back to "no fight" wake the UI once so the overlay clears.
+    pub_had_live_fight: bool,
     pub_token_gen: u64,
     pub_party_rev: u64,
     pub_encounter_rev: u64,
@@ -1247,6 +1257,22 @@ impl Worker {
         let feed_changed = feed_rev != self.pub_feed_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
+        // Projecting the live fights walks the active roster, so it is only done
+        // while an overlay is actually open to display them.
+        let overlays_open = self.overlays_open.load(Ordering::Relaxed);
+        let live_fights = if overlays_open {
+            self.processor.live_fights()
+        } else {
+            Vec::new()
+        };
+        // The fight timer is time-derived, so a live fight is "changed" every batch even
+        // when no new damage landed; an idle one must not keep waking the UI.
+        // A frozen (ended) fight never changes again, so it only earns the one
+        // repaint that puts its final numbers on screen.
+        let live_running = live_fights.iter().any(|fight| !fight.ended);
+        let live_combat_changed = live_running || self.pub_had_live_fight;
+        self.pub_had_live_fight = live_running;
+
         let lock_started = Instant::now();
         let previous = match self.snapshot.lock() {
             Ok(guard) => guard.clone(),
@@ -1269,20 +1295,22 @@ impl Worker {
             .flatten();
         let live_events = live_events_changed.then(|| Arc::new(self.processor.live_event_window()));
         let feed = feed_changed.then(|| Arc::new(self.processor.feed_context()));
-        let next = previous.next(
-            view.clone(),
-            live_char_id,
-            main_connection,
-            account_data,
-            live_vault_data,
-            mission_view,
-            token,
-            party,
-            encounters,
-            quests,
-            live_events,
-            feed,
-        );
+        let next = previous
+            .next(
+                view.clone(),
+                live_char_id,
+                main_connection,
+                account_data,
+                live_vault_data,
+                mission_view,
+                token,
+                party,
+                encounters,
+                quests,
+                live_events,
+                feed,
+            )
+            .with_live_fights(live_fights);
         let lock_started = Instant::now();
         let replaced = match self.snapshot.lock() {
             Ok(mut slot) => std::mem::replace(&mut *slot, Arc::new(next)),
@@ -1304,7 +1332,7 @@ impl Worker {
         self.pub_live_event_rev = live_event_rev;
         self.pub_feed_rev = feed_rev;
         self.pub_view = Some(view);
-        view_changed
+        view_changed || (overlays_open && live_combat_changed)
     }
 }
 
@@ -1884,6 +1912,7 @@ mod staging_tests {
             processor(&account),
             egui::Context::default(),
             AudioSender::disconnected(),
+            Arc::new(AtomicBool::new(false)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1905,6 +1934,7 @@ mod staging_tests {
             processor(&account),
             egui::Context::default(),
             AudioSender::disconnected(),
+            Arc::new(AtomicBool::new(false)),
             account.clone(),
         )
         .expect("worker thread spawns");
@@ -1931,6 +1961,7 @@ mod staging_tests {
             processor,
             egui::Context::default(),
             AudioSender::disconnected(),
+            Arc::new(AtomicBool::new(false)),
             account,
         )
         .unwrap();

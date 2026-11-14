@@ -149,6 +149,166 @@ pub struct Settings {
     /// Trophy Hall panel settings (tracked-loot data source).
     #[serde(default)]
     pub trophy_hall: TrophyHallSettings,
+
+    /// Floating in-game overlay windows (Live Combat + Live Loot).
+    #[serde(default)]
+    pub overlays: OverlaySettings,
+}
+
+/// Per-window placement and chrome state for one floating overlay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlayWindowSettings {
+    /// Whether the overlay window is shown.
+    #[serde(default)]
+    pub visible: bool,
+
+    /// Locked overlays ignore the mouse entirely: clicks pass through to the
+    /// game and the window can no longer be dragged or resized.
+    #[serde(default)]
+    pub locked: bool,
+
+    /// Collapsed to just its title bar.
+    #[serde(default)]
+    pub minimized: bool,
+
+    /// Last outer position in logical screen pixels (`None` = let the OS place it).
+    #[serde(default)]
+    pub x: Option<f32>,
+
+    /// See [`Self::x`].
+    #[serde(default)]
+    pub y: Option<f32>,
+
+    /// Last inner width in logical pixels.
+    pub width: f32,
+
+    /// Last inner height in logical pixels.
+    pub height: f32,
+}
+
+impl OverlayWindowSettings {
+    /// Placement defaults for an overlay of the given size at the given corner
+    /// offset. Used by the per-overlay `Default` impls.
+    fn at(width: f32, height: f32) -> Self {
+        Self {
+            visible: false,
+            locked: false,
+            minimized: false,
+            x: None,
+            y: None,
+            width,
+            height,
+        }
+    }
+}
+
+/// Floating always-on-top overlay windows drawn over the game client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlaySettings {
+    /// Live Combat overlay window.
+    #[serde(default = "default_live_combat_overlay", alias = "dps")]
+    pub live_combat: OverlayWindowSettings,
+
+    /// Live Loot overlay window.
+    #[serde(default = "default_live_loot_overlay", alias = "loot")]
+    pub live_loot: OverlayWindowSettings,
+
+    /// Shared window opacity for every overlay, `0.2`-`1.0`.
+    #[serde(default = "default_overlay_opacity")]
+    pub opacity: f32,
+
+    /// Pin the local player's Live Combat row above the scrolling list.
+    #[serde(default = "default_true", alias = "dps_follow_me")]
+    pub live_combat_follow_me: bool,
+
+    /// Draw each Live Combat combatant as their class's default sprite, ignoring
+    /// skins and dyes, so the class is unambiguous.
+    #[serde(default)]
+    pub live_combat_class_icons: bool,
+
+    /// Paint each Live Combat row's damage bar, scaled against the top dealer.
+    #[serde(default = "default_true")]
+    pub live_combat_share_bars: bool,
+
+    /// Maximum number of Live Combat rows rendered (0 = unlimited).
+    ///
+    /// Stored as the raw slider value so the settings UI can bind it directly.
+    /// Round-tripping through an integer would feed the slider a value it did
+    /// not produce, which makes it report a change every frame and walk the
+    /// setting to the end of its range.
+    #[serde(default = "default_live_combat_rows", alias = "dps_rows")]
+    pub live_combat_rows: f32,
+}
+
+/// Highest non-zero value of the Live Combat "teammates shown" slider.
+pub const MAX_LIVE_COMBAT_ROWS: f32 = 25.0;
+
+fn default_live_combat_overlay() -> OverlayWindowSettings {
+    OverlayWindowSettings::at(320.0, 240.0)
+}
+
+fn default_live_loot_overlay() -> OverlayWindowSettings {
+    OverlayWindowSettings::at(320.0, 180.0)
+}
+
+fn default_overlay_opacity() -> f32 {
+    0.9
+}
+
+fn default_live_combat_rows() -> f32 {
+    8.0
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            live_combat: default_live_combat_overlay(),
+            live_loot: default_live_loot_overlay(),
+            opacity: default_overlay_opacity(),
+            live_combat_follow_me: true,
+            live_combat_class_icons: false,
+            live_combat_share_bars: true,
+            live_combat_rows: default_live_combat_rows(),
+        }
+    }
+}
+
+impl OverlaySettings {
+    /// Clamp opacity into the range the overlay windows can actually render at.
+    /// A fully transparent overlay would be invisible but still swallow clicks.
+    pub fn clamped_opacity(&self) -> f32 {
+        self.opacity.clamp(0.2, 1.0)
+    }
+
+    /// Maximum Live Combat rows to render (0 = every participant).
+    pub fn max_rows(&self) -> usize {
+        self.live_combat_rows
+            .round()
+            .clamp(0.0, MAX_LIVE_COMBAT_ROWS) as usize
+    }
+
+    /// Whether any overlay window is currently shown.
+    pub fn any_visible(&self) -> bool {
+        self.live_combat.visible || self.live_loot.visible
+    }
+
+    /// Copy the user-editable preferences from `other`, leaving window geometry
+    /// alone.
+    ///
+    /// The overlay windows own their position and size and update them as the
+    /// user drags, so the settings UI must not write back a stale copy it read
+    /// several frames ago.
+    pub fn apply_preferences(&mut self, other: &Self) {
+        self.live_combat.visible = other.live_combat.visible;
+        self.live_combat.locked = other.live_combat.locked;
+        self.live_loot.visible = other.live_loot.visible;
+        self.live_loot.locked = other.live_loot.locked;
+        self.opacity = other.opacity;
+        self.live_combat_follow_me = other.live_combat_follow_me;
+        self.live_combat_class_icons = other.live_combat_class_icons;
+        self.live_combat_share_bars = other.live_combat_share_bars;
+        self.live_combat_rows = other.live_combat_rows;
+    }
 }
 
 /// How tab and sub-tab headers display their icon and text.
@@ -1587,6 +1747,13 @@ impl Default for CombatHistorySettings {
 }
 
 impl CombatHistorySettings {
+    /// Whether at least one boss group toggle is enabled.
+    pub fn tracks_any_group(&self) -> bool {
+        crate::assets::BossGroup::ALL
+            .iter()
+            .any(|group| self.tracks(*group))
+    }
+
     /// Whether the toggle for `group` is enabled.
     pub fn tracks(&self, group: crate::assets::BossGroup) -> bool {
         use crate::assets::BossGroup;
@@ -2674,6 +2841,7 @@ impl Default for Settings {
             widget_bar: WidgetBarSettings::default(),
             taskbar: TaskbarSettings::default(),
             trophy_hall: TrophyHallSettings::default(),
+            overlays: OverlaySettings::default(),
         }
     }
 }
@@ -3052,6 +3220,21 @@ mod tests {
         assert_eq!(back.realm_events.veteran.overrides.len(), 1);
         assert_eq!(back.realm_events.veteran.overrides[0].boss_id, 22146);
         assert_eq!(back.realm_events.veteran.overrides[0].volume, 0.8);
+    }
+
+    #[test]
+    fn live_combat_overlay_loads_pre_rename_keys_and_caps_rows() {
+        let legacy = r#"{
+            "dps": { "visible": true, "locked": true, "width": 400.0, "height": 300.0 },
+            "loot": { "visible": false, "width": 320.0, "height": 180.0 },
+            "dps_follow_me": false,
+            "dps_rows": 60.0
+        }"#;
+        let parsed: OverlaySettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.live_combat.visible && parsed.live_combat.locked);
+        assert_eq!(parsed.live_combat.width, 400.0);
+        assert!(!parsed.live_combat_follow_me);
+        assert_eq!(parsed.max_rows(), 25, "rows saved under the old 85 cap");
     }
 
     #[test]

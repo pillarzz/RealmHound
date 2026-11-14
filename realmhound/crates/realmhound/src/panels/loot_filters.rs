@@ -312,30 +312,37 @@ impl PropertyFilters {
         if !self.any() {
             return true;
         }
+        items.iter().any(|item| self.matches_item(item))
+    }
+
+    /// Whether a single item satisfies every active filter subgroup.
+    ///
+    /// [`Self::matches_items`] asks whether a *bag* is worth showing; this asks
+    /// whether an individual item inside it is worth listing.
+    pub(crate) fn matches_item<I: FilterItem>(&self, item: &I) -> bool {
+        if !self.any() {
+            return true;
+        }
         let am = get_asset_manager();
-        let type_active = self.type_active();
-        let rarity_constraining = self.rarity_constraining();
-        items.iter().any(|item| {
-            let id = item.item_id();
-            let type_ok = !type_active
-                || (self.ut && am.is_ut(id))
-                || (self.shiny && am.is_shiny(id))
-                || (self.st && am.get_object(id).map(|o| o.is_st()).unwrap_or(false));
-            if !type_ok {
-                return false;
-            }
-            if !rarity_constraining {
-                return true;
-            }
-            // Rarity is derived from enchant count, matching the displayed overlay.
-            match item.enchant_count() {
-                0 => self.r_none,
-                1 => self.r_uncommon,
-                2 => self.r_rare,
-                3 => self.r_legendary,
-                _ => self.r_divine,
-            }
-        })
+        let id = item.item_id();
+        let type_ok = !self.type_active()
+            || (self.ut && am.is_ut(id))
+            || (self.shiny && am.is_shiny(id))
+            || (self.st && am.get_object(id).map(|o| o.is_st()).unwrap_or(false));
+        if !type_ok {
+            return false;
+        }
+        if !self.rarity_constraining() {
+            return true;
+        }
+        // Rarity is derived from enchant count, matching the displayed overlay.
+        match item.enchant_count() {
+            0 => self.r_none,
+            1 => self.r_uncommon,
+            2 => self.r_rare,
+            3 => self.r_legendary,
+            _ => self.r_divine,
+        }
     }
 }
 

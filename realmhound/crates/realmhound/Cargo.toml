@@ -59,7 +59,7 @@ puffin_http = { version = "0.17", optional = true }
 
 # Windows API for single-instance mutex and title-bar icon
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(not(windows))'.dependencies]
@@ -73,15 +73,33 @@ fs2 = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 # Process start-time conversion for the Refresh safety gate's /proc lookup.
 libc = "0.2"
+# Overlay windows on X11/XWayland: choosing the X11 backend on a Wayland session
+# (winit is eframe's own copy) and the window-manager hints, pointer polling and
+# restacking the overlays need. All three are already in the tree through eframe.
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+x11rb = "0.13"
+# Pre-flights the same runtime-loaded X libraries winit needs, so a Wayland
+# session without a usable XWayland stays native instead of failing to start.
+x11-dl = "2.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Socket -> owning process lookup for the forge-fire relaunch safeguard,
 # replacing GetExtendedTcpTable/GetProcessTimes.
 libproc = "0.14"
-# A bundle-less Mach-O has nowhere to carry an icon, so AppKit's Dock tile is the
-# only place the plain binary can show one; NSBundle tells a bundled build apart.
+# Overlay window promotion: winit's always-on-top maps to NSFloatingWindowLevel,
+# which sits *below* a game in native Full Screen mode. Raising the overlay to
+# NSScreenSaverWindowLevel with an all-Spaces collection behavior needs AppKit.
+# AppKit's Dock tile is also the only place a bundle-less binary can show an
+# icon, and NSBundle tells a bundled build apart.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSEvent",
+    "NSImage",
+    "NSResponder",
+    "NSScreen",
+    "NSWindow",
+] }
 objc2-foundation = { version = "0.3", features = ["NSBundle", "NSData"] }
 
 [dev-dependencies]

@@ -16,6 +16,7 @@ use realmhound_core::{
     api::AccountData as ApiAccountData,
     api::{ClientSeasons, PlayerMissions},
     capture::PacketReceiver,
+    combat::LiveFightSnapshot,
     loot::{LootBagType, ProcessedLootDrop},
     protocol::QuestFetchResponsePacket,
     session::MainAccountStatus,
@@ -819,6 +820,14 @@ pub struct ModelSnapshot {
     pub live_vault_data: Arc<LiveVaultData>,
     /// Currently playing character id.
     pub live_char_id: Option<i32>,
+    /// Every boss fight of the current map instance, for the Live Combat overlay,
+    /// oldest engagement first. Empty when nothing has been fought here.
+    /// Republished every batch while a fight is live because the fight timer
+    /// is time-derived: the figures move even when no new damage arrives.
+    ///
+    /// Shared rather than owned: the UI clones this list every frame, and a
+    /// finished fight's projection never changes again.
+    pub live_fights: Vec<std::sync::Arc<LiveFightSnapshot>>,
     /// Socket of the verified main game-client connection, if tracked. Lets the
     /// UI map the connection to its owning OS process for the forge-fire
     /// relaunch safeguard.
@@ -854,6 +863,7 @@ impl ModelSnapshot {
             account_data: Arc::new(account_data),
             live_vault_data: Arc::new(live_vault_data),
             live_char_id,
+            live_fights: Vec::new(),
             main_connection: None,
             mission_view: Arc::new(MissionView::default()),
             token: None,
@@ -896,7 +906,14 @@ impl ModelSnapshot {
             quests: quests.or_else(|| self.quests.clone()),
             live_events: live_events.unwrap_or_else(|| self.live_events.clone()),
             feed: feed.unwrap_or_else(|| self.feed.clone()),
+            live_fights: Vec::new(),
         }
+    }
+
+    /// Attach the Live Combat projection; empty while no overlay is open.
+    pub fn with_live_fights(mut self, live_fights: Vec<Arc<LiveFightSnapshot>>) -> Self {
+        self.live_fights = live_fights;
+        self
     }
 }
 

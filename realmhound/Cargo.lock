@@ -36,7 +36,10 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows-sys 0.52.0",
+ "winit",
  "winres",
+ "x11-dl",
+ "x11rb",
 ]
 
 [[package]]

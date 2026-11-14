@@ -37,6 +37,11 @@ mod windows;
 pub(super) use windows::{game_window, game_window_active, Process};
 
 #[cfg(target_os = "linux")]
+pub(super) use linux::{game_window, game_window_active, Process};
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::pointer_over_window;
+#[cfg(target_os = "linux")]
 pub use linux::{event_loop_hook, is_forced_x11_failure, relaunch_on_wayland};
 
 /// What a title-bar or grip drag does to the overlay window.
@@ -166,7 +171,11 @@ pub fn begin_drag(kind: DragKind, min_w: f32, min_h: f32, pixels_per_point: f32)
         let scale = pixels_per_point.max(1.0);
         windows::begin_drag(kind, min_w * scale, min_h * scale)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::begin_drag(kind, min_w, min_h, pixels_per_point)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (kind, min_w, min_h, pixels_per_point);
         false
@@ -180,7 +189,11 @@ pub fn continue_drag() -> bool {
     {
         windows::continue_drag()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::continue_drag()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         false
     }

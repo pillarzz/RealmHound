@@ -30,6 +30,15 @@ pub(super) struct GameWindow {
     next_window: Option<Instant>,
     last_error: Option<String>,
     active: bool,
+    /// Linux-only: the association could not be inspected at all, so keep the
+    /// previous always-visible behaviour instead of hiding the overlays.
+    #[cfg(target_os = "linux")]
+    unresolved_visible: bool,
+    /// Linux-only: a game window has been linked at least once. Until then the
+    /// overlays stay visible, so starting RealmHound mid-connection (before a
+    /// map change hands us a fresh socket) does not hide them entirely.
+    #[cfg(target_os = "linux")]
+    ever_attached: bool,
 }
 
 impl GameWindow {
@@ -53,13 +62,29 @@ impl GameWindow {
                 self.find_window(pid);
             }
         } else {
-            self.active = false;
-            return false;
+            #[cfg(target_os = "linux")]
+            {
+                self.active = self.unresolved_visible || !self.ever_attached;
+                return self.active;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.active = false;
+                return false;
+            }
         }
 
         let (Some(window), Some(pid)) = (self.window, self.pid) else {
-            self.active = false;
-            return false;
+            #[cfg(target_os = "linux")]
+            {
+                self.active = self.unresolved_visible || !self.ever_attached;
+                return self.active;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.active = false;
+                return false;
+            }
         };
         // Re-validating the cached handle is cheap and catches a client that
         // was minimized, covered, or closed without a connection event.
@@ -67,6 +92,11 @@ impl GameWindow {
             Ok(Some(active)) => {
                 self.active = active;
                 self.last_error = None;
+                #[cfg(target_os = "linux")]
+                {
+                    self.unresolved_visible = false;
+                    self.ever_attached = true;
+                }
             }
             Ok(None) => {
                 self.window = None;
@@ -94,6 +124,10 @@ impl GameWindow {
                     self.next_process = None;
                     self.next_window = None;
                     self.last_error = None;
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.unresolved_visible = false;
+                    }
                 }
                 Err(error) => self.fail(error),
             },
@@ -111,6 +145,11 @@ impl GameWindow {
                 self.window = Some(window);
                 self.next_window = None;
                 self.last_error = None;
+                #[cfg(target_os = "linux")]
+                {
+                    self.unresolved_visible = false;
+                    self.ever_attached = true;
+                }
             }
             Ok(None) => {}
             Err(error) => self.fail(error),
@@ -124,6 +163,10 @@ impl GameWindow {
         self.next_process = None;
         self.next_window = None;
         self.active = false;
+        #[cfg(target_os = "linux")]
+        {
+            self.unresolved_visible = false;
+        }
     }
 
     fn fail(&mut self, error: String) {
@@ -131,7 +174,15 @@ impl GameWindow {
             tracing::warn!("[OVERLAY] {error}");
             self.last_error = Some(error);
         }
-        self.active = false;
+        #[cfg(windows)]
+        {
+            self.active = false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.unresolved_visible = true;
+            self.active = true;
+        }
     }
 }
 

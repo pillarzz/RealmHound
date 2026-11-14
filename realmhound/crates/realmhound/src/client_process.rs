@@ -52,6 +52,16 @@ pub fn connection_process_id(conn: &ConnectionKey) -> Result<Option<u32>, String
     windows_impl::owning_pid_checked(conn)
 }
 
+/// Resolve the process that owns `conn`, distinguishing "no such connection"
+/// from a failure to query the OS.
+///
+/// Wine shares the client's socket with `wineserver`, so a plain owner list is
+/// ambiguous; the client process is preferred by name.
+#[cfg(target_os = "linux")]
+pub fn connection_process_id(conn: &ConnectionKey) -> Result<Option<u32>, String> {
+    linux_impl::owning_pid_checked(conn)
+}
+
 #[cfg(target_os = "macos")]
 pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
     let pid = macos_impl::owning_pid(conn)?;
@@ -113,8 +123,12 @@ mod linux_impl {
     use std::net::Ipv4Addr;
     use std::path::Path;
 
+    /// Linux `TCP_ESTABLISHED` in `/proc/net/tcp`'s `st` column.
+    const TCP_ESTABLISHED: u8 = 0x01;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct TcpEntry {
+        state: u8,
         local_addr: Ipv4Addr,
         local_port: u16,
         remote_addr: Ipv4Addr,
@@ -142,6 +156,7 @@ mod linux_impl {
                 let (local_addr, local_port) = parse_endpoint(*fields.get(1)?)?;
                 let (remote_addr, remote_port) = parse_endpoint(*fields.get(2)?)?;
                 Some(TcpEntry {
+                    state: u8::from_str_radix(fields.get(3)?, 16).ok()?,
                     local_addr,
                     local_port,
                     remote_addr,
@@ -319,12 +334,53 @@ mod linux_impl {
 
     fn connection_entry(proc_root: &Path, uid: u32, conn: &ConnectionKey) -> Option<TcpEntry> {
         tcp_entries(proc_root)?.into_iter().find(|entry| {
-            entry.uid == uid
+            entry.state == TCP_ESTABLISHED
+                && entry.uid == uid
                 && entry.local_addr == conn.client_ip
                 && entry.local_port == conn.client_port
                 && entry.remote_addr == conn.server_ip
                 && entry.remote_port == conn.server_port
         })
+    }
+
+    /// Owner of `conn`, preferring the client process over Wine's shared
+    /// `wineserver` handle when the kernel reports more than one.
+    pub(super) fn owning_pid_checked(conn: &ConnectionKey) -> Result<Option<u32>, String> {
+        owning_pid_checked_at(Path::new("/proc"), conn)
+    }
+
+    fn owning_pid_checked_at(
+        proc_root: &Path,
+        conn: &ConnectionKey,
+    ) -> Result<Option<u32>, String> {
+        let uid = effective_uid(proc_root)
+            .ok_or_else(|| "Linux could not read the current user id.".to_string())?;
+        let Some(entry) = connection_entry(proc_root, uid, conn) else {
+            return Ok(None);
+        };
+        let targets = HashSet::from([entry.inode]);
+        let ticks = clock_ticks_per_second().unwrap_or(0);
+        let scan = scan_processes(proc_root, uid, ticks, &targets).ok_or_else(|| {
+            "Linux could not scan processes for the tracked connection.".to_string()
+        })?;
+        let owners = scan.owners.get(&entry.inode).cloned().unwrap_or_default();
+        // Wine duplicates the client's socket into `wineserver`, so more than
+        // one process legitimately owns it. Prefer the process whose task name
+        // is the game client; an unnamed single owner is still usable.
+        if let Some(client) = owners.iter().copied().find(|&pid| {
+            std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
+                .is_ok_and(|comm| is_rotmg_client_name(&comm))
+        }) {
+            return Ok(Some(client));
+        }
+        match owners.as_slice() {
+            [] => Ok(None),
+            [pid] => Ok(Some(*pid)),
+            _ => Err(
+                "Multiple processes own the tracked connection; overlay remains hidden."
+                    .to_string(),
+            ),
+        }
     }
 
     #[cfg(test)]
@@ -448,6 +504,7 @@ mod linux_impl {
             assert_eq!(
                 parse_tcp_table(table),
                 Some(vec![TcpEntry {
+                    state: TCP_ESTABLISHED,
                     local_addr: Ipv4Addr::new(127, 0, 0, 1),
                     local_port: 50_000,
                     remote_addr: Ipv4Addr::new(127, 0, 0, 2),
@@ -510,6 +567,75 @@ mod linux_impl {
                 earliest_client_start_unix_at(root, GAME_SERVER_PORT, 100),
                 ClientStart::NoneRunning
             );
+        }
+
+        fn write_socket_fixture(root: &Path, inode: u64, owners: &[(u32, &str)]) {
+            use std::os::unix::fs::symlink;
+
+            std::fs::create_dir_all(root.join("net")).unwrap();
+            std::fs::create_dir_all(root.join("self")).unwrap();
+            std::fs::write(root.join("self/status"), "Uid:\t1000\t1000\t1000\t1000\n").unwrap();
+            std::fs::write(root.join("stat"), "cpu 0 0 0 0\nbtime 1700000000\n").unwrap();
+            std::fs::write(
+                root.join("net/tcp"),
+                format!(
+                    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:C350 0200007F:0802 01 00000000:00000000 00:00000000 00000000  1000        0 {inode}\n"
+                ),
+            )
+            .unwrap();
+            for (pid, name) in owners {
+                let dir = root.join(pid.to_string());
+                std::fs::create_dir_all(dir.join("fd")).unwrap();
+                std::fs::write(dir.join("status"), "Uid:\t1000\t1000\t1000\t1000\n").unwrap();
+                std::fs::write(dir.join("comm"), format!("{name}\n")).unwrap();
+                let mut fields = vec!["0".to_owned(); 20];
+                fields[0] = "S".to_owned();
+                fields[19] = "500".to_owned();
+                std::fs::write(
+                    dir.join("stat"),
+                    format!("{pid} ({name}) {}\n", fields.join(" ")),
+                )
+                .unwrap();
+                symlink(format!("socket:[{inode}]"), dir.join("fd/7")).unwrap();
+            }
+        }
+
+        fn fixture_connection() -> ConnectionKey {
+            ConnectionKey::new([127, 0, 0, 1].into(), 50_000, [127, 0, 0, 2].into(), 2050)
+        }
+
+        #[test]
+        fn wine_socket_owner_prefers_the_game_process_over_wineserver() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write_socket_fixture(
+                root,
+                4242,
+                &[(12_595, "wineserver"), (12_964, "RotMG Exalt.exe")],
+            );
+            assert_eq!(
+                owning_pid_checked_at(root, &fixture_connection()),
+                Ok(Some(12_964))
+            );
+        }
+
+        #[test]
+        fn an_unshared_socket_owner_is_used_as_is() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write_socket_fixture(root, 4242, &[(500, "wine64-preloader")]);
+            assert_eq!(
+                owning_pid_checked_at(root, &fixture_connection()),
+                Ok(Some(500))
+            );
+        }
+
+        #[test]
+        fn ambiguous_unnamed_owners_are_rejected() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            write_socket_fixture(root, 4242, &[(500, "wineserver"), (501, "wine64")]);
+            assert!(owning_pid_checked_at(root, &fixture_connection()).is_err());
         }
 
         #[test]

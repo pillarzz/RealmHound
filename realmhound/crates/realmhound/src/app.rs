@@ -7607,8 +7607,8 @@ impl RealmHoundApp {
         shadcn.card(ui, "overlay_lock", "Lock", |ui| {
             ui.label(
                 RichText::new(
-                    "A locked overlay ignores the mouse, so it cannot be unlocked from its \
-                     own title bar. Unlock it here.",
+                    "A locked overlay passes clicks through to the game. Its title bar \
+                     normally stays usable, but you can always unlock it here.",
                 )
                 .weak(),
             );

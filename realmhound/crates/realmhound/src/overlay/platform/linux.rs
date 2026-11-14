@@ -17,11 +17,16 @@
 //!   flag so clicking an overlay never takes keyboard focus from the game.
 //! - A click-through window gets no pointer events, so [`cursor_position`] asks
 //!   the X server, which is what keeps a locked overlay's title bar usable.
+//! - Overlay windows are made override-redirect once mapped. An unmanaged
+//!   window is composited above the active-fullscreen game window, which KWin
+//!   otherwise keeps above `_NET_WM_STATE_ABOVE` clients. Moving and resizing
+//!   are then plain configure requests from this module.
 //!
-//! Windows are found through `_NET_CLIENT_LIST`, restricted to this process by
-//! `_NET_WM_PID`, then matched on the exact generation-suffixed title.
+//! Managed windows are found through `_NET_CLIENT_LIST`, restricted to this
+//! process by `_NET_WM_PID`; override-redirect overlays are found among the
+//! root's children. Both are matched on the exact generation-suffixed title.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -29,8 +34,8 @@ use std::sync::OnceLock;
 use x11rb::connection::Connection;
 use x11rb::properties::WmHints;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask,
-    StackMode, Window,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
+    ConnectionExt as _, EventMask, KeyButMask, MapState, StackMode, Window,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -38,6 +43,7 @@ use x11rb::rust_connection::RustConnection;
 const NET_WM_STATE_ADD: u32 = 1;
 /// `_NET_WM_STATE` source indication for a normal application.
 const SOURCE_APPLICATION: u32 = 1;
+
 /// Opt-out that keeps a Wayland session native. Also set on the replacement
 /// [`relaunch_on_wayland`] starts, so a fallback can never loop.
 const WAYLAND_OPT_OUT: &str = "REALMHOUND_WAYLAND";
@@ -164,10 +170,13 @@ pub fn relaunch_on_wayland() -> std::io::Result<()> {
 
 struct Atoms {
     client_list: Atom,
+    active_window: Atom,
     wm_pid: Atom,
     wm_name: Atom,
     utf8_string: Atom,
     wm_state: Atom,
+    focused: Atom,
+    hidden: Atom,
     above: Atom,
     skip_taskbar: Atom,
     skip_pager: Atom,
@@ -183,12 +192,15 @@ impl X11 {
     fn connect() -> Result<Self, Box<dyn std::error::Error>> {
         let (conn, screen) = x11rb::connect(None)?;
         let root = conn.setup().roots[screen].root;
-        let names: [&[u8]; 8] = [
+        let names: [&[u8]; 11] = [
             b"_NET_CLIENT_LIST",
+            b"_NET_ACTIVE_WINDOW",
             b"_NET_WM_PID",
             b"_NET_WM_NAME",
             b"UTF8_STRING",
             b"_NET_WM_STATE",
+            b"_NET_WM_STATE_FOCUSED",
+            b"_NET_WM_STATE_HIDDEN",
             b"_NET_WM_STATE_ABOVE",
             b"_NET_WM_STATE_SKIP_TASKBAR",
             b"_NET_WM_STATE_SKIP_PAGER",
@@ -205,10 +217,13 @@ impl X11 {
         let mut next = || atoms.next().unwrap_or_default();
         let atoms = Atoms {
             client_list: next(),
+            active_window: next(),
             wm_pid: next(),
             wm_name: next(),
             utf8_string: next(),
             wm_state: next(),
+            focused: next(),
+            hidden: next(),
             above: next(),
             skip_taskbar: next(),
             skip_pager: next(),
@@ -216,8 +231,8 @@ impl X11 {
         Ok(Self { conn, root, atoms })
     }
 
-    /// Find this process's top-level window titled exactly `title`.
-    fn find(&self, title: &str) -> Option<Window> {
+    /// Every managed top-level window, bottom-to-top.
+    fn client_list(&self) -> Option<Vec<Window>> {
         let clients = self
             .conn
             .get_property(
@@ -231,7 +246,50 @@ impl X11 {
             .ok()?
             .reply()
             .ok()?;
-        let clients: Vec<Window> = clients.value32()?.collect();
+        let windows = clients.value32()?.collect();
+        Some(windows)
+    }
+
+    fn window_pid(&self, window: Window) -> Option<u32> {
+        self.conn
+            .get_property(false, window, self.atoms.wm_pid, AtomEnum::CARDINAL, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?
+            .value32()?
+            .next()
+    }
+
+    fn window_states(&self, window: Window) -> Option<Vec<Atom>> {
+        self.conn
+            .get_property(false, window, self.atoms.wm_state, AtomEnum::ATOM, 0, 1024)
+            .ok()?
+            .reply()
+            .ok()?
+            .value32()
+            .map(|atoms| atoms.collect())
+    }
+
+    fn active_window(&self) -> Option<Window> {
+        self.conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms.active_window,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .ok()?
+            .reply()
+            .ok()?
+            .value32()?
+            .next()
+    }
+
+    /// Every managed top-level window owned by this process, bottom-to-top.
+    fn our_windows(&self) -> Option<Vec<Window>> {
+        let clients = self.client_list()?;
         // Pipeline the per-window lookups rather than one round trip each.
         let pids: Vec<_> = clients
             .iter()
@@ -241,28 +299,93 @@ impl X11 {
             })
             .collect();
         let pid = std::process::id();
-        let ours: Vec<Window> = clients
+        Some(
+            clients
+                .into_iter()
+                .zip(pids)
+                .filter_map(|(window, cookie)| {
+                    let reply = cookie.ok()?.reply().ok()?;
+                    let owner = reply.value32()?.next()?;
+                    (owner == pid).then_some(window)
+                })
+                .collect(),
+        )
+    }
+
+    fn window_name(&self, window: Window) -> Option<String> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.wm_name,
+                self.atoms.utf8_string,
+                0,
+                1024,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        String::from_utf8(reply.value).ok()
+    }
+
+    /// This process's window under the given root coordinates, topmost first.
+    fn window_at(&self, x: i32, y: i32) -> Option<Window> {
+        // The pointer's child is the topmost top-level window at that point.
+        // It is also the only way to find an override-redirect overlay, which
+        // the window manager no longer lists in `_NET_CLIENT_LIST`.
+        if let Some(pointer) = self
+            .conn
+            .query_pointer(self.root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        {
+            let child = pointer.child;
+            if child != x11rb::NONE
+                && (self.window_pid(child) == Some(std::process::id())
+                    || self
+                        .window_name(child)
+                        .is_some_and(|name| name.starts_with("RealmHound ")))
+            {
+                return Some(child);
+            }
+        }
+        let mut hit = None;
+        // `_NET_CLIENT_LIST` is ordered bottom-to-top, so the last match wins.
+        for window in self.our_windows()? {
+            let geometry = self.conn.get_geometry(window).ok()?.reply().ok()?;
+            let position = self
+                .conn
+                .translate_coordinates(window, self.root, 0, 0)
+                .ok()?
+                .reply()
+                .ok()?;
+            let left = i32::from(position.dst_x);
+            let top = i32::from(position.dst_y);
+            if (left..left + i32::from(geometry.width)).contains(&x)
+                && (top..top + i32::from(geometry.height)).contains(&y)
+            {
+                hit = Some(window);
+            }
+        }
+        hit
+    }
+
+    /// Find this process's top-level window titled exactly `title`.
+    fn find(&self, title: &str) -> Option<Window> {
+        if let Some(window) = self
+            .our_windows()?
             .into_iter()
-            .zip(pids)
-            .filter_map(|(window, cookie)| {
-                let reply = cookie.ok()?.reply().ok()?;
-                let owner = reply.value32()?.next()?;
-                (owner == pid).then_some(window)
-            })
-            .collect();
-        ours.into_iter().find(|&window| {
-            self.conn
-                .get_property(
-                    false,
-                    window,
-                    self.atoms.wm_name,
-                    self.atoms.utf8_string,
-                    0,
-                    1024,
-                )
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-                .is_some_and(|reply| reply.value == title.as_bytes())
+            .find(|&window| self.window_name(window).as_deref() == Some(title))
+        {
+            return Some(window);
+        }
+        // Override-redirect overlays are unmanaged: look among the root's
+        // children instead.
+        let tree = self.conn.query_tree(self.root).ok()?.reply().ok()?;
+        tree.children.into_iter().find(|&window| {
+            self.window_pid(window) == Some(std::process::id())
+                && self.window_name(window).as_deref() == Some(title)
         })
     }
 
@@ -320,6 +443,21 @@ pub(super) fn promote(title: &str) {
     let Some(window) = window(x, title) else {
         return;
     };
+    // Becoming override-redirect takes the window out of the window manager's
+    // stacking layers. That is what lets it sit above an active-fullscreen
+    // game, which KWin otherwise keeps above every keep-above client.
+    let already_override = x
+        .conn
+        .get_window_attributes(window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|attributes| attributes.override_redirect);
+    if !already_override {
+        let _ = x.conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().override_redirect(1),
+        );
+    }
     // ICCCM "no input" model: the window manager never gives the overlay
     // keyboard focus, so clicking its chrome leaves the game focused.
     if let Ok(cookie) = WmHints::get(&x.conn, window) {
@@ -348,6 +486,48 @@ pub(super) fn order_front(title: &str) {
     let _ = x.conn.flush();
 }
 
+/// Whether the OS pointer is inside the named overlay window.
+///
+/// Uses the live X11 geometry rather than egui's viewport rectangle, which is
+/// not populated on the frame a window is first mapped. That first frame is
+/// exactly when focus-follows-mouse can move focus off the game.
+pub(crate) fn pointer_over_window(title: &str) -> bool {
+    let Some(x) = x11() else {
+        return false;
+    };
+    let Some(window) = window(x, title) else {
+        return false;
+    };
+    let Some(pointer) = x
+        .conn
+        .query_pointer(x.root)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        return false;
+    };
+    let Some(geometry) = x
+        .conn
+        .get_geometry(window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        return false;
+    };
+    let Some(position) = x
+        .conn
+        .translate_coordinates(window, x.root, 0, 0)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        return false;
+    };
+    let left = i32::from(position.dst_x);
+    let top = i32::from(position.dst_y);
+    (left..left + i32::from(geometry.width)).contains(&i32::from(pointer.root_x))
+        && (top..top + i32::from(geometry.height)).contains(&i32::from(pointer.root_y))
+}
+
 pub(super) fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
     let x = x11()?;
     let pointer = x.conn.query_pointer(x.root).ok()?.reply().ok()?;
@@ -361,4 +541,216 @@ pub(super) fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
         f32::from(pointer.root_x) / scale,
         f32::from(pointer.root_y) / scale,
     ))
+}
+
+#[derive(Clone, Copy)]
+struct Drag {
+    window: Window,
+    kind: super::DragKind,
+    start_pointer: (i32, i32),
+    start_position: (i32, i32),
+    start_size: (u32, u32),
+    min_size: (u32, u32),
+}
+
+thread_local! {
+    /// The overlay move/resize this process is currently following.
+    static DRAG: Cell<Option<Drag>> = const { Cell::new(None) };
+}
+
+/// Start moving or resizing the overlay under the pointer.
+///
+/// Overlays are override-redirect, so there is no window manager move loop to
+/// ask for: remember the pointer and geometry, then apply the delta directly in
+/// [`continue_drag`] for as long as the button is held.
+pub(super) fn begin_drag(
+    kind: super::DragKind,
+    min_w: f32,
+    min_h: f32,
+    pixels_per_point: f32,
+) -> bool {
+    let Some(x) = x11() else {
+        return false;
+    };
+    let Some((window, pointer_x, pointer_y)) = (|| {
+        let pointer = x.conn.query_pointer(x.root).ok()?.reply().ok()?;
+        let pointer_x = i32::from(pointer.root_x);
+        let pointer_y = i32::from(pointer.root_y);
+        Some((x.window_at(pointer_x, pointer_y)?, pointer_x, pointer_y))
+    })() else {
+        return false;
+    };
+    let Some(geometry) = x
+        .conn
+        .get_geometry(window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        return false;
+    };
+    let Some(position) = x
+        .conn
+        .translate_coordinates(window, x.root, 0, 0)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        return false;
+    };
+    let scale = pixels_per_point.max(1.0);
+    DRAG.with(|drag| {
+        drag.set(Some(Drag {
+            window,
+            kind,
+            start_pointer: (pointer_x, pointer_y),
+            start_position: (i32::from(position.dst_x), i32::from(position.dst_y)),
+            start_size: (u32::from(geometry.width), u32::from(geometry.height)),
+            min_size: (
+                ((min_w.max(1.0) * scale).ceil() as u32).max(1),
+                ((min_h.max(1.0) * scale).ceil() as u32).max(1),
+            ),
+        }));
+    });
+    true
+}
+
+/// Keep moving the window with the pointer until the button is released.
+pub(super) fn continue_drag() -> bool {
+    let Some(drag) = DRAG.with(Cell::get) else {
+        return false;
+    };
+    let Some(x) = x11() else {
+        DRAG.with(|drag| drag.set(None));
+        return false;
+    };
+    let Some(pointer) = x
+        .conn
+        .query_pointer(x.root)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        DRAG.with(|drag| drag.set(None));
+        return false;
+    };
+    if !pointer.mask.contains(KeyButMask::BUTTON1) {
+        DRAG.with(|drag| drag.set(None));
+        return false;
+    }
+    let dx = i32::from(pointer.root_x) - drag.start_pointer.0;
+    let dy = i32::from(pointer.root_y) - drag.start_pointer.1;
+    let aux = match drag.kind {
+        super::DragKind::Move => ConfigureWindowAux::new()
+            .x(drag.start_position.0 + dx)
+            .y(drag.start_position.1 + dy),
+        super::DragKind::Resize => {
+            let width = (drag.start_size.0 as i32 + dx).max(drag.min_size.0 as i32) as u32;
+            let height = (drag.start_size.1 as i32 + dy).max(drag.min_size.1 as i32) as u32;
+            ConfigureWindowAux::new().width(width).height(height)
+        }
+    };
+    let _ = x.conn.configure_window(drag.window, &aux);
+    let _ = x.conn.flush();
+    true
+}
+
+/// Locate the visible top-level window owned by `pid`.
+///
+/// Only viewable windows count: a minimized client is left out so the overlay
+/// hides instead of presenting itself over the desktop.
+pub(crate) fn game_window(pid: u32) -> Result<Option<isize>, String> {
+    let x = x11()
+        .ok_or_else(|| "Cannot enumerate X11 windows for the linked game client.".to_string())?;
+    let clients = x
+        .client_list()
+        .ok_or_else(|| "Cannot enumerate X11 windows for the linked game client.".to_string())?;
+    let mut windows = Vec::new();
+    for window in clients {
+        if x.window_pid(window) != Some(pid) {
+            continue;
+        }
+        let viewable = x
+            .conn
+            .get_window_attributes(window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|attributes| attributes.map_state == MapState::VIEWABLE);
+        if viewable {
+            windows.push(window);
+        }
+    }
+    match windows.as_slice() {
+        [] => Ok(None),
+        [window] => Ok(Some(*window as isize)),
+        _ => {
+            Err("Multiple windows belong to the linked client; overlay remains hidden.".to_string())
+        }
+    }
+}
+
+/// Whether the linked client's window is still visible and focused.
+///
+/// `Ok(None)` means the cached window is gone and should be looked up again;
+/// `Ok(Some(false))` means it exists but belongs on screen without the overlays.
+pub(crate) fn game_window_active(window: isize, pid: u32) -> Result<Option<bool>, String> {
+    let x = x11().ok_or_else(|| {
+        "Cannot inspect the linked game window while X11 is unavailable.".to_string()
+    })?;
+    let window = window as Window;
+    if x.window_pid(window) != Some(pid) {
+        return Ok(None);
+    }
+    let viewable = x
+        .conn
+        .get_window_attributes(window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|attributes| attributes.map_state == MapState::VIEWABLE);
+    if !viewable {
+        return Ok(None);
+    }
+    let states = x.window_states(window).unwrap_or_default();
+    if states.contains(&x.atoms.hidden) {
+        return Ok(Some(false));
+    }
+    let active = x.active_window();
+    let focused = states.contains(&x.atoms.focused) || active == Some(window);
+    // Keep the overlays available while RealmHound itself is focused, so the
+    // overlay settings can be used without the game losing them. Another
+    // application taking focus still hides them.
+    let configuring = active
+        .and_then(|active| x.window_pid(active))
+        .is_some_and(|pid| pid == std::process::id());
+    Ok(Some(focused || configuring))
+}
+
+/// A retained association with the linked game process.
+///
+/// The start time is part of the identity: a recycled PID must not masquerade
+/// as the client the overlays were attached to.
+pub(crate) struct Process {
+    pid: u32,
+    start: u64,
+}
+
+impl Process {
+    pub fn open(pid: u32) -> Result<Self, String> {
+        let start = process_start(pid)
+            .ok_or_else(|| format!("Cannot inspect the linked game process {pid}."))?;
+        Ok(Self { pid, start })
+    }
+
+    pub fn is_alive(&self) -> Result<bool, String> {
+        Ok(process_start(self.pid) == Some(self.start))
+    }
+}
+
+/// Field 22 (`starttime`) of `/proc/<pid>/stat`, in clock ticks since boot.
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is parenthesized and may contain spaces or ')'.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }

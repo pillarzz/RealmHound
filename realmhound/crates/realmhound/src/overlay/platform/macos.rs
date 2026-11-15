@@ -137,21 +137,24 @@ impl Process {
 /// `NSScreenSaverWindowLevel`: the highest practical level for a game overlay.
 const SCREEN_SAVER_WINDOW_LEVEL: isize = 1000;
 
-/// Run `f` for every on-screen `NSWindow` whose title matches `title`.
-fn for_each_matching(title: &str, mut f: impl FnMut(&NSWindow)) {
+/// Run `f` for every matching window, including one created hidden.
+fn for_each_matching(title: &str, mut f: impl FnMut(&NSWindow)) -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
         tracing::debug!("[OVERLAY] skipping AppKit promotion off the main thread");
-        return;
+        return false;
     };
     let app = NSApplication::sharedApplication(mtm);
+    let mut found = false;
     for window in app.windows().iter() {
-        if window.isVisible() && window.title().to_string() == title {
+        if window.title().to_string() == title {
             f(&window);
+            found = true;
         }
     }
+    found
 }
 
-pub(super) fn promote(title: &str) {
+pub(super) fn promote(title: &str) -> bool {
     // `Transient` and `Stationary` are the same mutually exclusive group:
     // "You may specify at most one of Managed, Transient, or Stationary"
     // (AppKit's NSWindow.h). Setting both left the window server with an
@@ -164,7 +167,8 @@ pub(super) fn promote(title: &str) {
         | NSWindowCollectionBehavior::FullScreenAuxiliary
         | NSWindowCollectionBehavior::Transient
         | NSWindowCollectionBehavior::IgnoresCycle;
-    for_each_matching(title, |window| {
+    let mut prepared = true;
+    let found = for_each_matching(title, |window| {
         if window.collectionBehavior() != behavior {
             window.setCollectionBehavior(behavior);
         }
@@ -184,7 +188,12 @@ pub(super) fn promote(title: &str) {
         if window.hasShadow() {
             window.setHasShadow(false);
         }
+        prepared &= window.collectionBehavior() == behavior
+            && window.level() == SCREEN_SAVER_WINDOW_LEVEL
+            && !window.hidesOnDeactivate()
+            && !window.hasShadow();
     });
+    found && prepared
 }
 
 /// Raise the overlay if it has just gone from visible to covered, and report
@@ -200,6 +209,9 @@ pub(super) fn promote(title: &str) {
 pub(super) fn order_front(title: &str, was_hidden: bool) -> bool {
     let mut hidden = was_hidden;
     for_each_matching(title, |window| {
+        if !window.isVisible() {
+            return;
+        }
         hidden = !window
             .occlusionState()
             .contains(NSWindowOcclusionState::Visible);

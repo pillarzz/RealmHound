@@ -87,6 +87,7 @@ const COLLAPSED_H: f32 = TITLE_BAR_H + 10.0;
 /// is cheap (a title lookup plus a couple of setters) and keeps the overlay up
 /// without a per-frame native call.
 const PROMOTE_INTERVAL: Duration = Duration::from_secs(2);
+const PROMOTE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How often a locked overlay polls the pointer to decide whether to suspend
 /// click-through over its title bar.
@@ -222,12 +223,14 @@ struct WindowRuntime {
     /// A pass-through or resizable change went out last frame. winit applies
     /// either by rewriting the window's whole native style, which drops the
     /// tweaks [`platform::promote`] added, so they are re-applied next frame
-    /// rather than up to [`PROMOTE_INTERVAL`] later.
+    /// rather than up to [`PROMOTE_INTERVAL`] later. Failed preparation also
+    /// keeps this set until a retry succeeds.
     restyled: bool,
     /// Whether the window reported itself covered on the previous promote tick.
     /// [`platform::order_front`] is edge-triggered on it.
     hidden: bool,
     last_promoted: Option<Instant>,
+    next_promotion_retry: Option<Instant>,
 }
 
 impl WindowRuntime {
@@ -244,6 +247,7 @@ impl WindowRuntime {
             restyled: false,
             hidden: false,
             last_promoted: None,
+            next_promotion_retry: None,
         }
     }
 
@@ -268,6 +272,7 @@ impl WindowRuntime {
         self.restyled = false;
         self.hidden = false;
         self.last_promoted = None;
+        self.next_promotion_retry = None;
     }
 
     fn builder_for(
@@ -358,12 +363,30 @@ impl WindowRuntime {
                 .last_promoted
                 .is_none_or(|at| at.elapsed() >= PROMOTE_INTERVAL);
         if due {
+            let now = Instant::now();
+            if let Some(retry) = self.next_promotion_retry.filter(|&retry| retry > now) {
+                self.restyled = true;
+                if attached {
+                    ctx.request_repaint_after(retry - now);
+                }
+                return;
+            }
             // Retire leftovers first: raising the live window afterwards leaves
             // it on top even if the stale one was in front a moment ago.
             platform::dismiss_stale(self.title, &self.native_title);
-            platform::promote(&self.native_title);
-            self.hidden = platform::order_front(&self.native_title, self.hidden);
-            self.last_promoted = Some(Instant::now());
+            if platform::promote(&self.native_title) {
+                if attached {
+                    self.hidden = platform::order_front(&self.native_title, self.hidden);
+                }
+                self.last_promoted = Some(Instant::now());
+                self.next_promotion_retry = None;
+            } else {
+                self.restyled = true;
+                self.next_promotion_retry = Some(Instant::now() + PROMOTE_RETRY_INTERVAL);
+                if attached {
+                    ctx.request_repaint_after(PROMOTE_RETRY_INTERVAL);
+                }
+            }
         }
     }
 }
@@ -1117,6 +1140,46 @@ mod tests {
     };
     use eframe::egui;
     use realmhound_core::settings::OverlaySettings;
+
+    #[test]
+    fn missing_native_window_keeps_initial_and_restyle_preparation_pending() {
+        let cfg = OverlaySettings::default().live_combat;
+        let ctx = egui::Context::default();
+        for last in [None, Some(std::time::Instant::now())] {
+            let mut runtime = WindowRuntime::new("RealmHound preparation regression");
+            runtime.native_title = format!("RealmHound missing window {}", std::process::id());
+            runtime.last_promoted = last;
+            runtime.restyled = true;
+            runtime.visible = Some(false);
+            runtime.passthrough = Some(cfg.locked);
+            runtime.minimized = Some(cfg.minimized);
+            runtime.resizable = Some(!cfg.locked);
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.last_promoted, last);
+            assert!(runtime.restyled);
+            assert!(runtime.next_promotion_retry.is_some());
+            let retry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            runtime.next_promotion_retry = Some(retry);
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.last_promoted, last);
+            assert_eq!(runtime.next_promotion_retry, Some(retry));
+            assert!(runtime.restyled);
+            runtime.next_promotion_retry =
+                Some(std::time::Instant::now() - super::PROMOTE_RETRY_INTERVAL);
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.last_promoted, last);
+            assert!(runtime.restyled);
+            runtime.closed();
+            assert!(runtime.next_promotion_retry.is_none());
+            assert!(runtime.last_promoted.is_none());
+        }
+    }
 
     #[test]
     fn disabled_and_unattached_overlays_release_worker_demand() {

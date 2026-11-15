@@ -37,6 +37,7 @@ use super::DragKind;
 
 /// Logged once so a missing overlay window doesn't spam the log every frame.
 static MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+static TRANSPARENCY_WARNED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Generation title -> initialized handle and layered state.
@@ -58,9 +59,9 @@ fn find(title: &str) -> Option<HWND> {
     Some(hwnd)
 }
 
-pub(super) fn promote(title: &str) {
+pub(super) fn promote(title: &str) -> bool {
     let Some(hwnd) = find(title) else {
-        return;
+        return false;
     };
     let wanted = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize;
     // SAFETY: `hwnd` came from `FindWindowW` and is only read/written through
@@ -70,7 +71,11 @@ pub(super) fn promote(title: &str) {
         if current & wanted != wanted {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | wanted);
         }
-        ensure_transparency(title, hwnd, current & WS_EX_LAYERED as isize != 0);
+        if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & wanted != wanted
+            || !ensure_transparency(title, hwnd, current & WS_EX_LAYERED as isize != 0)
+        {
+            return false;
+        }
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -79,7 +84,7 @@ pub(super) fn promote(title: &str) {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+        ) != 0
     }
 }
 
@@ -93,18 +98,27 @@ pub(super) fn promote(title: &str) {
 ///
 /// `layered` mirrors `WS_EX_LAYERED`: click-through adds it, and a layered
 /// window stays invisible until its alpha is initialized.
-fn ensure_transparency(title: &str, hwnd: HWND, layered: bool) {
+fn ensure_transparency(title: &str, hwnd: HWND, layered: bool) -> bool {
     let needs_setup = COMPOSITOR.with(|seen| seen.borrow().get(title) != Some(&(hwnd, layered)));
     if !needs_setup {
-        return;
+        return true;
     }
     // SAFETY: `hwnd` came from `FindWindowW` and is only passed to the
     // documented DWM/GDI/layered-window entry points.
     match unsafe { enable_transparency(hwnd, layered) } {
-        Ok(()) => COMPOSITOR.with(|seen| {
-            seen.borrow_mut().insert(title.to_owned(), (hwnd, layered));
-        }),
-        Err(error) => tracing::warn!("[OVERLAY] {error}"),
+        Ok(()) => {
+            COMPOSITOR.with(|seen| {
+                seen.borrow_mut().insert(title.to_owned(), (hwnd, layered));
+            });
+            TRANSPARENCY_WARNED.store(false, Ordering::Relaxed);
+            true
+        }
+        Err(error) => {
+            if !TRANSPARENCY_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("[OVERLAY] {error}");
+            }
+            false
+        }
     }
 }
 

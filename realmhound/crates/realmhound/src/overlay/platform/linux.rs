@@ -408,19 +408,53 @@ impl X11 {
     }
 
     /// Ask the window manager to add up to two `_NET_WM_STATE` states.
-    fn add_states(&self, window: Window, first: Atom, second: Atom) {
+    fn add_states(&self, window: Window, first: Atom, second: Atom) -> Option<()> {
         let event = ClientMessageEvent::new(
             32,
             window,
             self.atoms.wm_state,
             [NET_WM_STATE_ADD, first, second, SOURCE_APPLICATION, 0],
         );
-        let _ = self.conn.send_event(
-            false,
-            self.root,
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            event,
-        );
+        self.conn
+            .send_event(
+                false,
+                self.root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .ok()?
+            .check()
+            .ok()?;
+        Some(())
+    }
+
+    fn prepare(&self, window: Window) -> Option<()> {
+        // Override-redirect bypasses the WM's fullscreen stacking layer.
+        let attributes = self.conn.get_window_attributes(window).ok()?.reply().ok()?;
+        if !attributes.override_redirect {
+            self.conn
+                .change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux::new().override_redirect(1),
+                )
+                .ok()?
+                .check()
+                .ok()?;
+        }
+        // ICCCM no-input hints keep keyboard focus on the game.
+        let mut hints = WmHints::get(&self.conn, window)
+            .ok()?
+            .reply()
+            .ok()?
+            .unwrap_or_default();
+        if hints.input != Some(false) {
+            hints.input = Some(false);
+            hints.set(&self.conn, window).ok()?.check().ok()?;
+        }
+        self.add_states(window, self.atoms.above, self.atoms.skip_taskbar)?;
+        self.add_states(window, self.atoms.skip_pager, 0)?;
+        self.conn.flush().ok()?;
+        Some(())
     }
 }
 
@@ -446,7 +480,12 @@ thread_local! {
 
 fn window(x: &X11, title: &str) -> Option<Window> {
     if let Some(window) = FOUND.with(|found| found.borrow().get(title).copied()) {
-        return Some(window);
+        if x.window_name(window).as_deref() == Some(title)
+            && x.window_pid(window) == Some(std::process::id())
+        {
+            return Some(window);
+        }
+        FOUND.with(|found| found.borrow_mut().remove(title));
     }
     let window = x.find(title)?;
     FOUND.with(|found| found.borrow_mut().insert(title.to_owned(), window));
@@ -461,40 +500,18 @@ pub(super) fn dismiss_stale(prefix: &str, keep: &str) {
     });
 }
 
-pub(super) fn promote(title: &str) {
+pub(super) fn promote(title: &str) -> bool {
     let Some(x) = x11() else {
-        return;
+        return false;
     };
     let Some(window) = window(x, title) else {
-        return;
+        return false;
     };
-    // Becoming override-redirect takes the window out of the window manager's
-    // stacking layers. That is what lets it sit above an active-fullscreen
-    // game, which KWin otherwise keeps above every keep-above client.
-    let already_override = x
-        .conn
-        .get_window_attributes(window)
-        .ok()
-        .and_then(|cookie| cookie.reply().ok())
-        .is_some_and(|attributes| attributes.override_redirect);
-    if !already_override {
-        let _ = x.conn.change_window_attributes(
-            window,
-            &ChangeWindowAttributesAux::new().override_redirect(1),
-        );
+    let prepared = x.prepare(window).is_some();
+    if !prepared {
+        FOUND.with(|found| found.borrow_mut().remove(title));
     }
-    // ICCCM "no input" model: the window manager never gives the overlay
-    // keyboard focus, so clicking its chrome leaves the game focused.
-    if let Ok(cookie) = WmHints::get(&x.conn, window) {
-        let mut hints = cookie.reply().ok().flatten().unwrap_or_default();
-        if hints.input != Some(false) {
-            hints.input = Some(false);
-            let _ = hints.set(&x.conn, window);
-        }
-    }
-    x.add_states(window, x.atoms.above, x.atoms.skip_taskbar);
-    x.add_states(window, x.atoms.skip_pager, 0);
-    let _ = x.conn.flush();
+    prepared
 }
 
 pub(super) fn order_front(title: &str) {
@@ -879,7 +896,27 @@ mod tests {
         }
         let title = "RealmHound lookup regression #1";
         let window = create_named_window(&x, title);
+        assert_eq!(x.prepare(window), Some(()));
+        assert_eq!(
+            WmHints::get(&x.conn, window)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .unwrap()
+                .input,
+            Some(false)
+        );
+        assert!(
+            x.conn
+                .get_window_attributes(window)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .override_redirect
+        );
+        assert_eq!(x.prepare(window), Some(()));
         assert_eq!(x.find(title), Some(window));
+        assert_eq!(super::window(&x, title), Some(window));
         x.conn
             .change_property32(
                 x11rb::protocol::xproto::PropMode::REPLACE,
@@ -894,9 +931,12 @@ mod tests {
         assert_eq!(x.find(title), Some(window));
         assert_eq!(x.find("wrong generation"), None);
         x.conn.destroy_window(window).unwrap().check().unwrap();
+        assert_eq!(x.prepare(window), None);
         assert_eq!(x.find(title), None);
+        assert_eq!(super::window(&x, title), None);
         let replacement = create_named_window(&x, title);
         assert_eq!(x.find(title), Some(replacement));
+        assert_eq!(super::window(&x, title), Some(replacement));
         x.conn
             .change_property32(
                 x11rb::protocol::xproto::PropMode::REPLACE,
@@ -909,6 +949,7 @@ mod tests {
             .check()
             .unwrap();
         assert_eq!(x.find(title), None);
+        assert_eq!(super::window(&x, title), None);
         x.conn.destroy_window(root).unwrap().check().unwrap();
     }
 

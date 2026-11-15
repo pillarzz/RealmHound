@@ -274,6 +274,23 @@ mod tests {
         game.poll(None);
         assert_eq!(game.pid, Some(pid));
         assert_eq!(game.window, Some(replacement.0));
+        let title = format!("RealmHound preparation regression {}", pid);
+        assert!(!platform::promote(&title));
+        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: this test owns the window and the title buffer is NUL-terminated.
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                    replacement.0,
+                    wide.as_ptr(),
+                )
+            },
+            0
+        );
+        assert!(platform::promote(&title));
+        drop(replacement);
+        assert!(!platform::promote(&title));
+        platform::dismiss_stale(&title, "");
     }
 
     #[test]

@@ -58,21 +58,27 @@ pub enum DragKind {
 /// Apply the always-on-top / all-Spaces / never-steal-focus promotion to the
 /// overlay window titled `title`.
 ///
-/// Idempotent, and safe to call before the window exists (it simply finds
-/// nothing). Must be called from the UI thread, which on macOS is also the
-/// AppKit main thread.
-pub fn promote(title: &str) {
+/// Returns true only when the window was found and preparation succeeded.
+/// Safe before creation; must run on the UI thread.
+pub fn promote(title: &str) -> bool {
     #[cfg(target_os = "macos")]
-    macos::promote(title);
+    {
+        macos::promote(title)
+    }
     #[cfg(windows)]
-    windows::promote(title);
+    {
+        windows::promote(title)
+    }
     #[cfg(target_os = "linux")]
-    linux::promote(title);
+    {
+        linux::promote(title)
+    }
     #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
         // BSD: winit's always-on-top window level is all we can portably ask
         // for.
         let _ = title;
+        false
     }
 }
 

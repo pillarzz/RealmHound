@@ -14,6 +14,7 @@ use super::platform::{self, Process};
 
 /// How often to retry a failed process/window lookup, in either direction.
 const LOOKUP_INTERVAL: Duration = Duration::from_millis(500);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The game client associated with the current session.
 ///
@@ -28,6 +29,7 @@ pub(super) struct GameWindow {
     window: Option<isize>,
     next_process: Option<Instant>,
     next_window: Option<Instant>,
+    next_poll: Option<Instant>,
     last_error: Option<String>,
     active: bool,
 }
@@ -36,6 +38,11 @@ impl GameWindow {
     /// Poll the attached client and return whether its game window is on screen
     /// and either the linked game or RealmHound is foreground right now.
     pub fn poll(&mut self, connection: Option<ConnectionKey>) -> bool {
+        let now = Instant::now();
+        if self.next_poll.is_some_and(|at| at > now) {
+            return self.active;
+        }
+        self.next_poll = Some(now + POLL_INTERVAL);
         self.active = false;
         if let Some(process) = self.process.as_ref() {
             match process.is_alive() {
@@ -62,8 +69,7 @@ impl GameWindow {
         let (Some(window), Some(pid)) = (self.window, self.pid) else {
             return false;
         };
-        // Re-validating the cached handle is cheap and catches a client that
-        // was minimized, covered, or closed without a connection event.
+        // Catch minimize/focus/exit transitions even without a connection event.
         match platform::game_window_active(window, pid) {
             Ok(Some(active)) => {
                 self.active = active;
@@ -141,6 +147,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn polls_reuse_cached_visibility_until_the_native_check_is_due() {
+        let mut game = GameWindow {
+            active: true,
+            next_poll: Some(Instant::now() + Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let deadline = game.next_poll;
+        assert!(game.poll(None));
+        assert_eq!(game.next_poll, deadline);
+        let before = Instant::now();
+        game.next_poll = Some(before - POLL_INTERVAL);
+        assert!(!game.poll(None));
+        assert!(game.next_poll.unwrap() >= before + POLL_INTERVAL);
+    }
+
+    #[test]
     fn unbound_polls_preserve_process_retry_deadline() {
         let mut game = GameWindow::default();
         assert!(due(&mut game.next_process));
@@ -215,6 +237,7 @@ mod tests {
         assert_eq!(game.pid, Some(pid));
         drop(child.stdin.take());
         child.wait().unwrap();
+        game.next_poll = None;
         assert!(!game.poll(None));
         assert_eq!(game.pid, None);
         assert!(game.process.is_none());

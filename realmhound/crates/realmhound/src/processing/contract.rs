@@ -822,8 +822,8 @@ pub struct ModelSnapshot {
     pub live_char_id: Option<i32>,
     /// Every boss fight of the current map instance, for the Live Combat overlay,
     /// oldest engagement first. Empty when nothing has been fought here.
-    /// Republished every batch while a fight is live because the fight timer
-    /// is time-derived: the figures move even when no new damage arrives.
+    /// Projected at most every 100 ms while expanded Live Combat is on screen.
+    /// The fight timer advances even when no new damage arrives.
     ///
     /// Shared rather than owned: the UI clones this list every frame, and a
     /// finished fight's projection never changes again.
@@ -910,7 +910,7 @@ impl ModelSnapshot {
         }
     }
 
-    /// Attach the Live Combat projection; empty while no overlay is open.
+    /// Attach the Live Combat projection; empty while its body is not on screen.
     pub fn with_live_fights(mut self, live_fights: Vec<Arc<LiveFightSnapshot>>) -> Self {
         self.live_fights = live_fights;
         self

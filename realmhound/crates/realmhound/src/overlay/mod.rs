@@ -92,6 +92,8 @@ const PROMOTE_INTERVAL: Duration = Duration::from_secs(2);
 /// click-through over its title bar.
 const CHROME_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+const DETACHED_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Overlay refresh rate while something on screen is actually moving.
 ///
 /// An overlay is an *immediate* viewport, so one overlay frame is also a full
@@ -375,9 +377,8 @@ pub struct OverlayManager {
     /// The game client the overlays attach to.
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     game: game::GameWindow,
-    /// Mirrors "at least one overlay is open" for the packet worker, which uses
-    /// it to keep waking the UI while a background tab is selected.
-    active: Arc<AtomicBool>,
+    /// Only an attached, expanded Live Combat window needs worker projections.
+    live_combat_demand: Arc<AtomicBool>,
     /// Set once if the backend turned out not to support real child windows, so
     /// the warning is logged a single time instead of every frame.
     embedded_warned: bool,
@@ -398,15 +399,13 @@ impl OverlayManager {
             live_loot: live_loot::LiveLootOverlay::default(),
             #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             game: game::GameWindow::default(),
-            active: Arc::new(AtomicBool::new(false)),
+            live_combat_demand: Arc::new(AtomicBool::new(false)),
             embedded_warned: false,
         }
     }
 
-    /// Shared flag the worker reads to decide whether overlay-only data (live
-    /// combat, loot) still needs to wake the UI on a background tab.
-    pub fn active_signal(&self) -> Arc<AtomicBool> {
-        self.active.clone()
+    pub fn live_combat_signal(&self) -> Arc<AtomicBool> {
+        self.live_combat_demand.clone()
     }
 
     /// Record a loot drop for the Live Loot overlay's counters and recent list.
@@ -427,7 +426,8 @@ impl OverlayManager {
     /// `eframe::App::update`, before the main window's panels.
     ///
     /// Requires a visible, unminimized window linked to a verified
-    /// `main_connection`, with the game or RealmHound foreground.
+    /// `main_connection`, with the game or RealmHound foreground. Returns
+    /// whether any overlay remains on screen, including collapsed windows.
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -435,25 +435,27 @@ impl OverlayManager {
         sprites: &mut SpriteRenderer,
         live: &[Arc<LiveFightSnapshot>],
         main_connection: Option<ConnectionKey>,
-    ) {
-        // The Live Loot overlay shares the Live Feed's bag and item toggles rather
-        // than offering a second place to configure the same thing.
-        let Ok((mut cfg, bag_filters, item_filters, tracking_any)) = settings.read().map(|s| {
-            (
-                s.overlays.clone(),
-                LootFilters::from_live_feed_settings(&s.live_feed.filters),
-                PropertyFilters::from_live_feed_settings(&s.live_feed.filters),
-                s.combat_history.tracks_any_group(),
-            )
-        }) else {
-            return;
+    ) -> bool {
+        let Ok(s) = settings.read() else {
+            self.live_combat_demand.store(false, Ordering::Relaxed);
+            return false;
         };
-        self.active.store(cfg.any_visible(), Ordering::Relaxed);
-        if !cfg.any_visible() {
+        if !s.overlays.any_visible() {
+            drop(s);
+            self.live_combat_demand.store(false, Ordering::Relaxed);
             self.live_combat_window.closed();
             self.live_loot_window.closed();
-            return;
+            return false;
         }
+        let mut cfg = s.overlays.clone();
+        let tracking_any = s.combat_history.tracks_any_group();
+        let loot_filters = cfg.live_loot.visible.then(|| {
+            (
+                LootFilters::from_live_feed_settings(&s.live_feed.filters),
+                PropertyFilters::from_live_feed_settings(&s.live_feed.filters),
+            )
+        });
+        drop(s);
 
         #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         let attached = self.game.poll(main_connection);
@@ -477,9 +479,7 @@ impl OverlayManager {
         let animating =
             cfg.live_combat.visible && !cfg.live_combat.minimized && live.iter().any(|f| !f.ended);
         ctx.request_repaint_after(if !attached {
-            // Detached overlays are hidden, so poll quickly enough that
-            // focusing the game brings them back without a visible lag.
-            CHROME_POLL_INTERVAL
+            DETACHED_POLL_INTERVAL
         } else if animating {
             ACTIVE_FRAME_INTERVAL
         } else {
@@ -489,6 +489,8 @@ impl OverlayManager {
         let before = cfg.clone();
         let opacity = cfg.clamped_opacity();
         let max_rows = cfg.max_rows();
+        let mut combat_visible = false;
+        let mut loot_visible = false;
 
         if cfg.live_combat.visible {
             let mut content = live_combat::LiveCombatContent {
@@ -509,12 +511,13 @@ impl OverlayManager {
                 sprites,
                 &mut content,
             );
+            combat_visible = attached && !embedded && cfg.live_combat.visible;
             self.warn_if_embedded(embedded);
         } else {
             self.live_combat_window.closed();
         }
 
-        if cfg.live_loot.visible {
+        if let Some((bag_filters, item_filters)) = loot_filters {
             let mut content = live_loot::LiveLootContent {
                 overlay: &mut self.live_loot,
                 filters: &bag_filters,
@@ -529,6 +532,7 @@ impl OverlayManager {
                 sprites,
                 &mut content,
             );
+            loot_visible = attached && !embedded && cfg.live_loot.visible;
             self.warn_if_embedded(embedded);
         } else {
             self.live_loot_window.closed();
@@ -549,6 +553,11 @@ impl OverlayManager {
                 s.overlays.live_combat_share_bars = cfg.live_combat_share_bars;
             }
         }
+        self.live_combat_demand.store(
+            combat_visible && !cfg.live_combat.minimized,
+            Ordering::Relaxed,
+        );
+        combat_visible || loot_visible
     }
 
     fn warn_if_embedded(&mut self, embedded: bool) {
@@ -1108,6 +1117,35 @@ mod tests {
     };
     use eframe::egui;
     use realmhound_core::settings::OverlaySettings;
+
+    #[test]
+    fn disabled_and_unattached_overlays_release_worker_demand() {
+        use super::{Arc, AtomicBool, Ordering, OverlayManager, RwLock, Settings, SpriteRenderer};
+
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let mut overlays = OverlayManager::new();
+        let signal: Arc<AtomicBool> = overlays.live_combat_signal();
+        let ctx = egui::Context::default();
+        let mut sprites = SpriteRenderer::new();
+        for (combat, loot, collapsed) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, false, false),
+        ] {
+            {
+                let mut s = settings.write().unwrap();
+                s.overlays.live_combat.visible = combat;
+                s.overlays.live_combat.minimized = collapsed;
+                s.overlays.live_loot.visible = loot;
+            }
+            signal.store(true, Ordering::Relaxed);
+            let _ = ctx.run(Default::default(), |ctx| {
+                assert!(!overlays.render(ctx, &settings, &mut sprites, &[], None));
+            });
+            assert!(!signal.load(Ordering::Relaxed));
+        }
+    }
 
     #[test]
     fn reopening_an_overlay_gives_its_window_a_fresh_native_title() {

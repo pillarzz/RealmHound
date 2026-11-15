@@ -1046,7 +1046,7 @@ impl RealmHoundApp {
             processor,
             egui_ctx.clone(),
             audio_tx.clone(),
-            overlays.active_signal(),
+            overlays.live_combat_signal(),
             account.clone(),
         )
         .map_err(|e| AppStartError::Worker(e.to_string()))?;
@@ -10406,7 +10406,7 @@ impl eframe::App for RealmHoundApp {
         // before the main window's panels and are unaffected by modal blocking.
         // They also drive their own repaints while open, which is what keeps a
         // live fight's clock-derived numbers moving.
-        self.overlays.render(
+        let overlays_visible = self.overlays.render(
             ctx,
             &self.settings,
             &mut self.sprite_renderer,
@@ -10448,11 +10448,8 @@ impl eframe::App for RealmHoundApp {
 
         // A minimized window never paints, so stop the worker waking it, unless
         // an overlay (painted from this window's update) is still on screen.
-        let live_demand = ctx.input(|input| input.viewport().minimized != Some(true))
-            || self
-                .overlays
-                .active_signal()
-                .load(std::sync::atomic::Ordering::Relaxed);
+        let live_demand =
+            ctx.input(|input| input.viewport().minimized != Some(true)) || overlays_visible;
         if self.live_demand != Some(live_demand) {
             self.live_demand = Some(live_demand);
             self.worker

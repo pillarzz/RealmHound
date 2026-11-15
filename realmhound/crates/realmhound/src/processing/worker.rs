@@ -116,6 +116,36 @@ impl WakeThrottle {
     }
 }
 
+/// Projection cadence is independent of packet batches and UI repaint wakes.
+#[derive(Default)]
+struct LiveCombatPublication {
+    demanded: bool,
+    pending: bool,
+    running: bool,
+    next: Option<Instant>,
+}
+
+impl LiveCombatPublication {
+    fn set_demand(&mut self, demanded: bool) {
+        if self.demanded != demanded {
+            self.demanded = demanded;
+            self.pending = demanded;
+            self.running = false;
+            self.next = None;
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.demanded && (self.pending || self.running) && self.next.is_none_or(|next| now >= next)
+    }
+
+    fn published(&mut self, now: Instant, running: bool) {
+        self.pending = false;
+        self.running = running;
+        self.next = Some(now + WAKE_INTERVAL);
+    }
+}
+
 /// Signal delivered to a freshly spawned, still-inactive worker deciding
 /// whether it begins processing or exits without ever persisting.
 enum StartSignal {
@@ -212,7 +242,7 @@ pub fn spawn(
     mut processor: PacketProcessor,
     ctx: egui::Context,
     audio_tx: AudioSender,
-    overlays_open: Arc<AtomicBool>,
+    live_combat_demand: Arc<AtomicBool>,
     account: Arc<AccountContext>,
 ) -> std::io::Result<WorkerHandle> {
     processor.set_selected_scope(account.account_key(), account.account_id().clone());
@@ -252,7 +282,7 @@ pub fn spawn(
         exalts_fetched: false,
         wake: WakeThrottle::default(),
         ctx,
-        overlays_open,
+        live_combat_demand,
         account,
         receiver: None,
         #[cfg(feature = "latency-diagnostics")]
@@ -267,7 +297,7 @@ pub fn spawn(
         pub_vault_gen: u64::MAX,
         pub_view: None,
         pub_mission_gen: u64::MAX,
-        pub_had_live_fight: false,
+        live_combat: LiveCombatPublication::default(),
         pub_token_gen: u64::MAX,
         pub_party_rev: u64::MAX,
         pub_encounter_rev: u64::MAX,
@@ -313,9 +343,7 @@ struct Worker {
     /// Coalesced repaint requests from worker traffic.
     wake: WakeThrottle,
     ctx: egui::Context,
-    /// Set by the UI while at least one overlay window is open. Live Combat is only
-    /// projected into the snapshot (and keeps waking the UI) while it is set.
-    overlays_open: Arc<AtomicBool>,
+    live_combat_demand: Arc<AtomicBool>,
     /// Shared immutable account context. Held so the exclusive profile lock
     /// inside it lives as long as the worker (including after a detached
     /// shutdown), keeping the selected profile owned by this process.
@@ -334,9 +362,7 @@ struct Worker {
     pub_vault_gen: u64,
     pub_view: Option<super::contract::ViewState>,
     pub_mission_gen: u64,
-    /// Whether the last publication carried a live fight. Lets the transition
-    /// back to "no fight" wake the UI once so the overlay clears.
-    pub_had_live_fight: bool,
+    live_combat: LiveCombatPublication,
     pub_token_gen: u64,
     pub_party_rev: u64,
     pub_encounter_rev: u64,
@@ -586,6 +612,7 @@ impl Worker {
             let missions_changed = self.processor.expire_mission_cooldowns();
             let identity_changed = self.processor.tick_identity();
             if !packets.is_empty() || capture_closed || self.processor.has_pending_updates() {
+                self.live_combat.pending = true;
                 // Inject queue-drop count into capture metrics.
                 if let Some(rx) = &self.receiver {
                     self.processor.update_queue_drops(rx.dropped());
@@ -674,6 +701,7 @@ impl Worker {
                     self.wake.request(&self.ctx);
                 }
             } else if missions_changed || identity_changed {
+                self.live_combat.pending |= identity_changed;
                 #[cfg(feature = "latency-diagnostics")]
                 let snapshot_started = Instant::now();
                 self.publish_snapshot();
@@ -682,6 +710,23 @@ impl Worker {
                     segments.snapshot = snapshot_started.elapsed();
                 }
                 self.wake.request(&self.ctx);
+            }
+
+            // Demand changes and a throttled final update must not wait for
+            // another packet. Empty/frozen fights have no periodic projection.
+            if self.live_combat.demanded != self.live_combat_demand.load(Ordering::Relaxed)
+                || self.live_combat.due(Instant::now())
+            {
+                #[cfg(feature = "latency-diagnostics")]
+                let snapshot_started = Instant::now();
+                let view_changed = self.publish_snapshot();
+                #[cfg(feature = "latency-diagnostics")]
+                {
+                    segments.snapshot += snapshot_started.elapsed();
+                }
+                if view_changed {
+                    self.wake.request(&self.ctx);
+                }
             }
 
             if queue_remaining == 0
@@ -759,6 +804,7 @@ impl Worker {
         // Shutdown: drain combat/loot, flush account data, close databases,
         // publish a final snapshot, then report the outcome.
         self.release_auto_callout();
+        self.live_combat.pending = true;
         self.processor.final_drain();
         for error in self.processor.drain_loot_persistence_errors() {
             self.health
@@ -1081,6 +1127,7 @@ impl Worker {
                 self.wake.set_demand(demand);
             }
             ControlMsg::StartCapture(receiver) => {
+                self.live_combat.pending = true;
                 self.processor.on_capture_start();
                 #[cfg(feature = "latency-diagnostics")]
                 if let Some(previous) = self.receiver.take() {
@@ -1093,6 +1140,7 @@ impl Worker {
                 self.wake.request(&self.ctx);
             }
             ControlMsg::StopCapture => {
+                self.live_combat.pending = true;
                 self.processor.on_capture_stop();
                 #[cfg(feature = "latency-diagnostics")]
                 if let Some(receiver) = self.receiver.take() {
@@ -1106,6 +1154,7 @@ impl Worker {
                 self.health.set_capture_state(CaptureState::Stopped);
             }
             other => {
+                self.live_combat.pending = true;
                 self.processor.apply_control(other);
                 let view_changed = self.publish_snapshot();
                 if view_changed {
@@ -1257,22 +1306,6 @@ impl Worker {
         let feed_changed = feed_rev != self.pub_feed_rev;
         let view_changed = self.pub_view.as_ref() != Some(&view);
 
-        // Projecting the live fights walks the active roster, so it is only done
-        // while an overlay is actually open to display them.
-        let overlays_open = self.overlays_open.load(Ordering::Relaxed);
-        let live_fights = if overlays_open {
-            self.processor.live_fights()
-        } else {
-            Vec::new()
-        };
-        // The fight timer is time-derived, so a live fight is "changed" every batch even
-        // when no new damage landed; an idle one must not keep waking the UI.
-        // A frozen (ended) fight never changes again, so it only earns the one
-        // repaint that puts its final numbers on screen.
-        let live_running = live_fights.iter().any(|fight| !fight.ended);
-        let live_combat_changed = live_running || self.pub_had_live_fight;
-        self.pub_had_live_fight = live_running;
-
         let lock_started = Instant::now();
         let previous = match self.snapshot.lock() {
             Ok(guard) => guard.clone(),
@@ -1280,6 +1313,26 @@ impl Worker {
         };
         self.health
             .record_snapshot_lock_wait(lock_started.elapsed());
+
+        self.live_combat
+            .set_demand(self.live_combat_demand.load(Ordering::Relaxed));
+        let now = Instant::now();
+        let live_fights = if !self.live_combat.demanded {
+            Vec::new()
+        } else if self.live_combat.due(now) {
+            let fights = self.processor.live_fights();
+            self.live_combat
+                .published(now, fights.iter().any(|fight| !fight.ended));
+            fights
+        } else {
+            previous.live_fights.clone()
+        };
+        let live_combat_changed = self.live_combat.demanded
+            && (live_fights.len() != previous.live_fights.len()
+                || live_fights
+                    .iter()
+                    .zip(&previous.live_fights)
+                    .any(|(new, old)| !Arc::ptr_eq(new, old)));
 
         // Heavy clones happen outside the lock; unchanged domains reuse their Arc.
         let account_data = account_changed.then(|| Arc::new(self.processor.account_data().clone()));
@@ -1332,7 +1385,7 @@ impl Worker {
         self.pub_live_event_rev = live_event_rev;
         self.pub_feed_rev = feed_rev;
         self.pub_view = Some(view);
-        view_changed || (overlays_open && live_combat_changed)
+        view_changed || live_combat_changed
     }
 }
 
@@ -1583,6 +1636,38 @@ mod tests {
         wake.set_demand(false);
         wake.set_demand(true);
         assert_eq!(wake.next_delay(t0 + Duration::from_millis(10)), None);
+    }
+
+    #[test]
+    fn live_combat_coalesces_bursts_and_publishes_the_trailing_update() {
+        let now = Instant::now();
+        let mut publication = LiveCombatPublication::default();
+        publication.set_demand(true);
+        assert!(publication.due(now));
+        publication.published(now, true);
+        publication.pending = true;
+        assert!(!publication.due(now + Duration::from_millis(99)));
+        assert!(publication.due(now + WAKE_INTERVAL));
+        publication.published(now + WAKE_INTERVAL, false);
+        assert!(!publication.due(now + Duration::from_secs(1)));
+        publication.pending = true;
+        assert!(publication.due(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn live_combat_refreshes_running_timers_but_not_empty_or_frozen_fights() {
+        let now = Instant::now();
+        let mut publication = LiveCombatPublication::default();
+        publication.set_demand(true);
+        publication.published(now, true);
+        assert!(publication.due(now + WAKE_INTERVAL));
+        publication.published(now + WAKE_INTERVAL, false);
+        assert!(!publication.due(now + Duration::from_secs(1)));
+        publication.set_demand(false);
+        publication.pending = true;
+        assert!(!publication.due(now + Duration::from_secs(2)));
+        publication.set_demand(true);
+        assert!(publication.due(now + WAKE_INTERVAL));
     }
 
     #[cfg(feature = "latency-diagnostics")]
@@ -1899,6 +1984,124 @@ mod staging_tests {
         serde_json::from_slice::<AccountData>(&bytes)
             .unwrap()
             .generation
+    }
+
+    #[test]
+    fn throttled_publications_reuse_fights_and_clear_the_trailing_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = StorageRoot::from_path(temp.path()).unwrap();
+        let account = selected_context(&root);
+        let processor = processor(&account);
+        let held = Arc::new(realmhound_core::combat::LiveFightSnapshot::default());
+        let snapshot = ModelSnapshot::new(
+            SelectedIdentity::new(account.account_key(), account.account_id().clone()),
+            processor.view_state(),
+            processor.account_data().clone(),
+            processor.live_vault_data(),
+            None,
+        )
+        .with_live_fights(vec![held.clone()]);
+        let (ui_tx, _ui_rx) = ui_channel::channel(ui_channel::DEFAULT_BOUND);
+        let mut worker = Worker {
+            settings: processor.settings_handle(),
+            pub_view: Some(processor.view_state()),
+            processor,
+            ui_tx,
+            audio_tx: AudioSender::disconnected(),
+            snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
+            health: Arc::new(HealthCounters::new()),
+            chat_log: ChatLogWriter::new(account.persistence().chat_logs().to_path_buf()),
+            watchlist: Watchlist::new(),
+            auto_callout: None,
+            exalts_fetched: false,
+            wake: WakeThrottle::default(),
+            ctx: egui::Context::default(),
+            live_combat_demand: Arc::new(AtomicBool::new(true)),
+            live_combat: LiveCombatPublication {
+                demanded: true,
+                pending: true,
+                running: true,
+                next: Some(Instant::now() + Duration::from_secs(60)),
+            },
+            account,
+            receiver: None,
+            #[cfg(feature = "latency-diagnostics")]
+            capture_drops: CaptureDropTotals::default(),
+            last_save: Instant::now(),
+            last_health_log: Instant::now(),
+            next_maintenance: None,
+            maintenance_history_dirty: false,
+            next_maintenance_refresh: Instant::now(),
+            pub_char_gen: u64::MAX,
+            pub_account_gen: u64::MAX,
+            pub_vault_gen: u64::MAX,
+            pub_mission_gen: u64::MAX,
+            pub_token_gen: u64::MAX,
+            pub_party_rev: u64::MAX,
+            pub_encounter_rev: u64::MAX,
+            pub_quest_rev: u64::MAX,
+            pub_live_event_rev: u64::MAX,
+            pub_feed_rev: u64::MAX,
+            #[cfg(feature = "latency-diagnostics")]
+            latency: LatencyDiagnostics::default(),
+        };
+        assert!(!worker.publish_snapshot());
+        assert!(Arc::ptr_eq(
+            &worker.snapshot.lock().unwrap().live_fights[0],
+            &held
+        ));
+        worker.live_combat.next = Some(Instant::now() - WAKE_INTERVAL);
+        assert!(
+            worker.publish_snapshot(),
+            "the final clearing update wakes once"
+        );
+        assert!(worker.snapshot.lock().unwrap().live_fights.is_empty());
+        assert!(!worker.live_combat.due(Instant::now() + WAKE_INTERVAL));
+        assert!(!worker.publish_snapshot());
+        worker.live_combat_demand.store(false, Ordering::Relaxed);
+        worker.publish_snapshot();
+        assert!(!worker.live_combat.demanded);
+        worker.live_combat_demand.store(true, Ordering::Relaxed);
+        worker.publish_snapshot();
+        assert!(worker.live_combat.demanded);
+        assert!(
+            !worker.live_combat.pending,
+            "reopening projects immediately"
+        );
+    }
+
+    #[test]
+    fn live_combat_demand_is_serviced_without_packets_or_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = StorageRoot::from_path(temp.path()).unwrap();
+        let account = selected_context(&root);
+        let demand = Arc::new(AtomicBool::new(false));
+        let mut worker = spawn(
+            processor(&account),
+            egui::Context::default(),
+            AudioSender::disconnected(),
+            demand.clone(),
+            account,
+        )
+        .unwrap();
+        let before = worker.snapshot.lock().unwrap().clone();
+        worker.activate();
+        demand.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut published = false;
+        while Instant::now() < deadline {
+            if !Arc::ptr_eq(&before, &worker.snapshot.lock().unwrap()) {
+                published = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let report = worker.shutdown(Duration::from_secs(5));
+        assert!(
+            published,
+            "opening combat must publish without incoming traffic"
+        );
+        assert!(report.is_success());
     }
 
     #[test]

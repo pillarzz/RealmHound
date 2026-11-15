@@ -833,47 +833,52 @@ mod tests {
             .unwrap();
         // Isolate root properties from the real desktop/window manager.
         x.root = root;
-        let window = x.conn.generate_id().unwrap();
-        x.conn
-            .create_window(
-                x11rb::COPY_DEPTH_FROM_PARENT,
-                window,
-                root,
-                0,
-                0,
-                10,
-                10,
-                0,
-                x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
-                0,
-                &x11rb::protocol::xproto::CreateWindowAux::new().override_redirect(1),
-            )
-            .unwrap()
-            .check()
-            .unwrap();
+        fn create_named_window(x: &X11, title: &str) -> Window {
+            use x11rb::wrapper::ConnectionExt as _;
+            let window = x.conn.generate_id().unwrap();
+            x.conn
+                .create_window(
+                    x11rb::COPY_DEPTH_FROM_PARENT,
+                    window,
+                    x.root,
+                    0,
+                    0,
+                    10,
+                    10,
+                    0,
+                    x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                    0,
+                    &x11rb::protocol::xproto::CreateWindowAux::new().override_redirect(1),
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            x.conn
+                .change_property8(
+                    x11rb::protocol::xproto::PropMode::REPLACE,
+                    window,
+                    x.atoms.wm_name,
+                    x.atoms.utf8_string,
+                    title.as_bytes(),
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            x.conn
+                .change_property32(
+                    x11rb::protocol::xproto::PropMode::REPLACE,
+                    window,
+                    x.atoms.wm_pid,
+                    AtomEnum::CARDINAL,
+                    &[std::process::id()],
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            window
+        }
         let title = "RealmHound lookup regression #1";
-        x.conn
-            .change_property8(
-                x11rb::protocol::xproto::PropMode::REPLACE,
-                window,
-                x.atoms.wm_name,
-                x.atoms.utf8_string,
-                title.as_bytes(),
-            )
-            .unwrap()
-            .check()
-            .unwrap();
-        x.conn
-            .change_property32(
-                x11rb::protocol::xproto::PropMode::REPLACE,
-                window,
-                x.atoms.wm_pid,
-                AtomEnum::CARDINAL,
-                &[std::process::id()],
-            )
-            .unwrap()
-            .check()
-            .unwrap();
+        let window = create_named_window(&x, title);
         assert_eq!(x.find(title), Some(window));
         x.conn
             .change_property32(
@@ -888,6 +893,22 @@ mod tests {
             .unwrap();
         assert_eq!(x.find(title), Some(window));
         assert_eq!(x.find("wrong generation"), None);
+        x.conn.destroy_window(window).unwrap().check().unwrap();
+        assert_eq!(x.find(title), None);
+        let replacement = create_named_window(&x, title);
+        assert_eq!(x.find(title), Some(replacement));
+        x.conn
+            .change_property32(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                replacement,
+                x.atoms.wm_pid,
+                AtomEnum::CARDINAL,
+                &[std::process::id() + 1],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(x.find(title), None);
         x.conn.destroy_window(root).unwrap().check().unwrap();
     }
 

@@ -179,6 +179,104 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_attachment_hides_a_previously_visible_overlay() {
+        let mut game = GameWindow {
+            active: true,
+            ..Default::default()
+        };
+        assert!(!game.poll(None));
+        assert!(!game.active);
+        assert!(game.pid.is_none());
+        assert!(game.window.is_none());
+    }
+
+    #[test]
+    fn missing_window_retries_without_detaching_the_live_process() {
+        let pid = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut game = GameWindow {
+            pid: Some(pid),
+            process: Some(Process::open(pid).unwrap()),
+            next_window: Some(deadline),
+            active: true,
+            ..Default::default()
+        };
+        assert!(!game.poll(None));
+        assert_eq!(game.next_window, Some(deadline));
+        assert_eq!(game.pid, Some(pid));
+        let before = Instant::now();
+        game.next_window = Some(before - LOOKUP_INTERVAL);
+        game.next_poll = None;
+        assert!(!game.poll(None));
+        assert_eq!(game.pid, Some(pid));
+        assert!(game.process.is_some());
+        assert!(game.window.is_none());
+        assert!(game.next_window.unwrap() >= before + LOOKUP_INTERVAL);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a native Windows desktop"]
+    fn disappeared_window_is_replaced_without_changing_the_linked_process() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_EX_NOACTIVATE, WS_POPUP, WS_VISIBLE,
+        };
+
+        struct Window(isize);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                // SAFETY: this test owns the native window.
+                unsafe {
+                    DestroyWindow(self.0);
+                }
+            }
+        }
+        fn create_window() -> Window {
+            let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: the class string is valid for the call; the owned window
+            // is placed off-screen and must not activate.
+            let handle = unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE,
+                    class.as_ptr(),
+                    std::ptr::null(),
+                    WS_POPUP | WS_VISIBLE,
+                    -10_000,
+                    -10_000,
+                    1,
+                    1,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(handle, 0, "{}", std::io::Error::last_os_error());
+            Window(handle)
+        }
+
+        let first = create_window();
+        let pid = std::process::id();
+        let mut game = GameWindow {
+            pid: Some(pid),
+            process: Some(Process::open(pid).unwrap()),
+            window: Some(first.0),
+            active: true,
+            ..Default::default()
+        };
+        drop(first);
+        assert!(!game.poll(None));
+        assert_eq!(game.pid, Some(pid));
+        assert!(game.window.is_none());
+        assert!(game.next_window.is_none());
+        let replacement = create_window();
+        game.next_poll = None;
+        game.poll(None);
+        assert_eq!(game.pid, Some(pid));
+        assert_eq!(game.window, Some(replacement.0));
+    }
+
+    #[test]
     fn inspection_failure_hides_without_forgetting_attachment() {
         let mut game = GameWindow {
             pid: Some(123),

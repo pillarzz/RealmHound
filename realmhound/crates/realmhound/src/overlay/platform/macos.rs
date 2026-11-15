@@ -1,9 +1,8 @@
 //! macOS overlay promotion via AppKit.
 //!
-//! `NSWindowCollectionBehaviorCanJoinAllSpaces | FullScreenAuxiliary` is what
-//! lets the overlay appear on the private Space a game in native Full Screen
-//! mode owns, and `NSScreenSaverWindowLevel` (1000) keeps it above the game's
-//! own chrome. Neither is reachable through winit.
+//! AppKit requests all-Spaces/fullscreen-auxiliary participation and an elevated
+//! window level, which winit cannot express. Native Full Screen behavior remains
+//! unverified; windowed or borderless fullscreen is the recommended game mode.
 //!
 //! All AppKit window mutation must happen on the AppKit main thread. eframe's
 //! update callback runs inside the winit event loop, which winit pins to the

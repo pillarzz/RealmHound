@@ -1401,7 +1401,9 @@ pub struct CombatTracker {
     /// Frozen projections of the current encounter's fights that have already
     /// left `fights`, so a kill keeps its final numbers on the Live Combat
     /// overlay. Engaging a different encounter replaces them (see
-    /// [`retain_current_encounter`]); cleared outright at map change / disconnect.
+    /// [`retain_current_encounter`]). Map changes and disconnects finalize active
+    /// fights without clearing these bounded snapshots, preserving the last
+    /// encounter until another one is selected for display.
     instance_fights: Vec<Arc<LiveFightSnapshot>>,
     frozen_phase_cache: Mutex<Vec<FrozenPhases>>,
     /// Aggregated non-boss damage summaries for the current run, keyed by aux

@@ -2,13 +2,13 @@
 //!
 //! egui/winit already give us an undecorated, transparent, always-on-top
 //! viewport with mouse pass-through, which is enough for a windowed or
-//! borderless-fullscreen game on Windows. Two things still need the native
+//! borderless-fullscreen game on Windows. Some behavior still needs the native
 //! APIs:
 //!
 //! - **macOS**: winit's always-on-top maps to `NSFloatingWindowLevel`, which is
-//!   *below* a native "Full Screen" Space. The overlay has to be promoted to
-//!   `NSScreenSaverWindowLevel` with a `CanJoinAllSpaces | FullScreenAuxiliary`
-//!   collection behavior to show over a fullscreen game client.
+//!   *below* a native "Full Screen" Space. AppKit requests an elevated window
+//!   level and `CanJoinAllSpaces | FullScreenAuxiliary` participation; native
+//!   Full Screen behavior still needs runtime verification.
 //! - **Windows**: the overlay must never steal focus from the game nor appear in
 //!   Alt-Tab, which means `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` on the extended
 //!   style. That same style stops the system move loop winit drags with, so

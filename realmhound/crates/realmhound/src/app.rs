@@ -7528,58 +7528,6 @@ impl RealmHoundApp {
 
         ui.add_space(10.0);
         ui.heading("Overlays");
-        ui.add_space(5.0);
-        ui.label(
-            RichText::new(
-                "Floating windows drawn over the game client. Lock an overlay to freeze it \
-                 in place and pass every click straight through to the game.",
-            )
-            .weak(),
-        );
-        if !crate::overlay::platform::is_supported() {
-            ui.add_space(5.0);
-            ui.label(
-                RichText::new(
-                    "This platform cannot verify game-window attachment; enabled overlays \
-                     remain hidden.",
-                )
-                .weak()
-                .italics(),
-            );
-            #[cfg(target_os = "linux")]
-            {
-                ui.label(
-                    RichText::new(
-                        "Overlays require XWayland and REALMHOUND_WAYLAND=1 must be unset.",
-                    )
-                    .weak()
-                    .italics(),
-                );
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            ui.add_space(5.0);
-            ui.label(
-                RichText::new(
-                    "macOS attachment uses window visibility and foreground-app metadata, \
-                     not window titles or screen capture. If macOS denies process/window \
-                     inspection, overlays stay hidden; check the RealmHound log.",
-                )
-                .weak()
-                .italics(),
-            );
-            ui.label(
-                RichText::new(
-                    "On macOS the game must run windowed or in windowed (borderless) \
-                     fullscreen. Native Full Screen moves the client onto its own Space, \
-                     which no other window can be drawn into, so the overlays will not \
-                     appear over it.",
-                )
-                .weak()
-                .italics(),
-            );
-        }
         ui.add_space(15.0);
 
         let Ok(mut overlays) = self.settings.read().map(|s| s.overlays.clone()) else {
@@ -7606,14 +7554,20 @@ impl RealmHoundApp {
                     "Show the Live Loot overlay",
                 )
                 .changed();
-            #[cfg(target_os = "linux")]
-            if overlays.any_visible() && crate::overlay::platform::can_restart_for_overlays() {
+            if overlays.any_visible() && !crate::overlay::platform::is_supported() {
+                #[cfg(target_os = "linux")]
+                let restart_available = crate::overlay::platform::can_restart_for_overlays();
+                #[cfg(not(target_os = "linux"))]
+                let restart_available = false;
+
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Restart RealmHound to enable overlays on XWayland.").weak(),
-                );
-                if shadcn.btn(ui, "Restart RealmHound").clicked() {
-                    self.pending_relaunch = Some(RelaunchReason::OverlayBackend);
+                if restart_available {
+                    ui.label(RichText::new("Restart required to enable overlays.").weak());
+                    if shadcn.btn(ui, "Restart RealmHound").clicked() {
+                        self.pending_relaunch = Some(RelaunchReason::OverlayBackend);
+                    }
+                } else {
+                    ui.label(RichText::new("Overlays unavailable on this backend.").weak());
                 }
             }
         });
@@ -7621,14 +7575,6 @@ impl RealmHoundApp {
         ui.add_space(10.0);
 
         shadcn.card(ui, "overlay_lock", "Lock", |ui| {
-            ui.label(
-                RichText::new(
-                    "A locked overlay passes clicks through to the game. Its title bar \
-                     normally stays usable, but you can always unlock it here.",
-                )
-                .weak(),
-            );
-            ui.add_space(6.0);
             changed |= shadcn
                 .switch(
                     ui,

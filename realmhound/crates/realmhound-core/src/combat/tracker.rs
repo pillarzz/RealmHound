@@ -1800,6 +1800,7 @@ impl CombatTracker {
         now_ms: i64,
         ended: bool,
     ) -> LiveFightSnapshot {
+        crate::prof_scope!("live_combat_projection");
         let mut participants: Vec<FightParticipant> = fight
             .attackers
             .iter()
@@ -6466,6 +6467,7 @@ fn fight_end(fight: &LiveFightSnapshot) -> i64 {
 /// Fold a boss's consecutive phases into one snapshot: summed participant
 /// totals over the whole span, with the current phase's HP and state.
 fn combine_phases(mut phases: Vec<Arc<LiveFightSnapshot>>) -> Arc<LiveFightSnapshot> {
+    crate::prof_scope!("live_combat_phase_merge");
     if phases.len() == 1 {
         return phases.pop().expect("one phase");
     }

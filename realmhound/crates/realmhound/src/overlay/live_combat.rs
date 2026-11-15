@@ -90,20 +90,36 @@ struct Columns {
 }
 
 impl Columns {
-    fn for_fight(ui: &egui::Ui, fight: &LiveFightSnapshot, total: i64) -> Self {
+    fn for_fight(
+        ui: &egui::Ui,
+        fight: &LiveFightSnapshot,
+        total: i64,
+        max_rows: usize,
+        pinned: Option<usize>,
+    ) -> Self {
+        realmhound_core::prof_scope!("live_combat_columns");
         let width = |text: String| {
             ui.painter()
                 .layout_no_wrap(text, ROW_FONT, Color32::WHITE)
                 .size()
                 .x
         };
-        let pct = fight
-            .participants
+        let shown = if max_rows == 0 {
+            fight.participants.len()
+        } else {
+            max_rows.min(fight.participants.len())
+        };
+        let extra = pinned.filter(|&index| index >= shown);
+        let pct = fight.participants[..shown]
             .iter()
+            .chain(extra.map(|index| &fight.participants[index]))
             .map(|p| width(share_label(share(p.damage, total))))
             .fold(width("00%".to_owned()), f32::max);
         Self {
-            rank: width(format!("{}.", fight.participants.len().max(1))),
+            rank: width(format!(
+                "{}.",
+                shown.max(pinned.map_or(0, |index| index + 1)).max(1)
+            )),
             pct,
         }
     }
@@ -179,6 +195,7 @@ impl LiveCombatOverlay {
         tracking_any: bool,
         hits: &mut HitRegions,
     ) {
+        realmhound_core::prof_scope!("live_combat_body");
         let fight: Option<&LiveFightSnapshot> = if fights.is_empty() {
             self.last_ids.clear();
             self.pinned = None;
@@ -201,8 +218,10 @@ impl LiveCombatOverlay {
             .then(|| fight.and_then(|f| f.participants.iter().map(|p| p.damage).max()))
             .flatten()
             .filter(|&d| d > 0);
-        let mut pinned = None;
-        let columns = fight.map(|f| Columns::for_fight(ui, f, total));
+        let pinned = follow
+            .then(|| fight.and_then(|f| f.local_index()))
+            .flatten();
+        let columns = fight.map(|f| Columns::for_fight(ui, f, total, max_rows, pinned));
         if let (Some(fight), Some(columns)) = (fight, columns) {
             if fights.len() > 1 {
                 self.tab_strip(ui, fights, fight.boss_object_id, hits);
@@ -212,9 +231,6 @@ impl LiveCombatOverlay {
             header(ui, sprites, fight, columns, self.gutter);
             ui.add_space(2.0);
 
-            pinned = follow
-                .then(|| fight.participants.iter().position(|p| p.is_local))
-                .flatten();
             if let Some(index) = pinned {
                 let size = egui::vec2((ui.available_width() - self.gutter).max(0.0), ICON);
                 ui.allocate_ui(size, |ui| {
@@ -830,6 +846,41 @@ mod tests {
         let mut snapshot = (*fight(id, 0, 1_000, vec![participant(1, "Me", 100, true)])).clone();
         snapshot.last_local_hit_at = hit_at;
         Arc::new(snapshot)
+    }
+
+    #[test]
+    fn columns_measure_only_displayed_rows_and_include_an_outside_pinned_row() {
+        use super::Columns;
+        let snapshot = fight(
+            1,
+            0,
+            30_000,
+            (0..85)
+                .map(|index| {
+                    participant(
+                        index,
+                        "Player",
+                        if index == 84 { 100 } else { 0 },
+                        index == 84,
+                    )
+                })
+                .collect(),
+        );
+        let ctx = eframe::egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                let capped = Columns::for_fight(ui, &snapshot, 100, 8, None);
+                let all = Columns::for_fight(ui, &snapshot, 100, 0, None);
+                let pinned = Columns::for_fight(ui, &snapshot, 100, 8, Some(84));
+                assert!(capped.rank < all.rank);
+                assert!(capped.pct < all.pct);
+                assert_eq!(pinned.rank, all.rank);
+                assert_eq!(pinned.pct, all.pct);
+                let oversized = Columns::for_fight(ui, &snapshot, 100, 100, None);
+                assert_eq!(oversized.rank, all.rank);
+                assert_eq!(oversized.pct, all.pct);
+            });
+        });
     }
 
     #[test]

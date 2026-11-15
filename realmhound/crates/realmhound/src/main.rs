@@ -169,10 +169,10 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
-        // On a Wayland session, run on XWayland so overlays can sit over the
-        // Proton (X11) game client; `REALMHOUND_WAYLAND=1` opts out.
+        // Only enabled overlays require XWayland; otherwise keep winit's
+        // native backend preference.
         #[cfg(target_os = "linux")]
-        event_loop_builder: overlay::platform::event_loop_hook(),
+        event_loop_builder: overlay::platform::event_loop_hook(preview.overlays.any_visible()),
         ..Default::default()
     };
 
@@ -192,6 +192,8 @@ fn main() -> Result<()> {
                 "RealmHound",
                 options,
                 Box::new(move |cc| {
+                    #[cfg(target_os = "linux")]
+                    overlay::platform::record_backend(cc);
                     #[cfg(target_os = "macos")]
                     dock_icon::install();
                     Ok(Box::new(RootApp::build(
@@ -210,6 +212,8 @@ fn main() -> Result<()> {
                 "RealmHound",
                 options,
                 Box::new(move |cc| {
+                    #[cfg(target_os = "linux")]
+                    overlay::platform::record_backend(cc);
                     #[cfg(target_os = "macos")]
                     dock_icon::install();
                     let egui_ctx = cc.egui_ctx.clone();

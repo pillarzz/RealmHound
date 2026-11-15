@@ -7550,10 +7550,7 @@ impl RealmHoundApp {
             {
                 ui.label(
                     RichText::new(
-                        "RealmHound is running natively on Wayland (REALMHOUND_WAYLAND=1 or \
-                         no XWayland), which cannot inspect the linked game window. Start it \
-                         without REALMHOUND_WAYLAND to run on XWayland, where the overlays \
-                         stay over the Proton client.",
+                        "Overlays require XWayland and REALMHOUND_WAYLAND=1 must be unset.",
                     )
                     .weak()
                     .italics(),
@@ -7609,6 +7606,16 @@ impl RealmHoundApp {
                     "Show the Live Loot overlay",
                 )
                 .changed();
+            #[cfg(target_os = "linux")]
+            if overlays.any_visible() && crate::overlay::platform::can_restart_for_overlays() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Restart RealmHound to enable overlays on XWayland.").weak(),
+                );
+                if shadcn.btn(ui, "Restart RealmHound").clicked() {
+                    self.pending_relaunch = Some(RelaunchReason::OverlayBackend);
+                }
+            }
         });
 
         ui.add_space(10.0);

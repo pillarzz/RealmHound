@@ -77,6 +77,51 @@ pub(super) struct LiveCombatOverlay {
     /// Width the row list's scrollbar took last frame, so the header timer and
     /// the pinned row, which sit above the scroll area, line up with the rows.
     gutter: f32,
+    row_cache: Option<RowCache>,
+}
+
+struct RowLabels {
+    rank: String,
+    damage: String,
+    pct: String,
+}
+
+struct RowCache {
+    snapshot: Arc<LiveFightSnapshot>,
+    shown: usize,
+    pinned: Option<usize>,
+    rows: Vec<RowLabels>,
+}
+
+impl RowCache {
+    fn new(snapshot: Arc<LiveFightSnapshot>, shown: usize, pinned: Option<usize>) -> Self {
+        let total = snapshot.total_damage().max(1);
+        let rows = (0..shown)
+            .chain(pinned.filter(|&index| index >= shown))
+            .map(|index| {
+                let participant = &snapshot.participants[index];
+                RowLabels {
+                    rank: format!("{}.", index + 1),
+                    damage: thousands(participant.damage),
+                    pct: share_label(share(participant.damage, total)),
+                }
+            })
+            .collect();
+        Self {
+            snapshot,
+            shown,
+            pinned,
+            rows,
+        }
+    }
+
+    fn row(&self, index: usize) -> &RowLabels {
+        &self.rows[if index < self.shown {
+            index
+        } else {
+            self.shown
+        }]
+    }
 }
 
 /// Fixed column widths shared by every row of a fight (pinned row included),
@@ -90,13 +135,7 @@ struct Columns {
 }
 
 impl Columns {
-    fn for_fight(
-        ui: &egui::Ui,
-        fight: &LiveFightSnapshot,
-        total: i64,
-        max_rows: usize,
-        pinned: Option<usize>,
-    ) -> Self {
+    fn for_rows(ui: &egui::Ui, cache: &RowCache) -> Self {
         realmhound_core::prof_scope!("live_combat_columns");
         let width = |text: String| {
             ui.painter()
@@ -104,22 +143,18 @@ impl Columns {
                 .size()
                 .x
         };
-        let shown = if max_rows == 0 {
-            fight.participants.len()
-        } else {
-            max_rows.min(fight.participants.len())
-        };
-        let extra = pinned.filter(|&index| index >= shown);
-        let pct = fight.participants[..shown]
+        let pct = cache
+            .rows
             .iter()
-            .chain(extra.map(|index| &fight.participants[index]))
-            .map(|p| width(share_label(share(p.damage, total))))
+            .map(|row| width(row.pct.clone()))
             .fold(width("00%".to_owned()), f32::max);
         Self {
-            rank: width(format!(
-                "{}.",
-                shown.max(pinned.map_or(0, |index| index + 1)).max(1)
-            )),
+            rank: width(
+                cache
+                    .rows
+                    .last()
+                    .map_or_else(|| "1.".to_owned(), |row| row.rank.clone()),
+            ),
             pct,
         }
     }
@@ -183,6 +218,21 @@ impl OverlayContent for LiveCombatContent<'_> {
 }
 
 impl LiveCombatOverlay {
+    fn cache_rows(
+        &mut self,
+        snapshot: &Arc<LiveFightSnapshot>,
+        shown: usize,
+        pinned: Option<usize>,
+    ) {
+        if self.row_cache.as_ref().is_none_or(|cache| {
+            !Arc::ptr_eq(&cache.snapshot, snapshot)
+                || cache.shown != shown
+                || cache.pinned != pinned
+        }) {
+            self.row_cache = Some(RowCache::new(snapshot.clone(), shown, pinned));
+        }
+    }
+
     fn body(
         &mut self,
         ui: &mut egui::Ui,
@@ -196,10 +246,11 @@ impl LiveCombatOverlay {
         hits: &mut HitRegions,
     ) {
         realmhound_core::prof_scope!("live_combat_body");
-        let fight: Option<&LiveFightSnapshot> = if fights.is_empty() {
+        let fight: Option<&Arc<LiveFightSnapshot>> = if fights.is_empty() {
             self.last_ids.clear();
             self.pinned = None;
             self.followed = None;
+            self.row_cache = None;
             None
         } else {
             self.sync_instance(fights);
@@ -207,7 +258,6 @@ impl LiveCombatOverlay {
                 self.pinned
                     .or(self.followed)
                     .and_then(|id| fights.iter().find(|f| f.boss_object_id == id))
-                    .map(|f| &**f)
                     .unwrap_or(&fights[0]),
             )
         };
@@ -221,7 +271,20 @@ impl LiveCombatOverlay {
         let pinned = follow
             .then(|| fight.and_then(|f| f.local_index()))
             .flatten();
-        let columns = fight.map(|f| Columns::for_fight(ui, f, total, max_rows, pinned));
+        let shown = fight.map_or(0, |fight| {
+            if max_rows == 0 {
+                fight.participants.len()
+            } else {
+                max_rows.min(fight.participants.len())
+            }
+        });
+        if let Some(fight) = fight {
+            self.cache_rows(fight, shown, pinned);
+        }
+        let columns = self
+            .row_cache
+            .as_ref()
+            .map(|cache| Columns::for_rows(ui, cache));
         if let (Some(fight), Some(columns)) = (fight, columns) {
             if fights.len() > 1 {
                 self.tab_strip(ui, fights, fight.boss_object_id, hits);
@@ -240,6 +303,7 @@ impl LiveCombatOverlay {
                         &fight.participants[index],
                         index + 1,
                         total,
+                        self.row_cache.as_ref().unwrap().row(index),
                         top,
                         columns,
                         class_icons,
@@ -270,12 +334,7 @@ impl LiveCombatOverlay {
                 });
                 return;
             };
-            let rows: &[FightParticipant] = if max_rows == 0 {
-                &fight.participants
-            } else {
-                let end = max_rows.min(fight.participants.len());
-                &fight.participants[..end]
-            };
+            let rows = &fight.participants[..shown];
             for (index, participant) in rows.iter().enumerate() {
                 if pinned == Some(index) {
                     continue;
@@ -286,6 +345,7 @@ impl LiveCombatOverlay {
                     participant,
                     index + 1,
                     total,
+                    self.row_cache.as_ref().unwrap().row(index),
                     top,
                     columns,
                     class_icons,
@@ -602,6 +662,7 @@ fn row(
     participant: &FightParticipant,
     rank: usize,
     total: i64,
+    labels: &RowLabels,
     top: Option<i64>,
     columns: Columns,
     class_icons: bool,
@@ -619,7 +680,7 @@ fn row(
         right_aligned_text(
             ui,
             columns.rank,
-            format!("{rank}."),
+            labels.rank.clone(),
             Color32::from_gray(130),
         );
 
@@ -659,10 +720,10 @@ fn row(
                 let pct = right_aligned_text(
                     ui,
                     columns.pct,
-                    share_label(share),
+                    labels.pct.clone(),
                     Color32::from_gray(150),
                 );
-                ui.label(row_text(thousands(participant.damage), color));
+                ui.label(row_text(&labels.damage, color));
                 pct.left()
             })
             .inner;
@@ -850,7 +911,7 @@ mod tests {
 
     #[test]
     fn columns_measure_only_displayed_rows_and_include_an_outside_pinned_row() {
-        use super::Columns;
+        use super::{Columns, RowCache};
         let snapshot = fight(
             1,
             0,
@@ -869,18 +930,51 @@ mod tests {
         let ctx = eframe::egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
             eframe::egui::CentralPanel::default().show(ctx, |ui| {
-                let capped = Columns::for_fight(ui, &snapshot, 100, 8, None);
-                let all = Columns::for_fight(ui, &snapshot, 100, 0, None);
-                let pinned = Columns::for_fight(ui, &snapshot, 100, 8, Some(84));
+                let capped = Columns::for_rows(ui, &RowCache::new(snapshot.clone(), 8, None));
+                let all = Columns::for_rows(ui, &RowCache::new(snapshot.clone(), 85, None));
+                let pinned = Columns::for_rows(ui, &RowCache::new(snapshot.clone(), 8, Some(84)));
                 assert!(capped.rank < all.rank);
                 assert!(capped.pct < all.pct);
                 assert_eq!(pinned.rank, all.rank);
                 assert_eq!(pinned.pct, all.pct);
-                let oversized = Columns::for_fight(ui, &snapshot, 100, 100, None);
-                assert_eq!(oversized.rank, all.rank);
-                assert_eq!(oversized.pct, all.pct);
             });
         });
+    }
+
+    #[test]
+    fn row_format_cache_tracks_snapshot_cap_and_pinned_row() {
+        let mut snapshot = fight(
+            1,
+            0,
+            30_000,
+            vec![
+                participant(1, "One", 100, false),
+                participant(2, "Two", 200, false),
+                participant(3, "Me", 300, true),
+            ],
+        );
+        let mut overlay = LiveCombatOverlay::default();
+        overlay.cache_rows(&snapshot, 1, Some(2));
+        let cache = overlay.row_cache.as_ref().unwrap();
+        assert_eq!(cache.rows.len(), 2);
+        assert_eq!(cache.row(0).pct, "17%");
+        assert_eq!(cache.row(2).rank, "3.");
+        assert_eq!(cache.row(2).damage, "300");
+        assert_eq!(cache.row(2).pct, "50%");
+        let text = cache.rows[0].damage.as_ptr();
+        overlay.cache_rows(&snapshot, 1, Some(2));
+        assert_eq!(
+            overlay.row_cache.as_ref().unwrap().rows[0].damage.as_ptr(),
+            text
+        );
+        Arc::make_mut(&mut snapshot).participants[2].damage = 900;
+        overlay.cache_rows(&snapshot, 1, Some(2));
+        assert_eq!(overlay.row_cache.as_ref().unwrap().row(2).damage, "900");
+        assert_eq!(overlay.row_cache.as_ref().unwrap().row(2).pct, "75%");
+        overlay.cache_rows(&snapshot, 1, None);
+        assert_eq!(overlay.row_cache.as_ref().unwrap().rows.len(), 1);
+        overlay.cache_rows(&snapshot, 3, Some(2));
+        assert_eq!(overlay.row_cache.as_ref().unwrap().rows.len(), 3);
     }
 
     #[test]

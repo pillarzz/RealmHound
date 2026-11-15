@@ -194,6 +194,9 @@ RealmHound log for process/window inspection errors.
 
 Linux attachment requires X11/XWayland and readable game-process/socket
 metadata; native Wayland cannot verify attachment and keeps overlays hidden.
+On Wayland, RealmHound selects XWayland only when an overlay is enabled at
+startup. Enabling one later offers a restart button when XWayland is available;
+`REALMHOUND_WAYLAND=1` continues to opt out.
 macOS uses libproc socket ownership, CoreGraphics window visibility and AppKit
 foreground-app metadata, without reading window titles or capturing pixels.
 Denied or missing metadata hides overlays. Native macOS/Windows interaction

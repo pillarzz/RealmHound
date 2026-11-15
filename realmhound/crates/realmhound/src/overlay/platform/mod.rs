@@ -40,7 +40,10 @@ pub(super) use windows::{game_window, game_window_active, Process};
 pub(super) use linux::{game_window, game_window_active, Process};
 
 #[cfg(target_os = "linux")]
-pub use linux::{event_loop_hook, is_forced_x11_failure, relaunch_on_wayland};
+pub use linux::{
+    can_restart_for_overlays, event_loop_hook, is_forced_x11_failure, record_backend,
+    relaunch_on_wayland,
+};
 #[cfg(target_os = "macos")]
 pub(super) use macos::{game_window, game_window_active, Process};
 

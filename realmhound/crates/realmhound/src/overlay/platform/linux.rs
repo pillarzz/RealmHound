@@ -3,7 +3,7 @@
 //! Proton runs the game through Wine's X11 driver, so on a Wayland desktop the
 //! client is an XWayland window. Native Wayland gives an overlay no way to stay
 //! above another app, no fixed position and no global pointer, so RealmHound
-//! runs on XWayland too unless the user opts out with `REALMHOUND_WAYLAND=1`
+//! runs on XWayland too when overlays are enabled, unless the user opts out with `REALMHOUND_WAYLAND=1`
 //! (see [`event_loop_hook`]). If XWayland turns out to be unusable, RealmHound
 //! falls back to native Wayland instead of failing to start: up front when the
 //! X libraries or display cannot be opened ([`uses_x11`]), and by relaunching
@@ -51,6 +51,7 @@ const WAYLAND_OPT_OUT: &str = "REALMHOUND_WAYLAND";
 /// Set once [`event_loop_hook`] has put winit on XWayland, so a startup failure
 /// can be told apart from one native Wayland would have hit as well.
 static FORCED_X11: AtomicBool = AtomicBool::new(false);
+static USES_X11: AtomicBool = AtomicBool::new(false);
 
 fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.is_empty())
@@ -58,25 +59,38 @@ fn env_set(name: &str) -> bool {
 
 /// Whether winit will talk to an X server for this process.
 ///
-/// True on an X11 session and, by default, on a Wayland session with a usable
-/// XWayland. `REALMHOUND_WAYLAND=1` keeps a Wayland session native, where
-/// attachment cannot be verified and overlays stay hidden. An XWayland that
-/// fails [`xwayland_usable`] also falls back to native Wayland.
+/// Recorded from the created window, so automatic backend fallbacks cannot
+/// leave attachment inspecting a different display protocol.
 pub fn uses_x11() -> bool {
-    static USES_X11: OnceLock<bool> = OnceLock::new();
-    *USES_X11.get_or_init(|| {
-        if !env_set("DISPLAY") {
-            return false;
-        }
-        if !env_set("WAYLAND_DISPLAY") {
-            // A plain X11 session: winit picks X11 on its own.
-            return true;
-        }
-        if std::env::var_os(WAYLAND_OPT_OUT).is_some_and(|value| value == "1") {
-            return false;
-        }
-        xwayland_usable()
-    })
+    USES_X11.load(Ordering::Relaxed)
+}
+
+pub fn record_backend(ctx: &eframe::CreationContext<'_>) {
+    use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+    USES_X11.store(
+        matches!(
+            ctx.display_handle().ok().map(|handle| handle.as_raw()),
+            Some(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_))
+        ),
+        Ordering::Relaxed,
+    );
+}
+
+fn prefer_xwayland(overlays_enabled: bool, display: bool, wayland: bool, opt_out: bool) -> bool {
+    overlays_enabled && display && wayland && !opt_out
+}
+
+pub fn can_restart_for_overlays() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    !uses_x11()
+        && *AVAILABLE.get_or_init(|| {
+            prefer_xwayland(
+                true,
+                env_set("DISPLAY"),
+                env_set("WAYLAND_DISPLAY"),
+                std::env::var_os(WAYLAND_OPT_OUT).is_some_and(|value| value == "1"),
+            ) && xwayland_usable()
+        })
 }
 
 /// Open the X display the way winit's X11 backend will, so a session where it
@@ -120,13 +134,19 @@ fn xwayland_usable() -> bool {
     opened
 }
 
-/// Event-loop hook that puts winit on XWayland in a Wayland session, or `None`
-/// when winit would already choose X11 (or must stay on Wayland).
+/// Event-loop hook that puts enabled overlays on XWayland in a Wayland session,
+/// or `None` when winit's normal backend preference should be preserved.
 ///
 /// winit prefers Wayland whenever `WAYLAND_DISPLAY` is set, and the backend can
 /// only be chosen before the event loop exists.
-pub fn event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
-    if !(uses_x11() && env_set("WAYLAND_DISPLAY")) {
+pub fn event_loop_hook(overlays_enabled: bool) -> Option<eframe::EventLoopBuilderHook> {
+    if !prefer_xwayland(
+        overlays_enabled,
+        env_set("DISPLAY"),
+        env_set("WAYLAND_DISPLAY"),
+        std::env::var_os(WAYLAND_OPT_OUT).is_some_and(|value| value == "1"),
+    ) || !xwayland_usable()
+    {
         return None;
     }
     tracing::info!(
@@ -745,6 +765,23 @@ fn process_start(path: &std::path::Path) -> Result<Option<u64>, String> {
 mod tests {
     use super::super::dismiss_stale;
     use super::*;
+
+    #[test]
+    fn xwayland_preference_requires_enabled_overlays_and_respects_opt_out() {
+        for (overlays, display, wayland, opt_out, expected) in [
+            (false, true, true, false, false),
+            (true, true, true, false, true),
+            (true, true, true, true, false),
+            (true, false, true, false, false),
+            (true, true, false, false, false),
+            (false, true, false, false, false),
+        ] {
+            assert_eq!(
+                prefer_xwayland(overlays, display, wayland, opt_out),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn retiring_generations_preserves_only_the_current_and_other_overlays() {

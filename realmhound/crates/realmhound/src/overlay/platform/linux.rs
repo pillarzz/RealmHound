@@ -371,8 +371,9 @@ impl X11 {
     /// Find this process's top-level window titled exactly `title`.
     fn find(&self, title: &str) -> Option<Window> {
         if let Some(window) = self
-            .our_windows()?
+            .our_windows()
             .into_iter()
+            .flatten()
             .find(|&window| self.window_name(window).as_deref() == Some(title))
         {
             return Some(window);
@@ -419,8 +420,7 @@ fn x11() -> Option<&'static X11> {
 }
 
 thread_local! {
-    /// Title -> window cache. Titles carry a per-window generation, so an entry
-    /// can never point at a different window than the one it was found for.
+    /// Title -> window cache, retired when an overlay generation closes.
     static FOUND: RefCell<HashMap<String, Window>> = RefCell::new(HashMap::new());
 }
 
@@ -431,6 +431,14 @@ fn window(x: &X11, title: &str) -> Option<Window> {
     let window = x.find(title)?;
     FOUND.with(|found| found.borrow_mut().insert(title.to_owned(), window));
     Some(window)
+}
+
+pub(super) fn dismiss_stale(prefix: &str, keep: &str) {
+    FOUND.with(|found| {
+        found
+            .borrow_mut()
+            .retain(|title, _| !title.starts_with(prefix) || title == keep);
+    });
 }
 
 pub(super) fn promote(title: &str) {
@@ -734,8 +742,117 @@ fn process_start(path: &std::path::Path) -> Result<Option<u64>, String> {
 }
 
 #[cfg(test)]
-mod process_tests {
+mod tests {
+    use super::super::dismiss_stale;
     use super::*;
+
+    #[test]
+    fn retiring_generations_preserves_only_the_current_and_other_overlays() {
+        FOUND.with(|found| {
+            found.borrow_mut().extend([
+                ("Combat #1".to_string(), 11),
+                ("Combat #2".to_string(), 12),
+                ("Loot #3".to_string(), 13),
+            ]);
+        });
+        dismiss_stale("Combat", "Combat #2");
+        FOUND.with(|found| {
+            let found = found.borrow();
+            assert!(!found.contains_key("Combat #1"));
+            assert_eq!(found.get("Combat #2"), Some(&12));
+            assert_eq!(found.get("Loot #3"), Some(&13));
+        });
+        dismiss_stale("Combat", "");
+        FOUND.with(|found| {
+            assert!(!found.borrow().contains_key("Combat #2"));
+            assert_eq!(found.borrow().get("Loot #3"), Some(&13));
+        });
+        dismiss_stale("Loot", "");
+    }
+
+    #[test]
+    #[ignore = "requires an X11 server"]
+    fn unmanaged_lookup_survives_missing_or_empty_client_list() {
+        use x11rb::wrapper::ConnectionExt as _;
+
+        let mut x = X11::connect().expect("X11 server required");
+        let root = x.conn.generate_id().unwrap();
+        x.conn
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                root,
+                x.root,
+                0,
+                0,
+                10,
+                10,
+                0,
+                x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                0,
+                &Default::default(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        // Isolate root properties from the real desktop/window manager.
+        x.root = root;
+        let window = x.conn.generate_id().unwrap();
+        x.conn
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                0,
+                0,
+                10,
+                10,
+                0,
+                x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                0,
+                &x11rb::protocol::xproto::CreateWindowAux::new().override_redirect(1),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let title = "RealmHound lookup regression #1";
+        x.conn
+            .change_property8(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                window,
+                x.atoms.wm_name,
+                x.atoms.utf8_string,
+                title.as_bytes(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        x.conn
+            .change_property32(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                window,
+                x.atoms.wm_pid,
+                AtomEnum::CARDINAL,
+                &[std::process::id()],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(x.find(title), Some(window));
+        x.conn
+            .change_property32(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                root,
+                x.atoms.client_list,
+                AtomEnum::WINDOW,
+                &[],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(x.find(title), Some(window));
+        assert_eq!(x.find("wrong generation"), None);
+        x.conn.destroy_window(root).unwrap().check().unwrap();
+    }
 
     #[test]
     fn missing_process_is_an_exit_but_unreadable_stat_is_an_error() {

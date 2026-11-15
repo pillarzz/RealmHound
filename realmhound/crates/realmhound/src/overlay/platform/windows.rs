@@ -11,6 +11,7 @@
 //! `WS_EX_LAYERED | WS_EX_TRANSPARENT` for us.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
@@ -38,10 +39,8 @@ use super::DragKind;
 static MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    /// Overlay windows the compositor setup has been applied to, with whether
-    /// their layered alpha was initialized. Keyed by `HWND` because both
-    /// overlay windows are promoted from the same UI thread.
-    static COMPOSITOR: RefCell<Vec<(HWND, bool)>> = const { RefCell::new(Vec::new()) };
+    /// Generation title -> initialized handle and layered state.
+    static COMPOSITOR: RefCell<HashMap<String, (HWND, bool)>> = RefCell::new(HashMap::new());
 }
 
 /// Locate the top-level window with exactly this title.
@@ -71,7 +70,7 @@ pub(super) fn promote(title: &str) {
         if current & wanted != wanted {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | wanted);
         }
-        ensure_transparency(hwnd, current & WS_EX_LAYERED as isize != 0);
+        ensure_transparency(title, hwnd, current & WS_EX_LAYERED as isize != 0);
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -94,13 +93,8 @@ pub(super) fn promote(title: &str) {
 ///
 /// `layered` mirrors `WS_EX_LAYERED`: click-through adds it, and a layered
 /// window stays invisible until its alpha is initialized.
-fn ensure_transparency(hwnd: HWND, layered: bool) {
-    let needs_setup = COMPOSITOR.with(|seen| {
-        seen.borrow()
-            .iter()
-            .find(|(handle, _)| *handle == hwnd)
-            .is_none_or(|(_, was_layered)| *was_layered != layered)
-    });
+fn ensure_transparency(title: &str, hwnd: HWND, layered: bool) {
+    let needs_setup = COMPOSITOR.with(|seen| seen.borrow().get(title) != Some(&(hwnd, layered)));
     if !needs_setup {
         return;
     }
@@ -108,14 +102,17 @@ fn ensure_transparency(hwnd: HWND, layered: bool) {
     // documented DWM/GDI/layered-window entry points.
     match unsafe { enable_transparency(hwnd, layered) } {
         Ok(()) => COMPOSITOR.with(|seen| {
-            let mut seen = seen.borrow_mut();
-            match seen.iter_mut().find(|(handle, _)| *handle == hwnd) {
-                Some(entry) => entry.1 = layered,
-                None => seen.push((hwnd, layered)),
-            }
+            seen.borrow_mut().insert(title.to_owned(), (hwnd, layered));
         }),
         Err(error) => tracing::warn!("[OVERLAY] {error}"),
     }
+}
+
+pub(super) fn dismiss_stale(prefix: &str, keep: &str) {
+    COMPOSITOR.with(|seen| {
+        seen.borrow_mut()
+            .retain(|title, _| !title.starts_with(prefix) || title == keep);
+    });
 }
 
 /// Give the window DWM composition with a full-window blur region, then
@@ -457,5 +454,36 @@ impl Drop for Process {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::dismiss_stale;
+    use super::*;
+
+    #[test]
+    fn retiring_generations_forgets_recycled_handles_without_affecting_other_overlays() {
+        COMPOSITOR.with(|seen| {
+            seen.borrow_mut().extend([
+                ("Combat #1".to_string(), (11, true)),
+                ("Combat #2".to_string(), (11, true)),
+                ("Loot #3".to_string(), (12, false)),
+            ]);
+        });
+        dismiss_stale("Combat", "Combat #2");
+        COMPOSITOR.with(|seen| {
+            let seen = seen.borrow();
+            assert!(!seen.contains_key("Combat #1"));
+            assert_eq!(seen.get("Combat #2"), Some(&(11, true)));
+            assert_eq!(seen.get("Loot #3"), Some(&(12, false)));
+            assert!(!seen.contains_key("Combat #4"));
+        });
+        dismiss_stale("Combat", "");
+        COMPOSITOR.with(|seen| {
+            assert!(!seen.borrow().contains_key("Combat #2"));
+            assert_eq!(seen.borrow().get("Loot #3"), Some(&(12, false)));
+        });
+        dismiss_stale("Loot", "");
     }
 }

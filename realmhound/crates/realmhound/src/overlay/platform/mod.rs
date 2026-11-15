@@ -109,21 +109,24 @@ pub fn order_front(title: &str, was_hidden: bool) -> bool {
     }
 }
 
-/// Take every on-screen window whose title starts with `prefix` off screen,
+/// Retire native state for every generation whose title starts with `prefix`,
 /// except the one titled `keep`.
 ///
 /// Each overlay window is opened with a unique generation suffix, so anything
 /// else sharing the prefix is a leftover from a window eframe has already
 /// replaced or discarded. On macOS those leftovers can linger on screen, where
 /// they show through the live overlay's translucent backdrop as a frozen frame
-/// from a previous instance. Pass an empty `keep` to retire all of them.
+/// from a previous instance, so they are also taken off screen. Pass an empty
+/// `keep` to retire all generations.
 pub fn dismiss_stale(prefix: &str, keep: &str) {
     #[cfg(target_os = "macos")]
     macos::dismiss_stale(prefix, keep);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    windows::dismiss_stale(prefix, keep);
+    #[cfg(target_os = "linux")]
+    linux::dismiss_stale(prefix, keep);
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
-        // Windows destroys an `HWND` synchronously, and an X11/Wayland window
-        // goes with its surface, so no other platform can strand one.
         let _ = (prefix, keep);
     }
 }

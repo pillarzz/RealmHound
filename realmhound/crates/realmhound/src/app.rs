@@ -7536,16 +7536,6 @@ impl RealmHoundApp {
             )
             .weak(),
         );
-        ui.label(
-            RichText::new(
-                "Enabled overlays appear only after linking to your verified game connection, \
-                 while the game window is visible and not minimized and either the game or \
-                 RealmHound is foreground. Unrelated apps, unresolved links and inspection \
-                 errors hide them. If no link is found, enter a realm or change maps and check \
-                 the RealmHound log for process/window access errors.",
-            )
-            .weak(),
-        );
         if !crate::overlay::platform::is_supported() {
             ui.add_space(5.0);
             ui.label(

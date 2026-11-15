@@ -361,8 +361,8 @@ pub(crate) fn game_window(pid: u32) -> Result<Option<HWND>, String> {
     }
 }
 
-/// Whether `window` still belongs to `pid` and is visible, unminimized and in
-/// front.
+/// Whether `window` still belongs to `pid` and is visible and unminimized,
+/// with either the linked game process or RealmHound foreground.
 ///
 /// Returns `Ok(None)` when the window disappeared or stopped belonging to the
 /// process, so the caller can look for a replacement.
@@ -393,8 +393,12 @@ pub(crate) fn game_window_active(window: HWND, pid: u32) -> Result<Option<bool>,
     }
     // A window belonging to a virtual desktop or a suspended UWP app stays
     // "visible" to the window manager but is not actually on screen.
-    let active =
-        unsafe { IsIconic(window) == 0 && GetForegroundWindow() == window } && cloaked == 0;
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut foreground_pid = 0;
+    unsafe { GetWindowThreadProcessId(foreground, &mut foreground_pid) };
+    let active = unsafe { IsIconic(window) == 0 }
+        && cloaked == 0
+        && (foreground_pid == pid || foreground_pid == std::process::id());
     Ok(Some(active))
 }
 

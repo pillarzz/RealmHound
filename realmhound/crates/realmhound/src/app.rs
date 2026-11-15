@@ -7536,12 +7536,22 @@ impl RealmHoundApp {
             )
             .weak(),
         );
+        ui.label(
+            RichText::new(
+                "Enabled overlays appear only after linking to your verified game connection, \
+                 while the game window is visible and not minimized and either the game or \
+                 RealmHound is foreground. Unrelated apps, unresolved links and inspection \
+                 errors hide them. If no link is found, enter a realm or change maps and check \
+                 the RealmHound log for process/window access errors.",
+            )
+            .weak(),
+        );
         if !crate::overlay::platform::is_supported() {
             ui.add_space(5.0);
             ui.label(
                 RichText::new(
-                    "On this platform the overlays are ordinary always-on-top windows: \
-                     showing them over a fullscreen game client is up to your compositor.",
+                    "This platform cannot verify game-window attachment; enabled overlays \
+                     remain hidden.",
                 )
                 .weak()
                 .italics(),
@@ -7551,7 +7561,7 @@ impl RealmHoundApp {
                 ui.label(
                     RichText::new(
                         "RealmHound is running natively on Wayland (REALMHOUND_WAYLAND=1 or \
-                         no XWayland), which cannot keep a window above the game. Start it \
+                         no XWayland), which cannot inspect the linked game window. Start it \
                          without REALMHOUND_WAYLAND to run on XWayland, where the overlays \
                          stay over the Proton client.",
                     )
@@ -7563,6 +7573,15 @@ impl RealmHoundApp {
         #[cfg(target_os = "macos")]
         {
             ui.add_space(5.0);
+            ui.label(
+                RichText::new(
+                    "macOS attachment uses window visibility and foreground-app metadata, \
+                     not window titles or screen capture. If macOS denies process/window \
+                     inspection, overlays stay hidden; check the RealmHound log.",
+                )
+                .weak()
+                .italics(),
+            );
             ui.label(
                 RichText::new(
                     "On macOS the game must run windowed or in windowed (borderless) \

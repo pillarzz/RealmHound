@@ -59,9 +59,9 @@ fn env_set(name: &str) -> bool {
 /// Whether winit will talk to an X server for this process.
 ///
 /// True on an X11 session and, by default, on a Wayland session with a usable
-/// XWayland. `REALMHOUND_WAYLAND=1` keeps a Wayland session native, where the
-/// overlays fall back to plain windows, and so does an XWayland that fails
-/// [`xwayland_usable`].
+/// XWayland. `REALMHOUND_WAYLAND=1` keeps a Wayland session native, where
+/// attachment cannot be verified and overlays stay hidden. An XWayland that
+/// fails [`xwayland_usable`] also falls back to native Wayland.
 pub fn uses_x11() -> bool {
     static USES_X11: OnceLock<bool> = OnceLock::new();
     *USES_X11.get_or_init(|| {
@@ -175,7 +175,6 @@ struct Atoms {
     wm_name: Atom,
     utf8_string: Atom,
     wm_state: Atom,
-    focused: Atom,
     hidden: Atom,
     above: Atom,
     skip_taskbar: Atom,
@@ -192,14 +191,13 @@ impl X11 {
     fn connect() -> Result<Self, Box<dyn std::error::Error>> {
         let (conn, screen) = x11rb::connect(None)?;
         let root = conn.setup().roots[screen].root;
-        let names: [&[u8]; 11] = [
+        let names: [&[u8]; 10] = [
             b"_NET_CLIENT_LIST",
             b"_NET_ACTIVE_WINDOW",
             b"_NET_WM_PID",
             b"_NET_WM_NAME",
             b"UTF8_STRING",
             b"_NET_WM_STATE",
-            b"_NET_WM_STATE_FOCUSED",
             b"_NET_WM_STATE_HIDDEN",
             b"_NET_WM_STATE_ABOVE",
             b"_NET_WM_STATE_SKIP_TASKBAR",
@@ -222,7 +220,6 @@ impl X11 {
             wm_name: next(),
             utf8_string: next(),
             wm_state: next(),
-            focused: next(),
             hidden: next(),
             above: next(),
             skip_taskbar: next(),
@@ -486,48 +483,6 @@ pub(super) fn order_front(title: &str) {
     let _ = x.conn.flush();
 }
 
-/// Whether the OS pointer is inside the named overlay window.
-///
-/// Uses the live X11 geometry rather than egui's viewport rectangle, which is
-/// not populated on the frame a window is first mapped. That first frame is
-/// exactly when focus-follows-mouse can move focus off the game.
-pub(crate) fn pointer_over_window(title: &str) -> bool {
-    let Some(x) = x11() else {
-        return false;
-    };
-    let Some(window) = window(x, title) else {
-        return false;
-    };
-    let Some(pointer) = x
-        .conn
-        .query_pointer(x.root)
-        .ok()
-        .and_then(|cookie| cookie.reply().ok())
-    else {
-        return false;
-    };
-    let Some(geometry) = x
-        .conn
-        .get_geometry(window)
-        .ok()
-        .and_then(|cookie| cookie.reply().ok())
-    else {
-        return false;
-    };
-    let Some(position) = x
-        .conn
-        .translate_coordinates(window, x.root, 0, 0)
-        .ok()
-        .and_then(|cookie| cookie.reply().ok())
-    else {
-        return false;
-    };
-    let left = i32::from(position.dst_x);
-    let top = i32::from(position.dst_y);
-    (left..left + i32::from(geometry.width)).contains(&i32::from(pointer.root_x))
-        && (top..top + i32::from(geometry.height)).contains(&i32::from(pointer.root_y))
-}
-
 pub(super) fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
     let x = x11()?;
     let pointer = x.conn.query_pointer(x.root).ok()?.reply().ok()?;
@@ -686,7 +641,8 @@ pub(crate) fn game_window(pid: u32) -> Result<Option<isize>, String> {
     }
 }
 
-/// Whether the linked client's window is still visible and focused.
+/// Whether the linked client's window is visible and unminimized, with either
+/// the linked game process or RealmHound foreground.
 ///
 /// `Ok(None)` means the cached window is gone and should be looked up again;
 /// `Ok(Some(false))` means it exists but belongs on screen without the overlays.
@@ -698,28 +654,33 @@ pub(crate) fn game_window_active(window: isize, pid: u32) -> Result<Option<bool>
     if x.window_pid(window) != Some(pid) {
         return Ok(None);
     }
-    let viewable = x
+    let attributes = x
         .conn
         .get_window_attributes(window)
         .ok()
         .and_then(|cookie| cookie.reply().ok())
-        .is_some_and(|attributes| attributes.map_state == MapState::VIEWABLE);
-    if !viewable {
-        return Ok(None);
+        .ok_or_else(|| "Cannot inspect linked game window attributes.".to_string())?;
+    if attributes.map_state != MapState::VIEWABLE {
+        return Ok(Some(false));
     }
-    let states = x.window_states(window).unwrap_or_default();
+    let states = x
+        .window_states(window)
+        .ok_or_else(|| "Cannot inspect linked game window state.".to_string())?;
     if states.contains(&x.atoms.hidden) {
         return Ok(Some(false));
     }
-    let active = x.active_window();
-    let focused = states.contains(&x.atoms.focused) || active == Some(window);
+    let active = x
+        .active_window()
+        .ok_or_else(|| "Cannot inspect the foreground X11 window.".to_string())?;
     // Keep the overlays available while RealmHound itself is focused, so the
     // overlay settings can be used without the game losing them. Another
     // application taking focus still hides them.
-    let configuring = active
-        .and_then(|active| x.window_pid(active))
-        .is_some_and(|pid| pid == std::process::id());
-    Ok(Some(focused || configuring))
+    let foreground_pid = x
+        .window_pid(active)
+        .ok_or_else(|| "Cannot inspect the foreground X11 process.".to_string())?;
+    Ok(Some(
+        foreground_pid == pid || foreground_pid == std::process::id(),
+    ))
 }
 
 /// A retained association with the linked game process.
@@ -733,24 +694,78 @@ pub(crate) struct Process {
 
 impl Process {
     pub fn open(pid: u32) -> Result<Self, String> {
-        let start = process_start(pid)
+        let start = process_start(std::path::Path::new(&format!("/proc/{pid}/stat")))?
             .ok_or_else(|| format!("Cannot inspect the linked game process {pid}."))?;
         Ok(Self { pid, start })
     }
 
     pub fn is_alive(&self) -> Result<bool, String> {
-        Ok(process_start(self.pid) == Some(self.start))
+        Ok(
+            process_start(std::path::Path::new(&format!("/proc/{}/stat", self.pid)))?
+                == Some(self.start),
+        )
     }
 }
 
 /// Field 22 (`starttime`) of `/proc/<pid>/stat`, in clock ticks since boot.
-fn process_start(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+fn process_start(path: &std::path::Path) -> Result<Option<u64>, String> {
+    let stat = match std::fs::read_to_string(path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Cannot inspect {}: {error}", path.display())),
+    };
     // The command name is parenthesized and may contain spaces or ')'.
-    stat.rsplit_once(") ")?
+    let invalid = || format!("Invalid linked process stat at {}.", path.display());
+    let mut fields = stat
+        .rsplit_once(") ")
+        .ok_or_else(invalid)?
         .1
-        .split_whitespace()
-        .nth(19)?
+        .split_whitespace();
+    let state = fields.next().ok_or_else(invalid)?;
+    let start = fields
+        .nth(18)
+        .ok_or_else(invalid)?
         .parse()
-        .ok()
+        .map_err(|_| invalid())?;
+    if matches!(state, "Z" | "X" | "x") {
+        return Ok(None);
+    }
+    Ok(Some(start))
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[test]
+    fn missing_process_is_an_exit_but_unreadable_stat_is_an_error() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = fixture.path().join("stat");
+        assert_eq!(process_start(&path), Ok(None));
+        // A directory deterministically produces a read failure even as root.
+        std::fs::create_dir(&path).unwrap();
+        assert!(process_start(&path).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "malformed stat").unwrap();
+        assert!(process_start(&path).is_err());
+    }
+
+    #[test]
+    fn process_identity_handles_command_names_and_zombies() {
+        let fixture = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = fixture.path().join("stat");
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[19] = "500";
+        std::fs::write(&path, format!("123 (game ) name) {}", fields.join(" "))).unwrap();
+        assert_eq!(process_start(&path), Ok(Some(500)));
+        let process = Process {
+            pid: std::process::id(),
+            start: 0,
+        };
+        assert_eq!(process.is_alive(), Ok(false));
+        fields[0] = "Z";
+        std::fs::write(&path, format!("123 (game) {}", fields.join(" "))).unwrap();
+        assert_eq!(process_start(&path), Ok(None));
+    }
 }

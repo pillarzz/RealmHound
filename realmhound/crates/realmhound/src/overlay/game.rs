@@ -2,9 +2,9 @@
 //! connection.
 //!
 //! Overlays are in-game furniture: they belong on screen exactly while the
-//! game window that produced the tracked socket is visible and focused, and
-//! hide when the user alt-tabs away, minimizes the client, or the client
-//! exits.
+//! game window that produced the tracked socket is visible and unminimized,
+//! and either the linked game or RealmHound is foreground. Unknown attachment or
+//! inspection failures hide them.
 
 use std::time::{Duration, Instant};
 
@@ -30,27 +30,23 @@ pub(super) struct GameWindow {
     next_window: Option<Instant>,
     last_error: Option<String>,
     active: bool,
-    /// Linux-only: the association could not be inspected at all, so keep the
-    /// previous always-visible behaviour instead of hiding the overlays.
-    #[cfg(target_os = "linux")]
-    unresolved_visible: bool,
-    /// Linux-only: a game window has been linked at least once. Until then the
-    /// overlays stay visible, so starting RealmHound mid-connection (before a
-    /// map change hands us a fresh socket) does not hide them entirely.
-    #[cfg(target_os = "linux")]
-    ever_attached: bool,
 }
 
 impl GameWindow {
     /// Poll the attached client and return whether its game window is on screen
-    /// and focused right now.
+    /// and either the linked game or RealmHound is foreground right now.
     pub fn poll(&mut self, connection: Option<ConnectionKey>) -> bool {
-        match self.process.as_ref().map_or(Ok(false), Process::is_alive) {
-            Ok(true) => {}
-            Ok(false) => self.detach(),
-            Err(error) => {
-                self.detach();
-                self.fail(error);
+        self.active = false;
+        if let Some(process) = self.process.as_ref() {
+            match process.is_alive() {
+                Ok(true) => {}
+                Ok(false) => self.detach(),
+                Err(error) => {
+                    // Unreadable evidence is not an exit: retain the verified
+                    // association, but never show an uninspected window.
+                    self.fail(error);
+                    return false;
+                }
             }
         }
 
@@ -61,30 +57,10 @@ impl GameWindow {
             if self.window.is_none() {
                 self.find_window(pid);
             }
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                self.active = self.unresolved_visible || !self.ever_attached;
-                return self.active;
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                self.active = false;
-                return false;
-            }
         }
 
         let (Some(window), Some(pid)) = (self.window, self.pid) else {
-            #[cfg(target_os = "linux")]
-            {
-                self.active = self.unresolved_visible || !self.ever_attached;
-                return self.active;
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                self.active = false;
-                return false;
-            }
+            return false;
         };
         // Re-validating the cached handle is cheap and catches a client that
         // was minimized, covered, or closed without a connection event.
@@ -92,11 +68,6 @@ impl GameWindow {
             Ok(Some(active)) => {
                 self.active = active;
                 self.last_error = None;
-                #[cfg(target_os = "linux")]
-                {
-                    self.unresolved_visible = false;
-                    self.ever_attached = true;
-                }
             }
             Ok(None) => {
                 self.window = None;
@@ -124,10 +95,6 @@ impl GameWindow {
                     self.next_process = None;
                     self.next_window = None;
                     self.last_error = None;
-                    #[cfg(target_os = "linux")]
-                    {
-                        self.unresolved_visible = false;
-                    }
                 }
                 Err(error) => self.fail(error),
             },
@@ -145,11 +112,6 @@ impl GameWindow {
                 self.window = Some(window);
                 self.next_window = None;
                 self.last_error = None;
-                #[cfg(target_os = "linux")]
-                {
-                    self.unresolved_visible = false;
-                    self.ever_attached = true;
-                }
             }
             Ok(None) => {}
             Err(error) => self.fail(error),
@@ -163,10 +125,6 @@ impl GameWindow {
         self.next_process = None;
         self.next_window = None;
         self.active = false;
-        #[cfg(target_os = "linux")]
-        {
-            self.unresolved_visible = false;
-        }
     }
 
     fn fail(&mut self, error: String) {
@@ -174,15 +132,92 @@ impl GameWindow {
             tracing::warn!("[OVERLAY] {error}");
             self.last_error = Some(error);
         }
-        #[cfg(windows)]
-        {
-            self.active = false;
+        self.active = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbound_polls_preserve_process_retry_deadline() {
+        let mut game = GameWindow::default();
+        assert!(due(&mut game.next_process));
+        let deadline = game.next_process;
+        let connection =
+            ConnectionKey::new([127, 0, 0, 1].into(), 50_000, [127, 0, 0, 2].into(), 2050);
+        for connection in [None, Some(connection), None] {
+            assert!(!game.poll(connection));
+            assert_eq!(game.next_process, deadline);
         }
-        #[cfg(target_os = "linux")]
-        {
-            self.unresolved_visible = true;
-            self.active = true;
+        assert!(!due(&mut game.next_process));
+        game.next_process = Some(Instant::now() - LOOKUP_INTERVAL);
+        assert!(due(&mut game.next_process));
+    }
+
+    #[test]
+    fn inspection_failure_hides_without_forgetting_attachment() {
+        let mut game = GameWindow {
+            pid: Some(123),
+            window: Some(456),
+            active: true,
+            ..Default::default()
+        };
+        game.fail("inspection unavailable".to_string());
+        assert!(!game.active);
+        assert_eq!(game.pid, Some(123));
+        assert_eq!(game.window, Some(456));
+        game.detach();
+        assert_eq!(game.pid, None);
+        assert_eq!(game.window, None);
+        assert!(!game.active);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_process_stays_linked_across_socket_changes() {
+        let pid = std::process::id();
+        let mut game = GameWindow {
+            pid: Some(pid),
+            process: Some(Process::open(pid).unwrap()),
+            next_window: Some(Instant::now() + LOOKUP_INTERVAL),
+            ..Default::default()
+        };
+        for port in [None, Some(50_000), Some(50_001)] {
+            let connection = port.map(|port| {
+                ConnectionKey::new([127, 0, 0, 1].into(), port, [127, 0, 0, 2].into(), 2050)
+            });
+            assert!(!game.poll(connection));
+            assert_eq!(game.pid, Some(pid));
+            assert!(game.process.is_some());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_process_clears_the_sticky_link() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut game = GameWindow {
+            pid: Some(pid),
+            process: Some(Process::open(pid).unwrap()),
+            next_window: Some(Instant::now() + LOOKUP_INTERVAL),
+            ..Default::default()
+        };
+        assert!(!game.poll(None));
+        assert_eq!(game.pid, Some(pid));
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(!game.poll(None));
+        assert_eq!(game.pid, None);
+        assert!(game.process.is_none());
     }
 }
 

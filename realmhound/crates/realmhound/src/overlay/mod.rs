@@ -21,9 +21,9 @@
 //! - Never takes focus. Clicking an overlay must not pull input away from the
 //!   game; the native tweaks in [`platform`] enforce this where the windowing
 //!   layer cannot.
-//! - On Windows, hidden unless the game client that owns the tracked main
-//!   connection is the focused window, so alt-tabbing or minimizing the client
-//!   takes the overlays with it.
+//! - Hidden unless a verified linked game window is visible and unminimized,
+//!   with either the linked game or RealmHound foreground. Unknown attachment
+//!   and inspection errors hide overlays on every platform.
 //! - Position, size and chrome state round-trip through
 //!   [`realmhound_core::settings::OverlaySettings`].
 
@@ -40,7 +40,7 @@ use realmhound_core::stream::ConnectionKey;
 use crate::panels::loot_filters::{LootFilters, PropertyFilters};
 use crate::rendering::SpriteRenderer;
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod game;
 mod live_combat;
 mod live_loot;
@@ -372,8 +372,8 @@ pub struct OverlayManager {
     live_combat: live_combat::LiveCombatOverlay,
     live_loot_window: WindowRuntime,
     live_loot: live_loot::LiveLootOverlay,
-    /// The game client the overlays attach to (Windows and Linux/X11).
-    #[cfg(any(windows, target_os = "linux"))]
+    /// The game client the overlays attach to.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     game: game::GameWindow,
     /// Mirrors "at least one overlay is open" for the packet worker, which uses
     /// it to keep waking the UI while a background tab is selected.
@@ -396,7 +396,7 @@ impl OverlayManager {
             live_combat: live_combat::LiveCombatOverlay::default(),
             live_loot_window: WindowRuntime::new(LIVE_LOOT_TITLE),
             live_loot: live_loot::LiveLootOverlay::default(),
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             game: game::GameWindow::default(),
             active: Arc::new(AtomicBool::new(false)),
             embedded_warned: false,
@@ -423,22 +423,11 @@ impl OverlayManager {
         self.live_loot.reset();
     }
 
-    /// On Linux, focus-follows-mouse moves focus off the game as soon as the
-    /// pointer reaches an overlay. Keep the overlay on screen while the pointer
-    /// is on it, so it cannot vanish from under the cursor.
-    #[cfg(target_os = "linux")]
-    fn pointer_over_overlay(&self) -> bool {
-        let over = |runtime: &WindowRuntime| {
-            runtime.visible == Some(true) && platform::pointer_over_window(&runtime.native_title)
-        };
-        over(&self.live_combat_window) || over(&self.live_loot_window)
-    }
-
     /// Render whichever overlays are enabled. Call once per frame from the root
     /// `eframe::App::update`, before the main window's panels.
     ///
-    /// On Windows the overlays are only shown while the game client that owns
-    /// `main_connection` is the focused window; elsewhere they are always shown.
+    /// Requires a visible, unminimized window linked to a verified
+    /// `main_connection`, with the game or RealmHound foreground.
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -466,16 +455,12 @@ impl OverlayManager {
             return;
         }
 
-        // The overlays are in-game furniture: only draw them while the client
-        // that owns the tracked connection is the focused window.
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         let attached = self.game.poll(main_connection);
-        #[cfg(target_os = "linux")]
-        let attached = attached || self.pointer_over_overlay();
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let attached = {
             let _ = main_connection;
-            true
+            false
         };
 
         // Overlays are *immediate* viewports, which eframe can only paint from

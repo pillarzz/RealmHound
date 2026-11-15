@@ -63,6 +63,11 @@ pub fn connection_process_id(conn: &ConnectionKey) -> Result<Option<u32>, String
 }
 
 #[cfg(target_os = "macos")]
+pub fn connection_process_id(conn: &ConnectionKey) -> Result<Option<u32>, String> {
+    macos_impl::owning_pid_checked(conn)
+}
+
+#[cfg(target_os = "macos")]
 pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
     let pid = macos_impl::owning_pid(conn)?;
     macos_impl::process_creation_unix(pid)
@@ -639,6 +644,20 @@ mod linux_impl {
         }
 
         #[test]
+        fn closed_socket_cannot_attach_even_with_a_matching_owner() {
+            let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+            let root = temp.path();
+            write_socket_fixture(root, 4242, &[(500, "RotMG Exalt.exe")]);
+            let table = root.join("net/tcp");
+            let established = std::fs::read_to_string(&table).unwrap();
+            for state in ["06", "07"] {
+                // TIME_WAIT and CLOSE.
+                std::fs::write(&table, established.replace(" 01 ", &format!(" {state} "))).unwrap();
+                assert_eq!(owning_pid_checked_at(root, &fixture_connection()), Ok(None));
+            }
+        }
+
+        #[test]
         fn named_client_fallback_ignores_launcher_and_uses_oldest_game() {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path();
@@ -1012,6 +1031,43 @@ mod macos_impl {
                         })
                 })
             })
+    }
+
+    /// Attachment never substitutes a different foreground or named client.
+    pub(super) fn owning_pid_checked(conn: &ConnectionKey) -> Result<Option<u32>, String> {
+        let pids = pids_by_type(ProcFilter::ByUID { uid: own_uid() })
+            .map_err(|error| format!("Cannot enumerate tracked socket owners: {error}"))?;
+        let mut owners = Vec::new();
+        let mut unreadable = Vec::new();
+        for pid in pids {
+            let Some(endpoints) = tcp_endpoints(pid) else {
+                unreadable.push(pid);
+                continue;
+            };
+            if endpoints
+                .iter()
+                .any(|&(local, local_port, remote, remote_port)| {
+                    local == conn.client_ip
+                        && local_port == conn.client_port
+                        && remote == conn.server_ip
+                        && remote_port == conn.server_port
+                })
+            {
+                owners.push(pid);
+            }
+        }
+        match owners.as_slice() {
+            [pid] => Ok(Some(*pid)),
+            [] if !any_still_running(&unreadable, own_uid()) => Ok(None),
+            [] => Err(
+                "Cannot inspect tracked socket owners on macOS; overlay remains hidden."
+                    .to_string(),
+            ),
+            _ => Err(
+                "Multiple processes own the tracked connection; overlay remains hidden."
+                    .to_string(),
+            ),
+        }
     }
 
     /// Read the creation time (Unix seconds) of the process with `pid`.

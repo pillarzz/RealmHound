@@ -22,9 +22,9 @@
 //! generation suffix precisely so the lookup can never land on a window the
 //! windowing layer has already abandoned; see [`dismiss_stale`].
 //!
-//! Every entry point is best-effort and infallible: a platform without an
-//! implementation (native Wayland, BSD) runs the stubs below and the overlay
-//! still works as a normal always-on-top window.
+//! Overlay manipulation is best-effort. Attachment inspection is fallible and
+//! fails closed: native Wayland and BSD cannot verify a linked game window,
+//! so enabled overlays remain hidden there.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -40,9 +40,9 @@ pub(super) use windows::{game_window, game_window_active, Process};
 pub(super) use linux::{game_window, game_window_active, Process};
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::pointer_over_window;
-#[cfg(target_os = "linux")]
 pub use linux::{event_loop_hook, is_forced_x11_failure, relaunch_on_wayland};
+#[cfg(target_os = "macos")]
+pub(super) use macos::{game_window, game_window_active, Process};
 
 /// What a title-bar or grip drag does to the overlay window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,8 +200,8 @@ pub fn continue_drag() -> bool {
 }
 
 /// Whether this platform has a native overlay implementation. Surfaced in the
-/// settings UI so users on native Wayland (or BSD) know the overlay is a plain
-/// window there.
+/// settings UI so users on native Wayland (or BSD) know attachment cannot be
+/// verified and enabled overlays stay hidden there.
 pub fn is_supported() -> bool {
     #[cfg(target_os = "linux")]
     {

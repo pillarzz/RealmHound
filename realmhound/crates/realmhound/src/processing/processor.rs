@@ -22,6 +22,7 @@ use realmhound_core::{
         parse_player_appearance, parse_player_inventory, shot_damage_bonus, ShotDamageBonus,
     },
     stream::{parse_tcp_segment, ConnectionKey, TcpReassembler},
+    thanks::AreaUnlockKind,
     vault::{
         AccountData, AccountDataRepository, CloseCallSync, LiveVaultData, LiveVaultItem,
         StatAwardSync, VaultType,
@@ -108,7 +109,8 @@ enum AreaUnlockMsg {
         item_name: &'static str,
         /// Full entry title, e.g. "Wine Cellar unlocked".
         title: &'static str,
-        short: &'static str,
+        /// Which customized "thank you" template the entry uses.
+        kind: AreaUnlockKind,
         popper: String,
     },
     /// A Lost Halls Rune monument activation. These are accumulated (last popper
@@ -124,15 +126,23 @@ enum AreaUnlockMsg {
 /// Map a dungeon display name to its area-unlock Live Feed entry, or `None` for
 /// dungeons that don't produce a pop.
 fn dungeon_unlock_single(dungeon: &str, popper: String) -> Option<AreaUnlockMsg> {
-    let (item_name, title, short) = match dungeon.trim() {
-        "Wine Cellar" => ("Wine Cellar Incantation", "Wine Cellar unlocked", "inc"),
-        "The Void" => ("Vial of Pure Darkness", "The Void unlocked", "vial"),
+    let (item_name, title, kind) = match dungeon.trim() {
+        "Wine Cellar" => (
+            "Wine Cellar Incantation",
+            "Wine Cellar unlocked",
+            AreaUnlockKind::Inc,
+        ),
+        "The Void" => (
+            "Vial of Pure Darkness",
+            "The Void unlocked",
+            AreaUnlockKind::Vial,
+        ),
         _ => return None,
     };
     Some(AreaUnlockMsg::Single {
         item_name,
         title,
-        short,
+        kind,
         popper,
     })
 }
@@ -1842,7 +1852,8 @@ impl PacketProcessor {
     /// Emit the combined Lost Halls Rune-monument entry from the accumulated
     /// per-monument poppers, if at least one monument was activated by a real
     /// player (all-auto runs are silent and produce nothing). Ordered
-    /// Sword, Shield, Helmet; the clipboard thanks each unique popper.
+    /// Sword, Shield, Helmet; the panel thanks each unique popper using the
+    /// current custom template.
     fn flush_monument_entry(&mut self) {
         let show = self
             .settings
@@ -1868,11 +1879,11 @@ impl PacketProcessor {
         if contributions.is_empty() {
             return;
         }
-        let callout = Self::monument_callout(&eligible);
         self.emit(UiPayload::AreaUnlock {
             title: "Sanctuary runes".to_string(),
+            kind: AreaUnlockKind::Runes,
             contributions,
-            callout,
+            thanks: eligible,
         });
     }
 
@@ -1884,29 +1895,6 @@ impl PacketProcessor {
             .as_deref()
             .map(|me| me.eq_ignore_ascii_case(name.trim()))
             .unwrap_or(false)
-    }
-
-    /// Build the Sanctuary runes thanks callout from the non-local contributors:
-    /// empty when only the local player popped, singular
-    /// "Thanks <Name> for the <type> rune!" for a lone rune from one player, else
-    /// "Thanks <Names> for the runes!".
-    fn monument_callout(eligible: &[(String, String)]) -> String {
-        if eligible.is_empty() {
-            return String::new();
-        }
-        let mut unique: Vec<&str> = Vec::new();
-        for (_, name) in eligible {
-            if !unique.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-                unique.push(name);
-            }
-        }
-        if unique.len() == 1 {
-            if eligible.len() == 1 {
-                return format!("Thanks {} for the {} rune!", eligible[0].1, eligible[0].0);
-            }
-            return format!("Thanks {} for the runes!", unique[0]);
-        }
-        format!("Thanks {} for the runes!", unique.join(", "))
     }
 
     /// Build the enchantment-notification context for a batch of loot drops:
@@ -2070,7 +2058,7 @@ impl PacketProcessor {
             AreaUnlockMsg::Single {
                 item_name,
                 title,
-                short,
+                kind,
                 popper,
             } if !popper.is_empty() => {
                 let show = self
@@ -2082,15 +2070,18 @@ impl PacketProcessor {
                     let item_id = realmhound_core::assets::get_asset_manager()
                         .object_id_for_name(item_name)
                         .unwrap_or(0);
-                    let callout = if self.is_local_player(&popper) {
-                        String::new()
+                    // The panel assembles the message from the current template,
+                    // so later edits apply to entries already in the feed.
+                    let thanks = if self.is_local_player(&popper) {
+                        Vec::new()
                     } else {
-                        format!("Thanks {} for the {}!", popper, short)
+                        vec![(String::new(), popper.clone())]
                     };
                     self.emit(UiPayload::AreaUnlock {
                         title: title.to_string(),
+                        kind,
                         contributions: vec![(item_id, popper)],
-                        callout,
+                        thanks,
                     });
                 }
             }
@@ -4531,18 +4522,19 @@ mod key_pop_tests {
 
 #[cfg(test)]
 mod area_unlock_tests {
-    use super::{parse_area_unlock, parse_area_unlock_json, AreaUnlockMsg, PacketProcessor};
+    use super::{parse_area_unlock, parse_area_unlock_json, AreaUnlockMsg};
+    use realmhound_core::thanks::AreaUnlockKind;
 
     #[test]
     fn parses_wine_cellar_single() {
         match parse_area_unlock("Wine Cellar unlocked by Pillar") {
             Some(AreaUnlockMsg::Single {
-                short,
+                kind,
                 popper,
                 title,
                 ..
             }) => {
-                assert_eq!(short, "inc");
+                assert_eq!(kind, AreaUnlockKind::Inc);
                 assert_eq!(popper, "Pillar");
                 assert_eq!(title, "Wine Cellar unlocked");
             }
@@ -4553,8 +4545,8 @@ mod area_unlock_tests {
     #[test]
     fn parses_void_single() {
         match parse_area_unlock("The Void unlocked by Lovens") {
-            Some(AreaUnlockMsg::Single { short, popper, .. }) => {
-                assert_eq!(short, "vial");
+            Some(AreaUnlockMsg::Single { kind, popper, .. }) => {
+                assert_eq!(kind, AreaUnlockKind::Vial);
                 assert_eq!(popper, "Lovens");
             }
             other => panic!("expected Single, got {other:?}"),
@@ -4581,36 +4573,6 @@ mod area_unlock_tests {
         assert!(parse_area_unlock("The Shatters Monument is not a thing").is_none());
     }
 
-    #[test]
-    fn monument_callout_forms() {
-        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
-
-        // No eligible contributors (only the local player popped) => no callout.
-        assert_eq!(PacketProcessor::monument_callout(&[]), "");
-
-        // Exactly one rune from one player => singular, lowercased rune type.
-        assert_eq!(
-            PacketProcessor::monument_callout(&[s("sword", "Greenmun")]),
-            "Thanks Greenmun for the sword rune!"
-        );
-
-        // One player, multiple runes => plural.
-        assert_eq!(
-            PacketProcessor::monument_callout(&[s("sword", "Greenmun"), s("shield", "Greenmun")]),
-            "Thanks Greenmun for the runes!"
-        );
-
-        // Multiple distinct players => plural, de-duplicated, order preserved.
-        assert_eq!(
-            PacketProcessor::monument_callout(&[
-                s("sword", "Alice"),
-                s("shield", "Bob"),
-                s("helmet", "Alice"),
-            ]),
-            "Thanks Alice, Bob for the runes!"
-        );
-    }
-
     // --- ServerMessage notification path (the real carrier) ---
 
     #[test]
@@ -4619,12 +4581,12 @@ mod area_unlock_tests {
             r#"{"k":"s.dungeon_unlocked_by","t":{"name":"Wine Cellar","player":"Jeffryjhon",}}"#;
         match parse_area_unlock_json(msg) {
             Some(AreaUnlockMsg::Single {
-                short,
+                kind,
                 popper,
                 title,
                 ..
             }) => {
-                assert_eq!(short, "inc");
+                assert_eq!(kind, AreaUnlockKind::Inc);
                 assert_eq!(popper, "Jeffryjhon");
                 assert_eq!(title, "Wine Cellar unlocked");
             }
@@ -4636,8 +4598,8 @@ mod area_unlock_tests {
     fn parses_void_notification() {
         let msg = r#"{"k":"s.dungeon_unlocked_by","t":{"name":"The Void","player":"Lovens",}}"#;
         match parse_area_unlock_json(msg) {
-            Some(AreaUnlockMsg::Single { short, popper, .. }) => {
-                assert_eq!(short, "vial");
+            Some(AreaUnlockMsg::Single { kind, popper, .. }) => {
+                assert_eq!(kind, AreaUnlockKind::Vial);
                 assert_eq!(popper, "Lovens");
             }
             other => panic!("expected Single, got {other:?}"),

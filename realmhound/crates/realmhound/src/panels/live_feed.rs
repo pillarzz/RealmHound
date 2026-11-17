@@ -12,6 +12,7 @@ use realmhound_core::{
     dungeon_modifiers::{ModDanger, ModType, OutlineKind},
     dust::{DustAmounts, DustState, DustType},
     loot::{LootBagType, LootDropRecord, LootItemRecord, ProcessedLootDrop, ProcessedLootItem},
+    thanks::{self, AreaUnlockKind},
 };
 
 use crate::panels::chat::ChatType;
@@ -32,6 +33,9 @@ use crate::tab_icons::{TabIconSprite, TAB_ICON_SIZE};
 const MAX_FEED_ENTRIES: usize = 100;
 const INACTIVE_CALLOUT_TEXT: Color32 = Color32::from_gray(120);
 const INACTIVE_CALLOUT_SPRITE: Color32 = Color32::from_gray(110);
+/// Green used for the right-aligned callout previews in the Live Feed, matching
+/// the dungeon and boss callout previews.
+const CALLOUT_PREVIEW_COLOR: Color32 = Color32::from_rgb(150, 230, 150);
 const CRYSTAL_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Which hover tooltip a pinned warning row shows. The season row gets a rich
@@ -395,52 +399,82 @@ impl KeyPopEntry {
         }
     }
 
-    /// The "Thanks <opener> for the key!" clipboard callout, or `None` when the
-    /// local player opened the key.
-    pub fn callout(&self) -> Option<String> {
+    /// The custom "Thanks <opener> for the key!" clipboard callout, or `None`
+    /// when the local player opened the key.
+    pub fn callout(&self, template: &str) -> Option<String> {
         self.thankable
-            .then(|| format!("Thanks {} for the key!", self.opener))
+            .then(|| thanks::assemble_single(template, thanks::DEFAULT_KEY_POP, &self.opener))
+            .flatten()
+            .filter(|text| !text.is_empty())
     }
 }
 
 /// Special "area unlock" entry: an immediate single-item pop (Wine Cellar
 /// Incantation or Vial of Pure Darkness) or the combined Lost Halls Rune
 /// monuments shown on Oryx's Sanctuary entry. Renders each contribution's item
-/// icon next to its popper and carries a ready-made clipboard callout.
+/// icon next to its popper and assembles the current custom thanks message on
+/// demand.
 #[derive(Debug, Clone)]
 pub struct AreaUnlockEntry {
     /// Timestamp when the entry was created.
     pub timestamp: DateTime<Local>,
     /// Entry title (e.g. "Wine Cellar unlocked", "Sanctuary runes").
     pub title: String,
+    /// Which custom "thank you" template this entry uses.
+    pub kind: AreaUnlockKind,
     /// One `(item_id, popper)` per contributing pop, in display order.
     pub contributions: Vec<(i32, String)>,
-    /// Ready-made clipboard callout ("Thanks <name> for the <item>"). Empty when
-    /// the local player was the (only) opener, so there is no one to thank.
-    pub callout: String,
+    /// Non-local contributors as `(rune type, popper)`, in pop order. Empty when
+    /// the local player was the (only) opener, so there is nobody to thank.
+    pub thanks: Vec<(String, String)>,
 }
 
 impl AreaUnlockEntry {
     /// Create a new area-unlock entry. These never expire so the thanks callout
     /// stays copyable indefinitely.
-    pub fn new(title: String, contributions: Vec<(i32, String)>, callout: String) -> Self {
+    pub fn new(
+        title: String,
+        kind: AreaUnlockKind,
+        contributions: Vec<(i32, String)>,
+        thanks: Vec<(String, String)>,
+    ) -> Self {
         Self {
             timestamp: Local::now(),
             title,
+            kind,
             contributions,
-            callout,
+            thanks,
         }
     }
 
-    /// The clipboard callout text.
-    pub fn callout(&self) -> String {
-        self.callout.clone()
+    /// Whether this entry has somebody to thank.
+    pub fn has_thanks(&self) -> bool {
+        !self.thanks.is_empty()
     }
 
-    /// Whether this entry has a copyable thanks callout.
-    pub fn has_callout(&self) -> bool {
-        !self.callout.is_empty()
+    /// Assemble the clipboard callout from the current custom templates.
+    /// `None` when the local player popped the unlock alone.
+    pub fn callout(&self, messages: &AreaUnlockThanks<'_>) -> Option<String> {
+        match self.kind {
+            AreaUnlockKind::Inc => {
+                thanks::assemble_single(messages.inc, thanks::DEFAULT_INC, &self.thanks.first()?.1)
+            }
+            AreaUnlockKind::Vial => thanks::assemble_single(
+                messages.vial,
+                thanks::DEFAULT_VIAL,
+                &self.thanks.first()?.1,
+            ),
+            AreaUnlockKind::Runes => thanks::assemble_runes(messages.runes, &self.thanks),
+        }
     }
+}
+
+/// Borrowed custom "thank you" templates used to assemble an area-unlock
+/// message.
+pub struct AreaUnlockThanks<'a> {
+    pub inc: &'a str,
+    pub vial: &'a str,
+    pub runes: &'a str,
 }
 
 /// Parse a `/who` reply into a sorted, de-duplicated player list.
@@ -1086,6 +1120,21 @@ pub struct LiveFeedPanel {
     show_key_pops: bool,
     /// Whether area-unlock entries are shown (mirrors `LiveFeedSettings::show_area_unlocks`).
     show_area_unlocks: bool,
+    /// Custom key-pop "thank you" template. Mirrors
+    /// `LiveFeedSettings::key_pop_thanks`.
+    key_pop_thanks: String,
+    /// Custom Wine Cellar Incantation "thank you" template. Mirrors
+    /// `LiveFeedSettings::area_unlock_inc_thanks`.
+    area_unlock_inc_thanks: String,
+    /// Custom Vial of Pure Darkness "thank you" template. Mirrors
+    /// `LiveFeedSettings::area_unlock_vial_thanks`.
+    area_unlock_vial_thanks: String,
+    /// Custom Lost Halls rune "thank you" template. Mirrors
+    /// `LiveFeedSettings::area_unlock_runes_thanks`.
+    area_unlock_runes_thanks: String,
+    /// Whether area unlocks copy their "thank you" message automatically.
+    /// Mirrors `LiveFeedSettings::auto_clipboard_area_unlock_thanks`.
+    auto_clipboard_area_unlock_thanks: bool,
     /// Whether dungeon-entry callouts are shown (mirrors `LiveFeedSettings::show_dungeon_entries`).
     show_dungeon_entries: bool,
     /// Whether realm event / boss callouts are shown (mirrors `LiveFeedSettings::show_boss_calls`).
@@ -1197,6 +1246,11 @@ impl LiveFeedPanel {
             show_who_roster: true,
             show_key_pops: true,
             show_area_unlocks: true,
+            key_pop_thanks: thanks::DEFAULT_KEY_POP.to_string(),
+            area_unlock_inc_thanks: thanks::DEFAULT_INC.to_string(),
+            area_unlock_vial_thanks: thanks::DEFAULT_VIAL.to_string(),
+            area_unlock_runes_thanks: thanks::DEFAULT_RUNES.to_string(),
+            auto_clipboard_area_unlock_thanks: false,
             show_dungeon_entries: true,
             show_boss_calls: true,
             show_loot_drops: true,
@@ -1286,6 +1340,11 @@ impl LiveFeedPanel {
         self.show_who_roster = settings.show_who_roster;
         self.show_key_pops = settings.show_key_pops;
         self.show_area_unlocks = settings.show_area_unlocks;
+        self.key_pop_thanks = settings.key_pop_thanks.clone();
+        self.area_unlock_inc_thanks = settings.area_unlock_inc_thanks.clone();
+        self.area_unlock_vial_thanks = settings.area_unlock_vial_thanks.clone();
+        self.area_unlock_runes_thanks = settings.area_unlock_runes_thanks.clone();
+        self.auto_clipboard_area_unlock_thanks = settings.auto_clipboard_area_unlock_thanks;
         self.show_dungeon_entries = settings.show_dungeon_entries;
         self.show_boss_calls = settings.show_boss_calls;
         self.show_loot_drops = settings.show_loot_drops;
@@ -2314,17 +2373,40 @@ impl LiveFeedPanel {
     }
 
     /// Push a special area-unlock entry (single-item pop or combined monuments).
+    /// When the "Auto-clipboard Area unlocks 'Thank you' message" setting is on,
+    /// the assembled message is queued for the clipboard immediately.
     pub fn push_area_unlock(
         &mut self,
         title: String,
+        kind: AreaUnlockKind,
         contributions: Vec<(i32, String)>,
-        callout: String,
+        thanks: Vec<(String, String)>,
     ) {
-        self.push_entry(FeedEntry::AreaUnlock(AreaUnlockEntry::new(
-            title,
-            contributions,
-            callout,
-        )));
+        let entry = AreaUnlockEntry::new(title, kind, contributions, thanks);
+        let auto_copy = self
+            .auto_clipboard_area_unlock_thanks
+            .then(|| self.area_unlock_callout(&entry))
+            .flatten()
+            .filter(|text| !text.is_empty());
+        self.push_entry(FeedEntry::AreaUnlock(entry));
+        if let Some(text) = auto_copy {
+            self.pending_clipboard = Some(ClipboardWrite::Copy(text));
+        }
+    }
+
+    /// The custom area-unlock "thank you" templates currently in effect.
+    fn area_unlock_thanks(&self) -> AreaUnlockThanks<'_> {
+        AreaUnlockThanks {
+            inc: &self.area_unlock_inc_thanks,
+            vial: &self.area_unlock_vial_thanks,
+            runes: &self.area_unlock_runes_thanks,
+        }
+    }
+
+    /// Assemble an area-unlock entry's clipboard message from the current
+    /// templates, or `None` when the local player popped it alone.
+    fn area_unlock_callout(&self, unlock: &AreaUnlockEntry) -> Option<String> {
+        unlock.callout(&self.area_unlock_thanks())
     }
 
     pub fn push_warning(&mut self, text: String, severity: WarningSeverity, copyable: bool) {
@@ -3352,12 +3434,12 @@ impl LiveFeedPanel {
                     }
                     FeedEntry::KeyPop(keypop) => {
                         if self.render_key_pop_entry(ui, keypop, sprite_renderer) {
-                            callout_to_copy = keypop.callout();
+                            callout_to_copy = keypop.callout(&self.key_pop_thanks);
                         }
                     }
                     FeedEntry::AreaUnlock(unlock) => {
                         if self.render_area_unlock_entry(ui, unlock, sprite_renderer) {
-                            callout_to_copy = Some(unlock.callout());
+                            callout_to_copy = self.area_unlock_callout(unlock);
                         }
                     }
                 }
@@ -4447,9 +4529,10 @@ impl LiveFeedPanel {
         keypop: &KeyPopEntry,
         sprite_renderer: &mut SpriteRenderer,
     ) -> bool {
-        let row_height = 32.0;
-        // Self-opened keys have no one to thank, so the row is inert (no copy).
         let clickable = keypop.thankable;
+        // Self-opened keys have no one to thank, so the row is inert (no copy).
+        let callout = keypop.callout(&self.key_pop_thanks);
+        let row_height = 32.0;
 
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), row_height),
@@ -4525,21 +4608,56 @@ impl LiveFeedPanel {
 
         // "Opened by <player>".
         let opener_text = format!("Opened by {}", keypop.opener);
-        ui.painter().text(
-            egui::pos2(text_left + name_width + 12.0, cy),
-            egui::Align2::LEFT_CENTER,
-            &opener_text,
+        let opener_galley = ui.painter().layout_no_wrap(
+            opener_text,
             egui::FontId::proportional(14.0),
             opener_color,
         );
+        let opener_width = opener_galley.size().x;
+        ui.painter().galley(
+            egui::pos2(
+                text_left + name_width + 12.0,
+                cy - opener_galley.size().y / 2.0,
+            ),
+            opener_galley,
+            opener_color,
+        );
 
-        if let Some(callout) = keypop.callout() {
+        if let Some(callout) = &callout {
+            // Right-aligned green preview, mirroring the dungeon/boss callouts.
+            let content_right = text_left + name_width + 12.0 + opener_width;
+            let preview_right = rect.right() - 10.0;
+            let avail = (preview_right - content_right - 20.0).max(0.0);
+            if avail > 24.0 {
+                let preview = Self::ellipsize_to_width(&format!("\u{1F4CB} {callout}"), avail);
+                ui.painter().text(
+                    egui::pos2(preview_right, cy),
+                    egui::Align2::RIGHT_CENTER,
+                    preview,
+                    egui::FontId::monospace(12.0),
+                    CALLOUT_PREVIEW_COLOR,
+                );
+            }
             response
                 .clone()
                 .hover_tip(format!("Click to copy: {}", callout));
         }
         ui.add_space(4.0);
         clickable && response.clicked()
+    }
+
+    /// Truncate `text` to fit `width` at the 12 px monospace preview size,
+    /// appending an ellipsis when it had to be cut.
+    fn ellipsize_to_width(text: &str, width: f32) -> String {
+        const CHAR_WIDTH: f32 = 7.2;
+        let max_chars = (width / CHAR_WIDTH).floor().max(0.0) as usize;
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+        let keep = max_chars.saturating_sub(1);
+        let mut out: String = text.chars().take(keep).collect();
+        out.push('…');
+        out
     }
 
     /// Render a special area-unlock entry: for each contribution draw the popped
@@ -4553,7 +4671,8 @@ impl LiveFeedPanel {
         unlock: &AreaUnlockEntry,
         sprite_renderer: &mut SpriteRenderer,
     ) -> bool {
-        let clickable = unlock.has_callout();
+        let callout = self.area_unlock_callout(unlock);
+        let clickable = unlock.has_thanks();
         let row_height = 32.0;
 
         let sense = if clickable {
@@ -4652,10 +4771,23 @@ impl LiveFeedPanel {
             x += popper_w + 14.0;
         }
 
-        if clickable {
+        if let Some(callout) = &callout {
+            // Right-aligned green preview, mirroring the dungeon/boss callouts.
+            let preview_right = rect.right() - 10.0;
+            let avail = (preview_right - x - 20.0).max(0.0);
+            if avail > 24.0 {
+                let preview = Self::ellipsize_to_width(&format!("\u{1F4CB} {callout}"), avail);
+                ui.painter().text(
+                    egui::pos2(preview_right, cy),
+                    egui::Align2::RIGHT_CENTER,
+                    preview,
+                    egui::FontId::monospace(12.0),
+                    CALLOUT_PREVIEW_COLOR,
+                );
+            }
             response
                 .clone()
-                .hover_tip(format!("Click to copy: {}", unlock.callout()));
+                .hover_tip(format!("Click to copy: {}", callout));
         }
         ui.add_space(4.0);
         clickable && response.clicked()
@@ -6036,6 +6168,7 @@ fn draw_chain_link(ui: &mut Ui, dim: bool) {
 mod tests {
     use super::*;
     use realmhound_core::settings::NexusMarker;
+    use realmhound_core::thanks::AreaUnlockKind;
 
     fn combined_variant(
         mark_id: i32,
@@ -6238,9 +6371,115 @@ mod tests {
         assert_eq!(entry.dungeon_name, "Snake Pit");
         assert_eq!(entry.key_id, 1234);
         assert_eq!(
-            entry.callout(),
+            entry.callout(&panel.key_pop_thanks),
             Some("Thanks Alice for the key!".to_string())
         );
+    }
+
+    fn newest_area_unlock(panel: &LiveFeedPanel) -> &AreaUnlockEntry {
+        panel
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                FeedEntry::AreaUnlock(unlock) => Some(unlock),
+                _ => None,
+            })
+            .expect("area unlock entry present")
+    }
+
+    #[test]
+    fn key_pop_uses_the_custom_thanks_template() {
+        let mut panel = LiveFeedPanel::new();
+        panel.key_pop_thanks = "Ty [Name]!".to_string();
+        panel.push_key_pop(1234, "Snake Pit".to_string(), "Alice".to_string(), true);
+        let entry = panel
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                FeedEntry::KeyPop(k) => Some(k),
+                _ => None,
+            })
+            .expect("key pop entry present");
+        assert_eq!(
+            entry.callout(&panel.key_pop_thanks),
+            Some("Ty Alice!".to_string())
+        );
+    }
+
+    #[test]
+    fn area_unlock_uses_the_custom_thanks_templates() {
+        let mut panel = LiveFeedPanel::new();
+        panel.area_unlock_inc_thanks = "Cheers [Name]!".to_string();
+        panel.push_area_unlock(
+            "Wine Cellar unlocked".to_string(),
+            AreaUnlockKind::Inc,
+            vec![(1, "Alice".to_string())],
+            vec![(String::new(), "Alice".to_string())],
+        );
+        assert_eq!(
+            newest_area_unlock(&panel).callout(&panel.area_unlock_thanks()),
+            Some("Cheers Alice!".to_string())
+        );
+    }
+
+    #[test]
+    fn area_unlock_defaults_keep_the_shipped_messages() {
+        let mut panel = LiveFeedPanel::new();
+        panel.push_area_unlock(
+            "Sanctuary runes".to_string(),
+            AreaUnlockKind::Runes,
+            vec![(1, "Greenmun".to_string())],
+            vec![("sword".to_string(), "Greenmun".to_string())],
+        );
+        assert_eq!(
+            newest_area_unlock(&panel).callout(&panel.area_unlock_thanks()),
+            Some("Thanks Greenmun for the sword rune!".to_string())
+        );
+    }
+
+    #[test]
+    fn area_unlock_without_non_local_poppers_has_no_thanks() {
+        let mut panel = LiveFeedPanel::new();
+        panel.push_area_unlock(
+            "The Void unlocked".to_string(),
+            AreaUnlockKind::Vial,
+            vec![(1, "Lovens".to_string())],
+            Vec::new(),
+        );
+        let unlock = newest_area_unlock(&panel);
+        assert!(!unlock.has_thanks());
+        assert_eq!(unlock.callout(&panel.area_unlock_thanks()), None);
+    }
+
+    #[test]
+    fn auto_clipboard_area_unlock_thanks_copies_once_when_enabled() {
+        let mut panel = LiveFeedPanel::new();
+        panel.auto_clipboard_area_unlock_thanks = true;
+        panel.push_area_unlock(
+            "Wine Cellar unlocked".to_string(),
+            AreaUnlockKind::Inc,
+            vec![(1, "Alice".to_string())],
+            vec![(String::new(), "Alice".to_string())],
+        );
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::Copy(
+                "Thanks Alice for the inc!".to_string()
+            ))
+        );
+        assert_eq!(panel.poll_clipboard(), None);
+    }
+
+    #[test]
+    fn auto_clipboard_area_unlock_thanks_is_off_by_default() {
+        let mut panel = LiveFeedPanel::new();
+        panel.push_area_unlock(
+            "Wine Cellar unlocked".to_string(),
+            AreaUnlockKind::Inc,
+            vec![(1, "Alice".to_string())],
+            vec![(String::new(), "Alice".to_string())],
+        );
+        assert_eq!(panel.poll_clipboard(), None);
     }
 
     #[test]

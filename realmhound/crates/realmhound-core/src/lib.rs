@@ -59,6 +59,7 @@ pub mod settings;
 pub mod stats;
 pub mod storage;
 pub mod stream;
+pub mod thanks;
 pub mod update;
 pub mod vault;
 pub mod watchlist;

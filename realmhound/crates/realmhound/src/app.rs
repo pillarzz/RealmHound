@@ -1791,11 +1791,12 @@ impl RealmHoundApp {
             }
             UiPayload::AreaUnlock {
                 title,
+                kind,
                 contributions,
-                callout,
+                thanks,
             } => {
                 self.live_feed_panel
-                    .push_area_unlock(title, contributions, callout);
+                    .push_area_unlock(title, kind, contributions, thanks);
             }
             UiPayload::PartyLocalLeaderStatus(is_leader) => {
                 self.party_panel.set_local_leader(is_leader);
@@ -3619,8 +3620,153 @@ impl RealmHoundApp {
         ui.add_space(6.0);
     }
 
-    /// The sample dungeon callout the Live Feed settings would copy, for the
-    /// preview block.
+    /// Render a custom "thank you" template editor: editable text segments
+    /// around fixed, non-removable placeholder pills. Returns true when the
+    /// template changed.
+    fn render_thanks_template(
+        ui: &mut egui::Ui,
+        shadcn: &crate::shadcn_ui::Shadcn,
+        id: &str,
+        label: &str,
+        template: &mut String,
+        default: &str,
+        tokens: &[&str],
+    ) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).strong());
+            if ui
+                .small_button("Reset")
+                .on_hover_text("Restore the default message")
+                .clicked()
+            {
+                *template = default.to_string();
+                changed = true;
+            }
+        });
+
+        // Fall back to the default when a hand-edited settings file lost a
+        // placeholder; the stored template is repaired on the next edit.
+        let source = if tokens.iter().all(|token| template.contains(token)) {
+            template.clone()
+        } else {
+            default.to_string()
+        };
+        let mut segments: Vec<String> = realmhound_core::thanks::split_segments(&source, tokens)
+            .expect("the default template contains every placeholder")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let budget = realmhound_core::thanks::editable_budget(tokens);
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let pills = tokens.len() as f32;
+            let field_w =
+                ((ui.available_width() - pills * 64.0 - 80.0) / segments.len() as f32).max(50.0);
+            for idx in 0..segments.len() {
+                if idx > 0 {
+                    Self::render_token_pill(ui, shadcn, tokens[idx - 1]);
+                }
+                let used_by_others: usize = segments
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != idx)
+                    .map(|(_, segment)| segment.chars().count())
+                    .sum();
+                let limit = budget.saturating_sub(used_by_others);
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut segments[idx])
+                            .id_source((id, idx))
+                            .char_limit(limit)
+                            .desired_width(field_w),
+                    )
+                    .changed();
+            }
+            let editable: usize = segments.iter().map(|s| s.chars().count()).sum();
+            let used = realmhound_core::thanks::worst_case_len(editable, tokens);
+            let mut counter = RichText::new(format!(
+                "{used}/{}",
+                realmhound_core::thanks::MAX_MESSAGE_LEN
+            ))
+            .weak()
+            .small();
+            if used > realmhound_core::thanks::MAX_MESSAGE_LEN {
+                counter = counter.color(Color32::from_rgb(235, 90, 90));
+            }
+            ui.label(counter).on_hover_text(
+                "Counts the longest possible player names and rune type, so the copied \
+                 message always fits 128 characters.",
+            );
+        });
+
+        if changed {
+            let mut rebuilt = String::new();
+            for (idx, segment) in segments.iter().enumerate() {
+                if idx > 0 {
+                    rebuilt.push_str(tokens[idx - 1]);
+                }
+                rebuilt.push_str(segment);
+            }
+            *template = rebuilt;
+        }
+
+        Self::render_preview(ui, std::slice::from_ref(&*template));
+        changed
+    }
+
+    /// A non-editable placeholder chip inside a custom "thank you" template.
+    fn render_token_pill(ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn, token: &str) {
+        let palette = shadcn.colors();
+        egui::Frame::NONE
+            .fill(palette.secondary)
+            .stroke(egui::Stroke::new(1.0_f32, palette.border))
+            .corner_radius(4)
+            .inner_margin(egui::Margin::symmetric(6, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(token)
+                        .monospace()
+                        .size(12.0)
+                        .color(palette.secondary_foreground),
+                );
+            });
+    }
+
+    /// The responsibility notice shown next to the custom "thank you" editors.
+    /// Uses the same warning yellow as the Live Feed's warning text; egui has no
+    /// bold face, so the ownership word gets a brighter shade of that yellow.
+    fn render_thanks_notice(ui: &mut egui::Ui) {
+        use egui::text::{LayoutJob, TextFormat};
+
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        let warning = Color32::from_rgb(220, 190, 90);
+        let emphasis = Color32::from_rgb(245, 215, 115);
+        let format = |color| TextFormat {
+            font_id: font.clone(),
+            color,
+            ..Default::default()
+        };
+
+        let mut job = LayoutJob::default();
+        job.append("\u{26A0}\u{FE0F} ", 0.0, format(warning));
+        job.append(
+            "Follow the game's Terms of Service when customizing these messages. RealmHound \
+             only prepares the text ahead of time; responsibility for what you send stays ",
+            0.0,
+            format(warning),
+        );
+        job.append("yours", 0.0, format(emphasis));
+        job.append(
+            ". Profanity or insults can get your account suspended regardless of the tools used.",
+            0.0,
+            format(warning),
+        );
+        ui.label(job);
+    }
+
     fn dungeon_callout_preview(current: &realmhound_core::settings::LiveFeedSettings) -> String {
         let params = crate::panels::dungeon_callout::DungeonCalloutParams {
             name_style: current.dungeon_name_style,
@@ -3723,8 +3869,8 @@ impl RealmHoundApp {
                 settings_changed |= shadcn
                     .switch(ui, &mut current.show_key_pops, "Key pops")
                     .hover_tip(
-                        "Show nearby players popping dungeon keys. Click an entry to copy a \
-                     \"Thanks <name> for the key!\" callout.",
+                        "Show nearby players popping dungeon keys. Set up the custom 'Thank you' \
+                     message that can be copied to your clipboard.",
                     )
                     .changed();
                 if current.show_key_pops {
@@ -3773,8 +3919,8 @@ impl RealmHoundApp {
                 .switch(ui, &mut current.show_area_unlocks, "Area unlocks")
                 .hover_tip(
                     "Show when nearby players pop area unlocks (Wine Cellar Incantation, Vial of \
-                     Pure Darkness, Lost Halls rune monuments). Click an entry to copy a \
-                     \"Thanks ...\" callout.",
+                     Pure Darkness, Lost Halls rune monuments). Set up the custom 'Thank you' \
+                     message that can be copied to your clipboard.",
                 )
                 .changed();
                 ui.add_space(4.0);
@@ -3796,6 +3942,93 @@ impl RealmHoundApp {
             });
 
             ui.add_space(12.0);
+
+            if current.show_key_pops || current.show_area_unlocks {
+                shadcn.card(ui, "lf_thanks", "Custom gratitude messages", |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Set up the custom gratitude messages that Key pops and Area unlocks \
+                             copy to your clipboard.",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
+                    Self::render_thanks_notice(ui);
+                    ui.add_space(8.0);
+
+                    if current.show_key_pops {
+                        settings_changed |= Self::render_thanks_template(
+                            ui,
+                            shadcn,
+                            "lf_key_pop_thanks",
+                            "Key pop gratitude message",
+                            &mut current.key_pop_thanks,
+                            realmhound_core::thanks::DEFAULT_KEY_POP,
+                            &[realmhound_core::thanks::NAME_TOKEN],
+                        );
+                    }
+
+                    if current.show_area_unlocks {
+                        if current.show_key_pops {
+                            ui.add_space(10.0);
+                        }
+                        settings_changed |= Self::render_thanks_template(
+                            ui,
+                            shadcn,
+                            "lf_inc_thanks",
+                            "Wine Cellar Incantation gratitude message",
+                            &mut current.area_unlock_inc_thanks,
+                            realmhound_core::thanks::DEFAULT_INC,
+                            &[realmhound_core::thanks::NAME_TOKEN],
+                        );
+                        ui.add_space(8.0);
+                        settings_changed |= Self::render_thanks_template(
+                            ui,
+                            shadcn,
+                            "lf_runes_thanks",
+                            "Oryx's Sanctuary Runes gratitude message",
+                            &mut current.area_unlock_runes_thanks,
+                            realmhound_core::thanks::DEFAULT_RUNES,
+                            &[
+                                realmhound_core::thanks::NAMES_TOKEN,
+                                realmhound_core::thanks::RUNE_TOKEN,
+                            ],
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Reserves room for up to three 15-character names and the rune \
+                                 type, so the copied message always fits 128 characters.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        ui.add_space(8.0);
+                        settings_changed |= Self::render_thanks_template(
+                            ui,
+                            shadcn,
+                            "lf_vial_thanks",
+                            "Vial of Pure Darkness gratitude message",
+                            &mut current.area_unlock_vial_thanks,
+                            realmhound_core::thanks::DEFAULT_VIAL,
+                            &[realmhound_core::thanks::NAME_TOKEN],
+                        );
+                        ui.add_space(10.0);
+                        settings_changed |= shadcn
+                            .switch(
+                                ui,
+                                &mut current.auto_clipboard_area_unlock_thanks,
+                                "Auto-clipboard Area unlocks gratitude messages",
+                            )
+                            .hover_tip(
+                                "Copy the area unlock gratitude message to the clipboard \
+                                 automatically when someone unlocks an area for you. Off by default.",
+                            )
+                            .changed();
+                    }
+                });
+
+                ui.add_space(12.0);
+            }
 
             shadcn.card(ui, "lf_warnings", "Warnings", |ui| {
                 settings_changed |= shadcn

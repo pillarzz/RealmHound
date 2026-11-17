@@ -20,6 +20,7 @@ use realmhound_core::{
     session::MainAccountStatus,
     settings::{CombatHistorySettings, LootTrackingSettings},
     stream::CaptureHealth,
+    thanks::AreaUnlockKind,
     vault::{AccountData, LiveVaultData},
     GameEvent,
 };
@@ -103,11 +104,14 @@ pub enum UiPayload {
     /// (Wine Cellar Incantation, Vial of Pure Darkness) and the combined Lost
     /// Halls Rune monuments (shown on Oryx's Sanctuary entry). `contributions`
     /// pairs each popped item's object id (for the sprite) with its popper name;
-    /// `callout` is the ready-to-copy "Thanks ..." clipboard string.
+    /// `thanks` carries the non-local contributors as `(rune type, popper)` (the
+    /// rune type is empty for single-item pops) so the panel can assemble the
+    /// current custom "thank you" message at render time.
     AreaUnlock {
         title: String,
+        kind: AreaUnlockKind,
         contributions: Vec<(i32, String)>,
-        callout: String,
+        thanks: Vec<(String, String)>,
     },
 
     /// Whether the local player is currently the party leader.

@@ -168,7 +168,7 @@ RealmHound/
 
 ## Legal Disclaimer
 
-This tool is for educational and personal use only. It passively captures network traffic and does not modify game data or inject packets. Use at your own risk and in accordance with the game's Terms of Service.
+This tool is for educational and personal use only. It passively captures network traffic and does not modify game data or inject packets. Use at your own risk and in accordance with the game's Terms of Service. Custom messages configured in RealmHound are authored and sent by you; profanity or insults can get your account suspended regardless of the tools used to prepare them.
 
 ## License
 

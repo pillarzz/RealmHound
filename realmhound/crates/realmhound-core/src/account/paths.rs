@@ -78,11 +78,6 @@ impl AccountPaths {
         self.resolve(Path::new("logs").join("chat"))
     }
 
-    /// Return the per-account event notification log.
-    pub fn event_notifications(&self) -> Result<PathBuf, StorageError> {
-        self.resolve(Path::new("logs").join("event_notifications.csv"))
-    }
-
     /// Return the per-account watchlist detection log.
     pub fn watchlist_detections(&self) -> Result<PathBuf, StorageError> {
         self.resolve(Path::new("logs").join("watchlist_detections.log"))
@@ -213,7 +208,6 @@ mod tests {
             paths.combat_database().unwrap(),
             paths.realmshark_import().unwrap(),
             paths.chat_logs().unwrap(),
-            paths.event_notifications().unwrap(),
             paths.watchlist_detections().unwrap(),
             paths.api_diagnostics().unwrap(),
         ];
@@ -229,7 +223,6 @@ mod tests {
                 .join("realmshark")
                 .join("dungeon.stats"),
             profile_root.join("logs").join("chat"),
-            profile_root.join("logs").join("event_notifications.csv"),
             profile_root.join("logs").join("watchlist_detections.log"),
             profile_root.join("diagnostics").join("api"),
         ];

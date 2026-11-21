@@ -8,6 +8,12 @@ pub const PKG_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 const PROJECT_LICENSE: &str = include_str!("../../../../LICENSE");
 const THIRD_PARTY_LICENSES: &str = include_str!("../../../../THIRD-PARTY-LICENSES.md");
 
+/// The embedded font stack. Segoe UI Symbol is layered on top at startup where
+/// it exists (Windows only), so these two are all every platform is guaranteed:
+/// a glyph outside them renders as a tofu box on macOS and Linux.
+pub(crate) const NOTO_SANS: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
+pub(crate) const NOTO_EMOJI: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+
 use crate::audio::{AudioHandle, AudioSender};
 use crate::capture_manager::CaptureManager;
 use crate::modals::{ModalState, SettingsCategory};
@@ -26,9 +32,10 @@ use crate::panels::update::UpdatePanel;
 use crate::panels::vault::VaultPanel;
 use crate::panels::{ActiveTab, AppAction, Panel, PanelContext};
 use crate::processing::contract::relaunch_preflight;
+use crate::processing::health::CaptureState;
 use crate::processing::{
-    spawn_worker, AccountOperationScope, AudioCommand, ControlMsg, PacketProcessor, UiPayload,
-    UiUpdate, ViewState, WorkerHandle,
+    spawn_worker, AccountOperationScope, AudioCommand, ControlMsg, HealthMonitor, PacketProcessor,
+    UiPayload, UiUpdate, ViewState, WorkerHandle,
 };
 use crate::rendering::{EmbeddedIcon, SpriteRenderer};
 use crate::sound::{custom_sounds_dir, SoundType};
@@ -49,13 +56,13 @@ use realmhound_core::{
     update::SelfUpdater,
     update::UpdateChecker,
     vault::{AccountData, LiveVaultData},
-    GameSession, Settings,
+    Settings,
 };
 use std::fs;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 #[cfg(feature = "latency-diagnostics")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 // MainAccountStatus is now in realmhound_core::session
 
@@ -531,104 +538,6 @@ impl OperationGenerations {
     }
 }
 
-#[cfg(feature = "latency-diagnostics")]
-#[derive(Default)]
-struct UiHealth {
-    started: Option<Instant>,
-    updates: u64,
-    capped_drain_frames: u64,
-    peak_oldest_wait: Duration,
-    peak_remaining: usize,
-    peak_frame_gap: Duration,
-}
-
-#[cfg(feature = "latency-diagnostics")]
-struct UiHealthSummary {
-    window: Duration,
-    updates: u64,
-    capped_drain_frames: u64,
-    peak_oldest_wait: Duration,
-    peak_remaining: usize,
-    peak_frame_gap: Duration,
-}
-
-#[cfg(feature = "latency-diagnostics")]
-impl UiHealth {
-    fn record(
-        &mut self,
-        now: Instant,
-        updates: usize,
-        capped: bool,
-        oldest_wait: Duration,
-        remaining: usize,
-        frame_gap: Duration,
-    ) -> Option<UiHealthSummary> {
-        if updates == 0 {
-            return None;
-        }
-        let started = *self.started.get_or_insert(now);
-        self.updates = self.updates.saturating_add(updates as u64);
-        self.capped_drain_frames = self.capped_drain_frames.saturating_add(u64::from(capped));
-        self.peak_oldest_wait = self.peak_oldest_wait.max(oldest_wait);
-        self.peak_remaining = self.peak_remaining.max(remaining);
-        self.peak_frame_gap = self.peak_frame_gap.max(frame_gap);
-        let window = now.duration_since(started);
-        if window < Duration::from_secs(30) {
-            return None;
-        }
-        let summary = UiHealthSummary {
-            window,
-            updates: self.updates,
-            capped_drain_frames: self.capped_drain_frames,
-            peak_oldest_wait: self.peak_oldest_wait,
-            peak_remaining: self.peak_remaining,
-            peak_frame_gap: self.peak_frame_gap,
-        };
-        *self = Self::default();
-        Some(summary)
-    }
-}
-
-#[cfg(all(test, feature = "latency-diagnostics"))]
-mod ui_health_tests {
-    use super::*;
-
-    #[test]
-    fn ui_health_requires_updates_and_resets_after_actual_window() {
-        let now = Instant::now();
-        let mut health = UiHealth::default();
-        assert!(health
-            .record(now, 0, false, Duration::ZERO, 0, Duration::ZERO)
-            .is_none());
-        assert!(health
-            .record(
-                now,
-                3,
-                false,
-                Duration::from_millis(20),
-                2,
-                Duration::from_millis(16),
-            )
-            .is_none());
-        let summary = health
-            .record(
-                now + Duration::from_secs(34),
-                4,
-                true,
-                Duration::from_millis(40),
-                5,
-                Duration::from_millis(80),
-            )
-            .unwrap();
-        assert_eq!(summary.window, Duration::from_secs(34));
-        assert_eq!(summary.updates, 7);
-        assert_eq!(summary.capped_drain_frames, 1);
-        assert_eq!(summary.peak_remaining, 5);
-        assert_eq!(summary.peak_frame_gap, Duration::from_millis(80));
-        assert!(health.started.is_none());
-    }
-}
-
 /// Main application state.
 pub struct RealmHoundApp {
     /// Packet capture lifecycle manager
@@ -636,6 +545,8 @@ pub struct RealmHoundApp {
     /// Whether raw packets are being written to a `.rhcap` file (Debug settings).
     record_raw_packets: bool,
     maintenance_ui_frames: u8,
+    /// Last live-demand flag sent to the worker (`None` until the first frame).
+    live_demand: Option<bool>,
     /// Debug "App resolution" width input (pixels, as typed).
     debug_window_width: String,
     /// Debug "App resolution" height input (pixels, as typed).
@@ -675,30 +586,39 @@ pub struct RealmHoundApp {
     missions_panel: crate::panels::missions::MissionsPanel,
     /// Captured access token from HELLO packet (for API calls)
     captured_access_token: Option<String>,
-    /// Time the current access token was captured (if known). Set to now on a
-    /// fresh live capture; loaded from disk otherwise so a deferred persist keeps
-    /// the real capture time.
+    /// Time the current access token was captured (if known), from the worker's
+    /// snapshot so a stalled UI cannot renew it.
     token_captured_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Whether we've already fetched exalt stats (only do once per app session)
-    exalts_fetched: bool,
+    /// Last applied token generation.
+    owned_token_gen: u64,
+    /// Last applied worker-owned party revision.
+    owned_party_rev: u64,
+    /// Last applied worker-owned encounter revision.
+    owned_encounter_rev: u64,
+    /// Last applied worker-owned quest revision.
+    owned_quest_rev: u64,
+    /// Last applied worker-owned recoverable Live Feed revision.
+    owned_live_event_rev: u64,
+    owned_live_event_seq: u64,
+    owned_feed_rev: u64,
+    owned_feed_seq: u64,
     /// Handle to the packet-processing worker thread (owns the model: session,
     /// reassembler, router, loot tracker, account/vault data).
     worker: WorkerHandle,
-    /// Active-tab signal shared with the worker so it only wakes the UI for
-    /// updates the current tab (or a global widget) displays. Written at the end
-    /// of each frame to reflect the tab actually rendered.
-    active_tab_signal: Arc<AtomicU8>,
+    /// The floating Live Combat / Live Loot overlay windows drawn over the game client.
+    overlays: crate::overlay::OverlayManager,
+    /// Owned snapshot of every boss fight of the current map instance,
+    /// refreshed from the worker each frame and rendered by the Live Combat overlay.
+    live_fights: Vec<Arc<realmhound_core::combat::LiveFightSnapshot>>,
     /// Audio thread handle (owns the `!Send` `SoundEngine`). Kept alive so the
     /// thread isn't torn down; dropped on app exit.
     audio: AudioHandle,
     /// Sender for audio commands (volume slider, test button).
     audio_tx: AudioSender,
-    #[cfg(feature = "latency-diagnostics")]
-    latency_last_frame: Instant,
+    /// Always-on UI pipeline health (frame gap, drains, queue, capture).
+    health: HealthMonitor,
     #[cfg(feature = "latency-diagnostics")]
     latency_last_ui_warn: Option<Instant>,
-    #[cfg(feature = "latency-diagnostics")]
-    latency_ui_health: UiHealth,
     /// Owned snapshot of the worker model, refreshed each frame from the shared
     /// snapshot. Panels read from these (the worker is the source of truth).
     account_data: AccountData,
@@ -742,7 +662,6 @@ pub struct RealmHoundApp {
     client_launch_unix: i64,
     /// A default session passed to transient panels' `handle_event` (they ignore
     /// it; the worker owns the real session).
-    event_session: GameSession,
     /// Sprite renderer for item icons (shared across panels)
     sprite_renderer: SpriteRenderer,
     /// Per-section autocomplete state for the realm-event boss picker,
@@ -888,6 +807,54 @@ struct WidgetChipCtx {
 // PendingCreate is now in realmhound_core::session
 // SettingsCategory and ModalState are in modal_state.rs
 
+/// Install the bundled UI fonts and their glyph fallbacks.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    fonts.font_data.insert(
+        "NotoSans".to_owned(),
+        egui::FontData::from_static(NOTO_SANS).into(),
+    );
+    fonts.font_data.insert(
+        "NotoEmoji".to_owned(),
+        egui::FontData::from_static(NOTO_EMOJI).into(),
+    );
+
+    // Noto Sans has no arrows or geometric glyphs; egui's monospace face does.
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "NotoSans".to_owned());
+        family.push("Hack".to_owned());
+        family.push("NotoEmoji".to_owned());
+    }
+
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        family.push("NotoEmoji".to_owned());
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod font_tests {
+    /// Every symbol the UI puts in a label must resolve to one of the loaded
+    /// fonts, or it renders as tofu.
+    #[test]
+    fn ui_symbols_have_a_font() {
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+
+        let required = "←↑→↓▼▲◆▤×✔📋⚠⚔🔄✅❌🔔⚡⏳🔊💀•ℹ✖⟳▾●";
+        let font_id = egui::FontId::proportional(14.0);
+        let missing: Vec<char> = required
+            .chars()
+            .filter(|&c| !ctx.fonts_mut(|fonts| fonts.has_glyph(&font_id, c)))
+            .collect();
+
+        assert!(missing.is_empty(), "missing glyphs: {missing:?}");
+    }
+}
+
 impl RealmHoundApp {
     /// Open the selected profile's read-only history connections.
     ///
@@ -918,55 +885,7 @@ impl RealmHoundApp {
     ) -> Result<Self, AppStartError> {
         // Set dark theme
         egui_ctx.set_visuals(Self::dark_visuals());
-
-        // Configure custom fonts with emoji support
-        let mut fonts = egui::FontDefinitions::default();
-
-        // Add Noto Sans as the primary font
-        fonts.font_data.insert(
-            "NotoSans".to_owned(),
-            egui::FontData::from_static(include_bytes!("../assets/NotoSans-Regular.ttf")).into(),
-        );
-
-        // Add Noto Emoji for emoji support
-        fonts.font_data.insert(
-            "NotoEmoji".to_owned(),
-            egui::FontData::from_static(include_bytes!("../assets/NotoEmoji-Regular.ttf")).into(),
-        );
-
-        // Try to load Segoe UI Symbol from Windows system fonts for arrows/symbols
-        // This is legal - we're using the system font, not redistributing it
-        let segoe_symbol_loaded =
-            if let Ok(font_data) = fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
-                fonts.font_data.insert(
-                    "SegoeUISymbol".to_owned(),
-                    egui::FontData::from_owned(font_data).into(),
-                );
-                tracing::info!("[FONTS] Loaded Segoe UI Symbol from system fonts");
-                true
-            } else {
-                tracing::warn!("[FONTS] Segoe UI Symbol not found, some symbols may not display");
-                false
-            };
-
-        // Set Noto Sans as the primary proportional font, with symbols and emoji as fallback
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            family.insert(0, "NotoSans".to_owned());
-            if segoe_symbol_loaded {
-                family.push("SegoeUISymbol".to_owned());
-            }
-            family.push("NotoEmoji".to_owned());
-        }
-
-        // Also add symbols and emoji support to monospace family as fallback
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            if segoe_symbol_loaded {
-                family.push("SegoeUISymbol".to_owned());
-            }
-            family.push("NotoEmoji".to_owned());
-        }
-
-        egui_ctx.set_fonts(fonts);
+        install_fonts(egui_ctx);
 
         // Initialize assets (extracts from game if needed)
         match get_asset_manager().initialize(Some(&settings)) {
@@ -1122,12 +1041,12 @@ impl RealmHoundApp {
         // context (and its lock) but processes and persists nothing until it is
         // activated. Creating the thread must succeed before any launch metadata
         // is recorded, so a spawn failure counts no launch.
-        let active_tab_signal = Arc::new(AtomicU8::new(ActiveTab::LiveFeed as u8));
+        let overlays = crate::overlay::OverlayManager::new();
         let worker = spawn_worker(
             processor,
             egui_ctx.clone(),
             audio_tx.clone(),
-            active_tab_signal.clone(),
+            overlays.live_combat_signal(),
             account.clone(),
         )
         .map_err(|e| AppStartError::Worker(e.to_string()))?;
@@ -1158,18 +1077,20 @@ impl RealmHoundApp {
             let snap = worker.snapshot.lock().unwrap();
             (
                 snap.view.clone(),
-                snap.account_data.clone(),
-                snap.live_vault_data.clone(),
+                (*snap.account_data).clone(),
+                (*snap.live_vault_data).clone(),
                 snap.live_char_id,
             )
         };
 
         let captured_access_token = None;
         let token_captured_at = None;
+        let health = HealthMonitor::new(worker.health.clone());
 
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
             maintenance_ui_frames: 0,
+            live_demand: None,
             // Honour the REALMHOUND_RECORD env var so the Debug toggle reflects
             // any recording already started at capture start.
             record_raw_packets: std::env::var("REALMHOUND_RECORD")
@@ -1207,17 +1128,22 @@ impl RealmHoundApp {
             missions_panel,
             captured_access_token,
             token_captured_at,
-            exalts_fetched: false,
+            owned_token_gen: 0,
+            owned_party_rev: 0,
+            owned_encounter_rev: 0,
+            owned_quest_rev: 0,
+            owned_live_event_rev: 0,
+            owned_live_event_seq: 0,
+            owned_feed_rev: 0,
+            owned_feed_seq: 0,
             worker,
-            active_tab_signal,
+            overlays,
+            live_fights: Vec::new(),
+            health,
             audio,
             audio_tx,
             #[cfg(feature = "latency-diagnostics")]
-            latency_last_frame: Instant::now(),
-            #[cfg(feature = "latency-diagnostics")]
             latency_last_ui_warn: None,
-            #[cfg(feature = "latency-diagnostics")]
-            latency_ui_health: UiHealth::default(),
             account_data: init_account,
             live_vault_data: init_vault,
             live_char_id: init_live_char,
@@ -1236,7 +1162,6 @@ impl RealmHoundApp {
             account,
             account_op_generations: OperationGenerations::default(),
             client_launch_unix,
-            event_session: GameSession::new(),
             sprite_renderer: SpriteRenderer::new(),
             event_pickers: std::collections::HashMap::new(),
             expanded_chat_alert: None,
@@ -1322,6 +1247,13 @@ impl RealmHoundApp {
     fn update_window_state(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
             let viewport = i.viewport();
+
+            // Windows parks a minimized window near -32000 and reports it as
+            // not maximized; persisting either would poison the next launch.
+            if viewport.minimized == Some(true) {
+                return;
+            }
+
             let mut settings = match self.settings.write() {
                 Ok(s) => s,
                 Err(_) => return,
@@ -1532,15 +1464,8 @@ impl RealmHoundApp {
     ///
     /// Returns `true` if the per-frame cap was hit (more may remain), so the
     /// caller can request another repaint to keep draining.
-    fn drain_ui_updates(&mut self, ctx: &egui::Context) -> bool {
-        #[cfg(feature = "latency-diagnostics")]
+    fn drain_ui_updates(&mut self, _ctx: &egui::Context) -> bool {
         let frame_started = Instant::now();
-        #[cfg(feature = "latency-diagnostics")]
-        let frame_gap = frame_started.duration_since(self.latency_last_frame);
-        #[cfg(feature = "latency-diagnostics")]
-        {
-            self.latency_last_frame = frame_started;
-        }
         #[cfg(feature = "latency-diagnostics")]
         let mut oldest_wait = Duration::ZERO;
 
@@ -1560,8 +1485,15 @@ impl RealmHoundApp {
                 None => break,
             }
         }
-        #[cfg(feature = "latency-diagnostics")]
-        let remaining = self.worker.ui_rx.len();
+        let queue_depth = self.worker.ui_rx.len();
+        let queue_drops = self.worker.ui_rx.dropped();
+        let summary = self.health.record_frame(
+            frame_started,
+            applied,
+            applied == 4096,
+            queue_depth,
+            queue_drops,
+        );
         #[cfg(feature = "latency-diagnostics")]
         if oldest_wait >= Duration::from_millis(500)
             && self
@@ -1582,230 +1514,56 @@ impl RealmHoundApp {
                 "[LATENCY][UI] oldest_queued_ms={} queue_remaining={} frame_gap_ms={} \
                  active_tab={} viewport_focused={} viewport_minimized={}",
                 oldest_wait.as_millis(),
-                remaining,
-                frame_gap.as_millis(),
+                queue_depth,
+                self.health.last_frame_gap().as_millis(),
                 self.active_tab.name(),
                 focused,
                 minimized
             );
         }
-        #[cfg(feature = "latency-diagnostics")]
-        if let Some(health) = self.latency_ui_health.record(
-            frame_started,
-            applied,
-            applied == 4096,
-            oldest_wait,
-            remaining,
-            frame_gap,
-        ) {
+        if let Some(summary) = summary {
             let (focused, minimized) = _ctx.input(|input| {
                 (
                     input.viewport().focused.unwrap_or(false),
                     input.viewport().minimized,
                 )
             });
-            let minimized = minimized
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            tracing::info!(
-                "[LATENCY][UI] health window_ms={} updates={} capped_drain_frames={} \
-                 peak_oldest_queued_ms={} peak_queue_remaining={} peak_frame_gap_ms={} \
-                 active_tab_at_emit={} viewport_focused={} viewport_minimized={}",
-                health.window.as_millis(),
-                health.updates,
-                health.capped_drain_frames,
-                health.peak_oldest_wait.as_millis(),
-                health.peak_remaining,
-                health.peak_frame_gap.as_millis(),
-                self.active_tab.name(),
-                focused,
-                minimized
-            );
+            summary.emit(self.active_tab.name(), focused, minimized);
         }
-        // The Live Feed panel decides when its automatic dungeon callout has to
-        // be copied or cleared, but it only runs while its tab is open. The
-        // clipboard write therefore happens here, every frame.
-        if let Some(write) = self.live_feed_panel.poll_clipboard() {
-            match write {
-                crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
-                crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
-                    // Checked and cleared in one clipboard session, so anything
-                    // the user copies meanwhile cannot be caught in between.
-                    crate::clipboard::clear_if_ours(&copied);
-                }
-            }
-        }
-
         applied == 4096
     }
 
     /// Apply a single processor [`UiUpdate`] to the UI panels.
     fn apply_update(&mut self, update: UiUpdate) {
         match update.payload {
-            UiPayload::Broadcast(event) => {
-                // Re-broadcast to the session-independent transient panels. These
-                // panels ignore the session arg (the worker owns the real one);
-                // chat/characters are resolved by the worker as their own updates.
-                let mut actions = Vec::new();
-                {
-                    let session = &self.event_session;
-                    actions.extend(self.quest_panel.handle_event(&event, session));
-                    actions.extend(self.party_panel.handle_event(&event, session));
-                    actions.extend(self.live_feed_panel.handle_event(&event, session));
-                    actions.extend(self.vault_panel.handle_event(&event, session));
-                }
-                self.process_actions(actions);
+            UiPayload::DungeonCallout { .. } => {}
+            UiPayload::Broadcast(_) => {
+                // Every state-bearing panel is driven by the snapshot.
             }
-            UiPayload::Chat(msg) => {
-                if msg.chat_type == crate::panels::chat::ChatType::Whisper
-                    && !msg.is_outgoing
-                    && self.live_feed_panel.dm_display_enabled()
-                {
-                    if !msg.sender.is_empty() {
-                        self.live_feed_panel
-                            .push_dm(msg.sender.clone(), msg.text.clone());
-                    }
-                }
-                self.chat_panel.add_message(msg);
+            UiPayload::Chat(_) => {
+                // Chat is written worker-side; DMs come from the live-event window.
             }
-            UiPayload::BossCall { boss_id, text } => {
-                let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                self.maybe_play_realm_event(boss_id, &text, should_sound, None);
-            }
-            UiPayload::RealmDiscovery(event) => {
-                use crate::processing::realm_discovery::{
-                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE,
-                };
-
-                let notification = match &event {
-                    DiscoveryEvent::Discovered {
-                        object_id,
-                        object_type: JAILER_TYPE,
-                        notify,
-                        ..
-                    } => Some((JAILER_TYPE, "Spectral Jailer", *notify, Some(*object_id))),
-                    DiscoveryEvent::Discovered {
-                        object_type: CRYSTAL_TYPE,
-                        notify,
-                        ..
-                    }
-                    | DiscoveryEvent::CrystalMessage { notify, .. } => {
-                        Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify, None))
-                    }
-                    // Totalia has no chat announcement: her object update (sent
-                    // even far outside view) is the only trigger. Several
-                    // instances spawn together, so share one sound key to let
-                    // the audio layer coalesce them.
-                    DiscoveryEvent::Discovered {
-                        object_type: TOTALIA_TYPE,
-                        notify,
-                        ..
-                    } => Some((TOTALIA_TYPE, "Totalia the Malevolent", *notify, None)),
-                    _ => None,
-                };
-                self.live_feed_panel.apply_realm_discovery(event);
-                if let Some((boss_id, name, notify, instance_id)) = notification {
-                    self.maybe_play_realm_event(boss_id, name, notify, instance_id);
-                }
-            }
-            UiPayload::KeyperEvent { towers } => {
-                use realmhound_core::keyper::{KEYPER_BOSS_ID, KEYPER_TOWER_SPRITE_ID};
-                let (boss_id, name) = if towers {
-                    (KEYPER_TOWER_SPRITE_ID, "Keyper Towers")
-                } else {
-                    (KEYPER_BOSS_ID, "The Keyper")
-                };
-                // Route through the shared realm-event notification path so the
-                // "Seasonal and special bosses" section (The Keyper / Keyper
-                // Towers rows) drives the sound, exactly like any other boss call.
-                let should_sound = self
-                    .live_feed_panel
-                    .push_boss_call(boss_id, name.to_string());
-                self.maybe_play_realm_event(boss_id, name, should_sound, None);
-            }
-            UiPayload::RealmClosed => {
-                use crate::panels::live_feed::WarningSeverity;
-                self.live_feed_panel.force_realm_closed();
-                self.live_feed_panel.push_warning(
-                    "Realm closed!".to_string(),
-                    WarningSeverity::Orange,
-                    false,
-                );
+            UiPayload::BossCall { .. } | UiPayload::KeyperEvent { .. } => {
+                // The worker's live-event window drives these feed entries.
             }
             UiPayload::OryxLagWarning => {
-                use crate::panels::live_feed::WarningSeverity;
-                if self.live_feed_panel.is_in_dungeon() {
-                    self.live_feed_panel.push_warning(
-                        "Oryx lag incoming, careful!".to_string(),
-                        WarningSeverity::Red,
-                        true,
-                    );
-                }
-            }
-            UiPayload::SetServerName(name) => {
-                self.live_feed_panel.set_server_name(name);
-            }
-            UiPayload::DungeonTimerFrozen {
-                map_seed,
-                elapsed_ms,
-            } => {
-                self.live_feed_panel
-                    .apply_dungeon_freeze(map_seed, elapsed_ms);
+                // The worker's live-event window drives the warning entry.
             }
             UiPayload::CombatHistoryChanged => {
                 self.combat_panel.invalidate_cards();
             }
             UiPayload::PushLoot(drop) => {
-                self.live_feed_panel.push_loot(&drop);
-                // A new drop was recorded by the worker; refresh the history view.
+                // The worker's live-event window drives the feed entry; the loot
+                // overlay tally and history view still consume the drop here.
+                self.overlays.push_live_loot(&drop);
                 self.loot_panel.mark_history_dirty();
             }
             UiPayload::LootBatchAdded => {
                 self.loot_panel.invalidate_autocomplete_cache();
                 self.loot_panel.mark_history_dirty();
             }
-            UiPayload::AddEncounter {
-                object_id,
-                object_type,
-                name,
-            } => {
-                self.live_feed_panel
-                    .add_encounter(object_id, object_type, name);
-            }
-            UiPayload::RemoveEncounter(object_id) => {
-                self.live_feed_panel.remove_encounter(object_id);
-            }
-            UiPayload::PartyMemberLeft(name) => {
-                if self.party_panel.remove_member_by_name(&name) {
-                    tracing::debug!("[PARTY] Member left (via chat): {}", name);
-                }
-            }
-            UiPayload::KeyPop {
-                opener,
-                key_id,
-                dungeon_name,
-                thankable,
-            } => {
-                self.live_feed_panel
-                    .push_key_pop(key_id, dungeon_name, opener, thankable);
-            }
-            UiPayload::AreaUnlock {
-                title,
-                kind,
-                contributions,
-                thanks,
-            } => {
-                self.live_feed_panel
-                    .push_area_unlock(title, kind, contributions, thanks);
-            }
-            UiPayload::PartyLocalLeaderStatus(is_leader) => {
-                self.party_panel.set_local_leader(is_leader);
-            }
-            UiPayload::PartyLocalPlayerName(name) => {
-                self.party_panel.set_local_player_name(name);
-            }
-            UiPayload::PartyCleared => {
-                self.party_panel.clear();
+            UiPayload::KeyPop { .. } | UiPayload::AreaUnlock { .. } => {
+                // The worker's live-event window drives these feed entries.
             }
             UiPayload::UpdateVaultPetSlot {
                 pet_instance_id,
@@ -1828,39 +1586,9 @@ impl RealmHoundApp {
             } => {
                 self.vault_panel.set_active_pet(char_id, instance_id);
             }
-            UiPayload::AccessTokenCaptured(token) => {
-                // Note: we deliberately do NOT mark the client as "seen" here.
-                // A HELLO can come from a mule/alt client, whereas the safety
-                // gate is per-account; only the verified main's live
-                // character (stamped in refresh_snapshot) may unlock refresh.
-                // Only a changed token counts as a fresh capture; a repeated HELLO
-                // with the same (aging) token must not renew its lifetime.
-                let token_changed = self.captured_access_token.as_deref() != Some(token.as_str());
-                self.captured_access_token = Some(token.clone());
-                if token_changed {
-                    self.token_captured_at = Some(chrono::Utc::now());
-                    self.characters_panel.reset_on_new_token();
-                    self.vault_panel.reset_on_new_token();
-                }
-
-                // The worker releases tokens only for the verified connection.
-                // They stay in this process and are never persisted.
-
-                // Fetch exalt stats once per app session
-                if !self.exalts_fetched {
-                    self.exalts_fetched = true;
-                    let token_for_exalts = token.clone();
-                    std::thread::spawn(move || {
-                        tracing::debug!("[API] Fetching exalt stats...");
-                        let client = realmhound_core::api::RotmgApiClient::new(token_for_exalts);
-                        match client.get_power_up_stats() {
-                            Ok(xml) => {
-                                tracing::info!("[EXALTS] Loaded exalt stats ({} bytes)", xml.len())
-                            }
-                            Err(e) => tracing::warn!("[EXALTS] Failed to load: {}", e),
-                        }
-                    });
-                }
+            UiPayload::AccessTokenCaptured(_) => {
+                // Token value, capture time and binding come from the snapshot;
+                // this update is only the wake hint. Tokens are never persisted.
             }
             UiPayload::Audio(cmd) => {
                 // The worker routes audio directly to the audio thread, so this
@@ -1876,11 +1604,14 @@ impl RealmHoundApp {
     /// cloned only when their generation changed.
     fn refresh_snapshot(&mut self) {
         let snap = match self.worker.snapshot.lock() {
-            Ok(s) => s,
+            Ok(guard) => Arc::clone(&guard),
             Err(_) => return,
         };
         self.view_state = snap.view.clone();
         self.live_char_id = snap.live_char_id;
+        // Cloned unconditionally: the fight timer is time-derived, so the figures move
+        // between publications even when the roster is unchanged.
+        self.live_fights = snap.live_fights.clone();
         // Remember the last-seen live character (persisted) so the
         // Current-Character widget can restore it, dimmed, after a restart.
         if let Some(id) = self.live_char_id {
@@ -1904,19 +1635,98 @@ impl RealmHoundApp {
 
         let epoch = (snap.view.char_view_gen, snap.view.account_generation);
         if epoch != self.owned_account_epoch {
-            self.account_data = snap.account_data.clone();
+            self.account_data = (*snap.account_data).clone();
             self.owned_account_epoch = epoch;
             self.account_data_revision = self.account_data_revision.wrapping_add(1);
         }
         if snap.view.vault_view_gen != self.owned_vault_gen {
-            self.live_vault_data = snap.live_vault_data.clone();
+            self.live_vault_data = (*snap.live_vault_data).clone();
             self.owned_vault_gen = snap.view.vault_view_gen;
         }
         if snap.view.mission_view_gen != self.owned_mission_gen {
-            self.mission_view = snap.mission_view.clone();
+            self.mission_view = (*snap.mission_view).clone();
             self.owned_mission_gen = snap.view.mission_view_gen;
         }
-        drop(snap);
+        if snap.view.token_gen != self.owned_token_gen {
+            let token = snap.token.as_ref();
+            self.captured_access_token = token.map(|t| t.token.clone());
+            self.token_captured_at = token.map(|t| t.captured_at);
+            self.characters_panel.reset_on_new_token();
+            self.vault_panel.reset_on_new_token();
+            self.owned_token_gen = snap.view.token_gen;
+        }
+        if snap.view.party_rev != self.owned_party_rev {
+            self.party_panel.apply_party_view(&snap.party);
+            self.owned_party_rev = snap.view.party_rev;
+        }
+        if snap.view.encounter_rev != self.owned_encounter_rev {
+            self.live_feed_panel.apply_encounter_view(&snap.encounters);
+            self.owned_encounter_rev = snap.view.encounter_rev;
+        }
+        if snap.view.quest_rev != self.owned_quest_rev {
+            if let Some(quests) = &snap.quests {
+                self.quest_panel.update_quests(&quests.packet);
+            }
+            self.owned_quest_rev = snap.view.quest_rev;
+        }
+        let live_new = snap.view.live_event_rev != self.owned_live_event_rev;
+        let feed_new = snap.view.feed_rev != self.owned_feed_rev;
+        if feed_new {
+            self.live_feed_panel
+                .set_learned_mod_sets(snap.feed.learned_mod_sets.clone());
+        }
+        if live_new || feed_new {
+            // Replay both domains in observation order, so a recovered row sees
+            // the map context that was current when the worker saw it.
+            let mut merged: Vec<(u64, bool, usize)> = Vec::with_capacity(64);
+            if live_new {
+                for (index, entry) in snap
+                    .live_events
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.seq > self.owned_live_event_seq)
+                {
+                    merged.push((entry.seq, true, index));
+                }
+            }
+            if feed_new {
+                for (index, entry) in snap
+                    .feed
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.seq > self.owned_feed_seq)
+                {
+                    merged.push((entry.seq, false, index));
+                }
+            }
+            // One worker-owned monotonic sequence: no wall-clock ordering.
+            merged.sort_by_key(|(seq, is_live, index)| (*seq, *is_live, *index));
+            for (_, is_live, index) in merged {
+                if is_live {
+                    self.owned_live_event_seq = snap.live_events.events[index].seq;
+                    self.live_feed_panel
+                        .apply_live_event(&snap.live_events.events[index]);
+                } else {
+                    let entry = &snap.feed.events[index];
+                    if entry.seq > self.owned_feed_seq {
+                        self.live_feed_panel
+                            .apply_context_event(&entry.event, entry.at);
+                        self.owned_feed_seq = entry.seq;
+                    }
+                }
+            }
+            if live_new {
+                self.owned_live_event_rev = snap.view.live_event_rev;
+            }
+            if feed_new {
+                // Reconcile with the durable state last: the bounded history may
+                // have lost the transition that produced it.
+                self.live_feed_panel.apply_feed_current(&snap.feed.current);
+                self.owned_feed_rev = snap.view.feed_rev;
+            }
+        }
         self.maybe_confirm_client_launch(conn_changed);
     }
 
@@ -2182,10 +1992,17 @@ impl RealmHoundApp {
                                 use realmhound_core::update::SelfUpdateState;
                                 match self.self_updater.state() {
                                     SelfUpdateState::Idle => {
-                                        if shadcn
+                                        if cfg!(target_os = "linux") {
+                                            ui.label(
+                                                "Install Linux updates through your package or source build.",
+                                            );
+                                        } else if shadcn
                                             .btn(
                                                 ui,
-                                                format!("⬇ Update to v{}", manifest.latest_version),
+                                                format!(
+                                                    "⬇ Update to v{}",
+                                                    manifest.latest_version
+                                                ),
                                             )
                                             .clicked()
                                         {
@@ -2209,8 +2026,10 @@ impl RealmHoundApp {
                                         });
                                     }
                                     SelfUpdateState::ReadyToApply => {
-                                        if shadcn.btn(ui, "✓ Restart to apply update").clicked() {
-                                            self.pending_relaunch = Some(RelaunchReason::Updated);
+                                        if shadcn.btn(ui, "✔ Restart to apply update").clicked()
+                                        {
+                                            self.pending_relaunch =
+                                                Some(RelaunchReason::Updated);
                                         }
                                     }
                                     SelfUpdateState::Failed(msg) => {
@@ -2227,9 +2046,12 @@ impl RealmHoundApp {
                             }
                             UpdateState::Error(err) => {
                                 ui.label(
-                                    RichText::new(format!("Update check failed: {}", err.message))
-                                        .color(Color32::from_rgb(200, 150, 100))
-                                        .small(),
+                                    RichText::new(format!(
+                                        "Update check failed: {}",
+                                        err.message
+                                    ))
+                                    .color(Color32::from_rgb(200, 150, 100))
+                                    .small(),
                                 );
                                 ui.add_space(4.0);
                                 if shadcn.btn(ui, "Retry").clicked() {
@@ -2335,6 +2157,7 @@ impl RealmHoundApp {
                             ("taskbar", "🧭 Taskbar & Quests"),
                             ("loot", "🎒 Loot History"),
                             ("combat_history", "⚔ Combat History"),
+                            ("overlays", "🖥 Overlays"),
                             ("trophy_hall", "🏆 Trophy Hall"),
                             ("treasury", "💰 Treasury"),
                             ("party", "🎉 Party"),
@@ -2476,6 +2299,8 @@ impl RealmHoundApp {
                                                         SettingsCategory::Debug => {
                                                             self.render_debug_settings(ui, &shadcn)
                                                         }
+                                                        SettingsCategory::Overlays => self
+                                                            .render_overlay_settings(ui, &shadcn),
                                                     }
                                                 });
                                         });
@@ -3302,7 +3127,7 @@ impl RealmHoundApp {
                         .hint_text(hint)
                         .desired_width(240.0),
                 );
-                if !state.text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+                if !state.text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
                     state.text.clear();
                     state.popup_open = false;
                     state.selected = None;
@@ -4511,7 +4336,7 @@ impl RealmHoundApp {
                             {
                                 settings_changed = true;
                             }
-                            ui.label(RichText::new("\u{24d8}").weak()).on_hover_text(
+                            ui.label(RichText::new("\u{2139}").weak()).on_hover_text(
                                 "OFF disables the whole dungeon callout that has this mod",
                             );
                         });
@@ -5591,10 +5416,7 @@ impl RealmHoundApp {
 
         // Get current settings
         let mut settings_changed = false;
-        let (mut current_settings, mut log_event_notifications) = {
-            let s = self.settings.read().unwrap();
-            (s.sound.clone(), s.live_feed.log_event_notifications)
-        };
+        let mut current_settings = { self.settings.read().unwrap().sound.clone() };
 
         // Sub-tab selection is driven by the nested sidebar nav items; render
         // only the active section's content here.
@@ -5606,12 +5428,8 @@ impl RealmHoundApp {
                 settings_changed |= self.render_sound_loot_bags(ui, shadcn, &mut current_settings);
             }
             SoundSubTab::RealmBosses => {
-                settings_changed |= self.render_realm_event_sounds(
-                    ui,
-                    shadcn,
-                    &mut current_settings,
-                    &mut log_event_notifications,
-                );
+                settings_changed |=
+                    self.render_realm_event_sounds(ui, shadcn, &mut current_settings);
             }
             SoundSubTab::Enchantments => {
                 settings_changed |=
@@ -5623,7 +5441,6 @@ impl RealmHoundApp {
         if settings_changed {
             if let Ok(mut s) = self.settings.write() {
                 s.sound = current_settings;
-                s.live_feed.log_event_notifications = log_event_notifications;
                 s.save();
             }
         }
@@ -5812,7 +5629,7 @@ impl RealmHoundApp {
                             current_settings,
                         );
                         if ui
-                            .small_button("✕")
+                            .small_button("×")
                             .hover_tip("Remove trigger alert")
                             .clicked()
                         {
@@ -6588,7 +6405,7 @@ impl RealmHoundApp {
                     .hint_text("Type or select an enchant name…")
                     .desired_width(220.0),
             );
-            if !state.text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+            if !state.text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
                 state.text.clear();
                 state.popup_open = false;
                 state.selected = None;
@@ -6715,7 +6532,6 @@ impl RealmHoundApp {
         ui: &mut egui::Ui,
         shadcn: &crate::shadcn_ui::Shadcn,
         current: &mut realmhound_core::settings::SoundSettings,
-        log_event_notifications: &mut bool,
     ) -> bool {
         use crate::realm_event_sound::SectionKind;
 
@@ -6741,19 +6557,6 @@ impl RealmHoundApp {
         }
         changed |= self.render_alien_section_card(ui, shadcn, current, label_w);
         ui.add_space(12.0);
-        shadcn.card(ui, "realm_event_history", "Diagnostic History", |ui| {
-            if shadcn
-                .switch(
-                    ui,
-                    log_event_notifications,
-                    "Write event notification history",
-                )
-                .hover_tip("Store boss-call diagnostics for the selected account. Off by default.")
-                .changed()
-            {
-                changed = true;
-            }
-        });
         changed
     }
 
@@ -6857,7 +6660,7 @@ impl RealmHoundApp {
                     .hint_text("Type or select a boss name…")
                     .desired_width(220.0),
             );
-            if !state.text.is_empty() && shadcn.btn(ui, "\u{2715}").clicked() {
+            if !state.text.is_empty() && shadcn.btn(ui, "\u{00d7}").clicked() {
                 state.text.clear();
                 state.popup_open = false;
                 state.selected = None;
@@ -7333,67 +7136,6 @@ impl RealmHoundApp {
         changed
     }
 
-    /// Play a realm-event notification sound for a Live Feed boss call, if the
-    /// matching section is enabled (see [`crate::realm_event_sound`]).
-    fn maybe_play_realm_event(
-        &self,
-        boss_id: i32,
-        text: &str,
-        should_sound: bool,
-        instance_id: Option<i32>,
-    ) {
-        let (events, custom_sounds, log_events) = match self.settings.read() {
-            Ok(s) => (
-                s.sound.realm_events.clone(),
-                s.sound.custom_sounds.clone(),
-                s.live_feed.log_event_notifications,
-            ),
-            Err(_) => return,
-        };
-        let sets = crate::realm_event_sound::EventSets::from_assets();
-
-        // Play first so a slow log write never delays the notification. Repeat
-        // callouts (e.g. the Crystal Prisoner re-announcing itself, or a boss
-        // deduped within the realm) pass `should_sound == false` and are logged
-        // silently.
-        use realmhound_core::settings::EventMode;
-        let any_enabled = events.veteran.mode != EventMode::None
-            || events.adept.mode != EventMode::None
-            || events.seasonal.mode != EventMode::None
-            || events.alien.enabled;
-        if should_sound && any_enabled {
-            if let Some(t) = crate::realm_event_sound::resolve(&events, boss_id, text, &sets) {
-                self.audio_tx.send(AudioCommand::PlayEvent {
-                    sound: t.sound,
-                    custom_key: t.custom_key,
-                    instance_id,
-                    volume: t.volume,
-                });
-            }
-        }
-
-        // Diagnostic log: record every boss call (including silent ones) so
-        // missing / mis-mapped notification sounds can be traced later. Written
-        // only when the global opt-in toggle is enabled, to the per-account log.
-        let display_name = realmhound_core::assets::get_asset_manager()
-            .get_object(boss_id)
-            .map(|o| o.name().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| text.to_string());
-        let history_path = (log_events && self.view_state.account_verified)
-            .then(|| self.persistence.event_notifications());
-        crate::event_log::log_boss_call(
-            history_path,
-            boss_id,
-            &display_name,
-            text,
-            should_sound,
-            &events,
-            &custom_sounds,
-            &sets,
-        );
-    }
-
     /// Render a custom sound file picker button for a given sound type.
     /// Returns `true` if settings were changed.
     fn render_custom_sound_button(
@@ -7533,7 +7275,7 @@ impl RealmHoundApp {
         };
         let mut changed = false;
         if ui
-            .small_button("✕")
+            .small_button("×")
             .hover_tip("Reset to default sound")
             .clicked()
         {
@@ -8012,6 +7754,163 @@ impl RealmHoundApp {
         }
     }
 
+    /// Settings for the floating Live Combat / Live Loot overlay windows.
+    fn render_overlay_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
+        use realmhound_core::settings::MAX_LIVE_COMBAT_ROWS;
+
+        ui.add_space(10.0);
+        ui.heading("Overlays");
+        ui.add_space(15.0);
+
+        let Ok(mut overlays) = self.settings.read().map(|s| s.overlays.clone()) else {
+            return;
+        };
+        // Event-driven, never a whole-struct diff: the overlay windows write
+        // their live geometry into these same settings every frame, so a diff
+        // here would save to disk continuously.
+        let mut changed = false;
+
+        shadcn.card(ui, "overlay_windows", "Windows", |ui| {
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat.visible,
+                    "Show the Live Combat overlay",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_loot.visible,
+                    "Show the Live Loot overlay",
+                )
+                .changed();
+            if overlays.any_visible() && !crate::overlay::platform::is_supported() {
+                #[cfg(target_os = "linux")]
+                let restart_available = crate::overlay::platform::can_restart_for_overlays();
+                #[cfg(not(target_os = "linux"))]
+                let restart_available = false;
+
+                ui.add_space(6.0);
+                if restart_available {
+                    ui.label(RichText::new("Restart required to enable overlays.").weak());
+                    if shadcn.btn(ui, "Restart RealmHound").clicked() {
+                        self.pending_relaunch = Some(RelaunchReason::OverlayBackend);
+                    }
+                } else {
+                    ui.label(RichText::new("Overlays unavailable on this backend.").weak());
+                }
+            }
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_lock", "Lock", |ui| {
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat.locked,
+                    "Lock the Live Combat overlay",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_loot.locked,
+                    "Lock the Live Loot overlay",
+                )
+                .changed();
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_appearance", "Appearance", |ui| {
+            ui.label("Background opacity");
+            // Bound in place rather than via a clamped copy: feeding the slider
+            // a value it did not produce makes it report a change every frame,
+            // which walks the setting to the end of its range.
+            changed |= shadcn
+                .slider_value(ui, "overlay_opacity", &mut overlays.opacity, 0.2, 1.0)
+                .changed();
+            ui.label(RichText::new(format!("{:.0}%", overlays.opacity * 100.0)).weak());
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_live_combat", "Live Combat overlay", |ui| {
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_follow_me,
+                    "Pin my own row above the list",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_class_icons,
+                    "Use default class icons (ignore skins and dyes)",
+                )
+                .changed();
+            ui.add_space(4.0);
+            changed |= shadcn
+                .switch(
+                    ui,
+                    &mut overlays.live_combat_share_bars,
+                    "Show damage bars behind each row",
+                )
+                .changed();
+            ui.add_space(6.0);
+            ui.label("Teammates shown");
+            // Settings saved before the cap may hold a larger value.
+            overlays.live_combat_rows = overlays.live_combat_rows.min(MAX_LIVE_COMBAT_ROWS);
+            changed |= shadcn
+                .slider_value(
+                    ui,
+                    "overlay_live_combat_rows",
+                    &mut overlays.live_combat_rows,
+                    0.0,
+                    MAX_LIVE_COMBAT_ROWS,
+                )
+                .changed();
+            let caption = if overlays.max_rows() == 0 {
+                "All teammates".to_string()
+            } else {
+                format!("Up to {} teammates", overlays.max_rows())
+            };
+            ui.label(RichText::new(caption).weak());
+        });
+
+        ui.add_space(10.0);
+
+        shadcn.card(ui, "overlay_live_loot", "Live Loot overlay", |ui| {
+            ui.label(
+                RichText::new(
+                    "Which bag colours the overlay counts follows the Live Feed's bag \
+                     toggles, so the two always agree.",
+                )
+                .weak(),
+            );
+            ui.add_space(8.0);
+            if shadcn.btn(ui, "🔄 Reset session tally").clicked() {
+                self.overlays.reset_live_loot();
+            }
+        });
+
+        if changed {
+            if let Ok(mut settings) = self.settings.write() {
+                // Only the fields this tab owns: the overlay windows are the
+                // authority for their own geometry and may have moved since the
+                // clone above.
+                settings.overlays.apply_preferences(&overlays);
+                settings.save();
+            }
+        }
+    }
+
     /// Persist the current treasury section order to settings.
     fn save_treasury_section_order(&self) {
         if let Ok(mut settings) = self.settings.write() {
@@ -8433,7 +8332,7 @@ impl RealmHoundApp {
                 ui.painter().text(
                     grect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "✓",
+                    "✔",
                     egui::FontId::proportional(10.0),
                     Color32::from_rgb(95, 120, 95),
                 );
@@ -10396,16 +10295,6 @@ impl RealmHoundApp {
                         s.save();
                     }
                 }
-                AppAction::PushKickAlert(name) => {
-                    self.live_feed_panel.push_kick_alert(name);
-                }
-                AppAction::PushJoinRequestAlert(name) => {
-                    self.live_feed_panel.push_join_request_alert(name);
-                }
-                AppAction::PushBossCall { boss_id, text } => {
-                    let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                    self.maybe_play_realm_event(boss_id, &text, should_sound, None);
-                }
                 AppAction::CharacterCacheChanged => {
                     // The processor owns the canonical character cache now; this
                     // action is retained for compatibility but is a no-op.
@@ -10438,7 +10327,11 @@ impl RealmHoundApp {
     }
 
     /// Render the status bar.
-    fn render_status_bar(&self, ui: &mut egui::Ui) {
+    fn render_status_bar(&mut self, ui: &mut egui::Ui) {
+        let health = self
+            .health
+            .counters()
+            .snapshot(self.worker.ui_rx.len(), self.worker.ui_rx.dropped());
         ui.horizontal(|ui| {
             // The party leader crown and party status indicator are part of the
             // moderation tools, so they only appear when those are enabled.
@@ -10539,6 +10432,43 @@ impl RealmHoundApp {
                     ui.label(format!("Queue drops: {}", vs.capture_queue_drops));
                     ui.label(format!("Time unsynced: {}ms", vs.capture_unsync_ms));
                 }
+                ui.separator();
+                ui.label(format!("Capture source: {}", health.capture.label()));
+                ui.label(format!(
+                    "UI frame gap: {} ms (peak {} ms)",
+                    self.health.last_frame_gap().as_millis(),
+                    health.peak_frame_gap.as_millis()
+                ));
+                ui.label(format!(
+                    "UI queue: {} pending, {} dropped",
+                    health.queue_depth, health.queue_drops
+                ));
+                ui.label(format!(
+                    "Live Feed evictions: {}",
+                    health.live_window_evictions
+                ));
+                ui.label(format!(
+                    "Audio drops: {} stale, {} full",
+                    health.audio_stale_drops, health.audio_full_drops
+                ));
+                ui.label(format!(
+                    "Peak snapshot: {} ms publish, {} ms lock wait",
+                    health.peak_snapshot_publish.as_millis(),
+                    health.peak_snapshot_lock_wait.as_millis()
+                ));
+                ui.label(format!(
+                    "Drain frames: {} ({} capped), {} updates",
+                    health.drain_frames, health.capped_drain_frames, health.drained_updates
+                ));
+                if health.persistence_failures > 0 {
+                    ui.label(format!(
+                        "Persistence failures: {}",
+                        health.persistence_failures
+                    ));
+                    if let Some(error) = &health.last_persistence_error {
+                        ui.label(error);
+                    }
+                }
             });
 
             // Surface UI-update-channel overflow as an anomaly
@@ -10549,6 +10479,27 @@ impl RealmHoundApp {
                     egui::RichText::new(format!("[!] Dropped {} updates", dropped))
                         .color(egui::Color32::from_rgb(255, 100, 100)),
                 );
+            }
+            if health.persistence_failures > 0 {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "[!] Persistence failures: {}",
+                        health.persistence_failures
+                    ))
+                    .color(egui::Color32::from_rgb(255, 100, 100)),
+                );
+            }
+            if health.capture == CaptureState::Closed {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("[!] Capture stopped")
+                        .color(egui::Color32::from_rgb(255, 100, 100)),
+                );
+                if ui.button("Retry").clicked() {
+                    self.capture.mark_stopped();
+                    self.start_capture();
+                }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -10636,6 +10587,18 @@ impl eframe::App for RealmHoundApp {
         // Update window state in settings (will be saved on exit)
         self.update_window_state(ctx);
 
+        // The floating overlays are separate native windows, so they render
+        // before the main window's panels and are unaffected by modal blocking.
+        // They also drive their own repaints while open, which is what keeps a
+        // live fight's clock-derived numbers moving.
+        let overlays_active = self.overlays.render(
+            ctx,
+            &self.settings,
+            &mut self.sprite_renderer,
+            &self.live_fights,
+            self.main_connection,
+        );
+
         // Update checker (runs on startup and every 2 hours)
         self.update_checker.update();
 
@@ -10662,6 +10625,21 @@ impl eframe::App for RealmHoundApp {
             }
             self.render_content(ui);
         });
+
+        if let Some(watchlist) = self.party_panel.take_watchlist_update() {
+            self.worker
+                .send_control(ControlMsg::SetWatchlist(watchlist));
+        }
+
+        // A minimized window never paints, so stop the worker waking it, unless
+        // an attached overlay still needs updates to prepare or paint itself.
+        let live_demand =
+            ctx.input(|input| input.viewport().minimized != Some(true)) || overlays_active;
+        if self.live_demand != Some(live_demand) {
+            self.live_demand = Some(live_demand);
+            self.worker
+                .send_control(ControlMsg::SetLiveDemand(live_demand));
+        }
 
         // About window (modal)
         if self.modals.show_about {
@@ -10716,11 +10694,6 @@ impl eframe::App for RealmHoundApp {
         // of burning CPU re-rendering unchanged frames.
 
         // Publish the tab that was actually rendered this frame so the worker
-        // gates repaints on the current view (relevance-gated wakes). Done at
-        // frame end so any in-frame tab switch (SwitchTab actions) is reflected.
-        self.active_tab_signal
-            .store(self.active_tab as u8, Ordering::Relaxed);
-
         #[cfg(feature = "profiling")]
         {
             let (glow, dye, char_dye, bytes) = self.sprite_renderer.cache_stats();

@@ -2,9 +2,8 @@
 //! `dirs::data_local_dir()` themselves.
 //!
 //! Panels receive their per-account paths from `AccountPersistencePaths`.
-//! Documented global paths -- application logs (`main.rs`), custom sounds
-//! (`sound.rs`), and the Oryx taunt capture / event-notification *global* opt-in
-//! (`event_log.rs`) -- are intentionally excluded.
+//! Documented global paths -- application logs (`main.rs`) and custom sounds
+//! (`sound.rs`) -- are intentionally excluded.
 
 use std::path::Path;
 
@@ -55,17 +54,4 @@ fn account_scoped_panels_do_not_resolve_localappdata() {
             );
         }
     }
-}
-
-#[test]
-fn event_log_no_longer_resolves_the_account_notification_path() {
-    // The per-account event-notification log path is injected; only the global
-    // Oryx taunt capture (a documented global diagnostic) may resolve LocalAppData
-    // in this module.
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/event_log.rs");
-    let contents = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        !contents.contains("event_notification_log.csv"),
-        "event_log.rs must receive the account notification path, not resolve it"
-    );
 }

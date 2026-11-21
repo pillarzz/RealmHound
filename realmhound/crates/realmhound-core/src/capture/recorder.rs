@@ -217,7 +217,7 @@ impl CaptureWriter {
     fn write_frame(&mut self, packet: &RawPacket) -> io::Result<()> {
         let ts_nanos = packet.timestamp.timestamp_nanos_opt().unwrap_or(0);
         self.inner.write_all(&ts_nanos.to_le_bytes())?;
-        self.inner.write_all(&[packet.packet_format as u8])?;
+        self.inner.write_all(&[packet.packet_format.code()])?;
         let len = packet.data.len() as u32;
         self.inner.write_all(&len.to_le_bytes())?;
         self.inner.write_all(&packet.data)?;
@@ -304,18 +304,12 @@ pub fn read_capture(path: &Path) -> io::Result<Vec<RawPacket>> {
         } else {
             let mut format = [0u8; 1];
             reader.read_exact(&mut format)?;
-            match format[0] {
-                0 => PacketFormat::Ethernet,
-                1 => PacketFormat::RawIp,
-                2 => PacketFormat::Loopback,
-                3 => PacketFormat::LoopbackNetwork,
-                value => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unsupported capture packet format {value}"),
-                    ));
-                }
-            }
+            PacketFormat::from_code(format[0]).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported capture packet format {}", format[0]),
+                )
+            })?
         };
 
         let mut len_buf = [0u8; 4];
@@ -645,6 +639,20 @@ mod tests {
                 enqueued_at: None,
                 data: vec![0; 40],
             },
+            RawPacket {
+                timestamp: Utc::now(),
+                packet_format: PacketFormat::LinuxSll,
+                #[cfg(feature = "latency-diagnostics")]
+                enqueued_at: None,
+                data: vec![0; 16],
+            },
+            RawPacket {
+                timestamp: Utc::now(),
+                packet_format: PacketFormat::LinuxSll2,
+                #[cfg(feature = "latency-diagnostics")]
+                enqueued_at: None,
+                data: vec![0; 20],
+            },
         ];
 
         {
@@ -723,7 +731,7 @@ mod tests {
         let path = dir.path().join("truncated.rhcap");
         let mut file = MAGIC.to_vec();
         file.extend_from_slice(&0i64.to_le_bytes());
-        file.push(PacketFormat::RawIp as u8);
+        file.push(PacketFormat::RawIp.code());
         file.extend_from_slice(&4u32.to_le_bytes());
         file.extend_from_slice(&[1, 2, 3, 4]);
         for length in MAGIC.len() + 1..file.len() {

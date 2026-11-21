@@ -15,21 +15,54 @@ use std::time::Duration;
 /// bound worst-case memory if the consumer fully stalls.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 4096;
 
+/// Maximum packet size captured by libpcap and accepted by the Linux helper protocol.
+///
+/// This is libpcap's maximum snapshot length for ordinary link-layer captures.
+pub(crate) const MAX_CAPTURE_FRAME: usize = 262_144;
+
 /// Packet framing, with stable identifiers used in `.rhcap` version 2 files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum PacketFormat {
     /// Ethernet II, including VLAN-tagged frames.
-    Ethernet = 0,
+    Ethernet,
     /// IP packets without a link-layer header.
-    RawIp = 1,
+    RawIp,
     /// DLT_NULL: a native-endian, four-byte address family followed by IP.
-    Loopback = 2,
+    Loopback,
     /// DLT_LOOP: a network-endian, four-byte address family followed by IP.
-    LoopbackNetwork = 3,
+    LoopbackNetwork,
+    /// Linux cooked capture v1 (the `any` device).
+    LinuxSll,
+    /// Linux cooked capture v2.
+    LinuxSll2,
 }
 
 impl PacketFormat {
+    /// Return the stable identifier used by capture protocols and files.
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Ethernet => 0,
+            Self::RawIp => 1,
+            Self::Loopback => 2,
+            Self::LoopbackNetwork => 3,
+            Self::LinuxSll => 4,
+            Self::LinuxSll2 => 5,
+        }
+    }
+
+    /// Decode a stable identifier used by capture protocols and files.
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Ethernet),
+            1 => Some(Self::RawIp),
+            2 => Some(Self::Loopback),
+            3 => Some(Self::LoopbackNetwork),
+            4 => Some(Self::LinuxSll),
+            5 => Some(Self::LinuxSll2),
+            _ => None,
+        }
+    }
+
     fn from_linktype(linktype: pcap::Linktype) -> Result<Self, CaptureError> {
         match linktype {
             pcap::Linktype::ETHERNET => Ok(Self::Ethernet),
@@ -37,13 +70,15 @@ impl PacketFormat {
             pcap::Linktype(12) | pcap::Linktype::RAW | pcap::Linktype::IPV4 => Ok(Self::RawIp),
             pcap::Linktype::NULL => Ok(Self::Loopback),
             pcap::Linktype::LOOP => Ok(Self::LoopbackNetwork),
+            pcap::Linktype(113) => Ok(Self::LinuxSll),
+            pcap::Linktype(276) => Ok(Self::LinuxSll2),
             _ => Err(CaptureError::UnsupportedLinkType(linktype.0)),
         }
     }
 }
 
 /// Configuration for the packet sniffer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SnifferConfig {
     /// Read timeout in milliseconds
     pub timeout_ms: i32,
@@ -109,6 +144,7 @@ impl Sniffer {
                 name: interface.name.clone(),
                 reason: e.to_string(),
             })?
+            .snaplen(MAX_CAPTURE_FRAME as i32)
             .timeout(config.timeout_ms)
             .buffer_size(config.buffer_size)
             .promisc(config.promiscuous)
@@ -429,6 +465,8 @@ pub fn packet_channel(capacity: usize) -> (PacketSender, PacketReceiver) {
 pub struct CaptureHandle {
     /// Flag to signal the capture loop to stop
     stop_flag: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    linux_child: Option<Arc<Mutex<std::process::Child>>>,
 }
 
 impl CaptureHandle {
@@ -436,12 +474,28 @@ impl CaptureHandle {
     fn new() -> Self {
         Self {
             stop_flag: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "linux")]
+            linux_child: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn with_linux_child(child: Arc<Mutex<std::process::Child>>) -> Self {
+        Self {
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            linux_child: Some(child),
         }
     }
 
     /// Stop the capture loop.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        #[cfg(target_os = "linux")]
+        if let Some(child) = &self.linux_child {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
+        }
     }
 
     /// Check if stop has been requested.
@@ -525,86 +579,97 @@ pub fn start_capture_auto_detect(
     ),
     CaptureError,
 > {
-    use std::sync::Mutex;
-
-    if interfaces.is_empty() {
-        return Err(CaptureError::NoInterfaces);
+    #[cfg(target_os = "linux")]
+    {
+        // Linux captures on libpcap's `any` device so VPN and loopback traffic is
+        // not missed; REALMHOUND_CAPTURE_INTERFACE narrows it to one interface.
+        let _ = interfaces;
+        return super::linux_helper::start(&config);
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::sync::Mutex;
 
-    let handle = CaptureHandle::new();
-    let stop_flag = handle.stop_flag.clone();
-
-    // Bounded, drop-oldest queue (see start_capture). The template `tx` keeps the
-    // producer count >= 1 while threads are being spawned; each thread gets a clone
-    // and the template is dropped afterwards so `closed` only fires once every
-    // surviving capture thread has exited.
-    let (tx, rx) = packet_channel(DEFAULT_QUEUE_CAPACITY);
-
-    // Channel to report which interface was detected
-    let (detected_tx, detected_rx) = tokio::sync::oneshot::channel();
-    let detected_tx = Arc::new(Mutex::new(Some(detected_tx)));
-
-    // Flag to indicate when we've found the active interface
-    let found_interface = Arc::new(AtomicBool::new(false));
-
-    // Validate every interface's format before any thread can select a winner.
-    let mut sniffers = Vec::new();
-    // Remembered so a machine that simply isn't set up for capture reports the
-    // fix instead of a bare "no interfaces found".
-    let mut setup_error = None;
-
-    for interface in interfaces {
-        // Windows VPN and loopback capture devices need not advertise an active IPv4 address.
-        if !cfg!(windows) && !interface.is_likely_active() {
-            tracing::debug!(
-                "Skipping interface {} (no active IPv4)",
-                interface.display_name()
-            );
-            continue;
+        if interfaces.is_empty() {
+            return Err(CaptureError::NoInterfaces);
         }
 
-        match Sniffer::new(interface, config.clone()) {
-            Ok(sniffer) => {
-                sniffers.push((sniffer, interface.display_name().to_string()));
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to open {} for capture: {}",
-                    interface.display_name(),
-                    e
+        let handle = CaptureHandle::new();
+        let stop_flag = handle.stop_flag.clone();
+
+        // Bounded, drop-oldest queue (see start_capture). The template `tx` keeps the
+        // producer count >= 1 while threads are being spawned; each thread gets a clone
+        // and the template is dropped afterwards so `closed` only fires once every
+        // surviving capture thread has exited.
+        let (tx, rx) = packet_channel(DEFAULT_QUEUE_CAPACITY);
+
+        // Channel to report which interface was detected
+        let (detected_tx, detected_rx) = tokio::sync::oneshot::channel();
+        let detected_tx = Arc::new(Mutex::new(Some(detected_tx)));
+
+        // Flag to indicate when we've found the active interface
+        let found_interface = Arc::new(AtomicBool::new(false));
+
+        // Validate every interface's format before any thread can select a winner.
+        let mut sniffers = Vec::new();
+        // Remembered so a machine that simply isn't set up for capture reports the
+        // fix instead of a bare "no interfaces found".
+        let mut setup_error = None;
+
+        for interface in interfaces {
+            // Windows VPN and loopback capture devices need not advertise an active IPv4 address.
+            if !cfg!(windows) && !interface.is_likely_active() {
+                tracing::debug!(
+                    "Skipping interface {} (no active IPv4)",
+                    interface.display_name()
                 );
-                if matches!(e, CaptureError::NpcapNotInstalled) {
-                    setup_error = Some(e);
+                continue;
+            }
+
+            match Sniffer::new(interface, config.clone()) {
+                Ok(sniffer) => {
+                    sniffers.push((sniffer, interface.display_name().to_string()));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to open {} for capture: {}",
+                        interface.display_name(),
+                        e
+                    );
+                    if matches!(e, CaptureError::NpcapNotInstalled) {
+                        setup_error = Some(e);
+                    }
                 }
             }
         }
+
+        if sniffers.is_empty() {
+            return Err(setup_error.unwrap_or(CaptureError::NoInterfaces));
+        }
+
+        let count = sniffers.len();
+        for (sniffer, iface_name) in sniffers {
+            let stop_flag = stop_flag.clone();
+            let found = found_interface.clone();
+            let tx = tx.clone();
+            let detected_tx = detected_tx.clone();
+            tracing::info!("Started sniffer on {}", iface_name);
+            std::thread::spawn(move || {
+                capture_on_interface(sniffer, iface_name, stop_flag, found, tx, detected_tx);
+            });
+        }
+
+        // Drop the template sender so only the per-thread clones keep the queue open.
+        drop(tx);
+
+        tracing::info!("Auto-detect started on {} interfaces", count);
+
+        Ok((handle, rx, detected_rx))
     }
-
-    if sniffers.is_empty() {
-        return Err(setup_error.unwrap_or(CaptureError::NoInterfaces));
-    }
-
-    let count = sniffers.len();
-    for (sniffer, iface_name) in sniffers {
-        let stop_flag = stop_flag.clone();
-        let found = found_interface.clone();
-        let tx = tx.clone();
-        let detected_tx = detected_tx.clone();
-        tracing::info!("Started sniffer on {}", iface_name);
-        std::thread::spawn(move || {
-            capture_on_interface(sniffer, iface_name, stop_flag, found, tx, detected_tx);
-        });
-    }
-
-    // Drop the template sender so only the per-thread clones keep the queue open.
-    drop(tx);
-
-    tracing::info!("Auto-detect started on {} interfaces", count);
-
-    Ok((handle, rx, detected_rx))
 }
 
 /// Capture loop for a single interface during auto-detection.
+#[cfg(not(target_os = "linux"))]
 fn capture_on_interface(
     mut sniffer: Sniffer,
     interface_name: String,
@@ -665,6 +730,7 @@ fn capture_on_interface(
 }
 
 /// Continue capturing on the detected interface after auto-detection.
+#[cfg(not(target_os = "linux"))]
 fn capture_remaining(mut sniffer: Sniffer, stop_flag: Arc<AtomicBool>, tx: PacketSender) {
     let mut last_dropped = 0u32;
     let mut last_if_dropped = 0u32;
@@ -702,6 +768,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packet_format_codes_round_trip() {
+        for (format, code) in [
+            (PacketFormat::Ethernet, 0),
+            (PacketFormat::RawIp, 1),
+            (PacketFormat::Loopback, 2),
+            (PacketFormat::LoopbackNetwork, 3),
+            (PacketFormat::LinuxSll, 4),
+            (PacketFormat::LinuxSll2, 5),
+        ] {
+            assert_eq!(format.code(), code);
+            assert_eq!(PacketFormat::from_code(code), Some(format));
+        }
+        assert_eq!(PacketFormat::from_code(u8::MAX), None);
+    }
+
+    #[test]
     fn recognizes_supported_linktypes() {
         for (linktype, expected) in [
             (pcap::Linktype::ETHERNET, PacketFormat::Ethernet),
@@ -710,6 +792,8 @@ mod tests {
             (pcap::Linktype::IPV4, PacketFormat::RawIp),
             (pcap::Linktype::NULL, PacketFormat::Loopback),
             (pcap::Linktype::LOOP, PacketFormat::LoopbackNetwork),
+            (pcap::Linktype(113), PacketFormat::LinuxSll),
+            (pcap::Linktype(276), PacketFormat::LinuxSll2),
         ] {
             assert_eq!(PacketFormat::from_linktype(linktype).unwrap(), expected);
         }
@@ -718,8 +802,8 @@ mod tests {
     #[test]
     fn rejects_unsupported_linktypes() {
         assert!(matches!(
-            PacketFormat::from_linktype(pcap::Linktype(113)),
-            Err(CaptureError::UnsupportedLinkType(113))
+            PacketFormat::from_linktype(pcap::Linktype(999)),
+            Err(CaptureError::UnsupportedLinkType(999))
         ));
     }
 

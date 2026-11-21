@@ -28,5 +28,7 @@ mod texture2d;
 pub mod xml_parser;
 
 pub use extractor::{find_resources_assets, ExtractionResult, UnityExtractor};
+#[cfg(target_os = "linux")]
+mod steam;
 pub use file_header::FileHeader;
 pub use xml_parser::generate_asset_lists;

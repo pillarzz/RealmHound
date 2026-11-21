@@ -175,12 +175,6 @@ pub fn flat_layout_inventory(has_roaming_root: bool) -> Vec<InventoryItem> {
             Validator::OpaqueTree,
         ),
         InventoryItem::local(
-            "event_notification_log.csv",
-            "event_notification_log.csv",
-            SourceClass::Attributable,
-            Validator::OpaqueFile,
-        ),
-        InventoryItem::local(
             "watchlist_detections.log",
             "watchlist_detections.log",
             SourceClass::Attributable,
@@ -398,7 +392,6 @@ mod tests {
             "char_list.xml",
             "imports/dungeon.stats",
             "logs/chat",
-            "event_notification_log.csv",
             "watchlist_detections.log",
             "access_token.txt",
             "party_sightings.json",

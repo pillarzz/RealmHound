@@ -1,0 +1,233 @@
+//! Native window tweaks the cross-platform windowing layer cannot express.
+//!
+//! egui/winit already give us an undecorated, transparent, always-on-top
+//! viewport with mouse pass-through, which is enough for a windowed or
+//! borderless-fullscreen game on Windows. Some behavior still needs the native
+//! APIs:
+//!
+//! - **macOS**: winit's always-on-top maps to `NSFloatingWindowLevel`, which is
+//!   *below* a native "Full Screen" Space. AppKit requests an elevated window
+//!   level and `CanJoinAllSpaces | FullScreenAuxiliary` participation; native
+//!   Full Screen behavior still needs runtime verification.
+//! - **Windows**: the overlay must never steal focus from the game nor appear in
+//!   Alt-Tab, which means `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` on the extended
+//!   style. That same style stops the system move loop winit drags with, so
+//!   Windows moves and resizes overlays itself (see [`begin_drag`]).
+//! - **Linux (X11/XWayland)**: the window manager has to be told to keep the
+//!   overlay above a fullscreen Proton client and out of the taskbar, and a
+//!   click-through overlay needs the X server for the pointer position.
+//!
+//! Windows are located by their title, exactly as the viewport sets it, so no
+//! handle plumbing through eframe is needed. That title carries a per-window
+//! generation suffix precisely so the lookup can never land on a window the
+//! windowing layer has already abandoned; see [`dismiss_stale`].
+//!
+//! Overlay manipulation is best-effort. Attachment inspection is fallible and
+//! fails closed: native Wayland and BSD cannot verify a linked game window,
+//! so enabled overlays remain hidden there.
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+pub(super) use windows::{game_window, game_window_active, Process};
+
+#[cfg(target_os = "linux")]
+pub(super) use linux::{game_window, game_window_active, Process};
+
+#[cfg(target_os = "linux")]
+pub use linux::{
+    can_restart_for_overlays, event_loop_hook, is_forced_x11_failure, record_backend,
+    relaunch_on_wayland,
+};
+#[cfg(target_os = "macos")]
+pub(crate) use macos::set_visible;
+#[cfg(target_os = "macos")]
+pub(super) use macos::{game_window, game_window_active, Process};
+
+/// What a title-bar or grip drag does to the overlay window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragKind {
+    Move,
+    /// Resize from the bottom-right corner.
+    Resize,
+}
+
+/// Apply the always-on-top / all-Spaces / never-steal-focus promotion to the
+/// overlay window titled `title`.
+///
+/// Returns true only when the window was found and preparation succeeded.
+/// Safe before creation; must run on the UI thread.
+pub fn promote(title: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::promote(title)
+    }
+    #[cfg(windows)]
+    {
+        windows::promote(title)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::promote(title)
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    {
+        // BSD: winit's always-on-top window level is all we can portably ask
+        // for.
+        let _ = title;
+        false
+    }
+}
+
+/// Raise the overlay above its same-level peers without changing its level and
+/// without taking keyboard focus.
+///
+/// Edge-triggered: pass back the value returned last time, and the raise only
+/// happens on the transition from on-screen to covered. Re-asserting the front
+/// position of a transparent window every heartbeat is not free on macOS -- see
+/// [`macos::order_front`].
+pub fn order_front(title: &str, was_hidden: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::order_front(title, was_hidden)
+    }
+    #[cfg(windows)]
+    {
+        // `SetWindowPos(HWND_TOPMOST)` is a cheap no-op on a window that is
+        // already topmost, and other apps claim topmost often enough that it
+        // has to be re-asserted unconditionally.
+        let _ = was_hidden;
+        windows::order_front(title);
+        false
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Like Windows: a window manager drops "above" order whenever a
+        // fullscreen client takes focus, and a restack request is cheap.
+        let _ = was_hidden;
+        linux::order_front(title);
+        false
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    {
+        let _ = (title, was_hidden);
+        false
+    }
+}
+
+/// Retire native state for every generation whose title starts with `prefix`,
+/// except the one titled `keep`.
+///
+/// Each overlay window is opened with a unique generation suffix, so anything
+/// else sharing the prefix is a leftover from a window eframe has already
+/// replaced or discarded. On macOS those leftovers can linger on screen, where
+/// they show through the live overlay's translucent backdrop as a frozen frame
+/// from a previous instance, so they are also taken off screen. Pass an empty
+/// `keep` to retire all generations.
+pub fn dismiss_stale(prefix: &str, keep: &str) {
+    #[cfg(target_os = "macos")]
+    macos::dismiss_stale(prefix, keep);
+    #[cfg(windows)]
+    windows::dismiss_stale(prefix, keep);
+    #[cfg(target_os = "linux")]
+    linux::dismiss_stale(prefix, keep);
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    {
+        let _ = (prefix, keep);
+    }
+}
+
+/// Pointer position in logical screen points with a top-left origin, matching
+/// [`egui::ViewportInfo::outer_rect`].
+///
+/// A click-through window receives no mouse events at all, so egui cannot say
+/// when the pointer is over the overlay's own title bar. Asking the OS directly
+/// is what lets a locked overlay keep its buttons usable.
+///
+/// Physical pixels use `pixels_per_point`; AppKit points need only egui zoom.
+pub fn cursor_position(pixels_per_point: f32, zoom_factor: f32) -> Option<(f32, f32)> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = pixels_per_point;
+        macos::cursor_position(zoom_factor)
+    }
+    #[cfg(windows)]
+    {
+        let _ = zoom_factor;
+        windows::cursor_position(pixels_per_point)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = zoom_factor;
+        linux::cursor_position(pixels_per_point)
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    {
+        let _ = (pixels_per_point, zoom_factor);
+        None
+    }
+}
+
+/// Start moving or resizing the overlay under the pointer natively.
+///
+/// Returns `false` when the platform leaves it to the windowing layer, in
+/// which case the caller sends `StartDrag` / `BeginResize` as usual. Once this
+/// returns `true`, call [`continue_drag`] every frame until it returns `false`.
+/// `min_w` / `min_h` bound a resize, in logical points.
+pub fn begin_drag(kind: DragKind, min_w: f32, min_h: f32, pixels_per_point: f32) -> bool {
+    #[cfg(windows)]
+    {
+        // Win32 works in physical pixels.
+        let scale = if pixels_per_point > 0.0 {
+            pixels_per_point
+        } else {
+            1.0
+        };
+        windows::begin_drag(kind, min_w * scale, min_h * scale)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::begin_drag(kind, min_w, min_h, pixels_per_point)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (kind, min_w, min_h, pixels_per_point);
+        false
+    }
+}
+
+/// Track the pointer for a drag [`begin_drag`] started. Returns `true` while
+/// the drag is still going, so the caller keeps frames coming.
+pub fn continue_drag() -> bool {
+    #[cfg(windows)]
+    {
+        windows::continue_drag()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::continue_drag()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Whether this platform has a native overlay implementation. Surfaced in the
+/// settings UI so users on native Wayland (or BSD) know attachment cannot be
+/// verified and enabled overlays stay hidden there.
+pub fn is_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::uses_x11()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "macos", windows))
+    }
+}

@@ -31,9 +31,9 @@ mod discovery;
 #[cfg(target_os = "macos")]
 mod dock_icon;
 mod enchant_sound;
-mod event_log;
 mod memo;
 mod modals;
+mod overlay;
 mod panels;
 mod processing;
 mod profiling;
@@ -70,6 +70,36 @@ mod test_support {
 }
 
 use app::{RealmHoundApp, PKG_NAME, VERSION};
+
+/// Windows keeps the empty icon so eframe does not blur its multi-size .ico and
+/// macOS uses the bundle icon, so only Linux decodes it for the window.
+fn window_icon() -> egui::IconData {
+    #[cfg(target_os = "linux")]
+    {
+        const ICO: &[u8] = include_bytes!("../assets/icon.ico");
+        if let Ok(image) = image::load_from_memory(ICO) {
+            let image = image.into_rgba8();
+            let (width, height) = image.dimensions();
+            return egui::IconData {
+                rgba: image.into_raw(),
+                width,
+                height,
+            };
+        }
+    }
+    egui::IconData::default()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod window_icon_tests {
+    #[test]
+    fn packaged_ico_decodes_to_an_icon() {
+        let icon = super::window_icon();
+
+        assert_eq!((icon.width, icon.height), (64, 64));
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+    }
+}
 
 fn main() -> Result<()> {
     // A relaunch replacement waits (bounded) for the previous instance to exit
@@ -120,28 +150,28 @@ fn main() -> Result<()> {
         .with_inner_size(window_size)
         .with_min_inner_size([800.0, 600.0])
         .with_title("RealmHound")
-        // Pass an explicit empty icon so eframe skips its runtime WM_SETICON path
-        // (which scales a single bitmap to system-metric sizes and blurs on high-DPI
-        // taskbars). Windows then uses the crisp multi-size .ico embedded as a
-        // resource by build.rs, picking the correct frame per DPI.
-        .with_icon(egui::IconData::default());
+        // eframe derives the GL config's alpha support from the *root* viewport
+        // alone, so the overlay child windows can only be see-through if this one
+        // asks for transparency too. The root clear and panels remain opaque.
+        //
+        // Windows is the exception: glutin still gives the context an 8-bit
+        // alpha buffer, but its WGL transparency probe reports false, so eframe
+        // logs an error and glutin strips the flag before the window exists.
+        // The platform layer applies DWM composition to each overlay instead.
+        .with_transparent(!cfg!(windows))
+        .with_app_id("realmhound")
+        .with_icon(window_icon());
 
-    if let Some((x, y)) = window_pos {
-        #[cfg(windows)]
-        if x.is_finite() && y.is_finite() {
-            viewport = viewport.with_position([x, y]);
-        }
-        #[cfg(not(windows))]
-        if x > -10000.0 && y > -10000.0 {
-            viewport = viewport.with_position([x, y]);
-        }
-    }
-    if maximized {
-        viewport = viewport.with_maximized(true);
+    if let Some(pos) = window_pos.and_then(|(x, y)| validated_window_position(x, y, window_size)) {
+        viewport = viewport.with_position(pos);
     }
 
     let options = eframe::NativeOptions {
         viewport,
+        // Only enabled overlays require XWayland; otherwise keep winit's
+        // native backend preference.
+        #[cfg(target_os = "linux")]
+        event_loop_builder: overlay::platform::event_loop_hook(preview.overlays.any_visible()),
         ..Default::default()
     };
 
@@ -161,6 +191,8 @@ fn main() -> Result<()> {
                 "RealmHound",
                 options,
                 Box::new(move |cc| {
+                    #[cfg(target_os = "linux")]
+                    overlay::platform::record_backend(cc);
                     #[cfg(target_os = "macos")]
                     dock_icon::install();
                     Ok(Box::new(RootApp::build(
@@ -171,14 +203,16 @@ fn main() -> Result<()> {
                     )))
                 }),
             )
-            .map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))?;
+            .or_else(startup_failure)?;
         }
         _ => {
             // Slow path: resolve on a background thread behind a progress screen.
             eframe::run_native(
                 "RealmHound",
                 options,
-                Box::new(|cc| {
+                Box::new(move |cc| {
+                    #[cfg(target_os = "linux")]
+                    overlay::platform::record_backend(cc);
                     #[cfg(target_os = "macos")]
                     dock_icon::install();
                     let egui_ctx = cc.egui_ctx.clone();
@@ -192,14 +226,30 @@ fn main() -> Result<()> {
                         .map_err(|e| {
                             Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())
                         })?;
-                    Ok(Box::new(RootApp::new(rx)) as Box<dyn eframe::App>)
+                    Ok(Box::new(RootApp::new(rx, maximized)) as Box<dyn eframe::App>)
                 }),
             )
-            .map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))?;
+            .or_else(startup_failure)?;
         }
     }
 
     Ok(())
+}
+
+/// Turn an eframe startup error into `main`'s result.
+///
+/// On Linux, a Wayland session put on XWayland whose X11 backend still cannot
+/// start is retried natively on Wayland in a fresh process instead of failing.
+fn startup_failure(e: eframe::Error) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if overlay::platform::is_forced_x11_failure(&e) {
+        tracing::warn!("[OVERLAY] XWayland startup failed ({e}); relaunching on native Wayland");
+        match overlay::platform::relaunch_on_wayland() {
+            Ok(()) => return Ok(()),
+            Err(spawn) => tracing::error!("[OVERLAY] Wayland relaunch failed: {spawn}"),
+        }
+    }
+    Err(anyhow::anyhow!("Failed to run application: {}", e))
 }
 
 #[cfg(all(feature = "latency-diagnostics", windows))]
@@ -491,6 +541,8 @@ struct RootApp {
     resolved: mpsc::Receiver<StartupMessage>,
     started: Instant,
     cleanup_warnings: Vec<String>,
+    /// Maximize after the first present; doing it at creation can deadlock it.
+    restore_maximized: bool,
 }
 
 enum RootState {
@@ -503,12 +555,13 @@ enum RootState {
 }
 
 impl RootApp {
-    fn new(resolved: mpsc::Receiver<StartupMessage>) -> Self {
+    fn new(resolved: mpsc::Receiver<StartupMessage>, restore_maximized: bool) -> Self {
         Self {
             state: RootState::Starting,
             resolved,
             started: Instant::now(),
             cleanup_warnings: Vec::new(),
+            restore_maximized,
         }
     }
 
@@ -519,6 +572,7 @@ impl RootApp {
         launch: StartupLaunch,
         cleanup_warnings: Vec<String>,
     ) -> Self {
+        let restore_maximized = settings.window.maximized;
         let app: Box<dyn eframe::App> = match launch {
             StartupLaunch::Selected(account) => {
                 let settings = Arc::new(RwLock::new(settings));
@@ -549,6 +603,7 @@ impl RootApp {
             resolved: mpsc::channel().1,
             started: Instant::now(),
             cleanup_warnings,
+            restore_maximized,
         }
     }
 
@@ -586,6 +641,13 @@ impl RootApp {
 }
 
 impl eframe::App for RootApp {
+    /// Keep the root opaque even when a screen does not paint a full panel.
+    /// Immediate overlays are cleared separately by eframe and their callback.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let mut color = visuals.panel_fill.to_normalized_gamma_f32();
+        color[3] = 1.0;
+        color
+    }
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let RootState::Active(app) = &mut self.state {
             app.on_exit(gl);
@@ -595,6 +657,13 @@ impl eframe::App for RootApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(windows)]
         crate::apply_window_chrome(&*frame);
+
+        if self.restore_maximized {
+            self.restore_maximized = false;
+            info!("[WINDOW] Restoring maximized window state");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+
         if !matches!(self.state, RootState::Active(_)) {
             match self.resolved.try_recv() {
                 Ok(StartupMessage::Migrating) => {
@@ -602,6 +671,8 @@ impl eframe::App for RootApp {
                 }
                 Ok(StartupMessage::Done(settings, launch, warnings)) => {
                     *self = Self::build(ctx, settings, launch, warnings);
+                    // Already handled on the first frame.
+                    self.restore_maximized = false;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -653,8 +724,20 @@ mod root_app_tests {
     use eframe::App;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    #[cfg(windows)]
-    use windows_sys::Win32::Foundation::RECT;
+    #[test]
+    fn root_clear_is_opaque_even_with_transparent_panel_visuals() {
+        let root = RootApp::new(mpsc::channel().1, false);
+        let mut visuals = egui::Visuals::dark();
+        for fill in [
+            egui::Color32::from_rgb(25, 25, 30),
+            egui::Color32::TRANSPARENT,
+        ] {
+            visuals.panel_fill = fill;
+            let clear = root.clear_color(&visuals);
+            assert_eq!(clear[3], 1.0);
+            assert_eq!(&clear[..3], &fill.to_normalized_gamma_f32()[..3]);
+        }
+    }
 
     #[test]
     fn root_app_forwards_shutdown_to_active_app() {
@@ -666,93 +749,124 @@ mod root_app_tests {
             }
         }
         let exited = Arc::new(AtomicBool::new(false));
-        let mut root = RootApp::new(mpsc::channel().1);
+        let mut root = RootApp::new(mpsc::channel().1, false);
         root.state = RootState::Active(Box::new(ExitApp(exited.clone())));
         root.on_exit(None);
         assert!(exited.load(Ordering::SeqCst));
     }
+}
 
-    #[cfg(windows)]
-    #[test]
-    fn title_bar_visibility_requires_configured_minimum() {
-        let work_area = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
-        };
-        let enough = RECT {
-            left: -850,
-            top: 100,
-            right: 800,
-            bottom: 800,
-        };
-        let too_narrow = RECT {
-            left: -1800,
-            top: 100,
-            right: 149,
-            bottom: 800,
-        };
-        let too_short = RECT {
-            left: 100,
-            top: -1,
-            right: 1000,
-            bottom: 49,
-        };
-        let exact_minimum = RECT {
-            left: -850,
-            top: 0,
-            right: 150,
-            bottom: 700,
-        };
+#[cfg(test)]
+mod window_geometry_tests {
+    use super::*;
 
-        assert!(has_usable_title_bar(enough, work_area));
-        assert!(has_usable_title_bar(exact_minimum, work_area));
-        assert!(!has_usable_title_bar(too_narrow, work_area));
-        assert!(!has_usable_title_bar(too_short, work_area));
+    fn rect(left: f32, top: f32, right: f32, bottom: f32) -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn fitted_center_uses_monitor_work_area() {
-        let window = RECT {
-            left: 0,
-            top: 0,
-            right: 1000,
-            bottom: 700,
-        };
-        let work_area = RECT {
-            left: -1920,
-            top: 40,
-            right: 0,
-            bottom: 1080,
-        };
+    fn primary() -> egui::Rect {
+        rect(0.0, 0.0, 1920.0, 1040.0)
+    }
 
+    #[test]
+    fn title_bar_visibility_requires_configured_minimum() {
+        let work_area = primary();
+
+        assert!(has_usable_title_bar(
+            rect(-850.0, 100.0, 800.0, 800.0),
+            work_area
+        ));
+        assert!(has_usable_title_bar(
+            rect(-850.0, 0.0, 150.0, 700.0),
+            work_area
+        ));
+        assert!(!has_usable_title_bar(
+            rect(-1800.0, 100.0, 149.0, 800.0),
+            work_area
+        ));
+        assert!(!has_usable_title_bar(
+            rect(100.0, -1.0, 1000.0, 49.0),
+            work_area
+        ));
+    }
+
+    #[test]
+    fn centered_window_uses_work_area() {
         assert_eq!(
-            fitted_centered_window(window, work_area),
-            (-1460, 210, 1000, 700)
+            centered_window(
+                rect(0.0, 0.0, 1000.0, 700.0),
+                rect(-1920.0, 40.0, 0.0, 1080.0)
+            ),
+            [-1460.0, 210.0, 1000.0, 700.0]
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn fitted_center_shrinks_oversized_window() {
-        let window = RECT {
-            left: 0,
-            top: 0,
-            right: 3000,
-            bottom: 2000,
-        };
-        let work_area = RECT {
-            left: 0,
-            top: 40,
-            right: 1920,
-            bottom: 1080,
-        };
-
+    fn centered_window_shrinks_oversized_window() {
         assert_eq!(
-            fitted_centered_window(window, work_area),
-            (0, 40, 1920, 1040)
+            centered_window(
+                rect(0.0, 0.0, 3000.0, 2000.0),
+                rect(0.0, 40.0, 1920.0, 1080.0)
+            ),
+            [0.0, 40.0, 1920.0, 1040.0]
+        );
+    }
+
+    #[test]
+    fn minimized_placeholder_is_centered() {
+        assert_eq!(
+            launch_window_position(
+                -32000.0,
+                -32000.0,
+                [1280.0, 720.0],
+                &[primary()],
+                Some(primary())
+            ),
+            Some([320.0, 160.0])
+        );
+    }
+
+    #[test]
+    fn second_monitor_position_is_kept() {
+        let monitors = [
+            rect(0.0, 0.0, 2560.0, 1440.0),
+            rect(2560.0, 0.0, 5120.0, 1440.0),
+        ];
+        assert_eq!(
+            launch_window_position(3022.0, 210.0, [1280.0, 720.0], &monitors, Some(monitors[0])),
+            Some([3022.0, 210.0])
+        );
+    }
+
+    #[test]
+    fn unreachable_title_bar_is_centered() {
+        // Only 20 px of title-bar width and 40 px of height would stay on screen.
+        assert_eq!(
+            launch_window_position(
+                1900.0,
+                1000.0,
+                [1280.0, 720.0],
+                &[primary()],
+                Some(primary())
+            ),
+            Some([320.0, 160.0])
+        );
+    }
+
+    #[test]
+    fn invalid_geometry_is_ignored() {
+        assert_eq!(
+            validated_window_position(f32::NAN, 0.0, [1280.0, 720.0]),
+            None
+        );
+        assert_eq!(
+            validated_window_position(0.0, f32::INFINITY, [1280.0, 720.0]),
+            None
+        );
+        assert_eq!(validated_window_position(0.0, 0.0, [f32::NAN, 720.0]), None);
+        assert_eq!(
+            validated_window_position(0.0, 0.0, [1280.0, f32::INFINITY]),
+            None
         );
     }
 }
@@ -852,23 +966,28 @@ impl BoundedApp {
 
     fn discovery(discovery: DiscoveryStartup) -> Self {
         let interfaces = realmhound_core::capture::NetworkInterface::list_all();
-        let (capture_handle, candidate_rx) = match interfaces {
+        let (capture_handle, candidate_rx, capture_error) = match interfaces {
             Ok(ref ifaces) if !ifaces.is_empty() => {
                 match discovery::start_discovery_capture(ifaces) {
-                    Ok((handle, rx)) => (Some(handle), Some(rx)),
+                    Ok((handle, rx)) => (Some(handle), Some(rx), None),
                     Err(e) => {
                         tracing::warn!("[DISCOVERY] Failed to start capture: {e}");
-                        (None, None)
+                        let visible_error = cfg!(target_os = "linux").then_some(e);
+                        (None, None, visible_error)
                     }
                 }
             }
             Ok(_) => {
                 tracing::warn!("[DISCOVERY] No network interfaces found");
-                (None, None)
+                let visible_error =
+                    cfg!(target_os = "linux").then(|| "No network interfaces found".to_string());
+                (None, None, visible_error)
             }
             Err(e) => {
                 tracing::warn!("[DISCOVERY] Failed to list interfaces: {e}");
-                (None, None)
+                let visible_error =
+                    cfg!(target_os = "linux").then(|| format!("Failed to list interfaces: {e}"));
+                (None, None, visible_error)
             }
         };
 
@@ -884,7 +1003,7 @@ impl BoundedApp {
             candidate_rx,
             candidates: Vec::new(),
             selected_idx: None,
-            action_error: None,
+            action_error: capture_error,
             committed: false,
         }
     }
@@ -1101,23 +1220,163 @@ pub fn apply_window_chrome<W: raw_window_handle::HasWindowHandle>(window: &W) {
     });
 }
 
-#[cfg(windows)]
-const MIN_VISIBLE_TITLE_BAR_WIDTH: i32 = 150;
-#[cfg(windows)]
-const MIN_VISIBLE_TITLE_BAR_HEIGHT: i32 = 50;
+#[cfg(any(windows, test))]
+const MIN_VISIBLE_TITLE_BAR_WIDTH: f32 = 150.0;
+#[cfg(any(windows, test))]
+const MIN_VISIBLE_TITLE_BAR_HEIGHT: f32 = 50.0;
 #[cfg(windows)]
 static NORMAL_WINDOW_PLACEMENT_CHECKED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Center the window when the saved position's title bar is unreachable.
+fn validated_window_position(x: f32, y: f32, size: [f32; 2]) -> Option<[f32; 2]> {
+    if !x.is_finite() || !y.is_finite() || !size[0].is_finite() || !size[1].is_finite() {
+        tracing::info!("[WINDOW] Ignoring invalid saved window geometry {x},{y} {size:?}");
+        return None;
+    }
+    // Windows parks minimized windows near -32000.
+    if x <= -10_000.0 || y <= -10_000.0 {
+        return None;
+    }
+
+    #[cfg(windows)]
+    {
+        let work_areas = monitor_work_areas();
+        if !work_areas.is_empty() {
+            return launch_window_position(x, y, size, &work_areas, primary_work_area());
+        }
+    }
+
+    Some([x, y])
+}
+
+/// Keep the saved position if its title bar is reachable, else center it.
+///
+/// shortcut: points are compared with physical work areas, so high-DPI
+/// positions can be accepted too eagerly; the first-frame pass corrects it.
+#[cfg(any(windows, test))]
+fn launch_window_position(
+    x: f32,
+    y: f32,
+    [width, height]: [f32; 2],
+    work_areas: &[egui::Rect],
+    primary: Option<egui::Rect>,
+) -> Option<[f32; 2]> {
+    let window = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height));
+    if work_areas
+        .iter()
+        .any(|area| has_usable_title_bar(window, *area))
+    {
+        return Some([x, y]);
+    }
+
+    let work_area = primary.or_else(|| work_areas.first().copied())?;
+    tracing::info!("[WINDOW] Ignoring off-screen saved position {x:.0},{y:.0}; centering instead");
+    let [centered_x, centered_y, ..] = centered_window(window, work_area);
+    Some([centered_x, centered_y])
+}
+
+/// The strip of the window that must stay reachable to grab it.
+#[cfg(any(windows, test))]
+fn title_bar_rect(window: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        window.min,
+        egui::pos2(
+            window.max.x,
+            (window.min.y + MIN_VISIBLE_TITLE_BAR_HEIGHT).min(window.max.y),
+        ),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn has_usable_title_bar(window: egui::Rect, work_area: egui::Rect) -> bool {
+    let overlap = title_bar_rect(window).intersect(work_area);
+    overlap.width() >= MIN_VISIBLE_TITLE_BAR_WIDTH
+        && overlap.height() >= MIN_VISIBLE_TITLE_BAR_HEIGHT
+}
+
+/// Fit the window into the work area and center it. Returns `x, y, width, height`.
+#[cfg(any(windows, test))]
+fn centered_window(window: egui::Rect, work_area: egui::Rect) -> [f32; 4] {
+    let work_width = work_area.width().max(1.0);
+    let work_height = work_area.height().max(1.0);
+    let width = window.width().clamp(1.0, work_width);
+    let height = window.height().clamp(1.0, work_height);
+    [
+        work_area.min.x + (work_width - width) / 2.0,
+        work_area.min.y + (work_height - height) / 2.0,
+        width,
+        height,
+    ]
+}
+
+#[cfg(windows)]
+fn rect_from_windows(rect: windows_sys::Win32::Foundation::RECT) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(rect.left as f32, rect.top as f32),
+        egui::pos2(rect.right as f32, rect.bottom as f32),
+    )
+}
+
+#[cfg(windows)]
+fn monitor_work_areas() -> Vec<egui::Rect> {
+    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+
+    unsafe extern "system" fn collect_monitor(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let work_areas = &mut *(data as *mut Vec<egui::Rect>);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            work_areas.push(rect_from_windows(info.rcWork));
+        }
+        1
+    }
+
+    let mut work_areas = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            0,
+            std::ptr::null(),
+            Some(collect_monitor),
+            &mut work_areas as *mut Vec<egui::Rect> as LPARAM,
+        );
+    }
+    work_areas
+}
+
+#[cfg(windows)]
+fn primary_work_area() -> Option<egui::Rect> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+
+    let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    if monitor == 0 {
+        return None;
+    }
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return None;
+    }
+    Some(rect_from_windows(info.rcWork))
+}
 
 /// Center a window on the primary display when its saved placement leaves too
 /// little title bar visible to notice and drag it.
 #[cfg(windows)]
 fn ensure_window_visible<W: raw_window_handle::HasWindowHandle>(window: &W) {
     use raw_window_handle::RawWindowHandle;
-    use windows_sys::Win32::Foundation::{POINT, RECT};
-    use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
-    };
+    use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowRect, IsIconic, IsZoomed, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
     };
@@ -1143,132 +1402,38 @@ fn ensure_window_visible<W: raw_window_handle::HasWindowHandle>(window: &W) {
         if GetWindowRect(hwnd, &mut window_rect) == 0 {
             return;
         }
+        let window_rect = rect_from_windows(window_rect);
 
-        match title_bar_is_visible_on_any_monitor(window_rect) {
-            Some(true) => {
-                NORMAL_WINDOW_PLACEMENT_CHECKED.store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-            Some(false) => {}
-            None => return,
-        }
-
-        let primary = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        if primary == 0 {
+        let work_areas = monitor_work_areas();
+        if work_areas.is_empty() {
             return;
         }
-        let mut primary_info: MONITORINFO = std::mem::zeroed();
-        primary_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(primary, &mut primary_info) == 0 {
+        if work_areas
+            .iter()
+            .any(|area| has_usable_title_bar(window_rect, *area))
+        {
+            NORMAL_WINDOW_PLACEMENT_CHECKED.store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
+        let Some(work_area) = primary_work_area() else {
+            return;
+        };
 
-        let (x, y, width, height) = fitted_centered_window(window_rect, primary_info.rcWork);
-        if SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE) != 0 {
+        let [x, y, width, height] = centered_window(window_rect, work_area);
+        if SetWindowPos(
+            hwnd,
+            0,
+            x.round() as i32,
+            y.round() as i32,
+            width.round() as i32,
+            height.round() as i32,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        ) != 0
+        {
             NORMAL_WINDOW_PLACEMENT_CHECKED.store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("[WINDOW] Recentered window after display layout change");
         }
     }
-}
-
-#[cfg(windows)]
-fn title_bar_is_visible_on_any_monitor(
-    window: windows_sys::Win32::Foundation::RECT,
-) -> Option<bool> {
-    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
-    use windows_sys::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
-    };
-
-    struct MonitorCheck {
-        window: RECT,
-        seen: bool,
-        visible: bool,
-    }
-
-    unsafe extern "system" fn check_monitor(
-        monitor: HMONITOR,
-        _hdc: HDC,
-        _rect: *mut RECT,
-        data: LPARAM,
-    ) -> BOOL {
-        let check = &mut *(data as *mut MonitorCheck);
-        check.seen = true;
-        let mut info: MONITORINFO = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(monitor, &mut info) != 0
-            && has_usable_title_bar(check.window, info.rcWork)
-        {
-            check.visible = true;
-            return 0;
-        }
-        1
-    }
-
-    let mut check = MonitorCheck {
-        window,
-        seen: false,
-        visible: false,
-    };
-    unsafe {
-        EnumDisplayMonitors(
-            0,
-            std::ptr::null(),
-            Some(check_monitor),
-            &mut check as *mut MonitorCheck as LPARAM,
-        );
-    }
-    check.seen.then_some(check.visible)
-}
-
-#[cfg(windows)]
-fn title_bar_rect(
-    window: windows_sys::Win32::Foundation::RECT,
-) -> windows_sys::Win32::Foundation::RECT {
-    windows_sys::Win32::Foundation::RECT {
-        left: window.left,
-        top: window.top,
-        right: window.right,
-        bottom: window
-            .top
-            .saturating_add(MIN_VISIBLE_TITLE_BAR_HEIGHT)
-            .min(window.bottom),
-    }
-}
-
-#[cfg(windows)]
-fn has_usable_title_bar(
-    window: windows_sys::Win32::Foundation::RECT,
-    work_area: windows_sys::Win32::Foundation::RECT,
-) -> bool {
-    let title_bar = title_bar_rect(window);
-    let width = i64::from(title_bar.right.min(work_area.right))
-        - i64::from(title_bar.left.max(work_area.left));
-    let height = i64::from(title_bar.bottom.min(work_area.bottom))
-        - i64::from(title_bar.top.max(work_area.top));
-    width >= i64::from(MIN_VISIBLE_TITLE_BAR_WIDTH)
-        && height >= i64::from(MIN_VISIBLE_TITLE_BAR_HEIGHT)
-}
-
-#[cfg(windows)]
-fn fitted_centered_window(
-    window: windows_sys::Win32::Foundation::RECT,
-    work_area: windows_sys::Win32::Foundation::RECT,
-) -> (i32, i32, i32, i32) {
-    let work_width =
-        (i64::from(work_area.right) - i64::from(work_area.left)).clamp(1, i64::from(i32::MAX));
-    let work_height =
-        (i64::from(work_area.bottom) - i64::from(work_area.top)).clamp(1, i64::from(i32::MAX));
-    let window_width = (i64::from(window.right) - i64::from(window.left)).clamp(1, work_width);
-    let window_height = (i64::from(window.bottom) - i64::from(window.top)).clamp(1, work_height);
-    let x = i64::from(work_area.left) + (work_width - window_width) / 2;
-    let y = i64::from(work_area.top) + (work_height - window_height) / 2;
-    (
-        x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        window_width as i32,
-        window_height as i32,
-    )
 }
 
 /// Set the window's title-bar icon (ICON_SMALL/ICON_BIG) from the multi-size
@@ -1478,6 +1643,16 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
 /// Get the directory for log files.
 fn get_log_directory() -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| std::path::Path::new(value).is_absolute())
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")));
+        if let Some(base) = base {
+            return base.join("RealmHound/logs");
+        }
+    }
     if let Some(data_dir) = dirs::data_local_dir() {
         data_dir.join("RealmHound").join("logs")
     } else {

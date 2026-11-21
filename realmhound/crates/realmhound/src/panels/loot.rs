@@ -422,10 +422,10 @@ impl LootPanel {
         &self.filters
     }
 
-    /// Reset the history list back to the top on the next render. Called when
-    /// the Loot History tab is (re)activated so it always opens on the most
-    /// recent drops instead of inheriting a stale scroll position.
+    /// Re-read history and return to the top when the tab is (re)activated.
     pub fn reset_scroll(&mut self) {
+        self.reset_history();
+        self.invalidate_autocomplete_cache();
         self.reset_scroll_pending = true;
     }
 
@@ -554,7 +554,7 @@ impl LootPanel {
         dungeon: &str,
         sprite_renderer: &mut SpriteRenderer,
     ) -> Option<String> {
-        if Self::render_dungeon_sprite_impl(ui, dungeon, sprite_renderer, true) {
+        if Self::render_dungeon_sprite_impl(ui, dungeon, sprite_renderer, true, 38.0) {
             Some(dungeon.to_string())
         } else {
             None
@@ -567,13 +567,14 @@ impl LootPanel {
         dungeon: &str,
         sprite_renderer: &mut SpriteRenderer,
         clickable: bool,
+        size: f32,
     ) -> bool {
         let sense = if clickable {
             egui::Sense::click()
         } else {
             egui::Sense::hover()
         };
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), sense);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), sense);
 
         if !ui.is_rect_visible(rect) {
             return false;
@@ -597,7 +598,7 @@ impl LootPanel {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "🚪",
-                egui::FontId::proportional(22.0),
+                egui::FontId::proportional(size * 0.58),
                 Color32::from_rgb(150, 180, 200),
             );
         }
@@ -632,7 +633,7 @@ impl LootPanel {
         mob_name: &str,
         sprite_renderer: &mut SpriteRenderer,
     ) -> Option<(i32, String)> {
-        if Self::render_mob_sprite_impl(ui, mob_type, mob_name, sprite_renderer, true) {
+        if Self::render_mob_sprite_impl(ui, mob_type, mob_name, sprite_renderer, true, 38.0) {
             Some((mob_type, mob_name.to_string()))
         } else {
             None
@@ -646,6 +647,7 @@ impl LootPanel {
         mob_name: &str,
         sprite_renderer: &mut SpriteRenderer,
         clickable: bool,
+        size: f32,
     ) -> bool {
         // Never render an environmental structure (wall/gate/pillar) as a drop
         // source, even if a legacy row stored one; fall back to the "?" marker.
@@ -656,7 +658,7 @@ impl LootPanel {
         } else {
             egui::Sense::hover()
         };
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), sense);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), sense);
 
         // Only draw if visible
         if !ui.is_rect_visible(rect) {
@@ -676,7 +678,7 @@ impl LootPanel {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "?",
-                egui::FontId::monospace(24.0),
+                egui::FontId::monospace(size * 0.63),
                 Color32::from_rgb(180, 150, 200),
             );
         }
@@ -1408,7 +1410,7 @@ impl LootPanel {
                 click_action = Some(HistoryClickAction::FilterDungeon(dungeon));
             }
         } else {
-            Self::render_dungeon_sprite_impl(ui, &drop.dungeon, sprite_renderer, false);
+            Self::render_dungeon_sprite_impl(ui, &drop.dungeon, sprite_renderer, false, 38.0);
         }
 
         ui.add_space(4.0);
@@ -1433,6 +1435,7 @@ impl LootPanel {
                 &drop.mob_name,
                 sprite_renderer,
                 false,
+                38.0,
             );
         }
 
@@ -1495,6 +1498,48 @@ impl LootPanel {
                 COMPACT_SIZE,
             );
         }
+    }
+
+    /// Compact drop row for the Live Loot overlay: bag, dungeon and source icons,
+    /// then whatever `items` draws.
+    pub(crate) fn render_compact_drop_row(
+        ui: &mut egui::Ui,
+        drop: &LootDropRecord,
+        sprite_renderer: &mut SpriteRenderer,
+        size: f32,
+        row_height: f32,
+        items: impl FnOnce(&mut egui::Ui, &mut SpriteRenderer),
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let spacing = ui.spacing().item_spacing.x;
+            let band = egui::vec2(size * 3.0 + spacing * 2.0, row_height.max(size));
+            ui.allocate_ui_with_layout(
+                band,
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_height(band.y);
+                    let bag_type = LootBagType::from_id(drop.bag_type);
+                    Self::render_bag_icon_by_id(ui, drop.bag_type, bag_type, sprite_renderer, size);
+                    Self::render_dungeon_sprite_impl(
+                        ui,
+                        &drop.dungeon,
+                        sprite_renderer,
+                        false,
+                        size,
+                    );
+                    Self::render_mob_sprite_impl(
+                        ui,
+                        drop.display_object_type,
+                        &drop.mob_name,
+                        sprite_renderer,
+                        false,
+                        size,
+                    );
+                },
+            );
+            items(ui, sprite_renderer);
+        });
     }
 
     /// Render a full loot card (background, optional select checkbox, drop row,
@@ -1834,7 +1879,7 @@ impl LootPanel {
         }
 
         // Clear button
-        if !self.search_text.is_empty() && shadcn.btn(ui, "✕").clicked() {
+        if !self.search_text.is_empty() && shadcn.btn(ui, "×").clicked() {
             self.search_text.clear();
             self.search_popup_open = false;
             self.search_selected_index = None;
@@ -2133,6 +2178,41 @@ impl Panel for LootPanel {
 mod property_history_tests {
     use super::*;
     use realmhound_core::loot::{NewLootDrop, NewLootItem, PlayerStateTracker};
+
+    #[test]
+    fn reopening_history_reloads_new_drops_without_appending_cached_pages() {
+        let mut db = LootDatabase::open_in_memory().unwrap();
+        let mut player = PlayerStateTracker::new();
+        player.on_create_success(1, 1);
+        player.on_new_map("Realm", 1);
+        let mut drop = NewLootDrop {
+            timestamp: 61_000,
+            player: player.capture_snapshot().unwrap(),
+            bag_type: LootBagType::White,
+            mob_type: 8200,
+            mob_name: String::new(),
+            items: Vec::new(),
+        };
+        for _ in 0..101 {
+            db.insert_loot_drop(&drop).unwrap();
+        }
+        let mut panel = LootPanel::default();
+        panel.load_history(&db);
+        panel.history_offset = 100;
+        panel.history_needs_refresh = true;
+        panel.load_history(&db);
+        assert_eq!(panel.history_drops.len(), 101);
+
+        drop.timestamp = 90_000;
+        let new_id = db.insert_loot_drop(&drop).unwrap();
+        panel.load_history(&db);
+        assert_eq!(panel.history_total_count, Some(101));
+        panel.reset_scroll();
+        panel.load_history(&db);
+        assert_eq!(panel.history_total_count, Some(102));
+        assert_eq!(panel.history_drops.len(), 100);
+        assert_eq!(panel.history_drops[0].id, new_id);
+    }
 
     #[test]
     fn property_pages_counts_and_resets_use_matching_bags_only() {

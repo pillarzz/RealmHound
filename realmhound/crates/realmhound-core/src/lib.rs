@@ -12,7 +12,6 @@
 //! - `capture` - Network packet capture using libpcap (Npcap on Windows)
 //! - `crypto` - RC4 encryption/decryption
 //! - `loot` - Loot detection, tracking, and history database
-//! - `party_cache` - In-memory player class/skin/guild sightings for the Party panel
 //! - `protocol` - RotMG packet definitions and parsing
 //! - `router` - Packet routing and game event generation
 //! - `session` - Central game session state model
@@ -47,7 +46,6 @@ pub mod dust;
 pub mod keyper;
 pub mod loot;
 pub mod maintenance;
-pub mod party_cache;
 pub mod profiling;
 pub mod protocol;
 pub mod realmshark_import;

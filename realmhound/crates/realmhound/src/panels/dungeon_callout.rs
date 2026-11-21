@@ -223,6 +223,46 @@ pub struct DungeonCalloutParams<'a> {
     pub origin_status: Option<&'a str>,
 }
 
+/// Assemble a full clipboard callout from a bare body, applying the party
+/// prefix, short server name, realm name and join-marker placement.
+///
+/// Shared by the UI copy buttons and the worker's automatic callout lane.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_callout(
+    body: &str,
+    server: Option<&str>,
+    realm: Option<&str>,
+    join: realmhound_core::settings::JoinPosition,
+    call_for_party: bool,
+    include_server_name: bool,
+    include_realm_name: bool,
+) -> String {
+    use realmhound_core::settings::JoinPosition;
+    let mut parts: Vec<String> = Vec::new();
+    if call_for_party {
+        parts.push("/p".to_string());
+    }
+    if join == JoinPosition::Beginning {
+        parts.push("j".to_string());
+    }
+    if include_server_name {
+        if let Some(server) = server {
+            parts.push(realmhound_core::protocol::short_server_name(server).to_string());
+        }
+    }
+    if include_realm_name {
+        if let Some(realm) = realm {
+            parts.push(realm.to_string());
+        }
+    }
+    parts.push(body.to_string());
+    if join == JoinPosition::End {
+        parts.push("j".to_string());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts.join(" ")
+}
+
 /// The realm-status callout suffix for a dungeon entered from a realm, or
 /// `None` when nothing should be appended.
 ///

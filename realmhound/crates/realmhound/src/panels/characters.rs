@@ -9,8 +9,8 @@ use crate::ui_ext::HoverTooltipExt;
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
     api::{
-        debug_order_alignment, decode_pcstats, parse_account_data, parse_char_list,
-        parse_owned_pet_skins, AccountData, CharacterStats, ClassExaltation, RotmgApiClient,
+        debug_order_alignment, decode_pcstats, parse_account_data, parse_owned_pet_skins,
+        AccountData, CharacterStats, ClassExaltation, RotmgApiClient,
     },
     assets::get_dungeon_portal_map,
     stats::{
@@ -883,24 +883,6 @@ impl CharactersPanel {
         self.needs_save = true;
     }
 
-    /// Mark a character as dead, moving it into the graveyard.
-    pub fn mark_dead(
-        &mut self,
-        char_id: i32,
-        killed_by: &str,
-        death_fame: i32,
-        gravestone_type: Option<i32>,
-    ) {
-        self.cache
-            .mark_dead(char_id, killed_by, death_fame, gravestone_type);
-        // Clear live char if it's the one that died
-        if self.live_char_id == Some(char_id) {
-            self.live_char_id = None;
-        }
-        // Death moves the char between lists, so counts must be recomputed.
-        self.recompute_tab_counts();
-    }
-
     /// Remove a dead character from the cache.
     pub fn remove_character(&mut self, char_id: i32) {
         self.cache.remove_character(char_id);
@@ -1073,27 +1055,6 @@ impl CharactersPanel {
             CharactersFetchState::Error(_) | CharactersFetchState::Loading
         ) {
             self.fetch_state = CharactersFetchState::Idle;
-        }
-    }
-
-    /// Parse character data from NewCharacterInfo packet XML.
-    /// This updates only the characters present in the XML, not replacing the whole list.
-    pub fn parse_character_xml(&mut self, xml: &str) {
-        match parse_char_list(xml) {
-            Ok(characters) => {
-                tracing::info!(
-                    "[CHARACTERS] Parsed {} characters from packet",
-                    characters.len()
-                );
-                // Update each character individually instead of replacing all
-                for character in &characters {
-                    self.cache.update_single_character(character);
-                }
-                self.recompute_tab_counts();
-            }
-            Err(e) => {
-                tracing::error!("[CHARACTERS] Failed to parse character XML: {}", e);
-            }
         }
     }
 
@@ -1472,7 +1433,7 @@ impl CharactersPanel {
         }
         let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-        if !self.search_query.is_empty() && shadcn.btn(ui, "✕").clicked() {
+        if !self.search_query.is_empty() && shadcn.btn(ui, "×").clicked() {
             self.search_query.clear();
             self.search_popup_open = false;
             self.search_selected_index = None;
@@ -2641,7 +2602,7 @@ impl CharactersPanel {
     /// Overlay the icon-only copy buttons at the top-right corner of a stats
     /// card, painted via [`egui::Ui::interact`] (not `ui.put`) so they never
     /// allocate layout space and shift the cards below. Statistics / Biome Kills
-    /// / Dungeons get a "Copy" button (⧉, "two pages" glyph); Dungeons also gets
+    /// / Dungeons get a "Copy" button (📋 clipboard glyph); Dungeons also gets
     /// a "Copy Debug" button (🔧 wrench) that dumps the raw PCStats alignment.
     /// Nothing is drawn for the non-exportable blocks or while collapsed.
     fn render_card_copy_buttons(
@@ -2681,7 +2642,7 @@ impl CharactersPanel {
             ui,
             ("card_copy", block),
             copy_rect,
-            "⧉",
+            "📋",
             &format!("Copy {}", category),
         ) {
             let text = match block {
@@ -4213,69 +4174,6 @@ impl Panel for CharactersPanel {
         actions.append(&mut self.pending_edits);
 
         actions
-    }
-
-    fn handle_event(
-        &mut self,
-        event: &realmhound_core::GameEvent,
-        session: &realmhound_core::GameSession,
-    ) -> Vec<AppAction> {
-        match event {
-            realmhound_core::GameEvent::CharacterDied {
-                char_id,
-                ref killed_by,
-                total_fame,
-                gravestone_type,
-            } => {
-                self.mark_dead(*char_id, killed_by, *total_fame, Some(*gravestone_type));
-            }
-            realmhound_core::GameEvent::CharacterXmlReceived { ref xml } => {
-                // Only ingest the character list from a verified main-account
-                // connection so mule/alt accounts don't populate the pages.
-                if session.connection.is_account_verified() {
-                    self.parse_character_xml(xml);
-                }
-            }
-            realmhound_core::GameEvent::SeasonalStatusReceived {
-                char_id,
-                is_seasonal,
-            } => {
-                self.cache.update_seasonal_status(*char_id, *is_seasonal);
-                self.recompute_tab_counts();
-            }
-            realmhound_core::GameEvent::ExaltationUpdated {
-                class_type,
-                ref exaltation,
-            } => {
-                // Gated on a verified main account so a mule/alt account can't
-                // overwrite the main's exaltation progress.
-                if session.connection.is_account_verified() {
-                    let changed = self
-                        .exaltation_stats
-                        .get(class_type)
-                        .map(|existing| existing != exaltation)
-                        .unwrap_or(true);
-
-                    if changed {
-                        self.exaltation_stats
-                            .insert(*class_type, exaltation.clone());
-                        self.cache
-                            .exaltation_stats
-                            .insert(*class_type, exaltation.clone());
-                        self.needs_save = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Signal cache change if modified during event handling
-        if self.needs_save {
-            self.needs_save = false;
-            vec![AppAction::CharacterCacheChanged]
-        } else {
-            vec![]
-        }
     }
 }
 

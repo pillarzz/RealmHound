@@ -75,7 +75,6 @@ fn seed_known_flat_layout(root: &StorageRoot, account_id: &str) {
     );
     write(root, "logs/chat/2026-08-01.log", b"hello world");
     write(root, "logs/app.log", b"global app log");
-    write(root, "event_notification_log.csv", b"a,b,c\n");
     write(root, "watchlist_detections.log", b"detection\n");
     write(root, "watchlist.txt", b"player\n");
     write(root, "captures/unassigned/x.pcap", b"capture");

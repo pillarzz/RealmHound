@@ -1550,7 +1550,6 @@ impl FlatLayoutMigration {
             "char_list.xml" => paths.character_list_cache()?,
             "imports/dungeon.stats" => paths.realmshark_import()?,
             "logs/chat" => paths.chat_logs()?,
-            "event_notification_log.csv" => paths.event_notifications()?,
             "watchlist_detections.log" => paths.watchlist_detections()?,
             "loot_history.db" => paths.loot_database()?,
             "combat_history.db" => paths.combat_database()?,

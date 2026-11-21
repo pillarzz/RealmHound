@@ -26,6 +26,8 @@ pub enum RelaunchReason {
     /// The active account was deleted; restart into the next profile or
     /// discovery mode.
     AccountDeletion,
+    /// Restarting to apply an overlay-compatible window backend.
+    OverlayBackend,
 }
 
 /// Spawn the replacement, telling it to wait for `wait_pid` to exit before

@@ -865,6 +865,113 @@ impl ExaltationsPanel {
         out
     }
 
+    /// Numeric cell values for the current display mode, used by the totals.
+    /// They are the same numbers the matrix cells show, just summed.
+    fn mode_values(&self, stats: &HashMap<i32, ClassExaltation>, class_id: i32) -> [u32; 8] {
+        match self.display_mode {
+            ExaltDisplayMode::Milestones => Self::class_levels(stats, class_id).map(|v| v as u32),
+            ExaltDisplayMode::Points => Self::class_points(stats, class_id).map(|v| v as u32),
+            ExaltDisplayMode::PointsRemaining => {
+                Self::class_points(stats, class_id).map(|v| STAT_MAX_POINTS as u32 - v as u32)
+            }
+        }
+    }
+
+    /// Per-stat totals, per-class totals and the grand total for the current
+    /// display mode. `classes` is the visible column/row order, so the totals
+    /// always match what the matrix shows.
+    fn matrix_totals(
+        &self,
+        stats: &HashMap<i32, ClassExaltation>,
+        classes: &[i32],
+    ) -> ([u32; 8], Vec<u32>, u32) {
+        let mut per_stat = [0u32; 8];
+        let mut per_class = Vec::with_capacity(classes.len());
+        let mut grand = 0u32;
+        for &cid in classes {
+            let values = self.mode_values(stats, cid);
+            let class_total: u32 = values.iter().sum();
+            per_class.push(class_total);
+            grand += class_total;
+            for (total, value) in per_stat.iter_mut().zip(values) {
+                *total += value;
+            }
+        }
+        (per_stat, per_class, grand)
+    }
+
+    /// Draw a summary cell (per-class, per-stat or grand total).
+    fn total_cell(ui: &mut egui::Ui, value: u32, size: egui::Vec2, grand: bool) {
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let fill = if grand {
+            Color32::from_white_alpha(20)
+        } else {
+            Color32::from_white_alpha(8)
+        };
+        ui.painter().rect_filled(rect, 2.0, fill);
+        let color = if grand {
+            exalt_colors::AMBER
+        } else {
+            Color32::WHITE
+        };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            value.to_string(),
+            egui::FontId::proportional(16.0),
+            color,
+        );
+    }
+
+    /// Header for the summary column or row. The text is exactly `TOTAL`.
+    fn total_header(ui: &mut egui::Ui, size: egui::Vec2) {
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        ui.painter()
+            .rect_filled(rect, 2.0, Color32::from_white_alpha(12));
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "TOTAL",
+            egui::FontId::proportional(11.5),
+            exalt_colors::GRAYTXT,
+        );
+    }
+
+    /// Widths for the horizontal layout: `(class column width, middle scroll
+    /// area width)` after reserving the pinned stat label and TOTAL column.
+    /// Falls back to the existing minimum (and scrolling) on narrow windows.
+    fn horizontal_layout_widths(
+        avail: f32,
+        stat_label_w: f32,
+        total_w: f32,
+        n: usize,
+        side_margin: f32,
+        gap: f32,
+    ) -> (f32, f32) {
+        let n = n.max(1) as f32;
+        let middle_w = (avail - (stat_label_w + total_w + side_margin * 3.0 + gap * 2.0)).max(52.0);
+        let class_w = ((middle_w - gap * (n - 1.0) - 4.0) / n).max(52.0);
+        (class_w, middle_w)
+    }
+
+    /// Width of one stat column in the vertical layout, after reserving the
+    /// pinned class column, TOTAL column and scrollbar.
+    fn vertical_stat_width(
+        avail: f32,
+        class_w: f32,
+        total_w: f32,
+        scrollbar_w: f32,
+        gap: f32,
+    ) -> f32 {
+        ((avail - class_w - total_w - gap * 10.0 - scrollbar_w) / 8.0).clamp(30.0, 90.0)
+    }
+
     /// Milestone level (0-5) for a raw point total (15 points per milestone).
     fn points_level(points: u8) -> u8 {
         (points / 15).min(5)
@@ -939,12 +1046,18 @@ impl ExaltationsPanel {
                 // stay aligned with the scrolling body columns.
                 ui.spacing_mut().item_spacing = spacing;
                 let scrollbar_w = 18.0;
+                let total_w = 70.0_f32;
                 let avail = ui.available_width();
                 let stat_w =
-                    ((avail - class_w - spacing.x * 9.0 - scrollbar_w) / 8.0).clamp(30.0, 90.0);
+                    Self::vertical_stat_width(avail, class_w, total_w, scrollbar_w, spacing.x);
+                let (per_stat, per_class, grand) = self.matrix_totals(stats, &classes);
+                let class_values: Vec<[(u8, bool, bool, u8); 8]> = classes
+                    .iter()
+                    .map(|&cid| self.cell_values(stats, cid))
+                    .collect();
 
-                // Pinned header row: empty corner + 8 stat headers (stays put
-                // while the class rows scroll underneath).
+                // Pinned header row: empty corner + 8 stat headers + TOTAL
+                // (stays put while the class rows scroll underneath).
                 let header = ui.horizontal(|ui| {
                     let (corner, _) =
                         ui.allocate_exact_size(egui::vec2(class_w, stat_h), egui::Sense::hover());
@@ -958,6 +1071,7 @@ impl ExaltationsPanel {
                             stats,
                         );
                     }
+                    Self::total_header(ui, egui::vec2(total_w, stat_h));
                 });
                 // Full-width horizontal divider under the pinned header.
                 let y = header.response.rect.bottom() + spacing.y * 0.5;
@@ -972,8 +1086,8 @@ impl ExaltationsPanel {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = spacing;
-                        for &cid in &classes {
-                            let values = self.cell_values(stats, cid);
+                        for (idx, &cid) in classes.iter().enumerate() {
+                            let values = class_values[idx];
                             ui.horizontal(|ui| {
                                 let resp = self.class_button(
                                     ui,
@@ -1006,10 +1120,36 @@ impl ExaltationsPanel {
                                                 egui::vec2(stat_w, cell_h),
                                             );
                                         }
+                                        Self::total_cell(
+                                            ui,
+                                            per_class[idx],
+                                            egui::vec2(total_w, cell_h),
+                                            false,
+                                        );
                                     });
                                 });
                             });
                         }
+
+                        // Per-stat totals along the bottom, plus the grand total.
+                        ui.horizontal(|ui| {
+                            Self::total_header(ui, egui::vec2(class_w, class_h));
+                            ui.vertical(|ui| {
+                                let pad = (class_h - cell_h) * 0.5;
+                                ui.add_space(pad);
+                                ui.horizontal(|ui| {
+                                    for total in per_stat {
+                                        Self::total_cell(
+                                            ui,
+                                            total,
+                                            egui::vec2(stat_w, cell_h),
+                                            false,
+                                        );
+                                    }
+                                    Self::total_cell(ui, grand, egui::vec2(total_w, cell_h), true);
+                                });
+                            });
+                        });
                     });
             }
             ExaltLayout::ClassesHorizontal => {
@@ -1021,10 +1161,22 @@ impl ExaltationsPanel {
 
                 // Stretch the class columns to fill the row edge-to-edge (no
                 // horizontal scroll) when they fit; fall back to a minimum width
-                // and scroll on narrow windows.
-                let n = classes.len().max(1) as f32;
-                let scroll_avail = ui.available_width() - (stat_label_w + side_margin * 3.0);
-                let class_w = ((scroll_avail - spacing.x * (n - 1.0) - 4.0) / n).max(52.0);
+                // and scroll on narrow windows. The TOTAL column is reserved in
+                // the fit so it never needs its own scroll.
+                let total_w = 70.0_f32;
+                let (class_w, middle_w) = Self::horizontal_layout_widths(
+                    ui.available_width(),
+                    stat_label_w,
+                    total_w,
+                    classes.len(),
+                    side_margin,
+                    spacing.x,
+                );
+                let (per_stat, per_class, grand) = self.matrix_totals(stats, &classes);
+                let class_values: Vec<[(u8, bool, bool, u8); 8]> = classes
+                    .iter()
+                    .map(|&cid| self.cell_values(stats, cid))
+                    .collect();
 
                 // Hide class names on every button when the widest one no longer
                 // fits, leaving just the scaled icon and count.
@@ -1043,6 +1195,7 @@ impl ExaltationsPanel {
                 let show_names = max_name_w <= class_w - 6.0;
 
                 let mut left_rect = egui::Rect::NOTHING;
+                let mut totals_rect = egui::Rect::NOTHING;
                 ScrollArea::vertical()
                     .id_salt("exalt_matrix_v")
                     .auto_shrink([false, false])
@@ -1067,12 +1220,14 @@ impl ExaltationsPanel {
                                         stats,
                                     );
                                 }
+                                Self::total_header(ui, egui::vec2(stat_label_w, row_h));
                             });
                             left_rect = left.response.rect;
 
                             ui.add_space(side_margin);
                             ScrollArea::horizontal()
                                 .id_salt("exalt_matrix")
+                                .max_width(middle_w)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     ui.spacing_mut().item_spacing = spacing;
@@ -1100,22 +1255,46 @@ impl ExaltationsPanel {
                                         });
                                         for i in 0..8 {
                                             ui.horizontal(|ui| {
-                                                for &cid in &classes {
-                                                    let values = self.cell_values(stats, cid);
+                                                for values in &class_values {
+                                                    let values = values[i];
                                                     Self::cell(
                                                         ui,
-                                                        values[i].0,
-                                                        values[i].1,
-                                                        values[i].2,
-                                                        values[i].3,
+                                                        values.0,
+                                                        values.1,
+                                                        values.2,
+                                                        values.3,
                                                         self.cell_colors,
                                                         egui::vec2(class_w, row_h),
                                                     );
                                                 }
                                             });
                                         }
+                                        // Per-class totals along the bottom.
+                                        ui.horizontal(|ui| {
+                                            for &total in &per_class {
+                                                Self::total_cell(
+                                                    ui,
+                                                    total,
+                                                    egui::vec2(class_w, row_h),
+                                                    false,
+                                                );
+                                            }
+                                        });
                                     });
                                 });
+                            ui.add_space(side_margin);
+                            // Pinned right column: TOTAL header, one total per
+                            // stat, then the grand total. It stays visible when
+                            // the class columns scroll horizontally.
+                            let totals = ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing = spacing;
+                                Self::total_header(ui, egui::vec2(total_w, class_h));
+                                for total in per_stat {
+                                    Self::total_cell(ui, total, egui::vec2(total_w, row_h), false);
+                                }
+                                Self::total_cell(ui, grand, egui::vec2(total_w, row_h), true);
+                            });
+                            totals_rect = totals.response.rect;
                         });
 
                         // Full-height dividers flanking the stat column, each
@@ -1125,7 +1304,9 @@ impl ExaltationsPanel {
                         ui.painter()
                             .vline(left_rect.left() - side_margin, y.clone(), stroke);
                         ui.painter()
-                            .vline(left_rect.right() + side_margin, y, stroke);
+                            .vline(left_rect.right() + side_margin, y.clone(), stroke);
+                        ui.painter()
+                            .vline(totals_rect.left() - side_margin, y, stroke);
                     });
             }
         }
@@ -1273,5 +1454,81 @@ impl Panel for ExaltationsPanel {
 
         self.scroll_to_selected = false;
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exalt(attack: u32, defense: u32) -> ClassExaltation {
+        ClassExaltation {
+            attack,
+            defense,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn totals_follow_each_display_mode() {
+        let mut stats = HashMap::new();
+        // Rogue: ATT capped at 75, DEF 15, everything else 0. Class 1 is
+        // missing entirely and must still contribute its cells.
+        stats.insert(0, exalt(75, 15));
+        let classes = [0, 1];
+        let mut panel = ExaltationsPanel::new();
+
+        panel.display_mode = ExaltDisplayMode::Milestones;
+        let (per_stat, per_class, grand) = panel.matrix_totals(&stats, &classes);
+        assert_eq!(per_stat, [5, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(per_class, vec![7, 0]);
+        assert_eq!(grand, 7);
+
+        panel.display_mode = ExaltDisplayMode::Points;
+        let (per_stat, per_class, grand) = panel.matrix_totals(&stats, &classes);
+        assert_eq!(per_stat, [75, 15, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(per_class, vec![90, 0]);
+        assert_eq!(grand, 90);
+
+        panel.display_mode = ExaltDisplayMode::PointsRemaining;
+        let (per_stat, per_class, grand) = panel.matrix_totals(&stats, &classes);
+        // ATT is complete (0 remaining); DEF has 60. The missing class has 75
+        // remaining in every stat, matching what its cells show.
+        assert_eq!(per_stat, [75, 135, 150, 150, 150, 150, 150, 150]);
+        assert_eq!(per_class, vec![510, 600]);
+        assert_eq!(grand, 1_110);
+    }
+
+    #[test]
+    fn points_are_clamped_before_totalling() {
+        let mut stats = HashMap::new();
+        stats.insert(0, exalt(100, 0));
+        let mut panel = ExaltationsPanel::new();
+        panel.display_mode = ExaltDisplayMode::Points;
+        assert_eq!(panel.mode_values(&stats, 0)[0], 75);
+        panel.display_mode = ExaltDisplayMode::PointsRemaining;
+        assert_eq!(panel.mode_values(&stats, 0)[0], 0);
+    }
+
+    #[test]
+    fn horizontal_widths_reserve_the_totals_column() {
+        let (class_w, middle_w) =
+            ExaltationsPanel::horizontal_layout_widths(1920.0, 72.0, 70.0, 19, 6.0, 6.0);
+        assert!(class_w >= 52.0);
+        assert!(middle_w < 1920.0 - 72.0 - 70.0);
+        // 19 class columns and their gaps fit inside the middle scroll area.
+        assert!(class_w * 19.0 + 6.0 * 18.0 + 4.0 <= middle_w + 0.5);
+
+        // A narrow window falls back to the existing minimum and scrolls.
+        let (class_w, _) =
+            ExaltationsPanel::horizontal_layout_widths(800.0, 72.0, 70.0, 19, 6.0, 6.0);
+        assert_eq!(class_w, 52.0);
+    }
+
+    #[test]
+    fn vertical_widths_reserve_the_totals_column() {
+        let stat_w = ExaltationsPanel::vertical_stat_width(1280.0, 64.0, 70.0, 18.0, 6.0);
+        assert!((30.0..=90.0).contains(&stat_w));
+        assert!(64.0 + 8.0 * stat_w + 70.0 + 10.0 * 6.0 + 18.0 <= 1280.0 + 0.5);
     }
 }

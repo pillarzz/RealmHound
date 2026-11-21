@@ -630,6 +630,36 @@ pub struct LiveFeedSettings {
     #[serde(default = "default_true")]
     pub show_area_unlocks: bool,
 
+    /// Custom "thank you" message copied when the user clicks a key-pop entry.
+    /// `[Name]` is replaced with the opener's IGN. Defaults to
+    /// [`crate::thanks::DEFAULT_KEY_POP`].
+    #[serde(default = "default_key_pop_thanks")]
+    pub key_pop_thanks: String,
+
+    /// Custom "thank you" message for Wine Cellar Incantation unlocks.
+    /// `[Name]` is replaced with the popper's IGN. Defaults to
+    /// [`crate::thanks::DEFAULT_INC`].
+    #[serde(default = "default_area_unlock_inc_thanks")]
+    pub area_unlock_inc_thanks: String,
+
+    /// Custom "thank you" message for Vial of Pure Darkness unlocks.
+    /// `[Name]` is replaced with the popper's IGN. Defaults to
+    /// [`crate::thanks::DEFAULT_VIAL`].
+    #[serde(default = "default_area_unlock_vial_thanks")]
+    pub area_unlock_vial_thanks: String,
+
+    /// Custom "thank you" message for Lost Halls rune unlocks. `[Names]` is
+    /// replaced with the popper list and `[Rune]` with the rune type. Defaults
+    /// to [`crate::thanks::DEFAULT_RUNES`].
+    #[serde(default = "default_area_unlock_runes_thanks")]
+    pub area_unlock_runes_thanks: String,
+
+    /// Copy the area-unlock "thank you" message to the clipboard automatically
+    /// when someone unlocks an area for the local player. Off by default; there
+    /// is deliberately no equivalent for key pops.
+    #[serde(default)]
+    pub auto_clipboard_area_unlock_thanks: bool,
+
     /// Show dungeon-entry callouts (created when the user enters a dungeon) in
     /// the Live Feed. Defaults to `true`.
     #[serde(default = "default_true")]
@@ -1028,6 +1058,26 @@ fn default_realm_status_threshold() -> i32 {
     33
 }
 
+/// Default key-pop "thank you" message.
+fn default_key_pop_thanks() -> String {
+    crate::thanks::DEFAULT_KEY_POP.to_string()
+}
+
+/// Default Wine Cellar Incantation "thank you" message.
+fn default_area_unlock_inc_thanks() -> String {
+    crate::thanks::DEFAULT_INC.to_string()
+}
+
+/// Default Vial of Pure Darkness "thank you" message.
+fn default_area_unlock_vial_thanks() -> String {
+    crate::thanks::DEFAULT_VIAL.to_string()
+}
+
+/// Default Lost Halls rune "thank you" message.
+fn default_area_unlock_runes_thanks() -> String {
+    crate::thanks::DEFAULT_RUNES.to_string()
+}
+
 /// Default number of consecutive dungeon spawns compared when recognizing an
 /// event mod from the user's own runs (3).
 fn default_learn_event_mods_runs() -> u32 {
@@ -1178,6 +1228,11 @@ impl Default for LiveFeedSettings {
             show_key_pops: true,
             key_pop_tiers: KeyPopTierFilter::default(),
             show_area_unlocks: true,
+            key_pop_thanks: default_key_pop_thanks(),
+            area_unlock_inc_thanks: default_area_unlock_inc_thanks(),
+            area_unlock_vial_thanks: default_area_unlock_vial_thanks(),
+            area_unlock_runes_thanks: default_area_unlock_runes_thanks(),
+            auto_clipboard_area_unlock_thanks: false,
             show_dungeon_entries: true,
             show_boss_calls: true,
             show_loot_drops: true,
@@ -3447,6 +3502,27 @@ mod tests {
         assert!(tracking.track_marks);
         assert!(tracking.track_tiered_items);
         assert_eq!(tracking.min_tiered_tier, 10);
+    }
+
+    #[test]
+    fn live_feed_thanks_messages_have_shipped_defaults() {
+        let lf = LiveFeedSettings::default();
+        assert_eq!(lf.key_pop_thanks, "Thanks [Name] for the key!");
+        assert_eq!(lf.area_unlock_inc_thanks, "Thanks [Name] for the inc!");
+        assert_eq!(lf.area_unlock_vial_thanks, "Thanks [Name] for the vial!");
+        assert_eq!(
+            lf.area_unlock_runes_thanks,
+            "Thanks [Names] for the [Rune]!"
+        );
+        assert!(!lf.auto_clipboard_area_unlock_thanks);
+    }
+
+    #[test]
+    fn live_feed_thanks_messages_fill_from_missing_json_fields() {
+        let lf: LiveFeedSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(lf.key_pop_thanks, crate::thanks::DEFAULT_KEY_POP);
+        assert_eq!(lf.area_unlock_runes_thanks, crate::thanks::DEFAULT_RUNES);
+        assert!(!lf.auto_clipboard_area_unlock_thanks);
     }
 
     #[test]

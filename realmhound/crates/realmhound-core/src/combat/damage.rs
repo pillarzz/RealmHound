@@ -736,6 +736,8 @@ mod tests {
         scaling_stat: ScalingStat::Wisdom,
         duration: 2.4,
         extra_shots: 2,
+        on_shoot: false,
+        required_condition_bit: 0,
     };
     // T0 Cloak of Shadows.
     const T0: LethalStrikeParams = LethalStrikeParams {
@@ -747,6 +749,8 @@ mod tests {
         scaling_stat: ScalingStat::Wisdom,
         duration: 2.4,
         extra_shots: 2,
+        on_shoot: false,
+        required_condition_bit: 0,
     };
 
     #[test]

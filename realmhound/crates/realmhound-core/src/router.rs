@@ -129,7 +129,14 @@ pub enum GameEvent {
     /// Carries the used item's type id so the combat engine can open a
     /// Knight-shield damage-reduction window when the item is a shield, plus the
     /// throw/aim world position (blast center for self-computed ability damage).
-    LocalItemUsed { item_id: i32, x: f32, y: f32 },
+    /// `use_item_flag` distinguishes a meter-gated item's normal ability (0)
+    /// from its switch/animal-form ability (1).
+    LocalItemUsed {
+        item_id: i32,
+        x: f32,
+        y: f32,
+        use_item_flag: i32,
+    },
 
     /// Character XML data received from server (NewCharacterInfo packet).
     CharacterXmlReceived { xml: String },
@@ -238,6 +245,11 @@ pub enum GameEvent {
     /// notification text; `picture_type` is the portal object type id (resolves
     /// to the dungeon name via the asset manager).
     PortalOpened { message: String, picture_type: i32 },
+
+    /// A player-death announcement (PlayerDeath notification, effect 7).
+    /// `message` is the raw `s.death` JSON-ish payload; `picture_type` is the
+    /// gravestone object type carried by the same packet.
+    PlayerDeathAnnounced { message: String, picture_type: i32 },
 
     /// A server-wide area-unlock / monument-activation broadcast (ServerMessage
     /// notification, effect 1). `message` is the raw JSON-ish notification text
@@ -467,6 +479,7 @@ impl PacketRouter {
                     item_id: use_item.slot_object.item_type,
                     x: use_item.use_item_position.x,
                     y: use_item.use_item_position.y,
+                    use_item_flag: use_item.use_item_flag,
                 }])
             }
 
@@ -1151,11 +1164,20 @@ impl PacketRouter {
 
             // ----- Notification (incoming): key-pop + area-unlock detection ----
             ParsedPacket::Notification(n) => {
-                // Effect 8 == PortalOpened. A key-pop notification carries a
-                // `"player"` field in its message; realm/other portal opens do
-                // not. Forward only PortalOpened; the processor filters on the
-                // player field.
-                if n.effect == 8 {
+                // Effect 7 == PlayerDeath. The message is the `s.death`
+                // stringlist payload and picture_type is the gravestone object
+                // type. This is the authoritative remote-death signal; the
+                // processor resolves the victim name from the payload.
+                if n.effect == 7 {
+                    RouteResult::Routed(vec![GameEvent::PlayerDeathAnnounced {
+                        message: n.message.clone(),
+                        picture_type: n.picture_type,
+                    }])
+                } else if n.effect == 8 {
+                    // Effect 8 == PortalOpened. A key-pop notification carries a
+                    // `"player"` field in its message; realm/other portal opens do
+                    // not. Forward only PortalOpened; the processor filters on the
+                    // player field.
                     RouteResult::Routed(vec![GameEvent::PortalOpened {
                         message: n.message.clone(),
                         picture_type: n.picture_type,
@@ -1350,8 +1372,8 @@ mod tests {
     use crate::protocol::packets::{
         CreatePacket, CreateSuccessPacket, DamagePacket, DeathPacket, EnemyHitPacket,
         ForgeUnlockedBlueprintsPacket, HelloPacket, IncomingPartyMemberInfoPacket, InvSwapPacket,
-        MapInfoPacket, NewCharacterInfoPacket, PartyMemberAddedPacket, PetChangeFormPacket,
-        QuestFetchResponsePacket, QuestObjectIdPacket, RealmHeroesLeftPacket,
+        MapInfoPacket, NewCharacterInfoPacket, NotificationPacket, PartyMemberAddedPacket,
+        PetChangeFormPacket, QuestFetchResponsePacket, QuestObjectIdPacket, RealmHeroesLeftPacket,
         RealmScoreUpdatePacket, ReskinUnlockPacket, SlotObjectData, TextPacket, VaultContentPacket,
     };
     use crate::session::GameSession;
@@ -2240,6 +2262,37 @@ mod tests {
                     other => panic!("Expected TextReceived, got {:?}", other),
                 }
             }
+            RouteResult::Unmapped => panic!("Expected Routed"),
+        }
+    }
+
+    // -- Notification: PlayerDeath --
+
+    #[test]
+    fn player_death_notification_emits_announcement() {
+        let mut router = PacketRouter::new();
+        let mut session = make_session();
+
+        let packet = ParsedPacket::Notification(NotificationPacket {
+            effect: 7,
+            message:
+                r#"{"k":"s.death","t":{"player":"Yumiho","level":"20","enemy":"Plagued Honey"}}"#
+                    .into(),
+            picture_type: 1837,
+            ..Default::default()
+        });
+
+        match router.route(&packet, &mut session) {
+            RouteResult::Routed(events) => match &events[0] {
+                GameEvent::PlayerDeathAnnounced {
+                    message,
+                    picture_type,
+                } => {
+                    assert!(message.contains("\"player\":\"Yumiho\""));
+                    assert_eq!(*picture_type, 1837);
+                }
+                other => panic!("Expected PlayerDeathAnnounced, got {:?}", other),
+            },
             RouteResult::Unmapped => panic!("Expected Routed"),
         }
     }

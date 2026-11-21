@@ -5714,6 +5714,7 @@ mod tests {
                 filled: Vec::new(),
                 empty: 1,
                 locked: 0,
+                ..Default::default()
             },
         );
         let mut account_data = AccountData::default();

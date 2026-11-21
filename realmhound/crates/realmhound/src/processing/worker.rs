@@ -650,6 +650,29 @@ impl Worker {
                                 origin.as_ref(),
                             );
                         }
+                        UiPayload::AreaUnlock {
+                            title,
+                            kind,
+                            contributions,
+                            thanks,
+                        } => {
+                            use crate::panels::live_feed::{AreaUnlockEntry, AreaUnlockThanks};
+
+                            if let Ok(settings) = self.settings.read() {
+                                let feed = &settings.live_feed;
+                                if feed.auto_clipboard_area_unlock_thanks {
+                                    let entry =
+                                        AreaUnlockEntry::new(title, kind, contributions, thanks);
+                                    if let Some(text) = entry.callout(&AreaUnlockThanks {
+                                        inc: &feed.area_unlock_inc_thanks,
+                                        vial: &feed.area_unlock_vial_thanks,
+                                        runes: &feed.area_unlock_runes_thanks,
+                                    }) {
+                                        crate::clipboard::set_text(&text);
+                                    }
+                                }
+                            }
+                        }
                         payload => {
                             if let UiPayload::Chat(message) = &payload {
                                 if let Err(error) = self.chat_log.append(message) {

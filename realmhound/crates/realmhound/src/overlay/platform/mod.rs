@@ -45,6 +45,8 @@ pub use linux::{
     relaunch_on_wayland,
 };
 #[cfg(target_os = "macos")]
+pub(crate) use macos::set_visible;
+#[cfg(target_os = "macos")]
 pub(super) use macos::{game_window, game_window_active, Process};
 
 /// What a title-bar or grip drag does to the overlay window.
@@ -147,25 +149,26 @@ pub fn dismiss_stale(prefix: &str, keep: &str) {
 /// when the pointer is over the overlay's own title bar. Asking the OS directly
 /// is what lets a locked overlay keep its buttons usable.
 ///
-/// `pixels_per_point` converts platforms that report physical pixels; it is
-/// unused where the OS already reports points.
-pub fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
+/// Physical pixels use `pixels_per_point`; AppKit points need only egui zoom.
+pub fn cursor_position(pixels_per_point: f32, zoom_factor: f32) -> Option<(f32, f32)> {
     #[cfg(target_os = "macos")]
     {
         let _ = pixels_per_point;
-        macos::cursor_position()
+        macos::cursor_position(zoom_factor)
     }
     #[cfg(windows)]
     {
+        let _ = zoom_factor;
         windows::cursor_position(pixels_per_point)
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = zoom_factor;
         linux::cursor_position(pixels_per_point)
     }
     #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
-        let _ = pixels_per_point;
+        let _ = (pixels_per_point, zoom_factor);
         None
     }
 }
@@ -180,7 +183,11 @@ pub fn begin_drag(kind: DragKind, min_w: f32, min_h: f32, pixels_per_point: f32)
     #[cfg(windows)]
     {
         // Win32 works in physical pixels.
-        let scale = pixels_per_point.max(1.0);
+        let scale = if pixels_per_point > 0.0 {
+            pixels_per_point
+        } else {
+            1.0
+        };
         windows::begin_drag(kind, min_w * scale, min_h * scale)
     }
     #[cfg(target_os = "linux")]

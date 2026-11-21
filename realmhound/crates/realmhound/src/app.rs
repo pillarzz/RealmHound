@@ -10359,7 +10359,7 @@ impl eframe::App for RealmHoundApp {
         // before the main window's panels and are unaffected by modal blocking.
         // They also drive their own repaints while open, which is what keeps a
         // live fight's clock-derived numbers moving.
-        let overlays_visible = self.overlays.render(
+        let overlays_active = self.overlays.render(
             ctx,
             &self.settings,
             &mut self.sprite_renderer,
@@ -10400,9 +10400,9 @@ impl eframe::App for RealmHoundApp {
         }
 
         // A minimized window never paints, so stop the worker waking it, unless
-        // an overlay (painted from this window's update) is still on screen.
+        // an attached overlay still needs updates to prepare or paint itself.
         let live_demand =
-            ctx.input(|input| input.viewport().minimized != Some(true)) || overlays_visible;
+            ctx.input(|input| input.viewport().minimized != Some(true)) || overlays_active;
         if self.live_demand != Some(live_demand) {
             self.live_demand = Some(live_demand);
             self.worker

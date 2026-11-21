@@ -531,7 +531,7 @@ pub(super) fn order_front(title: &str) {
 pub(super) fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
     let x = x11()?;
     let pointer = x.conn.query_pointer(x.root).ok()?.reply().ok()?;
-    // X reports physical pixels; window geometry is in logical points.
+    // X reports physical pixels; egui viewport geometry uses UI points.
     let scale = if pixels_per_point > 0.0 {
         pixels_per_point
     } else {
@@ -596,7 +596,11 @@ pub(super) fn begin_drag(
     else {
         return false;
     };
-    let scale = pixels_per_point.max(1.0);
+    let scale = if pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
     DRAG.with(|drag| {
         drag.set(Some(Drag {
             window,
@@ -865,7 +869,7 @@ mod tests {
                     0,
                     x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
                     0,
-                    &x11rb::protocol::xproto::CreateWindowAux::new().override_redirect(1),
+                    &x11rb::protocol::xproto::CreateWindowAux::new(),
                 )
                 .unwrap()
                 .check()
@@ -896,6 +900,15 @@ mod tests {
         }
         let title = "RealmHound lookup regression #1";
         let window = create_named_window(&x, title);
+        assert_eq!(
+            x.conn
+                .get_window_attributes(window)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .map_state,
+            MapState::UNMAPPED
+        );
         assert_eq!(x.prepare(window), Some(()));
         assert_eq!(
             WmHints::get(&x.conn, window)
@@ -914,6 +927,20 @@ mod tests {
                 .unwrap()
                 .override_redirect
         );
+        x.conn.map_window(window).unwrap().check().unwrap();
+        let mapped = x
+            .conn
+            .get_window_attributes(window)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert!(mapped.override_redirect);
+        assert_ne!(mapped.map_state, MapState::UNMAPPED);
+        assert_eq!(
+            x.conn.query_tree(window).unwrap().reply().unwrap().parent,
+            root
+        );
+        x.conn.unmap_window(window).unwrap().check().unwrap();
         assert_eq!(x.prepare(window), Some(()));
         assert_eq!(x.find(title), Some(window));
         assert_eq!(super::window(&x, title), Some(window));

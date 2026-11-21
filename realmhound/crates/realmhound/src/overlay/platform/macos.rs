@@ -196,6 +196,19 @@ pub(super) fn promote(title: &str) -> bool {
     found && prepared
 }
 
+pub(crate) fn set_visible(title: &str, visible: bool) -> bool {
+    let mut changed = true;
+    let found = for_each_matching(title, |window| {
+        if visible {
+            window.orderFrontRegardless();
+        } else {
+            window.orderOut(None);
+        }
+        changed &= window.isVisible() == visible;
+    });
+    found && changed
+}
+
 /// Raise the overlay if it has just gone from visible to covered, and report
 /// its current state so the caller can feed it back next time.
 ///
@@ -253,14 +266,17 @@ pub(super) fn dismiss_stale(prefix: &str, keep: &str) {
     }
 }
 
-pub(super) fn cursor_position() -> Option<(f32, f32)> {
+pub(super) fn cursor_position(zoom_factor: f32) -> Option<(f32, f32)> {
     let mtm = MainThreadMarker::new()?;
     // AppKit reports screen coordinates in points already, but with the origin
     // at the bottom-left of the *primary* display; winit (and so egui's window
     // geometry) uses a top-left origin.
     let primary = NSScreen::screens(mtm).firstObject()?.frame();
     let point = NSEvent::mouseLocation();
-    Some((point.x as f32, (primary.size.height - point.y) as f32))
+    Some((
+        point.x as f32 / zoom_factor,
+        (primary.size.height - point.y) as f32 / zoom_factor,
+    ))
 }
 
 #[cfg(test)]

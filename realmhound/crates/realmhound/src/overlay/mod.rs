@@ -275,11 +275,7 @@ impl WindowRuntime {
         self.next_promotion_retry = None;
     }
 
-    fn builder_for(
-        &mut self,
-        cfg: &OverlayWindowSettings,
-        attached: bool,
-    ) -> egui::ViewportBuilder {
+    fn builder_for(&mut self, cfg: &OverlayWindowSettings) -> egui::ViewportBuilder {
         if let Some(builder) = &self.builder {
             return builder.clone();
         }
@@ -295,7 +291,8 @@ impl WindowRuntime {
         let mut builder = egui::ViewportBuilder::default()
             .with_title(&self.native_title)
             .with_decorations(false)
-            .with_visible(attached)
+            // Native preparation must precede the first map/show.
+            .with_visible(false)
             // On Windows, DWM composition is applied natively by
             // `platform::promote`; requesting a transparent window there only
             // trips eframe's WGL probe (see `main`).
@@ -313,8 +310,50 @@ impl WindowRuntime {
                 builder = builder.with_position([x, y]);
             }
         }
-        self.visible = Some(attached);
+        self.visible = Some(false);
         self.builder.insert(builder).clone()
+    }
+
+    fn set_visible(&mut self, ctx: &egui::Context, visible: bool) -> bool {
+        if self.visible == Some(visible) {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        let changed = {
+            let _ = ctx;
+            platform::set_visible(&self.native_title, visible)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let changed = {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+            #[cfg(windows)]
+            {
+                self.restyled = true;
+            }
+            true
+        };
+        if changed {
+            self.visible = Some(visible);
+        }
+        changed
+    }
+
+    fn show_when_ready(&mut self, ctx: &egui::Context) {
+        if self.visible == Some(true) {
+            return;
+        }
+        if self.last_promoted.is_some() && self.next_promotion_retry.is_none() && !self.restyled {
+            if self.set_visible(ctx, true) {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.hidden = platform::order_front(&self.native_title, false);
+                }
+                return;
+            }
+            self.restyled = true;
+            self.next_promotion_retry = Some(Instant::now() + PROMOTE_RETRY_INTERVAL);
+        }
+        ctx.request_repaint_after(PROMOTE_RETRY_INTERVAL);
     }
 
     /// Push a pass-through change and re-assert the native promotion on a timer.
@@ -325,11 +364,10 @@ impl WindowRuntime {
         passthrough: bool,
         attached: bool,
     ) {
-        if self.visible != Some(attached) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(attached));
-            self.visible = Some(attached);
-        }
         let restyled = std::mem::take(&mut self.restyled);
+        if !attached || !cfg.visible {
+            self.set_visible(ctx, false);
+        }
         if self.passthrough != Some(passthrough) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
             self.passthrough = Some(passthrough);
@@ -375,7 +413,7 @@ impl WindowRuntime {
             // it on top even if the stale one was in front a moment ago.
             platform::dismiss_stale(self.title, &self.native_title);
             if platform::promote(&self.native_title) {
-                if attached {
+                if attached && self.visible == Some(true) {
                     self.hidden = platform::order_front(&self.native_title, self.hidden);
                 }
                 self.last_promoted = Some(Instant::now());
@@ -387,6 +425,10 @@ impl WindowRuntime {
                     ctx.request_repaint_after(PROMOTE_RETRY_INTERVAL);
                 }
             }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if attached && cfg.visible {
+            self.show_when_ready(ctx);
         }
     }
 }
@@ -450,7 +492,8 @@ impl OverlayManager {
     ///
     /// Requires a visible, unminimized window linked to a verified
     /// `main_connection`, with the game or RealmHound foreground. Returns
-    /// whether any overlay remains on screen, including collapsed windows.
+    /// whether attached overlays need parent updates, including preparation
+    /// before their first show and collapsed windows.
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -513,7 +556,7 @@ impl OverlayManager {
         let opacity = cfg.clamped_opacity();
         let max_rows = cfg.max_rows();
         let mut combat_visible = false;
-        let mut loot_visible = false;
+        let mut overlays_active = false;
 
         if cfg.live_combat.visible {
             let mut content = live_combat::LiveCombatContent {
@@ -534,7 +577,9 @@ impl OverlayManager {
                 sprites,
                 &mut content,
             );
-            combat_visible = attached && !embedded && cfg.live_combat.visible;
+            let active = attached && !embedded && cfg.live_combat.visible;
+            overlays_active |= active;
+            combat_visible = active && self.live_combat_window.visible == Some(true);
             self.warn_if_embedded(embedded);
         } else {
             self.live_combat_window.closed();
@@ -555,7 +600,7 @@ impl OverlayManager {
                 sprites,
                 &mut content,
             );
-            loot_visible = attached && !embedded && cfg.live_loot.visible;
+            overlays_active |= attached && !embedded && cfg.live_loot.visible;
             self.warn_if_embedded(embedded);
         } else {
             self.live_loot_window.closed();
@@ -580,7 +625,7 @@ impl OverlayManager {
             combat_visible && !cfg.live_combat.minimized,
             Ordering::Relaxed,
         );
-        combat_visible || loot_visible
+        overlays_active
     }
 
     fn warn_if_embedded(&mut self, embedded: bool) {
@@ -628,6 +673,12 @@ impl HitRegions {
     fn contains(&self, local: egui::Pos2) -> bool {
         self.0.iter().any(|rect| rect.contains(local))
     }
+
+    fn contains_in_viewport(&self, client: egui::Rect, pointer: egui::Pos2) -> bool {
+        client.contains(pointer)
+            && (chrome_strip(client).contains(pointer)
+                || self.contains(pointer - client.min.to_vec2()))
+    }
 }
 
 /// Open (or update) one overlay window and render its chrome plus content.
@@ -643,7 +694,7 @@ fn show_window(
     sprites: &mut SpriteRenderer,
     content: &mut dyn OverlayContent,
 ) -> bool {
-    let builder = runtime.builder_for(cfg, attached);
+    let builder = runtime.builder_for(cfg);
     let id = runtime.id;
     let title = runtime.title;
     let mut embedded = false;
@@ -714,6 +765,28 @@ fn show_window(
         runtime.sync_native(ctx, cfg, cfg.locked && !over_chrome, attached);
     });
 
+    // Windows rewrites extended styles when queued visibility/style commands
+    // are applied. Restore no-activation before returning to the event loop.
+    #[cfg(windows)]
+    if !embedded && runtime.restyled && runtime.next_promotion_retry.is_none() {
+        if platform::promote(&runtime.native_title) {
+            runtime.restyled = false;
+            runtime.last_promoted = Some(Instant::now());
+        } else {
+            runtime.next_promotion_retry = Some(Instant::now() + PROMOTE_RETRY_INTERVAL);
+            if attached {
+                ctx.request_repaint_after(PROMOTE_RETRY_INTERVAL);
+            }
+        }
+    }
+
+    // winit's macOS Visible(true) makes the window key. Order it non-key only
+    // after the hidden viewport has painted its first buffer.
+    #[cfg(target_os = "macos")]
+    if !embedded && attached && cfg.visible {
+        runtime.show_when_ready(ctx);
+    }
+
     if !cfg.visible {
         runtime.closed();
     }
@@ -756,17 +829,13 @@ fn wipe_buffer(ui: &egui::Ui) {
 /// Asks the platform rather than egui because a click-through window receives
 /// no pointer events at all.
 fn pointer_over_interactive(ctx: &egui::Context, hits: &HitRegions) -> bool {
-    let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+    let Some(client) = ctx.input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect)) else {
         return false;
     };
-    let Some((x, y)) = platform::cursor_position(ctx.pixels_per_point()) else {
+    let Some((x, y)) = platform::cursor_position(ctx.pixels_per_point(), ctx.zoom_factor()) else {
         return false;
     };
-    let pointer = egui::pos2(x, y);
-    if !outer.contains(pointer) {
-        return false;
-    }
-    chrome_strip(outer).contains(pointer) || hits.contains(pointer - outer.min.to_vec2())
+    hits.contains_in_viewport(client, egui::pos2(x, y))
 }
 
 /// The title-bar band of a window at `outer`, in screen points.
@@ -1142,6 +1211,67 @@ mod tests {
     use realmhound_core::settings::OverlaySettings;
 
     #[test]
+    fn overlays_stay_hidden_until_preparation_and_pending_styles_finish() {
+        let mut cfg = OverlaySettings::default().live_combat;
+        cfg.visible = true;
+        let mut runtime = WindowRuntime::new("RealmHound hidden preparation test");
+        let builder = runtime.builder_for(&cfg);
+        assert_eq!(builder.visible, Some(false));
+        assert_eq!(runtime.visible, Some(false));
+        runtime.native_title = format!("RealmHound missing preparation {}", std::process::id());
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            runtime.sync_native(ctx, &cfg, cfg.locked, true);
+        });
+        assert_eq!(runtime.visible, Some(false));
+        assert!(runtime.last_promoted.is_none());
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::Visible(true))));
+        runtime.last_promoted = Some(std::time::Instant::now());
+        runtime.next_promotion_retry = None;
+        runtime.restyled = true;
+        let _ = ctx.run(Default::default(), |ctx| runtime.show_when_ready(ctx));
+        assert_eq!(runtime.visible, Some(false));
+        #[cfg(not(target_os = "macos"))]
+        {
+            runtime.restyled = false;
+            let output = ctx.run(Default::default(), |ctx| runtime.show_when_ready(ctx));
+            assert_eq!(runtime.visible, Some(true));
+            assert!(output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Visible(true))));
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.visible, Some(false));
+        }
+    }
+
+    #[test]
+    fn hit_regions_use_client_origin_on_negative_and_scaled_displays() {
+        let mut hits = HitRegions::default();
+        hits.add(egui::Rect::from_min_max(
+            egui::pos2(25.0, 35.0),
+            egui::pos2(30.0, 40.0),
+        ));
+        for origin in [
+            egui::pos2(108.0, 208.0),
+            egui::pos2(-792.0, 108.0),
+            egui::pos2(10.5, -499.25),
+        ] {
+            let client = egui::Rect::from_min_size(origin, egui::vec2(300.0, 200.0));
+            let pointer = origin + egui::vec2(27.0, 37.0);
+            assert!(hits.contains_in_viewport(client, pointer));
+            assert!(!hits.contains_in_viewport(client, pointer + egui::vec2(8.0, 8.0)));
+            assert!(hits.contains_in_viewport(client, origin + egui::vec2(10.0, 10.0)));
+            assert!(!hits.contains_in_viewport(client, origin - egui::vec2(1.0, 1.0)));
+        }
+    }
+
+    #[test]
     fn missing_native_window_keeps_initial_and_restyle_preparation_pending() {
         let cfg = OverlaySettings::default().live_combat;
         let ctx = egui::Context::default();
@@ -1215,15 +1345,15 @@ mod tests {
         let cfg = OverlaySettings::default().live_combat;
         let mut runtime = WindowRuntime::new(LIVE_COMBAT_TITLE);
 
-        runtime.builder_for(&cfg, true);
+        runtime.builder_for(&cfg);
         let first = runtime.native_title.clone();
         // The same window must keep its title, or every frame would look like a
         // new generation to `dismiss_stale` and retire the live window.
-        runtime.builder_for(&cfg, true);
+        runtime.builder_for(&cfg);
         assert_eq!(runtime.native_title, first);
 
         runtime.closed();
-        runtime.builder_for(&cfg, true);
+        runtime.builder_for(&cfg);
         assert_ne!(
             runtime.native_title, first,
             "a replacement window must be distinguishable from the one it replaced"

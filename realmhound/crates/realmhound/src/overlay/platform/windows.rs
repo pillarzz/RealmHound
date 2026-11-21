@@ -209,7 +209,7 @@ pub(super) fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return None;
     }
-    // Win32 reports physical pixels; window geometry is in logical points.
+    // Win32 reports physical pixels; egui viewport geometry uses UI points.
     let scale = if pixels_per_point > 0.0 {
         pixels_per_point
     } else {

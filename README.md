@@ -178,6 +178,30 @@ Windows builds generate the `wpcap.lib` import library automatically; the Npcap
 SDK is not required. Running the app or tests still requires
 [Npcap](https://npcap.com/#download) with WinPcap compatibility mode.
 
+### Overlay attachment
+
+Enabled Live Combat and Live Loot overlays require a game window linked to the
+OS process owning the account-verified main connection. They appear only while
+that window is visible and not minimized, and either the linked game or
+RealmHound is foreground. Other foreground apps, unresolved attachment and
+inspection errors hide them; hovering an overlay does not bypass this rule.
+
+The linked PID is retained across area changes, socket gaps and capture
+restarts until the process exits. Switching accounts restarts RealmHound and
+clears the link. When starting mid-connection, enter a realm or change maps to
+allow account verification. If overlays still do not appear, check the
+RealmHound log for process/window inspection errors.
+
+Linux attachment requires X11/XWayland and readable game-process/socket
+metadata; native Wayland cannot verify attachment and keeps overlays hidden.
+On Wayland, RealmHound selects XWayland only when an overlay is enabled at
+startup. Enabling one later offers a restart button when XWayland is available;
+`REALMHOUND_WAYLAND=1` continues to opt out.
+macOS uses libproc socket ownership, CoreGraphics window visibility and AppKit
+foreground-app metadata, without reading window titles or capturing pixels.
+Denied or missing metadata hides overlays. Native macOS/Windows interaction
+and permission behavior still require validation on those operating systems.
+
 ### Build
 
 ```sh

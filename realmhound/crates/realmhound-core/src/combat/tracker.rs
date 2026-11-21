@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::api::character::parse_enchant_ids;
 use crate::assets::get_asset_manager;
@@ -1401,8 +1401,11 @@ pub struct CombatTracker {
     /// Frozen projections of the current encounter's fights that have already
     /// left `fights`, so a kill keeps its final numbers on the Live Combat
     /// overlay. Engaging a different encounter replaces them (see
-    /// [`retain_current_encounter`]); cleared outright at map change / disconnect.
+    /// [`retain_current_encounter`]). Map changes and disconnects finalize active
+    /// fights without clearing these bounded snapshots, preserving the last
+    /// encounter until another one is selected for display.
     instance_fights: Vec<Arc<LiveFightSnapshot>>,
+    frozen_phase_cache: Mutex<Vec<FrozenPhases>>,
     /// Aggregated non-boss damage summaries for the current run, keyed by aux
     /// category (e.g. "marble_core"). Accumulate across the whole run and emit as
     /// synthetic summary fights at run end.
@@ -1660,6 +1663,7 @@ impl CombatTracker {
             objects: HashMap::new(),
             fights: HashMap::new(),
             instance_fights: Vec::new(),
+            frozen_phase_cache: Mutex::new(Vec::new()),
             aux_fights: HashMap::new(),
             aux_instances: HashMap::new(),
             dormant_fights: HashMap::new(),
@@ -1780,7 +1784,11 @@ impl CombatTracker {
             }
         }
         out.retain(|fight| keep(fight));
-        retain_current_encounter(&mut out);
+        let mut cache = self
+            .frozen_phase_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        retain_current_encounter(&mut out, &mut cache);
         out
     }
 
@@ -1800,10 +1808,11 @@ impl CombatTracker {
         now_ms: i64,
         ended: bool,
     ) -> LiveFightSnapshot {
+        crate::prof_scope!("live_combat_projection");
         let mut participants: Vec<FightParticipant> = fight
             .attackers
             .iter()
-            .map(|(&aid, accum)| self.build_participant(aid, accum, fight.joined_late))
+            .map(|(&aid, accum)| self.build_participant(aid, accum, fight.joined_late, false))
             .collect();
         drop_unresolved(&mut participants);
         if ended && fight.killed {
@@ -5227,7 +5236,7 @@ impl CombatTracker {
         let mut participants: Vec<FightParticipant> = fight
             .attackers
             .iter()
-            .map(|(&aid, accum)| self.build_participant(aid, accum, joined_late))
+            .map(|(&aid, accum)| self.build_participant(aid, accum, joined_late, true))
             .collect();
         drop_unresolved(&mut participants);
         participants.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
@@ -5518,6 +5527,7 @@ impl CombatTracker {
         attacker_id: i32,
         accum: &ParticipantAccum,
         joined_late: bool,
+        include_details: bool,
     ) -> FightParticipant {
         let obj = self.objects.get(&attacker_id);
         // Prefer the live object, but fall back to the identity snapshotted at hit
@@ -5547,19 +5557,23 @@ impl CombatTracker {
         // gear swaps don't misreport the loadout as whatever was equipped when the
         // boss died. Fall back to the last-seen snapshot when no per-set data was
         // recorded. Enchants ride with the gear so the two always agree.
-        let best = accum
-            .damage_by_equipment
-            .iter()
-            .filter(|((gear, _), _)| gear.iter().any(|&s| s != -1))
-            .max_by_key(|(_, &(dmg, hits))| (dmg, hits))
-            .map(|(loadout, _)| loadout.clone());
-        let (equipment, equipment_enchants) = match best {
-            Some((gear, enchants)) => (gear, enchants),
-            None => (
-                obj.map(|o| o.equipment).unwrap_or([-1; 4]),
-                obj.map(|o| o.equipment_enchants.clone())
-                    .unwrap_or_default(),
-            ),
+        let (equipment, equipment_enchants) = if include_details {
+            let best = accum
+                .damage_by_equipment
+                .iter()
+                .filter(|((gear, _), _)| gear.iter().any(|&s| s != -1))
+                .max_by_key(|(_, &(dmg, hits))| (dmg, hits))
+                .map(|(loadout, _)| loadout.clone());
+            match best {
+                Some((gear, enchants)) => (gear, enchants),
+                None => (
+                    obj.map(|o| o.equipment).unwrap_or([-1; 4]),
+                    obj.map(|o| o.equipment_enchants.clone())
+                        .unwrap_or_default(),
+                ),
+            }
+        } else {
+            ([-1; 4], Default::default())
         };
 
         let is_local = accum.is_local || attacker_id == self.local_object_id;
@@ -5693,7 +5707,7 @@ impl CombatTracker {
             guarded_hits: Some(accum.guarded_hits),
             summon_damage: accum.summon_damage,
             summon_hits: accum.summon_hits,
-            summons: {
+            summons: if include_details {
                 let mut v: Vec<SummonContribution> = accum
                     .summons
                     .iter()
@@ -5710,11 +5724,13 @@ impl CombatTracker {
                     .collect();
                 v.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
                 v
+            } else {
+                Vec::new()
             },
             // Per-weapon rows are only meaningful for the local player, whose
             // damage is reconstructed from their own shot packets. Remote rows are
             // whole damage packets with no weapon attribution.
-            weapons: if is_local {
+            weapons: if is_local && include_details {
                 aggregate_weapons(
                     &accum.damage_by_equipment,
                     &accum.damage_by_pattern,
@@ -6407,6 +6423,11 @@ pub fn normalize_dungeon(name: &str) -> String {
     trimmed.to_string()
 }
 
+struct FrozenPhases {
+    phases: Vec<Arc<LiveFightSnapshot>>,
+    combined: Arc<LiveFightSnapshot>,
+}
+
 /// Narrow a fight list down to the most recent encounter, one entry per tab.
 ///
 /// Each fight, oldest first, is classified against the encounter so far:
@@ -6418,7 +6439,10 @@ pub fn normalize_dungeon(name: &str) -> String {
 ///   way, and it was engaged within [`PARALLEL_FIGHT_WINDOW_MS`] of the
 ///   encounter's latest activity. It gets a tab of its own.
 /// - Anything else starts a new encounter, replacing the previous one.
-fn retain_current_encounter(fights: &mut Vec<Arc<LiveFightSnapshot>>) {
+fn retain_current_encounter(
+    fights: &mut Vec<Arc<LiveFightSnapshot>>,
+    cache: &mut Vec<FrozenPhases>,
+) {
     fights.sort_by_key(|fight| fight.started_at);
     let mut tabs: Vec<Vec<Arc<LiveFightSnapshot>>> = Vec::new();
     let mut encounter_end = i64::MIN;
@@ -6455,7 +6479,30 @@ fn retain_current_encounter(fights: &mut Vec<Arc<LiveFightSnapshot>>) {
         }
         encounter_end = encounter_end.max(end);
     }
-    fights.extend(tabs.into_iter().map(combine_phases));
+    let mut previous = std::mem::take(cache);
+    fights.extend(tabs.into_iter().map(|phases| {
+        if phases.len() <= 1 || phases.iter().any(|phase| !phase.ended) {
+            return combine_phases(phases);
+        }
+        let entry = previous.iter().position(|held| {
+            held.phases.len() == phases.len()
+                && held
+                    .phases
+                    .iter()
+                    .zip(&phases)
+                    .all(|(a, b)| Arc::ptr_eq(a, b))
+        });
+        let held = match entry {
+            Some(index) => previous.swap_remove(index),
+            None => FrozenPhases {
+                combined: combine_phases(phases.clone()),
+                phases,
+            },
+        };
+        let combined = held.combined.clone();
+        cache.push(held);
+        combined
+    }));
 }
 
 /// When a snapshot's fight ended, or `now` for one still running.
@@ -6466,17 +6513,24 @@ fn fight_end(fight: &LiveFightSnapshot) -> i64 {
 /// Fold a boss's consecutive phases into one snapshot: summed participant
 /// totals over the whole span, with the current phase's HP and state.
 fn combine_phases(mut phases: Vec<Arc<LiveFightSnapshot>>) -> Arc<LiveFightSnapshot> {
+    crate::prof_scope!("live_combat_phase_merge");
     if phases.len() == 1 {
         return phases.pop().expect("one phase");
     }
     let first = &phases[0];
     let current = phases.last().expect("several phases");
-    let mut participants: Vec<FightParticipant> = Vec::new();
+    let mut participants: Vec<FightParticipant> = Vec::with_capacity(first.participants.len());
+    let mut indices = HashMap::with_capacity(first.participants.len());
     for phase in &phases {
         for p in &phase.participants {
-            match participants.iter_mut().find(|q| q.object_id == p.object_id) {
-                Some(total) => add_participant(total, p),
-                None => participants.push(p.clone()),
+            match indices.entry(p.object_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    add_participant(&mut participants[*entry.get()], p);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(participants.len());
+                    participants.push(p.clone());
+                }
             }
         }
     }
@@ -7479,6 +7533,69 @@ mod tests {
     }
 
     #[test]
+    fn frozen_phase_cache_reuses_only_identical_visible_inputs() {
+        let mut tracker = CombatTracker::new();
+        tracker.on_map_change("Tomb of the Ancients", 1, 0, &[]);
+        tracker.on_player_loaded(1000, 1);
+        engage(&mut tracker, 500, 3366, 10, 100_000, Some(30));
+        engage(&mut tracker, 700, 3367, 1000, 50_000, Some(1030));
+        let first = tracker.live_snapshots(2000);
+        let same = tracker.live_snapshots(2100);
+        assert!(first[0].ended);
+        assert!(Arc::ptr_eq(&first[0], &same[0]));
+        Arc::make_mut(&mut tracker.instance_fights[1]).participants[0].damage += 50;
+        let changed = tracker.live_snapshots(2200);
+        assert!(!Arc::ptr_eq(&first[0], &changed[0]));
+        assert_eq!(changed[0].total_damage(), first[0].total_damage() + 50);
+        let filtered = tracker.live_snapshots_where(2300, |fight| fight.boss_object_id != 700);
+        assert_eq!(filtered[0].total_damage(), 100_000);
+        assert!(tracker.frozen_phase_cache.lock().unwrap().is_empty());
+        let restored = tracker.live_snapshots(2400);
+        assert!(!Arc::ptr_eq(&changed[0], &restored[0]));
+        assert_eq!(restored[0].total_damage(), changed[0].total_damage());
+        assert_eq!(tracker.frozen_phase_cache.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn phase_roster_index_preserves_totals_and_first_seen_tie_order() {
+        let first = Arc::new(LiveFightSnapshot {
+            participants: vec![participant(1, true), participant(2, false)],
+            ..Default::default()
+        });
+        let mut newcomer = participant(3, false);
+        newcomer.damage = 200;
+        let second = Arc::new(LiveFightSnapshot {
+            participants: vec![participant(2, false), participant(1, true), newcomer],
+            ..Default::default()
+        });
+        let merged = combine_phases(vec![first, second]);
+        assert_eq!(
+            merged
+                .participants
+                .iter()
+                .map(|p| p.object_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            merged
+                .participants
+                .iter()
+                .map(|p| p.damage)
+                .collect::<Vec<_>>(),
+            vec![200, 200, 200]
+        );
+        assert_eq!(
+            merged
+                .participants
+                .iter()
+                .map(|p| p.hits)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+    }
+
+    #[test]
     fn a_boss_appearing_well_after_a_kill_starts_a_new_encounter() {
         let mut t = CombatTracker::new();
         t.on_map_change("Tomb of the Ancients", 1, 0, &[]);
@@ -7548,6 +7665,76 @@ mod tests {
             weapons: Vec::new(),
             packet_damage: 0,
             packet_hits: 0,
+        }
+    }
+
+    #[test]
+    fn live_participants_skip_details_without_changing_damage_or_identity() {
+        let mut tracker = CombatTracker::new();
+        tracker.on_player_loaded(1000, 1);
+        for id in [1000, 2000] {
+            for unresolved in [0, 2] {
+                let mut accum = ParticipantAccum {
+                    damage: 1000,
+                    hits: 12,
+                    last_name: Some("Player".into()),
+                    last_object_type: 0x0300,
+                    last_skin_id: 123,
+                    last_tex1: 456,
+                    last_tex2: 789,
+                    unresolved_local_hits: unresolved,
+                    summon_damage: 100,
+                    summon_hits: 2,
+                    damage_taken: 50,
+                    damage_taken_hits: 1,
+                    ..Default::default()
+                };
+                accum
+                    .damage_by_equipment
+                    .insert(([123, 456, 789, 100], Default::default()), (900, 10));
+                accum.summons.insert(
+                    1,
+                    SummonAccum {
+                        damage: 100,
+                        hits: 2,
+                        ..Default::default()
+                    },
+                );
+                let full = tracker.build_participant(id, &accum, true, true);
+                let live = tracker.build_participant(id, &accum, true, false);
+                assert_eq!(
+                    (
+                        live.object_id,
+                        live.object_type,
+                        live.skin_id,
+                        live.tex1,
+                        live.tex2
+                    ),
+                    (
+                        full.object_id,
+                        full.object_type,
+                        full.skin_id,
+                        full.tex1,
+                        full.tex2
+                    )
+                );
+                assert_eq!(live.name, full.name);
+                assert_eq!(
+                    (live.damage, live.hits, live.is_local, live.provenance),
+                    (full.damage, full.hits, full.is_local, full.provenance)
+                );
+                assert_eq!(live.damage_taken, full.damage_taken);
+                assert_eq!(live.damage_taken_provenance, full.damage_taken_provenance);
+                assert_eq!(live.summon_damage, full.summon_damage);
+                assert_eq!(live.summon_hits, full.summon_hits);
+                assert_eq!(live.equipment, [-1; 4]);
+                assert!(live.equipment_enchants.iter().all(Vec::is_empty));
+                assert!(live.summons.is_empty());
+                assert!(live.weapons.is_empty());
+                assert_eq!(full.equipment, [123, 456, 789, 100]);
+                assert_eq!(full.summons.len(), 1);
+                assert_eq!(full.weapons.len(), usize::from(full.is_local));
+            }
         }
     }
 

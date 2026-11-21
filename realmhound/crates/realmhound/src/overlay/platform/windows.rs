@@ -10,24 +10,39 @@
 //! with egui's `ViewportCommand::MousePassthrough`, which applies
 //! `WS_EX_LAYERED | WS_EX_TRANSPARENT` for us.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::{
+    Dwm::{
+        DwmEnableBlurBehindWindow, DwmGetWindowAttribute, DWMWA_CLOAKED, DWM_BB_BLURREGION,
+        DWM_BB_ENABLE, DWM_BLURBEHIND,
+    },
+    Gdi::{CreateRectRgn, DeleteObject},
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetAncestor, GetCursorPos, GetLayeredWindowAttributes, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, HWND_TOPMOST,
-    LAYERED_WINDOW_ATTRIBUTES_FLAGS, SM_SWAPBUTTON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    EnumWindows, FindWindowW, GetAncestor, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    GetWindow, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
+    IsIconic, IsWindowVisible, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GW_OWNER, HWND_TOPMOST, LWA_ALPHA, SM_SWAPBUTTON,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
 
 use super::DragKind;
 
 /// Logged once so a missing overlay window doesn't spam the log every frame.
 static MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+static TRANSPARENCY_WARNED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Generation title -> initialized handle and layered state.
+    static COMPOSITOR: RefCell<HashMap<String, (HWND, bool)>> = RefCell::new(HashMap::new());
+}
 
 /// Locate the top-level window with exactly this title.
 fn find(title: &str) -> Option<HWND> {
@@ -44,20 +59,22 @@ fn find(title: &str) -> Option<HWND> {
     Some(hwnd)
 }
 
-pub(super) fn promote(title: &str) {
+pub(super) fn promote(title: &str) -> bool {
     let Some(hwnd) = find(title) else {
-        return;
+        return false;
     };
     let wanted = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize;
     // SAFETY: `hwnd` came from `FindWindowW` and is only read/written through
-    // the documented extended-style index and layered-window calls.
+    // the documented extended-style index and compositor calls.
     unsafe {
         let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         if current & wanted != wanted {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | wanted);
         }
-        if current & WS_EX_LAYERED as isize != 0 {
-            init_layered(hwnd);
+        if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & wanted != wanted
+            || !ensure_transparency(title, hwnd, current & WS_EX_LAYERED as isize != 0)
+        {
+            return false;
         }
         SetWindowPos(
             hwnd,
@@ -67,30 +84,103 @@ pub(super) fn promote(title: &str) {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+        ) != 0
     }
 }
 
-/// Give a freshly layered window its layered attributes, keeping any it
-/// already has.
+/// Apply the compositor setup winit performs for a transparent window.
 ///
-/// `GetLayeredWindowAttributes` only succeeds once attributes have been set,
-/// and winit drops them every time it rewrites the extended style. Setting
-/// neither `LWA_COLORKEY` nor `LWA_ALPHA` keeps the window composited from the
-/// GL surface's own alpha, which is what the opacity slider drives.
+/// glutin can strip transparency from secondary Windows viewports
+/// (emilk/egui#3632), and winit rewrites the extended style whenever the
+/// mouse-passthrough flag changes. Either leaves the overlay composited as an
+/// opaque rectangle, so every new `HWND` -- and every layered/unlayered change
+/// -- gets DWM composition re-applied.
+///
+/// `layered` mirrors `WS_EX_LAYERED`: click-through adds it, and a layered
+/// window stays invisible until its alpha is initialized.
+fn ensure_transparency(title: &str, hwnd: HWND, layered: bool) -> bool {
+    let needs_setup = COMPOSITOR.with(|seen| seen.borrow().get(title) != Some(&(hwnd, layered)));
+    if !needs_setup {
+        return true;
+    }
+    // SAFETY: `hwnd` came from `FindWindowW` and is only passed to the
+    // documented DWM/GDI/layered-window entry points.
+    match unsafe { enable_transparency(hwnd, layered) } {
+        Ok(()) => {
+            COMPOSITOR.with(|seen| {
+                seen.borrow_mut().insert(title.to_owned(), (hwnd, layered));
+            });
+            TRANSPARENCY_WARNED.store(false, Ordering::Relaxed);
+            true
+        }
+        Err(error) => {
+            if !TRANSPARENCY_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("[OVERLAY] {error}");
+            }
+            false
+        }
+    }
+}
+
+pub(super) fn dismiss_stale(prefix: &str, keep: &str) {
+    COMPOSITOR.with(|seen| {
+        seen.borrow_mut()
+            .retain(|title, _| !title.starts_with(prefix) || title == keep);
+    });
+}
+
+/// Give the window DWM composition with a full-window blur region, then
+/// initialize its layered alpha when click-through has made it layered.
+///
+/// Per-pixel opacity still comes from the GL surface; `255` is the neutral
+/// global multiplier, so the opacity slider keeps working.
 ///
 /// # Safety
 /// `hwnd` must be a live window handle.
-unsafe fn init_layered(hwnd: HWND) {
-    let mut key = 0;
-    let mut alpha = 0;
-    let mut flags: LAYERED_WINDOW_ATTRIBUTES_FLAGS = 0;
-    // SAFETY: the out-pointers are valid locals; `hwnd` is live per the caller.
-    unsafe {
-        if GetLayeredWindowAttributes(hwnd, &mut key, &mut alpha, &mut flags) == 0 {
-            SetLayeredWindowAttributes(hwnd, 0, 0, 0);
-        }
+unsafe fn enable_transparency(hwnd: HWND, layered: bool) -> Result<(), String> {
+    // SAFETY: `region` is created here and released below.
+    let region = unsafe { CreateRectRgn(0, 0, -1, -1) };
+    if region == 0 {
+        return Err(format!(
+            "Cannot create overlay transparency region: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    // SAFETY: `hwnd` is live per the caller; `region` is a valid full-window
+    // region that DWM copies during this call.
+    let result = unsafe {
+        DwmEnableBlurBehindWindow(
+            hwnd,
+            &DWM_BLURBEHIND {
+                dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                fEnable: 1,
+                hRgnBlur: region,
+                fTransitionOnMaximized: 0,
+            },
+        )
+    };
+    // SAFETY: `region` is no longer used after the DWM call.
+    let deleted = unsafe { DeleteObject(region) };
+    if result < 0 {
+        return Err(format!(
+            "Windows could not enable overlay transparency: HRESULT 0x{:08X}",
+            result as u32
+        ));
+    }
+    if deleted == 0 {
+        return Err(format!(
+            "Cannot release overlay transparency region: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `hwnd` is live and already carries `WS_EX_LAYERED`.
+    if layered && unsafe { SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) } == 0 {
+        return Err(format!(
+            "Cannot initialize overlay layered-window alpha: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn order_front(title: &str) {
@@ -119,7 +209,7 @@ pub(super) fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return None;
     }
-    // Win32 reports physical pixels; window geometry is in logical points.
+    // Win32 reports physical pixels; egui viewport geometry uses UI points.
     let scale = if pixels_per_point > 0.0 {
         pixels_per_point
     } else {
@@ -236,4 +326,178 @@ pub(super) fn continue_drag() -> bool {
         );
     }
     true
+}
+
+/// Locate the visible top-level game window owned by `pid`.
+///
+/// Ownership is checked by process id rather than by window title so a
+/// renamed client or a launcher window cannot be mistaken for the game.
+pub(crate) fn game_window(pid: u32) -> Result<Option<HWND>, String> {
+    struct Search {
+        pid: u32,
+        windows: Vec<HWND>,
+    }
+    unsafe extern "system" fn find(window: HWND, param: LPARAM) -> BOOL {
+        let search = &mut *(param as *mut Search);
+        let mut owner = 0;
+        GetWindowThreadProcessId(window, &mut owner);
+        if owner == search.pid
+            && IsWindowVisible(window) != 0
+            && GetWindow(window, GW_OWNER) == 0
+            && GetWindowLongW(window, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW == 0
+        {
+            search.windows.push(window);
+        }
+        1
+    }
+
+    let mut search = Search {
+        pid,
+        windows: Vec::new(),
+    };
+    // SAFETY: `find` only reads each enumerated window; the callback data is
+    // a valid local for the duration of the call.
+    if unsafe { EnumWindows(Some(find), &mut search as *mut Search as LPARAM) } == 0 {
+        return Err(format!(
+            "Cannot enumerate the linked game's windows: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    match search.windows.as_slice() {
+        [] => Ok(None),
+        [window] => Ok(Some(*window)),
+        _ => {
+            Err("Multiple windows belong to the linked client; overlay remains hidden.".to_string())
+        }
+    }
+}
+
+/// Whether `window` still belongs to `pid` and is visible and unminimized,
+/// with either the linked game process or RealmHound foreground.
+///
+/// Returns `Ok(None)` when the window disappeared or stopped belonging to the
+/// process, so the caller can look for a replacement.
+pub(crate) fn game_window_active(window: HWND, pid: u32) -> Result<Option<bool>, String> {
+    let mut owner = 0;
+    // SAFETY: `window` is a handle the caller obtained from `game_window`.
+    unsafe {
+        GetWindowThreadProcessId(window, &mut owner);
+    }
+    if owner != pid || unsafe { IsWindowVisible(window) } == 0 {
+        return Ok(None);
+    }
+    let mut cloaked: u32 = 0;
+    // SAFETY: `cloaked` is a valid out-pointer; DWM only reads the attribute.
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED as u32,
+            &mut cloaked as *mut u32 as *mut _,
+            4,
+        )
+    };
+    if result < 0 {
+        return Err(format!(
+            "Cannot inspect linked game visibility: HRESULT 0x{:08X}",
+            result as u32
+        ));
+    }
+    // A window belonging to a virtual desktop or a suspended UWP app stays
+    // "visible" to the window manager but is not actually on screen.
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut foreground_pid = 0;
+    unsafe { GetWindowThreadProcessId(foreground, &mut foreground_pid) };
+    let active = unsafe { IsIconic(window) == 0 }
+        && cloaked == 0
+        && (foreground_pid == pid || foreground_pid == std::process::id());
+    Ok(Some(active))
+}
+
+/// A retained handle on the game client process.
+///
+/// Holding the handle is what makes "is this still the same process?" reliable:
+/// a recycled PID cannot masquerade as the client we associated with.
+pub(crate) struct Process {
+    handle: isize,
+}
+
+impl Process {
+    pub fn open(pid: u32) -> Result<Self, String> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        };
+        // SAFETY: opening a process by PID only returns a handle; no memory is
+        // dereferenced.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle == 0 {
+            return Err(format!(
+                "Cannot inspect the linked game process: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { handle })
+    }
+
+    pub fn is_alive(&self) -> Result<bool, String> {
+        use windows_sys::Win32::{
+            Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::WaitForSingleObject,
+        };
+        // SAFETY: `handle` came from `OpenProcess` and is released in `Drop`.
+        match unsafe { WaitForSingleObject(self.handle, 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_FAILED => Err(format!(
+                "Cannot check the linked process lifetime: {}",
+                std::io::Error::last_os_error()
+            )),
+            result => Err(format!("Unexpected linked-process wait result: {result}")),
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // SAFETY: `handle` is owned by this `Process` and closed exactly once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::dismiss_stale;
+    use super::*;
+
+    #[test]
+    fn retiring_generations_forgets_recycled_handles_without_affecting_other_overlays() {
+        COMPOSITOR.with(|seen| {
+            seen.borrow_mut().extend([
+                ("Combat #1".to_string(), (11, true)),
+                ("Combat #2".to_string(), (11, true)),
+                ("Loot #3".to_string(), (12, false)),
+            ]);
+        });
+        dismiss_stale("Combat", "Combat #2");
+        COMPOSITOR.with(|seen| {
+            let seen = seen.borrow();
+            assert!(!seen.contains_key("Combat #1"));
+            assert_eq!(seen.get("Combat #2"), Some(&(11, true)));
+            assert_eq!(seen.get("Loot #3"), Some(&(12, false)));
+            assert!(!seen.contains_key("Combat #4"));
+        });
+        dismiss_stale("Combat", "");
+        COMPOSITOR.with(|seen| {
+            assert!(!seen.borrow().contains_key("Combat #2"));
+            assert_eq!(seen.borrow().get("Loot #3"), Some(&(12, false)));
+        });
+        dismiss_stale("Loot", "");
+    }
 }

@@ -152,9 +152,13 @@ fn main() -> Result<()> {
         .with_title("RealmHound")
         // eframe derives the GL config's alpha support from the *root* viewport
         // alone, so the overlay child windows can only be see-through if this one
-        // asks for transparency too. The main window still looks opaque because
-        // its panels paint a solid background over the whole client area.
-        .with_transparent(true)
+        // asks for transparency too. The root clear and panels remain opaque.
+        //
+        // Windows is the exception: glutin still gives the context an 8-bit
+        // alpha buffer, but its WGL transparency probe reports false, so eframe
+        // logs an error and glutin strips the flag before the window exists.
+        // The platform layer applies DWM composition to each overlay instead.
+        .with_transparent(!cfg!(windows))
         .with_app_id("realmhound")
         .with_icon(window_icon());
 
@@ -164,10 +168,10 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
-        // On a Wayland session, run on XWayland so overlays can sit over the
-        // Proton (X11) game client; `REALMHOUND_WAYLAND=1` opts out.
+        // Only enabled overlays require XWayland; otherwise keep winit's
+        // native backend preference.
         #[cfg(target_os = "linux")]
-        event_loop_builder: overlay::platform::event_loop_hook(),
+        event_loop_builder: overlay::platform::event_loop_hook(preview.overlays.any_visible()),
         ..Default::default()
     };
 
@@ -187,6 +191,8 @@ fn main() -> Result<()> {
                 "RealmHound",
                 options,
                 Box::new(move |cc| {
+                    #[cfg(target_os = "linux")]
+                    overlay::platform::record_backend(cc);
                     #[cfg(target_os = "macos")]
                     dock_icon::install();
                     Ok(Box::new(RootApp::build(
@@ -205,6 +211,8 @@ fn main() -> Result<()> {
                 "RealmHound",
                 options,
                 Box::new(move |cc| {
+                    #[cfg(target_os = "linux")]
+                    overlay::platform::record_backend(cc);
                     #[cfg(target_os = "macos")]
                     dock_icon::install();
                     let egui_ctx = cc.egui_ctx.clone();
@@ -633,14 +641,12 @@ impl RootApp {
 }
 
 impl eframe::App for RootApp {
-    /// Clear every viewport to fully transparent.
-    ///
-    /// eframe uses a single clear color for all viewports, and the overlay
-    /// windows need theirs to be transparent so the game shows through. The
-    /// main window is unaffected: its top/bottom panels and central panel paint
-    /// an opaque background across the entire client area.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+    /// Keep the root opaque even when a screen does not paint a full panel.
+    /// Immediate overlays are cleared separately by eframe and their callback.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let mut color = visuals.panel_fill.to_normalized_gamma_f32();
+        color[3] = 1.0;
+        color
     }
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let RootState::Active(app) = &mut self.state {
@@ -717,6 +723,21 @@ mod root_app_tests {
     use super::*;
     use eframe::App;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn root_clear_is_opaque_even_with_transparent_panel_visuals() {
+        let root = RootApp::new(mpsc::channel().1, false);
+        let mut visuals = egui::Visuals::dark();
+        for fill in [
+            egui::Color32::from_rgb(25, 25, 30),
+            egui::Color32::TRANSPARENT,
+        ] {
+            visuals.panel_fill = fill;
+            let clear = root.clear_color(&visuals);
+            assert_eq!(clear[3], 1.0);
+            assert_eq!(&clear[..3], &fill.to_normalized_gamma_f32()[..3]);
+        }
+    }
 
     #[test]
     fn root_app_forwards_shutdown_to_active_app() {

@@ -21,6 +21,9 @@
 //! - Never takes focus. Clicking an overlay must not pull input away from the
 //!   game; the native tweaks in [`platform`] enforce this where the windowing
 //!   layer cannot.
+//! - Hidden unless a verified linked game window is visible and unminimized,
+//!   with either the linked game or RealmHound foreground. Unknown attachment
+//!   and inspection errors hide overlays on every platform.
 //! - Position, size and chrome state round-trip through
 //!   [`realmhound_core::settings::OverlaySettings`].
 
@@ -32,10 +35,13 @@ use eframe::egui::{self, Color32, CornerRadius, RichText};
 use realmhound_core::combat::LiveFightSnapshot;
 use realmhound_core::loot::ProcessedLootDrop;
 use realmhound_core::settings::{OverlayWindowSettings, Settings};
+use realmhound_core::stream::ConnectionKey;
 
 use crate::panels::loot_filters::{LootFilters, PropertyFilters};
 use crate::rendering::SpriteRenderer;
 
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+mod game;
 mod live_combat;
 mod live_loot;
 pub mod platform;
@@ -81,10 +87,13 @@ const COLLAPSED_H: f32 = TITLE_BAR_H + 10.0;
 /// is cheap (a title lookup plus a couple of setters) and keeps the overlay up
 /// without a per-frame native call.
 const PROMOTE_INTERVAL: Duration = Duration::from_secs(2);
+const PROMOTE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How often a locked overlay polls the pointer to decide whether to suspend
 /// click-through over its title bar.
 const CHROME_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+const DETACHED_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Overlay refresh rate while something on screen is actually moving.
 ///
@@ -209,15 +218,19 @@ struct WindowRuntime {
     minimized: Option<bool>,
     /// Last resizable state pushed to the backend, for the same reason.
     resizable: Option<bool>,
+    /// Last native visibility pushed to the backend, for the same reason.
+    visible: Option<bool>,
     /// A pass-through or resizable change went out last frame. winit applies
     /// either by rewriting the window's whole native style, which drops the
     /// tweaks [`platform::promote`] added, so they are re-applied next frame
-    /// rather than up to [`PROMOTE_INTERVAL`] later.
+    /// rather than up to [`PROMOTE_INTERVAL`] later. Failed preparation also
+    /// keeps this set until a retry succeeds.
     restyled: bool,
     /// Whether the window reported itself covered on the previous promote tick.
     /// [`platform::order_front`] is edge-triggered on it.
     hidden: bool,
     last_promoted: Option<Instant>,
+    next_promotion_retry: Option<Instant>,
 }
 
 impl WindowRuntime {
@@ -230,9 +243,11 @@ impl WindowRuntime {
             passthrough: None,
             minimized: None,
             resizable: None,
+            visible: None,
             restyled: false,
             hidden: false,
             last_promoted: None,
+            next_promotion_retry: None,
         }
     }
 
@@ -253,9 +268,11 @@ impl WindowRuntime {
         self.passthrough = None;
         self.minimized = None;
         self.resizable = None;
+        self.visible = None;
         self.restyled = false;
         self.hidden = false;
         self.last_promoted = None;
+        self.next_promotion_retry = None;
     }
 
     fn builder_for(&mut self, cfg: &OverlayWindowSettings) -> egui::ViewportBuilder {
@@ -274,7 +291,12 @@ impl WindowRuntime {
         let mut builder = egui::ViewportBuilder::default()
             .with_title(&self.native_title)
             .with_decorations(false)
-            .with_transparent(true)
+            // Native preparation must precede the first map/show.
+            .with_visible(false)
+            // On Windows, DWM composition is applied natively by
+            // `platform::promote`; requesting a transparent window there only
+            // trips eframe's WGL probe (see `main`).
+            .with_transparent(!cfg!(windows))
             .with_resizable(!cfg.locked)
             .with_always_on_top()
             .with_taskbar(false)
@@ -288,12 +310,64 @@ impl WindowRuntime {
                 builder = builder.with_position([x, y]);
             }
         }
+        self.visible = Some(false);
         self.builder.insert(builder).clone()
     }
 
+    fn set_visible(&mut self, ctx: &egui::Context, visible: bool) -> bool {
+        if self.visible == Some(visible) {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        let changed = {
+            let _ = ctx;
+            platform::set_visible(&self.native_title, visible)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let changed = {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+            #[cfg(windows)]
+            {
+                self.restyled = true;
+            }
+            true
+        };
+        if changed {
+            self.visible = Some(visible);
+        }
+        changed
+    }
+
+    fn show_when_ready(&mut self, ctx: &egui::Context) {
+        if self.visible == Some(true) {
+            return;
+        }
+        if self.last_promoted.is_some() && self.next_promotion_retry.is_none() && !self.restyled {
+            if self.set_visible(ctx, true) {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.hidden = platform::order_front(&self.native_title, false);
+                }
+                return;
+            }
+            self.restyled = true;
+            self.next_promotion_retry = Some(Instant::now() + PROMOTE_RETRY_INTERVAL);
+        }
+        ctx.request_repaint_after(PROMOTE_RETRY_INTERVAL);
+    }
+
     /// Push a pass-through change and re-assert the native promotion on a timer.
-    fn sync_native(&mut self, ctx: &egui::Context, cfg: &OverlayWindowSettings, passthrough: bool) {
+    fn sync_native(
+        &mut self,
+        ctx: &egui::Context,
+        cfg: &OverlayWindowSettings,
+        passthrough: bool,
+        attached: bool,
+    ) {
         let restyled = std::mem::take(&mut self.restyled);
+        if !attached || !cfg.visible {
+            self.set_visible(ctx, false);
+        }
         if self.passthrough != Some(passthrough) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
             self.passthrough = Some(passthrough);
@@ -327,12 +401,34 @@ impl WindowRuntime {
                 .last_promoted
                 .is_none_or(|at| at.elapsed() >= PROMOTE_INTERVAL);
         if due {
+            let now = Instant::now();
+            if let Some(retry) = self.next_promotion_retry.filter(|&retry| retry > now) {
+                self.restyled = true;
+                if attached {
+                    ctx.request_repaint_after(retry - now);
+                }
+                return;
+            }
             // Retire leftovers first: raising the live window afterwards leaves
             // it on top even if the stale one was in front a moment ago.
             platform::dismiss_stale(self.title, &self.native_title);
-            platform::promote(&self.native_title);
-            self.hidden = platform::order_front(&self.native_title, self.hidden);
-            self.last_promoted = Some(Instant::now());
+            if platform::promote(&self.native_title) {
+                if attached && self.visible == Some(true) {
+                    self.hidden = platform::order_front(&self.native_title, self.hidden);
+                }
+                self.last_promoted = Some(Instant::now());
+                self.next_promotion_retry = None;
+            } else {
+                self.restyled = true;
+                self.next_promotion_retry = Some(Instant::now() + PROMOTE_RETRY_INTERVAL);
+                if attached {
+                    ctx.request_repaint_after(PROMOTE_RETRY_INTERVAL);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if attached && cfg.visible {
+            self.show_when_ready(ctx);
         }
     }
 }
@@ -343,9 +439,11 @@ pub struct OverlayManager {
     live_combat: live_combat::LiveCombatOverlay,
     live_loot_window: WindowRuntime,
     live_loot: live_loot::LiveLootOverlay,
-    /// Mirrors "at least one overlay is open" for the packet worker, which uses
-    /// it to keep waking the UI while a background tab is selected.
-    active: Arc<AtomicBool>,
+    /// The game client the overlays attach to.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    game: game::GameWindow,
+    /// Only an attached, expanded Live Combat window needs worker projections.
+    live_combat_demand: Arc<AtomicBool>,
     /// Set once if the backend turned out not to support real child windows, so
     /// the warning is logged a single time instead of every frame.
     embedded_warned: bool,
@@ -364,15 +462,15 @@ impl OverlayManager {
             live_combat: live_combat::LiveCombatOverlay::default(),
             live_loot_window: WindowRuntime::new(LIVE_LOOT_TITLE),
             live_loot: live_loot::LiveLootOverlay::default(),
-            active: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+            game: game::GameWindow::default(),
+            live_combat_demand: Arc::new(AtomicBool::new(false)),
             embedded_warned: false,
         }
     }
 
-    /// Shared flag the worker reads to decide whether overlay-only data (live
-    /// combat, loot) still needs to wake the UI on a background tab.
-    pub fn active_signal(&self) -> Arc<AtomicBool> {
-        self.active.clone()
+    pub fn live_combat_signal(&self) -> Arc<AtomicBool> {
+        self.live_combat_demand.clone()
     }
 
     /// Record a loot drop for the Live Loot overlay's counters and recent list.
@@ -391,31 +489,47 @@ impl OverlayManager {
 
     /// Render whichever overlays are enabled. Call once per frame from the root
     /// `eframe::App::update`, before the main window's panels.
+    ///
+    /// Requires a visible, unminimized window linked to a verified
+    /// `main_connection`, with the game or RealmHound foreground. Returns
+    /// whether attached overlays need parent updates, including preparation
+    /// before their first show and collapsed windows.
     pub fn render(
         &mut self,
         ctx: &egui::Context,
         settings: &Arc<RwLock<Settings>>,
         sprites: &mut SpriteRenderer,
         live: &[Arc<LiveFightSnapshot>],
-    ) {
-        // The Live Loot overlay shares the Live Feed's bag and item toggles rather
-        // than offering a second place to configure the same thing.
-        let Ok((mut cfg, bag_filters, item_filters, tracking_any)) = settings.read().map(|s| {
-            (
-                s.overlays.clone(),
-                LootFilters::from_live_feed_settings(&s.live_feed.filters),
-                PropertyFilters::from_live_feed_settings(&s.live_feed.filters),
-                s.combat_history.tracks_any_group(),
-            )
-        }) else {
-            return;
+        main_connection: Option<ConnectionKey>,
+    ) -> bool {
+        let Ok(s) = settings.read() else {
+            self.live_combat_demand.store(false, Ordering::Relaxed);
+            return false;
         };
-        self.active.store(cfg.any_visible(), Ordering::Relaxed);
-        if !cfg.any_visible() {
+        if !s.overlays.any_visible() {
+            drop(s);
+            self.live_combat_demand.store(false, Ordering::Relaxed);
             self.live_combat_window.closed();
             self.live_loot_window.closed();
-            return;
+            return false;
         }
+        let mut cfg = s.overlays.clone();
+        let tracking_any = s.combat_history.tracks_any_group();
+        let loot_filters = cfg.live_loot.visible.then(|| {
+            (
+                LootFilters::from_live_feed_settings(&s.live_feed.filters),
+                PropertyFilters::from_live_feed_settings(&s.live_feed.filters),
+            )
+        });
+        drop(s);
+
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        let attached = self.game.poll(main_connection);
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        let attached = {
+            let _ = main_connection;
+            false
+        };
 
         // Overlays are *immediate* viewports, which eframe can only paint from
         // inside the parent window's update: asking the overlay's own window to
@@ -430,7 +544,9 @@ impl OverlayManager {
         // drags its entire UI along.
         let animating =
             cfg.live_combat.visible && !cfg.live_combat.minimized && live.iter().any(|f| !f.ended);
-        ctx.request_repaint_after(if animating {
+        ctx.request_repaint_after(if !attached {
+            DETACHED_POLL_INTERVAL
+        } else if animating {
             ACTIVE_FRAME_INTERVAL
         } else {
             IDLE_FRAME_INTERVAL
@@ -439,6 +555,8 @@ impl OverlayManager {
         let before = cfg.clone();
         let opacity = cfg.clamped_opacity();
         let max_rows = cfg.max_rows();
+        let mut combat_visible = false;
+        let mut overlays_active = false;
 
         if cfg.live_combat.visible {
             let mut content = live_combat::LiveCombatContent {
@@ -455,15 +573,19 @@ impl OverlayManager {
                 &mut self.live_combat_window,
                 &mut cfg.live_combat,
                 opacity,
+                attached,
                 sprites,
                 &mut content,
             );
+            let active = attached && !embedded && cfg.live_combat.visible;
+            overlays_active |= active;
+            combat_visible = active && self.live_combat_window.visible == Some(true);
             self.warn_if_embedded(embedded);
         } else {
             self.live_combat_window.closed();
         }
 
-        if cfg.live_loot.visible {
+        if let Some((bag_filters, item_filters)) = loot_filters {
             let mut content = live_loot::LiveLootContent {
                 overlay: &mut self.live_loot,
                 filters: &bag_filters,
@@ -474,9 +596,11 @@ impl OverlayManager {
                 &mut self.live_loot_window,
                 &mut cfg.live_loot,
                 opacity,
+                attached,
                 sprites,
                 &mut content,
             );
+            overlays_active |= attached && !embedded && cfg.live_loot.visible;
             self.warn_if_embedded(embedded);
         } else {
             self.live_loot_window.closed();
@@ -497,6 +621,11 @@ impl OverlayManager {
                 s.overlays.live_combat_share_bars = cfg.live_combat_share_bars;
             }
         }
+        self.live_combat_demand.store(
+            combat_visible && !cfg.live_combat.minimized,
+            Ordering::Relaxed,
+        );
+        overlays_active
     }
 
     fn warn_if_embedded(&mut self, embedded: bool) {
@@ -544,6 +673,12 @@ impl HitRegions {
     fn contains(&self, local: egui::Pos2) -> bool {
         self.0.iter().any(|rect| rect.contains(local))
     }
+
+    fn contains_in_viewport(&self, client: egui::Rect, pointer: egui::Pos2) -> bool {
+        client.contains(pointer)
+            && (chrome_strip(client).contains(pointer)
+                || self.contains(pointer - client.min.to_vec2()))
+    }
 }
 
 /// Open (or update) one overlay window and render its chrome plus content.
@@ -555,6 +690,7 @@ fn show_window(
     runtime: &mut WindowRuntime,
     cfg: &mut OverlayWindowSettings,
     opacity: f32,
+    attached: bool,
     sprites: &mut SpriteRenderer,
     content: &mut dyn OverlayContent,
 ) -> bool {
@@ -571,6 +707,12 @@ fn show_window(
 
         if ctx.input(|i| i.viewport().close_requested()) {
             cfg.visible = false;
+        }
+        if !attached {
+            // Keep the window alive but off screen while the game is not in
+            // front, so reattaching does not pay for a fresh native window.
+            runtime.sync_native(ctx, cfg, cfg.locked, attached);
+            return;
         }
         persist_geometry(ctx, cfg);
 
@@ -620,8 +762,30 @@ fn show_window(
         // Viewport commands target whichever viewport is current, so this has to
         // run inside the callback: from outside it would reconfigure the main
         // window instead. Last, so this frame's chrome clicks are included.
-        runtime.sync_native(ctx, cfg, cfg.locked && !over_chrome);
+        runtime.sync_native(ctx, cfg, cfg.locked && !over_chrome, attached);
     });
+
+    // Windows rewrites extended styles when queued visibility/style commands
+    // are applied. Restore no-activation before returning to the event loop.
+    #[cfg(windows)]
+    if !embedded && runtime.restyled && runtime.next_promotion_retry.is_none() {
+        if platform::promote(&runtime.native_title) {
+            runtime.restyled = false;
+            runtime.last_promoted = Some(Instant::now());
+        } else {
+            runtime.next_promotion_retry = Some(Instant::now() + PROMOTE_RETRY_INTERVAL);
+            if attached {
+                ctx.request_repaint_after(PROMOTE_RETRY_INTERVAL);
+            }
+        }
+    }
+
+    // winit's macOS Visible(true) makes the window key. Order it non-key only
+    // after the hidden viewport has painted its first buffer.
+    #[cfg(target_os = "macos")]
+    if !embedded && attached && cfg.visible {
+        runtime.show_when_ready(ctx);
+    }
 
     if !cfg.visible {
         runtime.closed();
@@ -665,17 +829,13 @@ fn wipe_buffer(ui: &egui::Ui) {
 /// Asks the platform rather than egui because a click-through window receives
 /// no pointer events at all.
 fn pointer_over_interactive(ctx: &egui::Context, hits: &HitRegions) -> bool {
-    let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+    let Some(client) = ctx.input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect)) else {
         return false;
     };
-    let Some((x, y)) = platform::cursor_position(ctx.pixels_per_point()) else {
+    let Some((x, y)) = platform::cursor_position(ctx.pixels_per_point(), ctx.zoom_factor()) else {
         return false;
     };
-    let pointer = egui::pos2(x, y);
-    if !outer.contains(pointer) {
-        return false;
-    }
-    chrome_strip(outer).contains(pointer) || hits.contains(pointer - outer.min.to_vec2())
+    hits.contains_in_viewport(client, egui::pos2(x, y))
 }
 
 /// The title-bar band of a window at `outer`, in screen points.
@@ -1049,6 +1209,136 @@ mod tests {
     };
     use eframe::egui;
     use realmhound_core::settings::OverlaySettings;
+
+    #[test]
+    fn overlays_stay_hidden_until_preparation_and_pending_styles_finish() {
+        let mut cfg = OverlaySettings::default().live_combat;
+        cfg.visible = true;
+        let mut runtime = WindowRuntime::new("RealmHound hidden preparation test");
+        let builder = runtime.builder_for(&cfg);
+        assert_eq!(builder.visible, Some(false));
+        assert_eq!(runtime.visible, Some(false));
+        runtime.native_title = format!("RealmHound missing preparation {}", std::process::id());
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            runtime.sync_native(ctx, &cfg, cfg.locked, true);
+        });
+        assert_eq!(runtime.visible, Some(false));
+        assert!(runtime.last_promoted.is_none());
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::Visible(true))));
+        runtime.last_promoted = Some(std::time::Instant::now());
+        runtime.next_promotion_retry = None;
+        runtime.restyled = true;
+        let _ = ctx.run(Default::default(), |ctx| runtime.show_when_ready(ctx));
+        assert_eq!(runtime.visible, Some(false));
+        #[cfg(not(target_os = "macos"))]
+        {
+            runtime.restyled = false;
+            let output = ctx.run(Default::default(), |ctx| runtime.show_when_ready(ctx));
+            assert_eq!(runtime.visible, Some(true));
+            assert!(output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Visible(true))));
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.visible, Some(false));
+        }
+    }
+
+    #[test]
+    fn hit_regions_use_client_origin_on_negative_and_scaled_displays() {
+        let mut hits = HitRegions::default();
+        hits.add(egui::Rect::from_min_max(
+            egui::pos2(25.0, 35.0),
+            egui::pos2(30.0, 40.0),
+        ));
+        for origin in [
+            egui::pos2(108.0, 208.0),
+            egui::pos2(-792.0, 108.0),
+            egui::pos2(10.5, -499.25),
+        ] {
+            let client = egui::Rect::from_min_size(origin, egui::vec2(300.0, 200.0));
+            let pointer = origin + egui::vec2(27.0, 37.0);
+            assert!(hits.contains_in_viewport(client, pointer));
+            assert!(!hits.contains_in_viewport(client, pointer + egui::vec2(8.0, 8.0)));
+            assert!(hits.contains_in_viewport(client, origin + egui::vec2(10.0, 10.0)));
+            assert!(!hits.contains_in_viewport(client, origin - egui::vec2(1.0, 1.0)));
+        }
+    }
+
+    #[test]
+    fn missing_native_window_keeps_initial_and_restyle_preparation_pending() {
+        let cfg = OverlaySettings::default().live_combat;
+        let ctx = egui::Context::default();
+        for last in [None, Some(std::time::Instant::now())] {
+            let mut runtime = WindowRuntime::new("RealmHound preparation regression");
+            runtime.native_title = format!("RealmHound missing window {}", std::process::id());
+            runtime.last_promoted = last;
+            runtime.restyled = true;
+            runtime.visible = Some(false);
+            runtime.passthrough = Some(cfg.locked);
+            runtime.minimized = Some(cfg.minimized);
+            runtime.resizable = Some(!cfg.locked);
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.last_promoted, last);
+            assert!(runtime.restyled);
+            assert!(runtime.next_promotion_retry.is_some());
+            let retry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            runtime.next_promotion_retry = Some(retry);
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.last_promoted, last);
+            assert_eq!(runtime.next_promotion_retry, Some(retry));
+            assert!(runtime.restyled);
+            runtime.next_promotion_retry =
+                Some(std::time::Instant::now() - super::PROMOTE_RETRY_INTERVAL);
+            let _ = ctx.run(Default::default(), |ctx| {
+                runtime.sync_native(ctx, &cfg, cfg.locked, false);
+            });
+            assert_eq!(runtime.last_promoted, last);
+            assert!(runtime.restyled);
+            runtime.closed();
+            assert!(runtime.next_promotion_retry.is_none());
+            assert!(runtime.last_promoted.is_none());
+        }
+    }
+
+    #[test]
+    fn disabled_and_unattached_overlays_release_worker_demand() {
+        use super::{Arc, AtomicBool, Ordering, OverlayManager, RwLock, Settings, SpriteRenderer};
+
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let mut overlays = OverlayManager::new();
+        let signal: Arc<AtomicBool> = overlays.live_combat_signal();
+        let ctx = egui::Context::default();
+        let mut sprites = SpriteRenderer::new();
+        for (combat, loot, collapsed) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, false, false),
+        ] {
+            {
+                let mut s = settings.write().unwrap();
+                s.overlays.live_combat.visible = combat;
+                s.overlays.live_combat.minimized = collapsed;
+                s.overlays.live_loot.visible = loot;
+            }
+            signal.store(true, Ordering::Relaxed);
+            let _ = ctx.run(Default::default(), |ctx| {
+                assert!(!overlays.render(ctx, &settings, &mut sprites, &[], None));
+            });
+            assert!(!signal.load(Ordering::Relaxed));
+        }
+    }
 
     #[test]
     fn reopening_an_overlay_gives_its_window_a_fresh_native_title() {

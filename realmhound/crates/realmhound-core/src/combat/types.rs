@@ -538,6 +538,9 @@ impl CompletedFight {
 /// local player's damage may still be `SelfPending`/`SelfEstimated` and the
 /// end-of-fight reconciliation passes (HP-gap fill, unknown-row collapsing)
 /// have not run yet. It is never persisted.
+///
+/// Equipment/enchant, summon and weapon breakdowns are omitted from this
+/// compact projection; completed fights retain those details.
 #[derive(Debug, Clone, Default)]
 pub struct LiveFightSnapshot {
     /// World object id of the boss this snapshot is for.

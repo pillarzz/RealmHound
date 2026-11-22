@@ -155,11 +155,35 @@ impl UpdatePanel {
                         // Action buttons
                         match self_updater.state() {
                             SelfUpdateState::Idle => {
-                                if cfg!(target_os = "linux") {
-                                    ui.label(
-                                        "Install Linux updates through your package or source build.",
-                                    );
-                                } else if shadcn
+                                #[cfg(target_os = "linux")]
+                                {
+                                    use realmhound_core::install::InstallKind;
+                                    match self_updater.install_kind() {
+                                        InstallKind::OfficialUser => {
+                                            if shadcn
+                                                .btn(
+                                                    ui,
+                                                    format!(
+                                                        "⬇ Update to v{}",
+                                                        manifest.latest_version
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                self_updater.start_download(
+                                                    manifest.artifact_for_this_platform(),
+                                                );
+                                            }
+                                        }
+                                        other => {
+                                            if let Some(hint) = other.update_hint() {
+                                                ui.label(hint);
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                if shadcn
                                     .btn(ui, format!("⬇ Update to v{}", manifest.latest_version))
                                     .clicked()
                                 {

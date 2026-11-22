@@ -12,12 +12,176 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_BUFFER_SIZE: i32 = 64 * 1024;
 const MAX_BUFFER_SIZE: i32 = 256 * 1024 * 1024;
 const MAX_TIMEOUT_MS: i32 = 60_000;
+
+/// Version reported by this helper. It covers the helper's capabilities and
+/// stream framing; the GUI and helper do not need matching release numbers.
+pub const HELPER_VERSION: u32 = 2;
+/// Oldest helper this GUI accepts. Helpers published before versioning are
+/// treated as protocol 1 and remain supported.
+pub const MIN_SUPPORTED_HELPER_VERSION: u32 = 1;
+/// Helpers published before `--version` existed still speak this stream.
+const LEGACY_HELPER_VERSION: u32 = 1;
+const VERSION_FLAG: &str = "--version";
+const VERSION_PREFIX: &str = "helper-version=";
+
+/// What could be learned about an installed helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperVersion {
+    /// No helper could be found or executed.
+    Missing,
+    /// A helper from before `--version` existed.
+    Legacy,
+    /// A helper that reported its own version.
+    Version(u32),
+}
+
+impl HelperVersion {
+    /// The protocol level to compare, treating legacy helpers as level 1.
+    pub fn number(self) -> Option<u32> {
+        match self {
+            Self::Missing => None,
+            Self::Legacy => Some(LEGACY_HELPER_VERSION),
+            Self::Version(version) => Some(version),
+        }
+    }
+}
+
+/// Resolve the helper without relying on `PATH`.
+///
+/// The protected canonical path wins, then a sibling used by source builds,
+/// then the previous official location. This ordering keeps a migrated install
+/// on its protected helper while still running an unmigrated one.
+pub fn resolve_helper_path() -> Result<std::path::PathBuf, String> {
+    use crate::install::{HELPER_CANONICAL_PATH, HELPER_ENV_OVERRIDE, HELPER_LEGACY_PATH};
+
+    if let Some(value) = std::env::var_os(HELPER_ENV_OVERRIDE) {
+        let path = std::path::PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{HELPER_ENV_OVERRIDE} must be an absolute path, got {}",
+                path.display()
+            ));
+        }
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "{HELPER_ENV_OVERRIDE} points at {}, which is not a file",
+            path.display()
+        ));
+    }
+
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let sibling = exe.with_file_name("realmhound-capture");
+    for candidate in [
+        std::path::PathBuf::from(HELPER_CANONICAL_PATH),
+        sibling,
+        std::path::PathBuf::from(HELPER_LEGACY_PATH),
+    ] {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "Cannot find realmhound-capture. Expected the protected helper at {HELPER_CANONICAL_PATH}. \
+         Install it with the official Linux installer."
+    ))
+}
+
+/// Ask an explicit helper binary for its version.
+///
+/// Bounded so a helper that hangs cannot wedge startup or an update check.
+pub fn helper_version_at(path: &std::path::Path) -> HelperVersion {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let Ok(mut child) = Command::new(path)
+        .arg(VERSION_FLAG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return HelperVersion::Missing;
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    // A helper from before `--version` existed rejects the
+                    // flag. That is a valid legacy install, not a missing one.
+                    return HelperVersion::Legacy;
+                }
+                let mut stdout = Vec::new();
+                if let Some(mut output) = child.stdout.take() {
+                    let _ = output.read_to_end(&mut stdout);
+                }
+                return parse_helper_version(&stdout)
+                    .map(HelperVersion::Version)
+                    .unwrap_or(HelperVersion::Legacy);
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return HelperVersion::Missing;
+            }
+        }
+    }
+}
+
+fn parse_helper_version(stdout: &[u8]) -> Option<u32> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix(VERSION_PREFIX)?.trim().parse().ok())
+}
+
+/// Version of the helper this install would launch.
+pub fn installed_helper_version() -> HelperVersion {
+    match resolve_helper_path() {
+        Ok(path) => helper_version_at(&path),
+        Err(_) => HelperVersion::Missing,
+    }
+}
+
+/// Check a helper against the minimum this release can use.
+pub fn require_helper_version(required: u32, installed: HelperVersion) -> Result<(), String> {
+    let Some(available) = installed.number() else {
+        return Err(
+            "The capture helper was not found, so RealmHound cannot capture packets. \
+             Install it with the official Linux installer or the release's \
+             install-helper.sh, then retry the update."
+                .to_string(),
+        );
+    };
+    if available >= required {
+        return Ok(());
+    }
+    let installed_label = match installed {
+        HelperVersion::Legacy => format!("v{available} (legacy)"),
+        _ => format!("v{available}"),
+    };
+    Err(format!(
+        "This RealmHound requires capture helper v{required} or newer, but {installed_label} is installed. \
+         Download the official release, verify its published SHA-256, and run the release's \
+         install-helper.sh with --sha256 <official helper hash>, then retry."
+    ))
+}
+
+/// Startup check used by the GUI so an incompatible helper is visible rather
+/// than silently disabling capture.
+pub fn startup_compatibility() -> Result<(), String> {
+    let path = resolve_helper_path()?;
+    require_helper_version(MIN_SUPPORTED_HELPER_VERSION, helper_version_at(&path))
+        .map_err(|message| format!("{message} (helper: {})", path.display()))
+}
 
 fn capture_interface_name(override_name: Option<String>) -> String {
     override_name
@@ -166,6 +330,11 @@ fn await_startup(
 
 /// Entry point for the separately installed, capability-bearing executable.
 pub fn run() -> Result<(), String> {
+    if std::env::args_os().skip(1).any(|arg| arg == VERSION_FLAG) {
+        println!("{VERSION_PREFIX}{HELPER_VERSION}");
+        return Ok(());
+    }
+
     let parent_disconnected = Arc::new(AtomicBool::new(false));
     let disconnect_signal = parent_disconnected.clone();
     std::thread::spawn(move || {
@@ -272,15 +441,16 @@ pub fn start(
     ),
     CaptureError,
 > {
-    let exe = std::env::current_exe().map_err(|e| CaptureError::CaptureError(e.to_string()))?;
-    let helper = exe.with_file_name("realmhound-capture");
+    let helper = resolve_helper_path().map_err(CaptureError::CaptureError)?;
+    require_helper_version(MIN_SUPPORTED_HELPER_VERSION, helper_version_at(&helper))
+        .map_err(CaptureError::CaptureError)?;
     let mut child = Command::new(&helper)
         .args(helper_args(config))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| CaptureError::CaptureError(format!("Cannot launch {}: {e}. Install the Linux capture helper beside RealmHound and run the one-time setup.", helper.display())))?;
+        .map_err(|e| CaptureError::CaptureError(format!("Cannot launch {}: {e}. Install the protected Linux capture helper with the official installer.", helper.display())))?;
     let output = child.stdout.take().unwrap();
     let errors = child.stderr.take().unwrap();
     std::thread::spawn(move || {
@@ -313,6 +483,48 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_version_line_from_helper_output() {
+        assert_eq!(parse_helper_version(b"helper-version=2\n"), Some(2));
+        assert_eq!(
+            parse_helper_version(b"diagnostic\nhelper-version=7\n"),
+            Some(7)
+        );
+        assert_eq!(parse_helper_version(b"no version here\n"), None);
+    }
+
+    #[test]
+    fn the_release_manifest_minimum_matches_this_gui() {
+        let manifest_min = include_str!("../../../../../packaging/linux/min-helper-version");
+        assert_eq!(
+            manifest_min.trim().parse::<u32>().unwrap(),
+            MIN_SUPPORTED_HELPER_VERSION
+        );
+    }
+
+    #[test]
+    fn legacy_helpers_count_as_version_one() {
+        assert_eq!(HelperVersion::Legacy.number(), Some(1));
+        assert_eq!(HelperVersion::Missing.number(), None);
+        assert_eq!(HelperVersion::Version(4).number(), Some(4));
+    }
+
+    #[test]
+    fn compatibility_treats_legacy_as_supported_version_one() {
+        assert!(require_helper_version(1, HelperVersion::Legacy).is_ok());
+        assert!(require_helper_version(2, HelperVersion::Legacy).is_err());
+        assert!(require_helper_version(2, HelperVersion::Version(2)).is_ok());
+        assert!(require_helper_version(3, HelperVersion::Version(2)).is_err());
+        assert!(require_helper_version(1, HelperVersion::Missing).is_err());
+    }
+
+    #[test]
+    fn incompatible_helpers_are_told_how_to_upgrade() {
+        let message = require_helper_version(3, HelperVersion::Version(2)).unwrap_err();
+        assert!(message.contains("helper v3"));
+        assert!(message.contains("install-helper.sh"));
+    }
 
     #[test]
     fn closed_parent_pipe_signals_disconnect() {

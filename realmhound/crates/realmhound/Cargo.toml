@@ -110,6 +110,8 @@ tempfile = "3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 [features]
+# Forwarded by distro packagers; disables upstream self-replacement.
+package-build = ["realmhound-core/package-build"]
 # Enable the in-app puffin profiler overlay (toggle with F12) and pipeline scopes.
 profiling = ["dep:puffin", "dep:puffin_egui", "dep:puffin_http", "realmhound-core/profiling"]
 # Enable diagnostic-only capture, pipeline, storage, UI, and audio latency logging.

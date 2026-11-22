@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::install::InstallKind;
+
 /// URL to the version manifest gist
 const VERSION_MANIFEST_URL: &str =
     "https://gist.githubusercontent.com/pillarzz/4f50870a65c14d179eb2c361b5915946/raw/version.json";
@@ -38,15 +40,40 @@ pub struct VersionManifest {
     /// SHA-256 hex digest of the archive at `macos_download_url`.
     #[serde(default)]
     pub macos_sha256: Option<String>,
+    /// Bare x86-64 Linux GUI executable for in-app replacement.
+    #[serde(default)]
+    pub linux_x86_64_download_url: Option<String>,
+    /// SHA-256 hex digest of the executable at `linux_x86_64_download_url`.
+    #[serde(default)]
+    pub linux_x86_64_sha256: Option<String>,
+    /// Bare aarch64 Linux GUI executable, once that build is published.
+    #[serde(default)]
+    pub linux_aarch64_download_url: Option<String>,
+    /// SHA-256 hex digest of the executable at `linux_aarch64_download_url`.
+    #[serde(default)]
+    pub linux_aarch64_sha256: Option<String>,
+    /// SHA-256 hex digest of the Linux capture helper in this release.
+    #[serde(default)]
+    pub linux_helper_sha256: Option<String>,
+    /// Oldest capture helper this GUI release works with.
+    #[serde(default)]
+    pub linux_min_helper_version: Option<u32>,
     pub releases: Vec<Release>,
 }
 
 /// A release artifact this platform can actually install: the Windows
-/// executable, or the macOS `.app` bundle as a zip.
+/// executable, the macOS `.app` bundle as a zip, or the Linux GUI binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformArtifact {
     pub download_url: String,
     pub sha256: Option<String>,
+    /// Linux only: the minimum capture-helper version this release needs.
+    /// `None` for platforms without a separately installed helper, and for
+    /// manifests that do not declare a requirement.
+    pub min_helper_version: Option<u32>,
+    /// Linux only: the official helper digest, shown when a manual helper
+    /// upgrade is required.
+    pub helper_sha256: Option<String>,
 }
 
 impl VersionManifest {
@@ -56,23 +83,38 @@ impl VersionManifest {
     /// `download_url` is the Windows executable: it predates any other target
     /// and is left unqualified so older clients keep resolving it.
     pub fn artifact_for_this_platform(&self) -> Option<PlatformArtifact> {
-        #[cfg(windows)]
-        {
-            Some(PlatformArtifact {
+        self.artifact_for(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// Pure platform/architecture selection, so every branch is testable
+    /// regardless of the host this test binary runs on.
+    fn artifact_for(&self, os: &str, arch: &str) -> Option<PlatformArtifact> {
+        match (os, arch) {
+            ("windows", _) => Some(PlatformArtifact {
                 download_url: self.download_url.clone(),
                 sha256: self.sha256.clone(),
-            })
-        }
-        #[cfg(target_os = "macos")]
-        {
-            Some(PlatformArtifact {
+                min_helper_version: None,
+                helper_sha256: None,
+            }),
+            ("macos", _) => Some(PlatformArtifact {
                 download_url: self.macos_download_url.clone()?,
                 sha256: self.macos_sha256.clone(),
-            })
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            None
+                min_helper_version: None,
+                helper_sha256: None,
+            }),
+            ("linux", "x86_64") => Some(PlatformArtifact {
+                download_url: self.linux_x86_64_download_url.clone()?,
+                sha256: self.linux_x86_64_sha256.clone(),
+                min_helper_version: self.linux_min_helper_version,
+                helper_sha256: self.linux_helper_sha256.clone(),
+            }),
+            ("linux", "aarch64") => Some(PlatformArtifact {
+                download_url: self.linux_aarch64_download_url.clone()?,
+                sha256: self.linux_aarch64_sha256.clone(),
+                min_helper_version: self.linux_min_helper_version,
+                helper_sha256: self.linux_helper_sha256.clone(),
+            }),
+            _ => None,
         }
     }
 }
@@ -412,19 +454,27 @@ pub struct SelfUpdater {
     state: Arc<Mutex<SelfUpdateState>>,
     /// Path to the downloaded new exe (set after download completes)
     new_exe_path: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// How this copy was installed. Linux only; other platforms ignore it.
+    install_kind: InstallKind,
 }
 
 impl SelfUpdater {
-    pub fn new() -> Self {
+    pub fn new(install_kind: InstallKind) -> Self {
         Self {
             state: Arc::new(Mutex::new(SelfUpdateState::Idle)),
             new_exe_path: Arc::new(Mutex::new(None)),
+            install_kind,
         }
     }
 
     /// Get the current self-update state.
     pub fn state(&self) -> SelfUpdateState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// How this copy was installed.
+    pub fn install_kind(&self) -> InstallKind {
+        self.install_kind
     }
 
     /// Whether an update operation is in progress.
@@ -442,15 +492,26 @@ impl SelfUpdater {
     /// published no binary for is told so rather than being handed one the
     /// kernel cannot run; the update *check* is separate and still reports that
     /// a newer version exists.
+    ///
+    /// Linux additionally refuses package-managed and unrecognized installs,
+    /// and refuses a GUI that requires a newer capture helper until that helper
+    /// has been upgraded and rechecked.
     pub fn start_download(&self, artifact: Option<PlatformArtifact>) {
         let Some(artifact) = artifact else {
-            *self.state.lock().unwrap() = SelfUpdateState::Failed(format!(
-                "This release does not publish a {} build. Pull the latest \
-                 source and rebuild to update.",
-                std::env::consts::OS
-            ));
+            *self.state.lock().unwrap() = SelfUpdateState::Failed(missing_artifact_message());
             return;
         };
+
+        // Linux: a package-managed or unrecognized install must never replace
+        // itself from upstream. This is a policy gate, not a privilege check.
+        #[cfg(target_os = "linux")]
+        if let Some(hint) = self.install_kind.update_hint() {
+            *self.state.lock().unwrap() = SelfUpdateState::Failed(hint.to_string());
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        let helper_sha256 = artifact.helper_sha256.clone();
         let download_url = artifact.download_url;
         let expected_sha256 = match artifact.sha256 {
             Some(value)
@@ -470,6 +531,24 @@ impl SelfUpdater {
             }
         };
 
+        // Linux: never replace the GUI with one that needs a newer capture
+        // helper. The user must upgrade the helper first and retry; silently
+        // landing in incompatible capture is not an option.
+        #[cfg(target_os = "linux")]
+        if let Some(required) = artifact.min_helper_version {
+            let installed = crate::capture::linux_helper::installed_helper_version();
+            if let Err(message) =
+                crate::capture::linux_helper::require_helper_version(required, installed)
+            {
+                let message = match helper_sha256 {
+                    Some(hash) => format!("{message}\n\nOfficial helper SHA-256: {hash}"),
+                    None => message,
+                };
+                *self.state.lock().unwrap() = SelfUpdateState::Failed(message);
+                return;
+            }
+        }
+
         let state = Arc::clone(&self.state);
         let new_exe_path = Arc::clone(&self.new_exe_path);
 
@@ -479,6 +558,12 @@ impl SelfUpdater {
         // the download.
         #[cfg(target_os = "macos")]
         if let Some(blocker) = bundle_update_blocker() {
+            *state.lock().unwrap() = SelfUpdateState::Failed(blocker);
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(blocker) = linux_gui_update_blocker() {
             *state.lock().unwrap() = SelfUpdateState::Failed(blocker);
             return;
         }
@@ -530,8 +615,45 @@ impl SelfUpdater {
 
 impl Default for SelfUpdater {
     fn default() -> Self {
-        Self::new()
+        Self::new(InstallKind::Unmanaged)
     }
+}
+
+/// Explain an update manifest that has no artifact this build can run.
+fn missing_artifact_message() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let arch = std::env::consts::ARCH;
+        format!(
+            "This release does not publish a Linux build for {arch}. \
+             Supported Linux builds are x86-64. Update through your package \
+             manager or build from source."
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        format!(
+            "This release does not publish a {os}/{arch} build. Pull the latest \
+             source and rebuild to update."
+        )
+    }
+}
+
+/// Refuse a Linux update when the account cannot replace the GUI in place.
+#[cfg(target_os = "linux")]
+fn linux_gui_update_blocker() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let parent = exe.parent()?;
+    if can_write_in(parent) {
+        return None;
+    }
+    Some(format!(
+        "RealmHound is in {}, which this account cannot write to. Reinstall it \
+         with the official release installer so in-app updates can replace it.",
+        parent.display()
+    ))
 }
 
 /// Maximum allowed download size (100 MB) to prevent unbounded memory usage.
@@ -609,8 +731,8 @@ fn bundle_update_blocker() -> Option<String> {
 }
 
 /// Whether this process can create files in `dir`. Probing is the only reliable
-/// answer on macOS, where ACLs and SIP both override the mode bits.
-#[cfg(target_os = "macos")]
+/// answer on Unix, where ACLs and SIP both override the mode bits.
+#[cfg(unix)]
 fn can_write_in(dir: &std::path::Path) -> bool {
     let probe = dir.join(format!(".realmhound-update-probe-{}", std::process::id()));
     match std::fs::File::create(&probe) {
@@ -623,12 +745,12 @@ fn can_write_in(dir: &std::path::Path) -> bool {
 }
 
 /// Phrase a filesystem failure during the swap so the user can act on it.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn swap_error(path: &std::path::Path, error: &std::io::Error) -> String {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => format!(
-            "No permission to replace {}. Move RealmHound.app somewhere you can \
-             write to, or update it manually.",
+            "No permission to replace {}. Reinstall RealmHound with the official \
+             release installer, or update it manually.",
             path.display()
         ),
         std::io::ErrorKind::NotFound => format!(
@@ -698,6 +820,9 @@ fn download_update(
         total: total_size,
     });
 
+    // Remove a stale partial download (including a symlink) before creating the
+    // staging file, so the write can never follow a link out of the install.
+    let _ = std::fs::remove_file(&new_path);
     let mut file = std::fs::File::create(&new_path)
         .map_err(|e| format!("Failed to create temp file: {}", e))?;
 
@@ -751,7 +876,51 @@ fn download_update(
     }
 
     info!("Download complete: {} bytes", downloaded);
+
+    // A hash match proves the bytes are the published ones, not that this host
+    // can run them. Refuse a wrong-architecture or missing-library binary
+    // before it ever replaces the working GUI.
+    #[cfg(target_os = "linux")]
+    if !downloaded_exe_runs(&new_path) {
+        let _ = std::fs::remove_file(&new_path);
+        return Err(
+            "The downloaded update cannot run on this system. The current \
+             installation was not changed."
+                .to_string(),
+        );
+    }
+
     Ok(new_path)
+}
+
+/// Run the downloaded GUI with `--version`, bounded so a broken binary cannot
+/// wedge the download thread.
+#[cfg(target_os = "linux")]
+fn downloaded_exe_runs(path: &std::path::Path) -> bool {
+    const VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let Ok(mut child) = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + VALIDATION_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// A completed executable swap awaiting relaunch. Holds the paths needed to
@@ -783,8 +952,54 @@ impl StagedSwap {
 pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwap, String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Cannot determine current exe path: {}", e))?;
-    let old_path = sibling_with_suffix(&current_exe, ".old")
+    stage_executable_swap_at(new_exe_path, &current_exe)
+}
+
+/// Swap an explicit executable, so tests never touch the running install.
+fn stage_executable_swap_at(
+    new_exe_path: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> Result<StagedSwap, String> {
+    let old_path = sibling_with_suffix(current_exe, ".old")
         .ok_or_else(|| "Cannot determine backup path".to_string())?;
+
+    // Only a regular file may become the live executable; a symlink or special
+    // file staged by something else must not be renamed into place.
+    match std::fs::symlink_metadata(new_exe_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a regular file; refusing to apply it.",
+                new_exe_path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect {}: {}",
+                new_exe_path.display(),
+                error
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let parent = current_exe.parent().unwrap_or(current_exe);
+        if !parent.exists() {
+            return Err(swap_error(
+                current_exe,
+                &std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        // Fail before renaming anything when the install is not writable, and
+        // phrase it as something the user can act on.
+        if !can_write_in(parent) {
+            return Err(swap_error(
+                current_exe,
+                &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ));
+        }
+    }
 
     info!("Applying update: swapping {:?}", current_exe);
 
@@ -795,18 +1010,18 @@ pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwa
     }
 
     // Rename the running binary aside
-    std::fs::rename(&current_exe, &old_path)
+    std::fs::rename(current_exe, &old_path)
         .map_err(|e| format!("Failed to rename current exe to .old: {}", e))?;
 
     // Rename .new to the original exe name
-    if let Err(e) = std::fs::rename(new_exe_path, &current_exe) {
+    if let Err(e) = std::fs::rename(new_exe_path, current_exe) {
         // Rollback: restore original
-        let _ = std::fs::rename(&old_path, &current_exe);
+        let _ = std::fs::rename(&old_path, current_exe);
         return Err(format!("Failed to rename new exe into place: {}", e));
     }
 
     Ok(StagedSwap {
-        current_exe,
+        current_exe: current_exe.to_path_buf(),
         old_path,
         new_exe_path: new_exe_path.to_path_buf(),
         #[cfg(target_os = "macos")]
@@ -924,8 +1139,16 @@ pub fn rollback_executable_swap(staged: &StagedSwap) {
     let _ = std::fs::rename(&staged.old_path, &staged.current_exe);
 }
 
-/// Clean up leftover .old file from a previous update.
-/// Call this on app startup.
+/// Marker written after the GUI has rendered its first frame.
+#[cfg(target_os = "linux")]
+const STARTUP_CONFIRMED_NAME: &str = "startup-confirmed";
+
+/// Clean up leftovers from a previous update. Call this on app startup.
+///
+/// Linux keeps the previous GUI until the *same* version has proved it can
+/// render a frame (see [`confirm_startup`]), so a process that merely spawned
+/// cannot discard the recovery copy. Windows and macOS keep their existing
+/// next-launch cleanup behavior.
 pub fn cleanup_old_exe() {
     #[cfg(target_os = "macos")]
     if let Some(bundle) = installed_bundle() {
@@ -946,16 +1169,88 @@ pub fn cleanup_old_exe() {
         return;
     }
     if let Ok(current_exe) = std::env::current_exe() {
-        let Some(old_path) = sibling_with_suffix(&current_exe, ".old") else {
-            return;
-        };
-        if old_path.exists() {
-            match std::fs::remove_file(&old_path) {
-                Ok(()) => info!("Cleaned up old exe: {:?}", old_path),
-                Err(e) => debug!("Could not clean up old exe: {}", e),
+        #[cfg(target_os = "linux")]
+        {
+            cleanup_linux_exe(&current_exe);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let Some(old_path) = sibling_with_suffix(&current_exe, ".old") else {
+                return;
+            };
+            if old_path.exists() {
+                match std::fs::remove_file(&old_path) {
+                    Ok(()) => info!("Cleaned up old exe: {:?}", old_path),
+                    Err(e) => debug!("Could not clean up old exe: {}", e),
+                }
             }
         }
     }
+}
+
+/// Remove a stale partial download and, once this exact version has already
+/// started successfully, the previous release it replaced.
+#[cfg(target_os = "linux")]
+fn cleanup_linux_exe(current_exe: &std::path::Path) {
+    let Some(dir) = current_exe.parent() else {
+        return;
+    };
+
+    if let Some(new_path) = sibling_with_suffix(current_exe, ".new") {
+        if new_path.exists() {
+            match std::fs::remove_file(&new_path) {
+                Ok(()) => info!("Removed incomplete update download: {:?}", new_path),
+                Err(e) => debug!("Could not remove {:?}: {}", new_path, e),
+            }
+        }
+    }
+
+    let Some(old_path) = sibling_with_suffix(current_exe, ".old") else {
+        return;
+    };
+    if !old_path.exists() {
+        return;
+    }
+    let confirmed = std::fs::read_to_string(dir.join(STARTUP_CONFIRMED_NAME))
+        .map(|version| version.trim() == env!("CARGO_PKG_VERSION"))
+        .unwrap_or(false);
+    if !confirmed {
+        info!(
+            "Keeping the previous RealmHound at {:?} until this version starts successfully",
+            old_path
+        );
+        return;
+    }
+    match std::fs::remove_file(&old_path) {
+        Ok(()) => info!("Cleaned up old exe: {:?}", old_path),
+        Err(e) => debug!("Could not clean up old exe: {}", e),
+    }
+}
+
+/// Record that this version reached its first rendered frame.
+///
+/// Called once per run. The next launch may then remove the previous release,
+/// so a broken update keeps its recovery copy through startup.
+pub fn confirm_startup(install_kind: InstallKind) {
+    #[cfg(target_os = "linux")]
+    {
+        if install_kind != InstallKind::OfficialUser {
+            return;
+        }
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = current_exe.parent() else {
+            return;
+        };
+        let marker = dir.join(STARTUP_CONFIRMED_NAME);
+        let staging = dir.join(format!(".{STARTUP_CONFIRMED_NAME}.{}", std::process::id()));
+        if std::fs::write(&staging, env!("CARGO_PKG_VERSION")).is_ok() {
+            let _ = std::fs::rename(&staging, &marker);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = install_kind;
 }
 
 #[cfg(test)]
@@ -981,43 +1276,62 @@ mod tests {
         assert_eq!(manifest.macos_sha256, None);
     }
 
-    #[test]
-    fn each_platform_resolves_only_a_binary_it_can_run() {
-        let manifest: VersionManifest = serde_json::from_str(
+    fn full_manifest() -> VersionManifest {
+        serde_json::from_str(
             r#"{
-                "latest_version": "0.21.1",
+                "latest_version": "0.22.2",
                 "download_url": "https://example.invalid/RealmHound.exe",
                 "sha256": "ab",
                 "macos_download_url": "https://example.invalid/RealmHound-macos-app.zip",
                 "macos_sha256": "cd",
+                "linux_x86_64_download_url": "https://example.invalid/RealmHound-linux-x86_64",
+                "linux_x86_64_sha256": "ef",
+                "linux_helper_sha256": "12",
+                "linux_min_helper_version": 2,
                 "releases": []
             }"#,
         )
-        .expect("manifest parses");
-
-        let artifact = manifest.artifact_for_this_platform();
-        if cfg!(windows) {
-            let artifact = artifact.expect("windows publishes an executable");
-            assert!(artifact.download_url.ends_with(".exe"));
-            assert_eq!(artifact.sha256.as_deref(), Some("ab"));
-        } else if cfg!(target_os = "macos") {
-            let artifact = artifact.expect("macOS publishes a bundle");
-            assert!(artifact.download_url.ends_with("-macos-app.zip"));
-            assert_eq!(artifact.sha256.as_deref(), Some("cd"));
-        } else {
-            assert_eq!(artifact, None, "no binary is published for this platform");
-        }
+        .expect("manifest parses")
     }
 
     #[test]
-    fn macos_resolves_nothing_when_the_release_published_no_macos_binary() {
+    fn each_supported_platform_resolves_only_its_own_binary() {
+        let manifest = full_manifest();
+
+        let windows = manifest.artifact_for("windows", "x86_64").unwrap();
+        assert!(windows.download_url.ends_with(".exe"));
+        assert_eq!(windows.sha256.as_deref(), Some("ab"));
+        assert_eq!(windows.min_helper_version, None);
+
+        let macos = manifest.artifact_for("macos", "aarch64").unwrap();
+        assert!(macos.download_url.ends_with("-macos-app.zip"));
+        assert_eq!(macos.sha256.as_deref(), Some("cd"));
+        assert_eq!(macos.min_helper_version, None);
+
+        let linux = manifest.artifact_for("linux", "x86_64").unwrap();
+        assert!(linux.download_url.ends_with("-linux-x86_64"));
+        assert_eq!(linux.sha256.as_deref(), Some("ef"));
+        assert_eq!(linux.min_helper_version, Some(2));
+        assert_eq!(linux.helper_sha256.as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn an_unpublished_linux_architecture_resolves_nothing() {
+        let manifest = full_manifest();
+        assert_eq!(
+            manifest.artifact_for("linux", "aarch64"),
+            None,
+            "no aarch64 artifact is published"
+        );
+        assert_eq!(manifest.artifact_for("freebsd", "x86_64"), None);
+    }
+
+    #[test]
+    fn a_legacy_manifest_never_offers_windows_to_linux() {
         let manifest: VersionManifest =
             serde_json::from_str(LEGACY_MANIFEST).expect("legacy manifest parses");
-        // The Windows executable must never be offered to another platform.
-        #[cfg(not(windows))]
-        assert_eq!(manifest.artifact_for_this_platform(), None);
-        #[cfg(windows)]
-        assert!(manifest.artifact_for_this_platform().is_some());
+        assert_eq!(manifest.artifact_for("linux", "x86_64"), None);
+        assert!(manifest.artifact_for("windows", "x86_64").is_some());
     }
 
     #[test]
@@ -1053,6 +1367,12 @@ mod tests {
             sha256: None,
             macos_download_url: None,
             macos_sha256: None,
+            linux_x86_64_download_url: None,
+            linux_x86_64_sha256: None,
+            linux_aarch64_download_url: None,
+            linux_aarch64_sha256: None,
+            linux_helper_sha256: None,
+            linux_min_helper_version: None,
             releases: vec![
                 Release {
                     version: "0.5.0".to_string(),
@@ -1102,11 +1422,13 @@ mod tests {
 
     #[test]
     fn test_missing_checksum_blocks_download() {
-        let updater = SelfUpdater::new();
+        let updater = SelfUpdater::new(InstallKind::OfficialUser);
 
         updater.start_download(Some(PlatformArtifact {
             download_url: "http://example.com".to_string(),
             sha256: None,
+            min_helper_version: None,
+            helper_sha256: None,
         }));
 
         assert!(matches!(
@@ -1117,11 +1439,13 @@ mod tests {
 
     #[test]
     fn test_invalid_checksum_blocks_download() {
-        let updater = SelfUpdater::new();
+        let updater = SelfUpdater::new(InstallKind::OfficialUser);
 
         updater.start_download(Some(PlatformArtifact {
             download_url: "http://example.com".to_string(),
             sha256: Some("g".repeat(64)),
+            min_helper_version: None,
+            helper_sha256: None,
         }));
 
         assert!(matches!(
@@ -1132,7 +1456,7 @@ mod tests {
 
     #[test]
     fn a_platform_without_a_published_binary_is_told_so() {
-        let updater = SelfUpdater::new();
+        let updater = SelfUpdater::new(InstallKind::OfficialUser);
 
         updater.start_download(None);
 
@@ -1317,5 +1641,144 @@ mod tests {
             b"old exe",
             "the install must be left alone when the archive is unusable"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_official_linux_installs_are_refused_before_download() {
+        for (kind, expected) in [
+            (InstallKind::PackageManaged, "package manager"),
+            (InstallKind::Unmanaged, "official release installer"),
+        ] {
+            let updater = SelfUpdater::new(kind);
+            updater.start_download(Some(PlatformArtifact {
+                download_url: "http://example.invalid/RealmHound".to_string(),
+                sha256: None,
+                min_helper_version: None,
+                helper_sha256: None,
+            }));
+            assert!(matches!(
+                updater.state(),
+                SelfUpdateState::Failed(message) if message.contains(expected)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_directory_is_not_reported_as_writable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        assert!(can_write_in(temp.path()));
+        assert!(!can_write_in(&temp.path().join("missing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_swaps_the_executable_and_rolls_back() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let current = temp.path().join("RealmHound");
+        let new = temp.path().join("RealmHound.new");
+        std::fs::write(&current, b"old exe").expect("write old");
+        std::fs::write(&new, b"new exe").expect("write new");
+
+        let staged = stage_executable_swap_at(&new, &current).expect("swap");
+
+        assert_eq!(staged.exe_path(), current);
+        assert_eq!(std::fs::read(&current).expect("exe"), b"new exe");
+        assert_eq!(
+            std::fs::read(current.with_file_name("RealmHound.old")).expect("backup"),
+            b"old exe"
+        );
+
+        rollback_executable_swap(&staged);
+        assert_eq!(std::fs::read(&current).expect("exe"), b"old exe");
+        assert_eq!(std::fs::read(&new).expect("new"), b"new exe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_staged_binary_is_refused() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let current = temp.path().join("RealmHound");
+        let target = temp.path().join("elsewhere");
+        let new = temp.path().join("RealmHound.new");
+        std::fs::write(&current, b"old exe").expect("write current");
+        std::fs::write(&target, b"new exe").expect("write target");
+        std::os::unix::fs::symlink(&target, &new).expect("symlink");
+
+        let error = match stage_executable_swap_at(&new, &current) {
+            Ok(_) => panic!("a symlinked staged binary must be refused"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("not a regular file"));
+        assert_eq!(
+            std::fs::read(&current).expect("current"),
+            b"old exe",
+            "the live install must not change"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn downloaded_binaries_are_validated_by_exit_status() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let executable = |name: &str, body: &str| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, body).expect("write script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        };
+
+        assert!(downloaded_exe_runs(&executable(
+            "ok",
+            "#!/bin/sh\nexit 0\n"
+        )));
+        assert!(!downloaded_exe_runs(&executable(
+            "bad",
+            "#!/bin/sh\nexit 1\n"
+        )));
+        assert!(!downloaded_exe_runs(&temp.path().join("missing")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_keeps_the_previous_version_until_this_version_has_started() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let current = temp.path().join("RealmHound");
+        let old = temp.path().join("RealmHound.old");
+        let new = temp.path().join("RealmHound.new");
+        std::fs::write(&current, b"new exe").expect("write current");
+        std::fs::write(&old, b"old exe").expect("write old");
+        std::fs::write(&new, b"partial").expect("write new");
+
+        cleanup_linux_exe(&current);
+        assert!(!new.exists(), "a partial download must be removed");
+        assert!(old.exists(), "spawning alone must not discard the backup");
+
+        std::fs::write(
+            temp.path().join(STARTUP_CONFIRMED_NAME),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("write marker");
+        cleanup_linux_exe(&current);
+        assert!(!old.exists(), "a confirmed start releases the backup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_marker_from_another_version_does_not_discard_the_backup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let current = temp.path().join("RealmHound");
+        let old = temp.path().join("RealmHound.old");
+        std::fs::write(&current, b"new exe").expect("write current");
+        std::fs::write(&old, b"old exe").expect("write old");
+        std::fs::write(temp.path().join(STARTUP_CONFIRMED_NAME), "0.0.0").expect("write marker");
+
+        cleanup_linux_exe(&current);
+
+        assert!(old.exists(), "another version's success is not this one's");
     }
 }

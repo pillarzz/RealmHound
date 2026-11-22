@@ -123,6 +123,20 @@ require_protected_dir() {
     safe_mode "$(stat -c '%a' "$path")" "$path" >/dev/null
 }
 
+# Create a missing directory beneath a validated parent without changing an
+# existing directory's mode. Existing restrictive modes are preserved.
+ensure_protected_dir() {
+    path=$1
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        require_protected_dir "$path"
+        return
+    fi
+    parent=$(dirname -- "$path")
+    require_protected_dir "$parent"
+    sudo install -d -m 0755 -o root -g root "$path"
+    require_protected_dir "$path"
+}
+
 legacy_changed=0
 remove_legacy() {
     path=$1
@@ -239,10 +253,9 @@ chmod 0644 "$desktop_tmp"
 echo "Installing the protected capture helper (sudo required)..."
 require_protected_dir /
 require_protected_dir /usr
-require_protected_dir /usr/local
-sudo install -d -m 0755 -o root -g root "$helper_dir"
-require_protected_dir /usr/local/libexec
-require_protected_dir "$helper_dir"
+ensure_protected_dir /usr/local
+ensure_protected_dir /usr/local/libexec
+ensure_protected_dir "$helper_dir"
 
 if [ -d "$helper_dest" ]; then
     echo "$helper_dest is a directory; refusing to replace it." >&2

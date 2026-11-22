@@ -182,15 +182,14 @@ require_protected_dir /usr
 # Create a missing directory beneath a validated parent without changing an
 # existing directory's mode. Existing restrictive modes are preserved.
 ensure_protected_dir() {
-    path=$1
-    if [ -e "$path" ] || [ -L "$path" ]; then
-        require_protected_dir "$path"
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        require_protected_dir "$1"
         return
     fi
-    parent=$(dirname -- "$path")
-    require_protected_dir "$parent"
-    install -d -m 0755 -o root -g root "$path"
-    require_protected_dir "$path"
+    ensure_parent=$(dirname -- "$1")
+    require_protected_dir "$ensure_parent"
+    install -d -m 0755 -o root -g root "$1"
+    require_protected_dir "$1"
 }
 
 require_protected_dir /

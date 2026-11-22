@@ -64,6 +64,11 @@ pub fn official_gui_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(GUI_DIR_FROM_HOME))
 }
 
+/// The stable launcher installed by the official installer.
+pub fn official_launcher_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".local/bin").join(LAUNCHER_NAME))
+}
+
 /// Whether `exe` is the GUI in the official user-owned layout.
 ///
 /// This is deliberately cheaper than [`detect_install_kind`]: it does not ask

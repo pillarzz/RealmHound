@@ -893,34 +893,61 @@ fn download_update(
     Ok(new_path)
 }
 
-/// Run the downloaded GUI with `--version`, bounded so a broken binary cannot
-/// wedge the download thread.
+/// Run a Linux GUI with `--version`, bounded so a broken binary cannot wedge
+/// the caller. Returns its stdout on a successful exit.
 #[cfg(target_os = "linux")]
-fn downloaded_exe_runs(path: &std::path::Path) -> bool {
+fn run_version(path: &std::path::Path) -> Option<Vec<u8>> {
     const VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
     let Ok(mut child) = std::process::Command::new(path)
         .arg("--version")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
     else {
-        return false;
+        return None;
     };
     let deadline = Instant::now() + VALIDATION_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut stdout = Vec::new();
+                if let Some(mut output) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = output.read_to_end(&mut stdout);
+                }
+                return Some(stdout);
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return None;
             }
         }
     }
+}
+
+/// Whether a downloaded Linux GUI can answer `--version`.
+#[cfg(target_os = "linux")]
+fn downloaded_exe_runs(path: &std::path::Path) -> bool {
+    run_version(path).is_some()
+}
+
+/// The version printed by a Linux GUI's `--version` line.
+#[cfg(target_os = "linux")]
+fn read_exe_version(path: &std::path::Path) -> Option<String> {
+    let stdout = run_version(path)?;
+    String::from_utf8_lossy(&stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().last())
+        .map(str::to_string)
 }
 
 /// A completed executable swap awaiting relaunch. Holds the paths needed to
@@ -1245,6 +1272,29 @@ fn cleanup_linux_exe(current_exe: &std::path::Path) {
         Err(e) => debug!("Could not clean up old exe: {}", e),
     }
 }
+
+/// Record the version of a replacement before starting it directly.
+///
+/// The launcher normally does this. A fallback direct relaunch (for example, a
+/// missing launcher) still needs the attempt marker so the next desktop launch
+/// can detect that the replacement never confirmed startup.
+#[cfg(target_os = "linux")]
+pub fn record_launch_attempt(exe: &std::path::Path) {
+    let Some(version) = read_exe_version(exe) else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let staging = dir.join(format!(".launch-attempt.{}", std::process::id()));
+    if std::fs::write(&staging, version).is_ok() {
+        let _ = std::fs::rename(&staging, dir.join(".launch-attempt"));
+    }
+}
+
+/// Non-Linux relaunches do not use the Linux launcher recovery marker.
+#[cfg(not(target_os = "linux"))]
+pub fn record_launch_attempt(_exe: &std::path::Path) {}
 
 /// Record that this version reached its first rendered frame.
 ///
@@ -1760,6 +1810,24 @@ mod tests {
             "#!/bin/sh\nexit 1\n"
         )));
         assert!(!downloaded_exe_runs(&temp.path().join("missing")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn records_the_replacement_version_before_a_direct_relaunch() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let exe = temp.path().join("RealmHound");
+        std::fs::write(&exe, "#!/bin/sh\necho 'RealmHound 9.9.9'\n").expect("write");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        record_launch_attempt(&exe);
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".launch-attempt")).expect("marker"),
+            "9.9.9"
+        );
     }
 
     #[cfg(target_os = "linux")]

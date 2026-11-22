@@ -1429,7 +1429,7 @@ impl RealmHoundApp {
         }
 
         // Swap the new exe into place; roll back if the spawn below fails.
-        let staged = match reason {
+        let staged = match &reason {
             RelaunchReason::Updated => match self.self_updater.stage_swap() {
                 Ok(staged) => Some(staged),
                 Err(e) => {
@@ -1451,7 +1451,25 @@ impl RealmHoundApp {
             },
         };
 
-        if let Err(e) = spawn_replacement(&exe, std::process::id()) {
+        // An applied update goes through the recovery-aware launcher when
+        // this is an official install. The launcher records the new version
+        // before starting it and restores the retained previous binary if the
+        // replacement fails before rendering a frame. Other relaunch reasons
+        // start the executable directly.
+        let launcher = if reason == RelaunchReason::Updated
+            && self.self_updater.install_kind()
+                == realmhound_core::install::InstallKind::OfficialUser
+        {
+            realmhound_core::install::official_launcher_path().filter(|path| path.is_file())
+        } else {
+            None
+        };
+        if reason == RelaunchReason::Updated && launcher.is_none() {
+            realmhound_core::update::record_launch_attempt(&exe);
+        }
+        let launch_target = launcher.unwrap_or_else(|| exe.clone());
+
+        if let Err(e) = spawn_replacement(&launch_target, std::process::id()) {
             if let Some(staged) = &staged {
                 rollback_executable_swap(staged);
             }

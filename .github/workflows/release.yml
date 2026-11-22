@@ -15,10 +15,19 @@ concurrency:
 
 jobs:
   build-linux:
-    name: Build Linux archive
+    name: Build Linux artifacts
     runs-on: ubuntu-latest
+    # The documented oldest supported runtime. Building on ubuntu-latest alone
+    # would link against a newer glibc than users on older distros have.
+    container: debian:12
 
     steps:
+      - name: Prepare the container
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            git ca-certificates curl xz-utils
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -27,17 +36,21 @@ jobs:
 
       - name: Install native dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes libasound2-dev libpcap-dev libudev-dev libxkbcommon-dev
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            build-essential pkg-config libpcap-dev libasound2-dev libssl-dev \
+            libudev-dev libxkbcommon-dev libdbus-1-dev libcap2-bin
 
       - name: Build both Linux executables
         working-directory: realmhound
         run: cargo build --release --locked --workspace
 
-      - name: Package Linux archive
+      - name: Package Linux artifacts
         run: |
+          set -euo pipefail
           tar -czf RealmHound-linux-x86_64.tar.gz \
-            README.md LICENSE packaging/linux/install.sh packaging/linux/realmhound.desktop \
+            README.md LICENSE packaging/linux/install.sh packaging/linux/install-helper.sh \
+            packaging/linux/realmhound.desktop \
             packaging/linux/icons/hicolor/64x64/apps/realmhound.png \
             packaging/linux/icons/hicolor/128x128/apps/realmhound.png \
             packaging/linux/icons/hicolor/256x256/apps/realmhound.png \
@@ -45,13 +58,33 @@ jobs:
             realmhound/target/release/RealmHound realmhound/target/release/realmhound-capture
           sha256sum RealmHound-linux-x86_64.tar.gz > RealmHound-linux-x86_64.tar.gz.sha256
 
-      - name: Upload Linux archive
+          # The GUI updater consumes only this bare executable; the full tarball
+          # remains the manual install and helper source.
+          install -m 0755 realmhound/target/release/RealmHound RealmHound-linux-x86_64
+          sha256sum RealmHound-linux-x86_64 > RealmHound-linux-x86_64.sha256
+          sha256sum realmhound/target/release/realmhound-capture \
+            > RealmHound-linux-x86_64-helper.sha256
+
+      - name: Verify the documented oldest runtime
+        run: |
+          set -euo pipefail
+          # Running each binary proves the dynamic loader resolves every library
+          # on Debian 12, not only on the build machine.
+          ./RealmHound-linux-x86_64 --version
+          ./realmhound/target/release/realmhound-capture --version
+          ldd RealmHound-linux-x86_64 | tee ldd.txt
+          ! grep -q "not found" ldd.txt
+
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-archive
           path: |
             RealmHound-linux-x86_64.tar.gz
             RealmHound-linux-x86_64.tar.gz.sha256
+            RealmHound-linux-x86_64
+            RealmHound-linux-x86_64.sha256
+            RealmHound-linux-x86_64-helper.sha256
           if-no-files-found: error
           retention-days: 1
 
@@ -331,6 +364,17 @@ jobs:
             Set-Content "realmhound/target/release/RealmHound-macos-app.zip.sha256"
           "MACOS_SHA256=$macosAppHash" >> $env:GITHUB_OUTPUT
 
+          $linuxGui = "realmhound/target/release/RealmHound-linux-x86_64"
+          $linuxGuiHash = (Get-FileHash -Algorithm SHA256 $linuxGui).Hash.ToLowerInvariant()
+          $linuxSidecar = ((Get-Content "realmhound/target/release/RealmHound-linux-x86_64.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
+          if ($linuxGuiHash -ne $linuxSidecar) {
+            throw "Linux GUI checksum sidecar does not match the artifact"
+          }
+          "LINUX_SHA256=$linuxGuiHash" >> $env:GITHUB_OUTPUT
+
+          $helperSidecar = ((Get-Content "realmhound/target/release/RealmHound-linux-x86_64-helper.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
+          "LINUX_HELPER_SHA256=$helperSidecar" >> $env:GITHUB_OUTPUT
+
       - name: Create GitHub release
         if: github.event_name == 'push' && github.event.repository.private == false
         uses: softprops/action-gh-release@v2
@@ -343,6 +387,9 @@ jobs:
             realmhound/target/release/RealmHound.exe.sha256
             realmhound/target/release/RealmHound-macos-app.zip
             realmhound/target/release/RealmHound-macos-app.zip.sha256
+            realmhound/target/release/RealmHound-linux-x86_64
+            realmhound/target/release/RealmHound-linux-x86_64.sha256
+            realmhound/target/release/RealmHound-linux-x86_64-helper.sha256
             realmhound/target/release/RealmHound-linux-x86_64.tar.gz
             realmhound/target/release/RealmHound-linux-x86_64.tar.gz.sha256
             LICENSE
@@ -359,6 +406,8 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.VERSION }}
           RELEASE_SHA256: ${{ steps.checksum.outputs.SHA256 }}
           RELEASE_MACOS_SHA256: ${{ steps.checksum.outputs.MACOS_SHA256 }}
+          RELEASE_LINUX_SHA256: ${{ steps.checksum.outputs.LINUX_SHA256 }}
+          RELEASE_LINUX_HELPER_SHA256: ${{ steps.checksum.outputs.LINUX_HELPER_SHA256 }}
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
@@ -367,6 +416,11 @@ jobs:
             const version = process.env.RELEASE_VERSION;
             const sha256 = process.env.RELEASE_SHA256;
             const macosSha256 = process.env.RELEASE_MACOS_SHA256;
+            const linuxSha256 = process.env.RELEASE_LINUX_SHA256;
+            const linuxHelperSha256 = process.env.RELEASE_LINUX_HELPER_SHA256;
+            const minHelperVersion = Number(
+              fs.readFileSync('packaging/linux/min-helper-version', 'utf8').trim()
+            );
             const notes = fs.readFileSync('realmhound/RELEASE_NOTES.txt', 'utf8');
             const downloadUrl =
               `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
@@ -374,6 +428,9 @@ jobs:
             const macosDownloadUrl =
               `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
               `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound-macos-app.zip`;
+            const linuxDownloadUrl =
+              `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
+              `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound-linux-x86_64`;
 
             const gist = await github.rest.gists.get({ gist_id: gistId });
             const manifest = JSON.parse(gist.data.files['version.json'].content);
@@ -408,6 +465,11 @@ jobs:
               manifest.sha256 = sha256;
               manifest.macos_download_url = macosDownloadUrl;
               manifest.macos_sha256 = macosSha256;
+              // Unknown fields are ignored by older Windows/macOS clients.
+              manifest.linux_x86_64_download_url = linuxDownloadUrl;
+              manifest.linux_x86_64_sha256 = linuxSha256;
+              manifest.linux_helper_sha256 = linuxHelperSha256;
+              manifest.linux_min_helper_version = minHelperVersion;
             }
 
             const existingIndex = manifest.releases.findIndex(

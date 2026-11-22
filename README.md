@@ -45,7 +45,7 @@ Releases ship a build for each platform:
 | --- | --- | --- |
 | Windows | `RealmHound.exe` | Download and run it. |
 | macOS | `RealmHound-macos-app.zip` | Universal (Apple Silicon and Intel). Unzip and drag `RealmHound.app` to Applications. |
-| Linux | `RealmHound-linux-x86_64.tar.gz` | Extract and run `./packaging/linux/install.sh` (asks for sudo). `libpcap` is required at runtime. |
+| Linux | `RealmHound-linux-x86_64.tar.gz` | Extract and run `./packaging/linux/install.sh` as your normal user. It escalates only for the protected capture helper and retiring old system files. `libpcap` is required at runtime. |
 
 macOS quarantines anything downloaded through a browser, so the first launch is
 blocked with "cannot be opened because the developer cannot be verified". Clear
@@ -56,6 +56,13 @@ quarantined and need neither step.
 The in-app updater replaces the whole `RealmHound.app`, so the icon, `Info.plist`
 and signature always match the version you are running. It updates only a copy
 running from `RealmHound.app`; a binary built from source has to be rebuilt.
+
+On Linux, the official installer keeps the GUI under
+`~/.local/opt/realmhound` and the capability-bearing helper under
+`/usr/local/libexec/realmhound`. In-app updates replace only the user-owned GUI
+and need no password. Replacing the helper is a rare manual administrative
+step, because Linux file capabilities belong to the file and restoring them
+requires privilege the GUI does not have.
 
 ## Requirements
 
@@ -78,9 +85,11 @@ running from `RealmHound.app`; a binary built from source has to be rebuilt.
 
 ### Linux
 
-- **x86_64** on Steam/Proton
-- `libpcap` at runtime, plus a one-time `CAP_NET_RAW` grant for the capture
-  helper that `packaging/linux/install.sh` applies (see
+- **x86-64** on Steam/Proton. The release artifact is built on Debian 12 and
+  requires glibc 2.36 or newer; aarch64 is not published yet.
+- `libpcap` at runtime, plus `sudo` and `setcap`/`getcap` from `libcap2-bin`
+  (or `libcap` on Arch) for the one-time `CAP_NET_RAW` grant that
+  `packaging/linux/install.sh` applies (see
   [Linux build steps](#linux-steamproton))
 - For a prebuilt tarball, the linked runtime libraries are `libpcap.so.1`,
   `libasound.so.2`, `libssl.so.3`, `libsystemd.so.0`, and `libdbus-1.so.3`,
@@ -112,30 +121,65 @@ platform.
 
 ### Linux (Steam/Proton)
 
-Tested on Debian trixie and Arch-based systems. Install Rust from
-[rustup.rs](https://rustup.rs/); distro packages are often too old.
+The release artifact is built and validated on Debian 12 (glibc 2.36), the
+oldest supported runtime. It is also tested on Debian trixie and Arch-based
+systems. Install Rust from [rustup.rs](https://rustup.rs/); distro packages are
+often too old.
 
 ```sh
-sudo apt install build-essential pkg-config libpcap-dev libasound2-dev libssl-dev libcap2-bin
+sudo apt install build-essential pkg-config libpcap-dev libasound2-dev libssl-dev libudev-dev libxkbcommon-dev libcap2-bin
 cd realmhound
 cargo build --workspace --release --locked
 cd ..
 ./packaging/linux/install.sh
 ```
 
-`install.sh` copies both binaries into `/usr/local/bin`, grants only
-`CAP_NET_RAW` to the helper, and installs the desktop launcher. Never grant
-capabilities to `RealmHound` itself. Verify with
-`/usr/sbin/getcap /usr/local/bin/realmhound-capture` (some shells omit
-`/usr/sbin` from `PATH`); the expected output includes `cap_net_raw=ep`.
-Re-run the installer after every rebuild, because replacing the helper clears
-its capability. The helper stays world-executable, so any local account on the
-machine can use it to capture port-2050 traffic; this assumes a single-user
-desktop (see [SECURITY.md](SECURITY.md)). Ordinary launches need no sudo:
+When installing a downloaded release, verify the tarball against its published
+`.sha256` first. `install.sh` runs as your normal user. It installs the GUI into
+`~/.local/opt/realmhound`, creates the `~/.local/bin/realmhound` launcher and a
+user desktop entry, then uses sudo only to install the helper as
+`root:root 0755` at `/usr/local/libexec/realmhound/realmhound-capture` with
+exactly `cap_net_raw=ep`, and to retire non-package-owned files from the previous
+`/usr/local/bin` installation. Never grant capabilities to `RealmHound` itself.
+Verify with
+`/usr/sbin/getcap /usr/local/libexec/realmhound/realmhound-capture` (some
+shells omit `/usr/sbin` from `PATH`); the expected output includes
+`cap_net_raw=ep`.
+
+Routine in-app updates replace only the user-owned GUI and need no password.
+Desktop entries and icons are installed by `install.sh`; if a release changes
+them, rerun the installer from the verified tarball. A helper upgrade is a rare
+manual step, because replacing the helper clears its capability.
+
+Download the official release, verify its SHA-256, then run:
 
 ```sh
-RealmHound
+sudo ./packaging/linux/install-helper.sh --sha256 <official helper hash> /path/to/realmhound-capture
 ```
+
+The helper digest is published as
+`RealmHound-linux-x86_64-helper.sha256` with each release.
+
+The helper installer verifies the copied file against the supplied digest,
+installs only that helper, and restores exactly `cap_net_raw=ep`; it never
+launches or modifies the GUI. Re-run `install.sh` after a source rebuild if the
+helper itself changed. The helper stays world-executable, so any local account
+on the machine can use it to capture port-2050 traffic; this assumes a
+single-user desktop (see [SECURITY.md](SECURITY.md)). Ordinary launches need no
+sudo:
+
+```sh
+~/.local/bin/realmhound
+```
+
+Package-managed builds use the `package-build` Cargo feature and never replace
+themselves from upstream artifacts; update those through the package manager.
+
+Existing releases cannot bootstrap the new Linux updater from inside the app.
+Migrate once by downloading this release and running `install.sh` as your user:
+it stages the user-owned GUI and protected helper first, then retires
+`/usr/local/bin/RealmHound` only after migration succeeds. Account data and
+settings under `~/.local/share/RealmHound` are untouched.
 
 Steam/Proton traffic normally crosses the host network stack, so the helper
 listens passively on libpcap's `any` device with a fixed `tcp port 2050`
@@ -154,14 +198,19 @@ assets, account data, and settings live under `~/.local/share/RealmHound`
 
 Troubleshooting:
 
-- Capture fails: check `getcap` on the helper, then the log above.
+- Capture fails: check `getcap` on `/usr/local/libexec/realmhound/realmhound-capture`, then the log above.
+- An update does not start: the launcher checks the replacement and restores
+  `RealmHound.old` automatically. The previous binary is also kept there until
+  the new version has completed a successful launch.
 - "Waiting for a connection": enter a realm or change maps; the cipher cannot
   be reconstructed from the middle of an existing stream.
 - Missing sprites or names: confirm Steam finished downloading the Unity
   client, or set `REALMHOUND_GAME_DIR`.
 
-There is no in-app updater on Linux yet: rebuild and re-run `install.sh`. The
-existing protocol pipeline decodes IPv4 game connections; IPv6 is a current
+The Linux updater refuses to replace a GUI when the installed capture helper is
+missing or too old for the new release, and explains the manual helper upgrade
+instead. It also refuses package-managed and source/unrecognized installations.
+The existing protocol pipeline decodes IPv4 game connections; IPv6 is a current
 limitation.
 
 ### Prerequisites
@@ -220,9 +269,11 @@ tools/macos/make-app-bundle.sh realmhound/target/release/RealmHound realmhound/t
 
 ### Platform notes
 
-- **Automatic updates** fetch the build for the platform they are running on and
-  verify its SHA-256 before swapping it in. A release that publishes no binary
-  for a platform reports that instead of offering one it cannot run.
+- **Automatic updates** fetch the build for the platform and architecture they
+  are running on and verify its SHA-256 before swapping it in. A release that
+  publishes no binary for a target reports that instead of offering one it
+  cannot run. Linux updates additionally require the official user-owned
+  install layout and a compatible capture helper.
 - **Game assets** are read from the RotMG install: `%LOCALAPPDATA%` on Windows,
   `~/.local/share/RealmOfTheMadGod` on macOS, and the Steam/Proton prefix on
   Linux. See [Game assets](#game-assets).

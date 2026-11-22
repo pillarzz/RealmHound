@@ -144,14 +144,16 @@ helper and legacy cleanup. The helper is installed at
 helper keeps its execution group and safe mode, so a shared-machine restriction
 such as `chgrp realmhound` + `chmod 0750` survives an upgrade. The installers
 refuse unsafe permissions, symlinked ancestors, and package-owned helper
-destinations. Never grant capabilities to `RealmHound` itself. Verify with
+destinations. Existing helper directory modes are preserved too; missing
+directories are created only beneath validated root-owned parents. Never grant
+capabilities to `RealmHound` itself. Verify with
 `/usr/sbin/getcap /usr/local/libexec/realmhound/realmhound-capture` (some
 shells omit `/usr/sbin` from `PATH`); the expected output includes
 `cap_net_raw=ep`.
 
 Routine in-app updates replace only the user-owned GUI and need no password.
-Desktop entries and icons are installed by `install.sh`; if a release changes
-them, rerun the installer from the verified tarball. A helper upgrade is a rare
+Desktop entries, icons, and the launcher are installed by `install.sh`; if a
+release changes them, rerun the installer from the verified tarball. A helper upgrade is a rare
 manual step, because replacing the helper clears its capability.
 
 Download the official release, verify its SHA-256, then run:
@@ -222,10 +224,11 @@ Troubleshooting:
 
 - Capture fails: check `getcap` on `/usr/local/libexec/realmhound/realmhound-capture`, then the log above.
 - An update does not start: the launcher checks the replacement and restores
-  `RealmHound.old` automatically. If the replacement starts but fails before
-  rendering a frame, the next launch restores the retained previous binary. The
-  previous binary is kept until the new version has completed a successful
-  launch.
+  `RealmHound.old` automatically. In-app updates start the replacement through
+  the same launcher, so the attempt is recorded for update relaunches. If the
+  replacement starts but fails before rendering a frame, the next launch
+  restores the retained previous binary. The previous binary is kept until the
+  new version has completed a successful launch.
 - "Waiting for a connection": enter a realm or change maps; the cipher cannot
   be reconstructed from the middle of an existing stream.
 - Missing sprites or names: confirm Steam finished downloading the Unity

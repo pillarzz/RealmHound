@@ -31,9 +31,11 @@ needed, and coordinate disclosure after a fix is available.
 A fresh helper directory and helper are `root:root 0755` with exactly
 `cap_net_raw=ep`. Upgrades preserve an existing root-owned helper's execution
 group and safe mode (for example `0750` with a dedicated group), and refuse
-setuid/setgid/sticky or group/other-writable modes. Both installers validate
-the whole `/usr/local` hierarchy, reject symlinked ancestors, and refuse to
-overwrite a package-owned helper destination.
+setuid/setgid/sticky or group/other-writable modes. Existing helper-directory
+modes are preserved; missing directories are created only beneath validated
+root-owned parents. Both installers validate the whole `/usr/local` hierarchy,
+reject symlinked ancestors, and refuse to overwrite a package-owned helper
+destination.
 
 Routine in-app updates replace only the user-owned GUI under
 `~/.local/opt/realmhound`. They never modify the helper or apply capabilities.
@@ -44,7 +46,9 @@ The Linux swap never removes the live path: it links the current binary to
 `.old` and atomically replaces the live path, so a concurrent launcher cannot
 consume the recovery copy. The launcher records each launch attempt and, if a
 new version exits before confirming a rendered frame, restores the retained
-previous binary on the next launch.
+previous binary on the next launch. An in-app update starts the replacement
+through that same launcher, so the attempt is recorded for update relaunches
+too, not only for desktop launches.
 
 The routine Linux update artifact is a single executable, not an archive. The
 GUI verifies its SHA-256 while downloading into a private file beside the

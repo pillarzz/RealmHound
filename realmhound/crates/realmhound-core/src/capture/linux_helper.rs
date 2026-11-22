@@ -295,6 +295,17 @@ fn kill_and_wait(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn helper_startup_error(path: &std::path::Path, error: CaptureError) -> CaptureError {
+    match error {
+        CaptureError::CaptureError(message) => CaptureError::CaptureError(format!(
+            "{message}\n\nCapture helper: {}\nIf this is a development build, grant it CAP_NET_RAW once:\n  sudo setcap cap_net_raw=ep {}",
+            path.display(),
+            path.display()
+        )),
+        other => other,
+    }
+}
+
 fn await_startup(
     mut output: ChildStdout,
     child: &mut Child,
@@ -468,7 +479,8 @@ pub fn start(
             tracing::warn!("Linux capture helper: {line}");
         }
     });
-    let mut output = await_startup(output, &mut child, STARTUP_TIMEOUT)?;
+    let mut output = await_startup(output, &mut child, STARTUP_TIMEOUT)
+        .map_err(|error| helper_startup_error(&helper, error))?;
     let child = Arc::new(Mutex::new(child));
     let handle = CaptureHandle::with_linux_child(child.clone());
     let (tx, rx) = packet_channel(DEFAULT_QUEUE_CAPACITY);
@@ -493,6 +505,19 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_errors_name_the_helper_and_the_setcap_fix() {
+        let message = helper_startup_error(
+            std::path::Path::new("/src/target/debug/realmhound-capture"),
+            CaptureError::CaptureError("CAP_NET_RAW may be required".into()),
+        )
+        .to_string();
+
+        assert!(message.contains("CAP_NET_RAW"));
+        assert!(message.contains("/src/target/debug/realmhound-capture"));
+        assert!(message.contains("sudo setcap cap_net_raw=ep"));
+    }
 
     #[test]
     fn parses_the_version_line_from_helper_output() {

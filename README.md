@@ -179,7 +179,15 @@ A source build is treated as unmanaged and never replaces itself either. For
 development, `cargo run -p RealmHound` uses the sibling
 `realmhound-capture` in the same target directory, so build both with
 `cargo build --workspace` (or `cargo build -p realmhound-core --bin
-realmhound-capture`). To point a dev build at a helper elsewhere, set
+realmhound-capture`). The sibling helper needs `CAP_NET_RAW`; grant it once
+after building or rebuilding it, because replacing the binary clears the
+capability:
+
+```sh
+sudo setcap cap_net_raw=ep realmhound/target/debug/realmhound-capture
+```
+
+To point a dev build at a helper elsewhere, set
 `REALMHOUND_CAPTURE_HELPER=/absolute/path/to/realmhound-capture`. The official
 installer's protected helper is preferred only for an official install.
 

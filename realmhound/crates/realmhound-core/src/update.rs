@@ -946,9 +946,12 @@ impl StagedSwap {
 }
 
 /// Swap the running binary with the new one, leaving the process running.
-/// Rename current -> .old, rename .new -> current. On the second rename
-/// failing, the first is rolled back before returning the error. Both Windows
-/// and Unix allow renaming the image of a running process.
+///
+/// Linux creates `.old` as a hard link and atomically replaces the live path,
+/// so a concurrent launcher never observes the executable missing and cannot
+/// consume the backup. Other platforms rename current -> .old, then .new ->
+/// current, rolling the first rename back if the second fails. Both Windows and
+/// Unix allow renaming the image of a running process.
 pub fn stage_executable_swap(new_exe_path: &std::path::Path) -> Result<StagedSwap, String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Cannot determine current exe path: {}", e))?;
@@ -1009,15 +1012,31 @@ fn stage_executable_swap_at(
             .map_err(|e| format!("Cannot remove old backup ({}): {}", old_path.display(), e))?;
     }
 
-    // Rename the running binary aside
-    std::fs::rename(current_exe, &old_path)
-        .map_err(|e| format!("Failed to rename current exe to .old: {}", e))?;
+    #[cfg(target_os = "linux")]
+    {
+        // Keep the live path present throughout the swap. The launcher restores
+        // .old when the executable is missing, so removing current first would
+        // let an overlapping launch consume the backup.
+        std::fs::hard_link(current_exe, &old_path)
+            .map_err(|e| format!("Failed to link current exe to .old: {}", e))?;
+        if let Err(e) = std::fs::rename(new_exe_path, current_exe) {
+            let _ = std::fs::remove_file(&old_path);
+            return Err(format!("Failed to rename new exe into place: {}", e));
+        }
+    }
 
-    // Rename .new to the original exe name
-    if let Err(e) = std::fs::rename(new_exe_path, current_exe) {
-        // Rollback: restore original
-        let _ = std::fs::rename(&old_path, current_exe);
-        return Err(format!("Failed to rename new exe into place: {}", e));
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Rename the running binary aside
+        std::fs::rename(current_exe, &old_path)
+            .map_err(|e| format!("Failed to rename current exe to .old: {}", e))?;
+
+        // Rename .new to the original exe name
+        if let Err(e) = std::fs::rename(new_exe_path, current_exe) {
+            // Rollback: restore original
+            let _ = std::fs::rename(&old_path, current_exe);
+            return Err(format!("Failed to rename new exe into place: {}", e));
+        }
     }
 
     Ok(StagedSwap {
@@ -1741,6 +1760,33 @@ mod tests {
             "#!/bin/sh\nexit 1\n"
         )));
         assert!(!downloaded_exe_runs(&temp.path().join("missing")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_swap_keeps_a_hard_link_backup() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let current = temp.path().join("RealmHound");
+        let new = temp.path().join("RealmHound.new");
+        std::fs::write(&current, b"old exe").expect("write old");
+        std::fs::write(&new, b"new exe").expect("write new");
+        let old_inode = std::fs::metadata(&current).expect("metadata").ino();
+
+        let staged = stage_executable_swap_at(&new, &current).expect("swap");
+        let old = current.with_file_name("RealmHound.old");
+
+        assert_eq!(std::fs::metadata(&old).expect("old").ino(), old_inode);
+        assert_eq!(std::fs::read(&old).expect("old"), b"old exe");
+        assert_eq!(std::fs::read(&current).expect("current"), b"new exe");
+        assert_ne!(
+            std::fs::metadata(&old).expect("old").ino(),
+            std::fs::metadata(&current).expect("current").ino()
+        );
+
+        rollback_executable_swap(&staged);
+        assert_eq!(std::fs::read(&current).expect("current"), b"old exe");
     }
 
     #[cfg(target_os = "linux")]

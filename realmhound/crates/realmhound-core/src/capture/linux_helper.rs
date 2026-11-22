@@ -54,11 +54,12 @@ impl HelperVersion {
 
 /// Resolve the helper without relying on `PATH`.
 ///
-/// The protected canonical path wins, then a sibling used by source builds,
-/// then the previous official location. This ordering keeps a migrated install
-/// on its protected helper while still running an unmigrated one.
+/// A migrated official install always uses its protected helper. A source,
+/// package, or legacy install prefers the sibling beside the GUI, which keeps
+/// `cargo run` and unmigrated installs using their own helper, then falls back
+/// to the protected path and the previous official location.
 pub fn resolve_helper_path() -> Result<std::path::PathBuf, String> {
-    use crate::install::{HELPER_CANONICAL_PATH, HELPER_ENV_OVERRIDE, HELPER_LEGACY_PATH};
+    use crate::install::{HELPER_CANONICAL_PATH, HELPER_ENV_OVERRIDE};
 
     if let Some(value) = std::env::var_os(HELPER_ENV_OVERRIDE) {
         let path = std::path::PathBuf::from(value);
@@ -78,12 +79,8 @@ pub fn resolve_helper_path() -> Result<std::path::PathBuf, String> {
     }
 
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let sibling = exe.with_file_name("realmhound-capture");
-    for candidate in [
-        std::path::PathBuf::from(HELPER_CANONICAL_PATH),
-        sibling,
-        std::path::PathBuf::from(HELPER_LEGACY_PATH),
-    ] {
+    let official = crate::install::is_official_layout(&exe);
+    for candidate in helper_candidates(&exe, official) {
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -92,6 +89,19 @@ pub fn resolve_helper_path() -> Result<std::path::PathBuf, String> {
         "Cannot find realmhound-capture. Expected the protected helper at {HELPER_CANONICAL_PATH}. \
          Install it with the official Linux installer."
     ))
+}
+
+fn helper_candidates(exe: &std::path::Path, official: bool) -> Vec<std::path::PathBuf> {
+    use crate::install::{HELPER_CANONICAL_PATH, HELPER_LEGACY_PATH};
+
+    let canonical = std::path::PathBuf::from(HELPER_CANONICAL_PATH);
+    let sibling = exe.with_file_name("realmhound-capture");
+    let legacy = std::path::PathBuf::from(HELPER_LEGACY_PATH);
+    if official {
+        vec![canonical, sibling, legacy]
+    } else {
+        vec![sibling, canonical, legacy]
+    }
 }
 
 /// Ask an explicit helper binary for its version.
@@ -500,6 +510,46 @@ mod tests {
         assert_eq!(
             manifest_min.trim().parse::<u32>().unwrap(),
             MIN_SUPPORTED_HELPER_VERSION
+        );
+    }
+
+    #[test]
+    fn official_installs_prefer_the_protected_helper() {
+        use std::path::{Path, PathBuf};
+
+        let exe = Path::new("/home/u/.local/opt/realmhound/RealmHound");
+        let candidates = helper_candidates(exe, true);
+        assert_eq!(
+            candidates[0],
+            PathBuf::from(crate::install::HELPER_CANONICAL_PATH)
+        );
+        assert_eq!(
+            candidates[1],
+            Path::new("/home/u/.local/opt/realmhound/realmhound-capture")
+        );
+        assert_eq!(
+            candidates[2],
+            PathBuf::from(crate::install::HELPER_LEGACY_PATH)
+        );
+    }
+
+    #[test]
+    fn source_builds_prefer_their_sibling_helper() {
+        use std::path::{Path, PathBuf};
+
+        let exe = Path::new("/src/target/debug/RealmHound");
+        let candidates = helper_candidates(exe, false);
+        assert_eq!(
+            candidates[0],
+            Path::new("/src/target/debug/realmhound-capture")
+        );
+        assert_eq!(
+            candidates[1],
+            PathBuf::from(crate::install::HELPER_CANONICAL_PATH)
+        );
+        assert_eq!(
+            candidates[2],
+            PathBuf::from(crate::install::HELPER_LEGACY_PATH)
         );
     }
 

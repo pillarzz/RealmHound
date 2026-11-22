@@ -64,6 +64,16 @@ pub fn official_gui_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(GUI_DIR_FROM_HOME))
 }
 
+/// Whether `exe` is the GUI in the official user-owned layout.
+///
+/// This is deliberately cheaper than [`detect_install_kind`]: it does not ask
+/// a package manager, so helper resolution can use it on every capture start.
+pub fn is_official_layout(exe: &Path) -> bool {
+    official_gui_dir()
+        .map(|dir| in_official_layout(exe, &dir))
+        .unwrap_or(false)
+}
+
 /// Detect how the running copy of RealmHound was installed.
 pub fn detect_install_kind() -> InstallKind {
     #[cfg(target_os = "linux")]
@@ -89,10 +99,14 @@ fn detect_install_kind_at(
     official_dir: Option<&Path>,
     package_owned: bool,
 ) -> InstallKind {
-    let in_official_layout = official_dir
-        .map(|dir| same_file(exe, &dir.join(GUI_BINARY_NAME)) && marker_is_official(dir))
+    let official = official_dir
+        .map(|dir| in_official_layout(exe, dir))
         .unwrap_or(false);
-    classify(package_owned, in_official_layout)
+    classify(package_owned, official)
+}
+
+fn in_official_layout(exe: &Path, dir: &Path) -> bool {
+    same_file(exe, &dir.join(GUI_BINARY_NAME)) && marker_is_official(dir)
 }
 
 fn classify(package_owned: bool, in_official_layout: bool) -> InstallKind {

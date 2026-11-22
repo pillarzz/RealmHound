@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+# Ignore the caller's PATH: privileged lookups (sudo, setcap, package tools)
+# must not resolve through a user-controlled directory.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
 # Official Linux installer.
 #
 # Runs as the logged-in user: the GUI and its launcher are user-owned and
@@ -86,6 +91,14 @@ remove_legacy() {
 }
 
 # ── User-owned GUI ──────────────────────────────────────────────────────────
+max_bytes=104857600
+gui_size=$(stat -c '%s' "$build/RealmHound")
+helper_size=$(stat -c '%s' "$build/realmhound-capture")
+if [ "$gui_size" -gt "$max_bytes" ] || [ "$helper_size" -gt "$max_bytes" ]; then
+    echo "Refusing to install: staged binary exceeds 100 MB." >&2
+    exit 1
+fi
+
 mkdir -p "$gui_dir" "$launcher_dir" "$applications_dir"
 
 # Replace via rename: writing over a running executable can fail with ETXTBSY.

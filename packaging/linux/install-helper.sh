@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+# Ignore the caller's PATH: privileged lookups (sudo, setcap, package tools)
+# must not resolve through a user-controlled directory.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
 # Manual, privileged capture-helper install or upgrade.
 #
 # This is the rare administrative step. The GUI never runs it and never
@@ -66,6 +71,10 @@ esac
     echo "$src is a symlink; pass the downloaded regular file." >&2
     exit 1
 }
+if [ "$(stat -c '%s' "$src")" -gt 104857600 ]; then
+    echo "$src exceeds the 100 MB helper limit." >&2
+    exit 1
+fi
 
 getcap_bin=$(command -v getcap 2>/dev/null || true)
 if [ -z "$getcap_bin" ] && [ -x /usr/sbin/getcap ]; then

@@ -26,14 +26,25 @@ needed, and coordinate disclosure after a fix is available.
 `RealmHound` stays unprivileged and capability-free. The installer grants
 `cap_net_raw=ep` only to the separately installed helper at
 `/usr/local/libexec/realmhound/realmhound-capture`. The helper is never granted
-`cap_net_admin`, and the GUI never requests promiscuous mode. The helper
-directory is `root:root 0755`, and the helper itself is `root:root 0755` with
-exactly `cap_net_raw=ep`.
+`cap_net_admin`, and the GUI never requests promiscuous mode.
+
+A fresh helper directory and helper are `root:root 0755` with exactly
+`cap_net_raw=ep`. Upgrades preserve an existing root-owned helper's execution
+group and safe mode (for example `0750` with a dedicated group), and refuse
+setuid/setgid/sticky or group/other-writable modes. Both installers validate
+the whole `/usr/local` hierarchy, reject symlinked ancestors, and refuse to
+overwrite a package-owned helper destination.
 
 Routine in-app updates replace only the user-owned GUI under
 `~/.local/opt/realmhound`. They never modify the helper or apply capabilities.
 An older helper that remains protocol-compatible keeps working across GUI
 updates.
+
+The Linux swap never removes the live path: it links the current binary to
+`.old` and atomically replaces the live path, so a concurrent launcher cannot
+consume the recovery copy. The launcher records each launch attempt and, if a
+new version exits before confirming a rendered frame, restores the retained
+previous binary on the next launch.
 
 The routine Linux update artifact is a single executable, not an archive. The
 GUI verifies its SHA-256 while downloading into a private file beside the
@@ -70,12 +81,13 @@ sudo ./packaging/linux/install-helper.sh --sha256 <official helper hash> /path/t
 ```
 
 The digest is published as `RealmHound-linux-x86_64-helper.sha256` with each
-release. The installer rejects symlinks, copies into a private root-owned
-temporary file in the protected destination directory, verifies the copied
-bytes rather than the caller's file, renames the verified inode into place,
-applies exactly `cap_net_raw=ep`, and verifies the result. It never installs or launches the
-GUI. Because the destination directory is root-owned, unprivileged users
-cannot replace the helper.
+release. The installer rejects symlinks, validates the destination hierarchy
+and package ownership, preserves an existing root-owned helper's group and
+restrictive mode, copies into a private root-owned temporary file, verifies the
+copied bytes rather than the caller's file, renames the verified inode into
+place, applies exactly `cap_net_raw=ep`, and verifies the result. It never
+installs or launches the GUI. Because the destination directory is root-owned,
+unprivileged users cannot replace the helper.
 
 SHA-256 verifies integrity against expected release metadata; it does not by
 itself establish publisher authenticity. Windows, macOS, and Linux trust the
@@ -85,7 +97,8 @@ than something Linux hashing alone solves.
 ### Shared machines
 
 File capabilities cannot be scoped to one user. Any local account that can
-execute the helper can capture the machine's port-2050 traffic. This is accepted
-for a single-user desktop and is unchanged by the user-owned GUI migration. To
-restrict it on a shared machine, scope execution with a dedicated group
-(`chgrp realmhound`, `chmod 0750`) or move capture behind a system service.
+execute the helper can capture the machine's port-2050 traffic. A fresh install
+uses the documented world-executable policy, accepted for a single-user
+desktop. To restrict it on a shared machine, scope execution with a dedicated
+group (`chgrp realmhound`, `chmod 0750`) or move capture behind a system
+service; the installers preserve that restriction across upgrades.

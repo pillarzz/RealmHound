@@ -82,9 +82,15 @@ they never replace package-managed files from upstream artifacts:
 
 ```sh
 cargo build --release --locked -p RealmHound --features package-build
-``` `BUILD_ASSETS_TOKEN` must be a fine-grained, read-only token with
-access to `pillarzz/realmhound-build-assets`. The workflow's built-in
-`GITHUB_TOKEN` publishes the GitHub Release.
+```
+
+The official Linux installers preserve an existing root-owned helper's group
+and safe mode, validate the `/usr/local` hierarchy, and refuse package-owned
+helper destinations.
+
+`BUILD_ASSETS_TOKEN` must be a fine-grained, read-only token with access to
+`pillarzz/realmhound-build-assets`. The workflow's built-in `GITHUB_TOKEN`
+publishes the GitHub Release.
 
 To replace official sounds, publish a new immutable release in the private
 asset repository, then update its tag, archive SHA-256, and expected paths in

@@ -137,11 +137,14 @@ cd ..
 When installing a downloaded release, verify the tarball against its published
 `.sha256` first. `install.sh` runs as your normal user. It installs the GUI into
 `~/.local/opt/realmhound`, creates the `~/.local/bin/realmhound` launcher
-(plus a `RealmHound` alias) and a user desktop entry, then uses sudo only to install the helper as
-`root:root 0755` at `/usr/local/libexec/realmhound/realmhound-capture` with
-exactly `cap_net_raw=ep`, and to retire non-package-owned files from the previous
-`/usr/local/bin` installation. Never grant capabilities to `RealmHound` itself.
-Verify with
+(plus a `RealmHound` alias) and a user desktop entry, and uses sudo only for the
+helper and legacy cleanup. The helper is installed at
+`/usr/local/libexec/realmhound/realmhound-capture` with exactly
+`cap_net_raw=ep`. A fresh helper is `root:root 0755`; an existing root-owned
+helper keeps its execution group and safe mode, so a shared-machine restriction
+such as `chgrp realmhound` + `chmod 0750` survives an upgrade. The installers
+refuse unsafe permissions, symlinked ancestors, and package-owned helper
+destinations. Never grant capabilities to `RealmHound` itself. Verify with
 `/usr/sbin/getcap /usr/local/libexec/realmhound/realmhound-capture` (some
 shells omit `/usr/sbin` from `PATH`); the expected output includes
 `cap_net_raw=ep`.
@@ -161,12 +164,13 @@ The helper digest is published as
 `RealmHound-linux-x86_64-helper.sha256` with each release.
 
 The helper installer verifies the copied file against the supplied digest,
-installs only that helper, and restores exactly `cap_net_raw=ep`; it never
-launches or modifies the GUI. Re-run `install.sh` after a source rebuild if the
-helper itself changed. The helper stays world-executable, so any local account
-on the machine can use it to capture port-2050 traffic; this assumes a
-single-user desktop (see [SECURITY.md](SECURITY.md)). Ordinary launches need no
-sudo:
+installs only that helper, preserves an existing root-owned helper's group and
+restrictive mode, and restores exactly `cap_net_raw=ep`; it never launches or
+modifies the GUI. Re-run `install.sh` after a source rebuild if the helper
+itself changed. A fresh helper is world-executable, so any local account on the
+machine can use it to capture port-2050 traffic; this assumes a single-user
+desktop (see [SECURITY.md](SECURITY.md)). An existing group-scoped restriction
+is preserved. Ordinary launches need no sudo:
 
 ```sh
 ~/.local/bin/realmhound
@@ -174,6 +178,7 @@ sudo:
 
 Package-managed builds use the `package-build` Cargo feature and never replace
 themselves from upstream artifacts; update those through the package manager.
+The installers also refuse to overwrite a package-owned helper.
 
 A source build is treated as unmanaged and never replaces itself either. For
 development, `cargo run -p RealmHound` uses the sibling
@@ -193,9 +198,10 @@ installer's protected helper is preferred only for an official install.
 
 Existing releases cannot bootstrap the new Linux updater from inside the app.
 Migrate once by downloading this release and running `install.sh` as your user:
-it stages the user-owned GUI and protected helper first, then retires
-`/usr/local/bin/RealmHound` only after migration succeeds. Account data and
-settings under `~/.local/share/RealmHound` are untouched.
+it installs and verifies the protected helper first, then publishes the
+user-owned GUI and launcher, and retires `/usr/local/bin/RealmHound` only after
+migration succeeds. Account data and settings under `~/.local/share/RealmHound`
+are untouched.
 
 Steam/Proton traffic normally crosses the host network stack, so the helper
 listens passively on libpcap's `any` device with a fixed `tcp port 2050`
@@ -216,8 +222,10 @@ Troubleshooting:
 
 - Capture fails: check `getcap` on `/usr/local/libexec/realmhound/realmhound-capture`, then the log above.
 - An update does not start: the launcher checks the replacement and restores
-  `RealmHound.old` automatically. The previous binary is also kept there until
-  the new version has completed a successful launch.
+  `RealmHound.old` automatically. If the replacement starts but fails before
+  rendering a frame, the next launch restores the retained previous binary. The
+  previous binary is kept until the new version has completed a successful
+  launch.
 - "Waiting for a connection": enter a realm or change maps; the cipher cannot
   be reconstructed from the middle of an existing stream.
 - Missing sprites or names: confirm Steam finished downloading the Unity

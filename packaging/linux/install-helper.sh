@@ -131,7 +131,7 @@ if [ "$actual" != "$(printf '%s' "$expected" | tr 'A-F' 'a-f')" ]; then
     exit 1
 fi
 
-if ! "$tmp" --version >/dev/null 2>&1; then
+if ! timeout 10 "$tmp" --version >/dev/null 2>&1; then
     echo "The supplied helper cannot run on this system; nothing was installed." >&2
     exit 1
 fi

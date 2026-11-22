@@ -109,7 +109,7 @@ desktop_tmp="$applications_dir/.realmhound.desktop.$$"
 trap 'rm -f "$gui_tmp" "$marker_tmp" "$launcher_tmp" "$desktop_tmp"' EXIT
 
 install -m 0755 "$build/RealmHound" "$gui_tmp"
-if ! "$gui_tmp" --version >/dev/null 2>&1; then
+if ! timeout 10 "$gui_tmp" --version >/dev/null 2>&1; then
     echo "The staged GUI cannot run on this system; leaving the previous installation in place." >&2
     exit 1
 fi
@@ -195,7 +195,7 @@ esac
 helper_tmp="$helper_dir/.realmhound-capture.$$"
 trap 'sudo rm -f "$helper_tmp"' EXIT
 sudo install -o root -g root -m 0755 "$build/realmhound-capture" "$helper_tmp"
-if ! sudo "$helper_tmp" --version >/dev/null 2>&1; then
+if ! sudo timeout 10 "$helper_tmp" --version >/dev/null 2>&1; then
     echo "The staged capture helper cannot run on this system; leaving the previous helper in place." >&2
     exit 1
 fi

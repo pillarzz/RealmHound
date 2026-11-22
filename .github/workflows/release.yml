@@ -20,6 +20,11 @@ jobs:
     # The documented oldest supported runtime. Building on ubuntu-latest alone
     # would link against a newer glibc than users on older distros have.
     container: debian:12
+    # GitHub's container jobs default run steps to sh; these scripts use bash
+    # features such as pipefail.
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Prepare the container

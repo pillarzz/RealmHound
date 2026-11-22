@@ -25,9 +25,10 @@ needed, and coordinate disclosure after a fix is available.
 
 `RealmHound` stays unprivileged and capability-free. The installer grants
 `cap_net_raw=ep` only to the separately installed helper at
-`/usr/local/libexec/realmhound/realmhound-capture`; the helper never uses
-`cap_net_admin` or promiscuous mode. The helper directory is `root:root 0755`,
-and the helper itself is `root:root 0755` with exactly `cap_net_raw=ep`.
+`/usr/local/libexec/realmhound/realmhound-capture`. The helper is never granted
+`cap_net_admin`, and the GUI never requests promiscuous mode. The helper
+directory is `root:root 0755`, and the helper itself is `root:root 0755` with
+exactly `cap_net_raw=ep`.
 
 Routine in-app updates replace only the user-owned GUI under
 `~/.local/opt/realmhound`. They never modify the helper or apply capabilities.

@@ -1,11 +1,6 @@
 #!/bin/sh
 set -eu
 
-# Ignore the caller's PATH: privileged lookups (sudo, setcap, package tools)
-# must not resolve through a user-controlled directory.
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export PATH
-
 # Manual, privileged capture-helper install or upgrade.
 #
 # This is the rare administrative step. The GUI never runs it and never
@@ -13,8 +8,14 @@ export PATH
 # user-owned.
 #
 # Obtain the helper from an official release and pass the SHA-256 published
-# with that release. The destination is fixed; the helper is installed
-# root:root 0755 with exactly cap_net_raw=ep.
+# with that release. The destination is fixed; the helper keeps an existing
+# root-owned installation's execution group and restrictive mode, or uses
+# root:root 0755 for a fresh installation.
+
+# Ignore the caller's PATH: privileged lookups (setcap, package tools) must not
+# resolve through a user-controlled directory.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
 usage() {
     echo "Usage: sudo $0 --sha256 <64-hex-digest> <path-to-realmhound-capture>" >&2
@@ -91,12 +92,98 @@ fi
 
 helper_dir="/usr/local/libexec/realmhound"
 helper_dest="$helper_dir/realmhound-capture"
+legacy_helper="/usr/local/bin/realmhound-capture"
 
-install -d -m 0755 -o root -g root "$helper_dir"
-if [ -L "$helper_dir" ]; then
-    echo "$helper_dir is a symlink; refusing to install through it." >&2
-    exit 1
+# Directory writability is not proof of ownership; ask the package manager.
+pkg_owned() {
+    path=$1
+    if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -S "$path" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v rpm >/dev/null 2>&1 && rpm -qf "$path" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v pacman >/dev/null 2>&1 && pacman -Qo "$path" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# Print a mode without setuid/setgid/sticky or group/other write, or fail.
+safe_mode() {
+    mode=$1
+    path=$2
+    case "$mode" in
+        [0-7]) mode="00$mode" ;;
+        [0-7][0-7]) mode="0$mode" ;;
+    esac
+    case "$mode" in
+        [0-7][0-7][0-7]) ;;
+        [0-7][0-7][0-7][0-7])
+            case "$mode" in
+                0*) mode=${mode#0} ;;
+                *)
+                    echo "$path has special permission bits ($mode); refusing." >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo "$path has an unsafe mode ($mode); refusing." >&2
+            return 1
+            ;;
+    esac
+    case "$mode" in
+        ?[2367]?|??[2367])
+            echo "$path is writable by group or other ($mode); refusing." >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$mode"
+}
+
+# Every directory from /usr/local down to the helper must be a real root-owned
+# directory that unprivileged users cannot redirect or modify.
+require_protected_dir() {
+    path=$1
+    if [ ! -d "$path" ] || [ -L "$path" ]; then
+        echo "$path must be a real directory, not a symlink." >&2
+        exit 1
+    fi
+    if [ "$(stat -c '%u' "$path")" -ne 0 ]; then
+        echo "$path is not root-owned." >&2
+        exit 1
+    fi
+    safe_mode "$(stat -c '%a' "$path")" "$path" >/dev/null
+}
+
+# Preserve an existing root-owned helper's execution group and restrictive
+# mode. Fresh installations use the documented world-executable policy.
+helper_group=root
+helper_mode=755
+existing_helper=""
+for candidate in "$helper_dest" "$legacy_helper"; do
+    if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then
+        existing_helper=$candidate
+        break
+    fi
+done
+if [ -n "$existing_helper" ]; then
+    if [ "$(stat -c '%U' "$existing_helper")" != root ]; then
+        echo "$existing_helper is not root-owned; refusing to replace a user-controlled helper." >&2
+        exit 1
+    fi
+    helper_mode=$(safe_mode "$(stat -c '%a' "$existing_helper")" "$existing_helper")
+    helper_group=$(stat -c '%G' "$existing_helper")
 fi
+
+require_protected_dir /
+require_protected_dir /usr
+require_protected_dir /usr/local
+install -d -m 0755 -o root -g root "$helper_dir"
+require_protected_dir /usr/local/libexec
+require_protected_dir "$helper_dir"
+
 if [ -d "$helper_dest" ]; then
     echo "$helper_dest is a directory; refusing to replace it." >&2
     exit 1
@@ -105,15 +192,10 @@ if [ -e "$helper_dest" ] && [ -L "$helper_dest" ]; then
     echo "$helper_dest is a symlink; refusing to replace it." >&2
     exit 1
 fi
-chown root:root "$helper_dir"
-chmod 0755 "$helper_dir"
-helper_mode=$(stat -c '%a' "$helper_dir")
-case "$helper_mode" in
-    *[2367])
-        echo "$helper_dir is writable by group or other ($helper_mode); refusing." >&2
-        exit 1
-        ;;
-esac
+if [ -e "$helper_dest" ] && pkg_owned "$helper_dest"; then
+    echo "$helper_dest is owned by a package manager; refusing to overwrite it." >&2
+    exit 1
+fi
 
 # Copy into a private root-owned inode in the destination directory, verify
 # the copy rather than the caller's file (closing the hash/copy race), then
@@ -122,7 +204,7 @@ tmp=$(mktemp "$helper_dir/.realmhound-capture.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
 cp -- "$src" "$tmp"
 chown root:root "$tmp"
-chmod 0755 "$tmp"
+chmod 0700 "$tmp"
 
 actual=$(sha256sum -- "$tmp" | awk '{print $1}')
 if [ "$actual" != "$(printf '%s' "$expected" | tr 'A-F' 'a-f')" ]; then
@@ -136,6 +218,8 @@ if ! timeout 10 "$tmp" --version >/dev/null 2>&1; then
     exit 1
 fi
 
+chown "root:$helper_group" "$tmp"
+chmod "$helper_mode" "$tmp"
 "$setcap_bin" cap_net_raw=ep "$tmp"
 tmp_cap=$("$getcap_bin" "$tmp" 2>/dev/null || true)
 case "$tmp_cap" in
@@ -157,6 +241,12 @@ case "$final_cap" in
         exit 1
         ;;
 esac
+if [ "$(stat -c '%U' "$helper_dest")" != root ] \
+    || [ "$(stat -c '%G' "$helper_dest")" != "$helper_group" ] \
+    || [ "$(stat -c '%a' "$helper_dest")" -ne "$helper_mode" ]; then
+    echo "The helper's ownership or permissions were not preserved." >&2
+    exit 1
+fi
 
 echo "Installed $helper_dest"
 echo "$final_cap"

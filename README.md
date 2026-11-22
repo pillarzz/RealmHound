@@ -136,8 +136,8 @@ cd ..
 
 When installing a downloaded release, verify the tarball against its published
 `.sha256` first. `install.sh` runs as your normal user. It installs the GUI into
-`~/.local/opt/realmhound`, creates the `~/.local/bin/realmhound` launcher and a
-user desktop entry, then uses sudo only to install the helper as
+`~/.local/opt/realmhound`, creates the `~/.local/bin/realmhound` launcher
+(plus a `RealmHound` alias) and a user desktop entry, then uses sudo only to install the helper as
 `root:root 0755` at `/usr/local/libexec/realmhound/realmhound-capture` with
 exactly `cap_net_raw=ep`, and to retire non-package-owned files from the previous
 `/usr/local/bin` installation. Never grant capabilities to `RealmHound` itself.

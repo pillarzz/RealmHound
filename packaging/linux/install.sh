@@ -137,6 +137,13 @@ exec "$exe" "$@"
 LAUNCHER
 chmod 0755 "$launcher_tmp"
 mv -f "$launcher_tmp" "$launcher"
+# Keep the familiar command name without leaving a system-wide launcher that
+# could shadow the migrated installation.
+if [ -d "$launcher_dir/RealmHound" ] && [ ! -L "$launcher_dir/RealmHound" ]; then
+    echo "$launcher_dir/RealmHound is a directory; refusing to replace it." >&2
+    exit 1
+fi
+ln -sf "$launcher" "$launcher_dir/RealmHound"
 
 sed "s|@LAUNCHER@|$launcher|g" "$repo/packaging/linux/realmhound.desktop" > "$desktop_tmp"
 chmod 0644 "$desktop_tmp"

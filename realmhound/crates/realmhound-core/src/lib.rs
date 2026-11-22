@@ -11,6 +11,7 @@
 //! - `assets` - Game asset management (object definitions, sprites)
 //! - `capture` - Network packet capture using libpcap (Npcap on Windows)
 //! - `crypto` - RC4 encryption/decryption
+//! - `install` - Linux installation layout and install-kind detection
 //! - `loot` - Loot detection, tracking, and history database
 //! - `protocol` - RotMG packet definitions and parsing
 //! - `router` - Packet routing and game event generation
@@ -43,6 +44,7 @@ pub mod combat;
 pub mod crypto;
 pub mod dungeon_modifiers;
 pub mod dust;
+pub mod install;
 pub mod keyper;
 pub mod loot;
 pub mod maintenance;

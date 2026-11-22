@@ -12,8 +12,9 @@ const CAPTURE_SETUP_HELP: &str = "RealmHound may not open a capture device: read
                                   log out and back in.";
 #[cfg(all(unix, not(target_os = "macos")))]
 const CAPTURE_SETUP_HELP: &str = "RealmHound may not open a capture device. Install libpcap, then \
-                                  install the realmhound-capture helper beside RealmHound and \
-                                  run the one-time Linux setup script. The GUI must remain unprivileged.";
+                                  install the /usr/local/libexec/realmhound/realmhound-capture \
+                                  helper with the official Linux installer. The GUI must remain \
+                                  unprivileged.";
 
 /// Errors that can occur during packet capture.
 #[derive(Error, Debug)]

@@ -57,6 +57,11 @@ The release workflow:
   `RealmHound-macos-app.zip`, the only macOS download; the updater replaces the
   whole bundle, so its metadata and signature never outlive the executable
 - Builds `RealmHound.exe` with the locked dependency graph
+- Builds the Linux GUI and capture helper in a Debian 12 container, the oldest
+  supported runtime, and validates the produced binaries there
+- Publishes `RealmHound-linux-x86_64` (the bare GUI update artifact and its
+  sidecar), `RealmHound-linux-x86_64-helper.sha256`, and the full
+  `RealmHound-linux-x86_64.tar.gz` manual-install archive and sidecar
 - Generates and publishes `RealmHound.exe.sha256` and
   `RealmHound-macos-app.zip.sha256`
 - Creates a GitHub Release in this repository
@@ -65,9 +70,27 @@ The release workflow:
 
 `DISCORD_WEBHOOK` is required for public release announcements. `GIST_PAT` is
 required only for stable public releases, which update the production updater
-manifest. `BUILD_ASSETS_TOKEN` must be a fine-grained, read-only token with
-access to `pillarzz/realmhound-build-assets`. The workflow's built-in
-`GITHUB_TOKEN` publishes the GitHub Release.
+manifest. The manifest's `linux_min_helper_version` comes from
+`packaging/linux/min-helper-version`; keep it equal to
+`MIN_SUPPORTED_HELPER_VERSION` in
+`realmhound/crates/realmhound-core/src/capture/linux_helper.rs`. Raise it only
+when a GUI release genuinely requires a newer helper, because it blocks GUI
+updates until users complete the manual helper step.
+
+Distribution packages must be built with the `package-build` Cargo feature so
+they never replace package-managed files from upstream artifacts:
+
+```sh
+cargo build --release --locked -p RealmHound --features package-build
+```
+
+The official Linux installers preserve an existing root-owned helper's group
+and safe mode, validate the `/usr/local` hierarchy, and refuse package-owned
+helper destinations.
+
+`BUILD_ASSETS_TOKEN` must be a fine-grained, read-only token with access to
+`pillarzz/realmhound-build-assets`. The workflow's built-in `GITHUB_TOKEN`
+publishes the GitHub Release.
 
 To replace official sounds, publish a new immutable release in the private
 asset repository, then update its tag, archive SHA-256, and expected paths in
@@ -96,11 +119,20 @@ For every release:
 - Confirm `RealmHound.exe` and `RealmHound.exe.sha256` are present.
 - Confirm `RealmHound-macos-app.zip` and its `.sha256` are present, and that
   unzipping it yields a `RealmHound.app` showing the RealmHound icon in Finder.
+- Confirm `RealmHound-linux-x86_64`, its `.sha256`, and
+  `RealmHound-linux-x86_64-helper.sha256` are present, and that the full Linux
+  tarball and its sidecar are present.
 - Download each artifact and verify its SHA-256 against the checksum file.
+- Run `./RealmHound-linux-x86_64 --version` and
+  `./realmhound-capture --version` from the Linux tarball on Debian 12 (or the
+  documented oldest supported runtime) and confirm they start without missing
+  libraries.
 
 For a stable version at or above the manifest's current latest version, also
 confirm the production updater manifest contains the new version, the
-same-repository download URLs and matching SHA-256 for both `download_url` and
-`macos_download_url`, and that `macos_download_url` points at the
-`-macos-app.zip` archive rather than a bare binary. For a prerelease, confirm
-the production updater manifest remains unchanged.
+same-repository download URLs and matching SHA-256 for `download_url`,
+`macos_download_url`, and `linux_x86_64_download_url`, that
+`macos_download_url` points at the `-macos-app.zip` archive rather than a bare
+binary, and that `linux_helper_sha256` and `linux_min_helper_version` match the
+release. For a prerelease, confirm the production updater manifest remains
+unchanged.

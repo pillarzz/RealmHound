@@ -73,6 +73,8 @@ find-msvc-tools = "0.1"
 profiling = ["dep:puffin"]
 # Retain capture queue timing metadata for latency diagnostics.
 latency-diagnostics = []
+# Distro package builds must never replace their package-managed files.
+package-build = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

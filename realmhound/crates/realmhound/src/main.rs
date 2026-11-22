@@ -102,6 +102,13 @@ mod window_icon_tests {
 }
 
 fn main() -> Result<()> {
+    // Lets the release pipeline prove the built artifact runs on its documented
+    // oldest supported runtime without opening a window.
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("{} {}", PKG_NAME, VERSION);
+        return Ok(());
+    }
+
     // A relaunch replacement waits (bounded) for the previous instance to exit
     // before contending for the single-instance claim or the profile lock.
     if let Some(pid) = relaunch_wait_pid() {

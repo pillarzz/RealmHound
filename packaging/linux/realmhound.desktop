@@ -1,8 +1,9 @@
 [Desktop Entry]
+# The Exec launcher is filled in by packaging/linux/install.sh.
 Type=Application
 Name=RealmHound
 Comment=Realm of the Mad God account and packet viewer
-Exec=RealmHound
+Exec="@LAUNCHER@"
 Icon=realmhound
 Terminal=false
 Categories=Game;Utility;

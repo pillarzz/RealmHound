@@ -542,6 +542,9 @@ impl OperationGenerations {
 pub struct RealmHoundApp {
     /// Packet capture lifecycle manager
     capture: CaptureManager,
+    /// Last capture startup error, shown so a missing or incompatible helper is
+    /// never silently ignored.
+    capture_start_error: Option<String>,
     /// Whether raw packets are being written to a `.rhcap` file (Debug settings).
     record_raw_packets: bool,
     maintenance_ui_frames: u8,
@@ -683,6 +686,8 @@ pub struct RealmHoundApp {
     pending_relaunch: Option<RelaunchReason>,
     /// Update notification panel
     update_panel: UpdatePanel,
+    /// Whether this run has reached its first rendered frame.
+    startup_confirmed: bool,
     /// Last synced character cache epoch `(account generation, character-view
     /// generation)` (avoids cloning every frame).
     treasury_cache_epoch: (u64, u64),
@@ -907,6 +912,9 @@ impl RealmHoundApp {
         let interfaces =
             realmhound_core::capture::NetworkInterface::list_all().map_err(|e| e.to_string());
 
+        // Identifies whether this copy may replace itself from upstream.
+        let install_kind = realmhound_core::install::detect_install_kind();
+
         // Every account-scoped path comes from the immutable account context.
         // Global installation paths (watchlist) stay under the storage root.
         let storage_root = account.storage_root().clone();
@@ -1089,6 +1097,7 @@ impl RealmHoundApp {
 
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
+            capture_start_error: None,
             maintenance_ui_frames: 0,
             live_demand: None,
             // Honour the REALMHOUND_RECORD env var so the Debug toggle reflects
@@ -1168,9 +1177,10 @@ impl RealmHoundApp {
             settings: settings.clone(),
             modals: ModalState::new(),
             update_checker: UpdateChecker::new(),
-            self_updater: SelfUpdater::new(),
+            self_updater: SelfUpdater::new(install_kind),
             pending_relaunch: None,
             update_panel: UpdatePanel::new(),
+            startup_confirmed: false,
             treasury_cache_epoch: (u64::MAX, u64::MAX), // Force initial sync
             last_char_view_gen: u64::MAX,               // Force initial sync
             last_vault_view_gen: u64::MAX,              // Force initial sync
@@ -1330,8 +1340,18 @@ impl RealmHoundApp {
 
     /// Start packet capture with auto-detection of active interface.
     fn start_capture(&mut self) {
+        // A missing or incompatible protected helper must be visible, not a
+        // silent loss of capture.
+        #[cfg(target_os = "linux")]
+        if let Err(message) = realmhound_core::capture::linux_helper::startup_compatibility() {
+            tracing::error!("{}", message);
+            self.capture_start_error = Some(message);
+            return;
+        }
+
         match self.capture.start() {
             Ok(()) => {
+                self.capture_start_error = None;
                 // Hand the fresh capture source to the worker, which resets the
                 // session/reassembler and begins draining it on its own thread.
                 if let Some(rx) = self.capture.take_receiver() {
@@ -1341,6 +1361,12 @@ impl RealmHoundApp {
             }
             Err(e) => {
                 tracing::error!("{}", e);
+                // Keep the new visible-error UI Linux-only so Windows/macOS
+                // startup behavior is unchanged.
+                #[cfg(target_os = "linux")]
+                {
+                    self.capture_start_error = Some(e);
+                }
             }
         }
     }
@@ -1403,7 +1429,7 @@ impl RealmHoundApp {
         }
 
         // Swap the new exe into place; roll back if the spawn below fails.
-        let staged = match reason {
+        let staged = match &reason {
             RelaunchReason::Updated => match self.self_updater.stage_swap() {
                 Ok(staged) => Some(staged),
                 Err(e) => {
@@ -1425,7 +1451,25 @@ impl RealmHoundApp {
             },
         };
 
-        if let Err(e) = spawn_replacement(&exe, std::process::id()) {
+        // An applied update goes through the recovery-aware launcher when
+        // this is an official install. The launcher records the new version
+        // before starting it and restores the retained previous binary if the
+        // replacement fails before rendering a frame. Other relaunch reasons
+        // start the executable directly.
+        let launcher = if reason == RelaunchReason::Updated
+            && self.self_updater.install_kind()
+                == realmhound_core::install::InstallKind::OfficialUser
+        {
+            realmhound_core::install::official_launcher_path().filter(|path| path.is_file())
+        } else {
+            None
+        };
+        if reason == RelaunchReason::Updated && launcher.is_none() {
+            realmhound_core::update::record_launch_attempt(&exe);
+        }
+        let launch_target = launcher.unwrap_or_else(|| exe.clone());
+
+        if let Err(e) = spawn_replacement(&launch_target, std::process::id()) {
             if let Some(staged) = &staged {
                 rollback_executable_swap(staged);
             }
@@ -1992,17 +2036,38 @@ impl RealmHoundApp {
                                 use realmhound_core::update::SelfUpdateState;
                                 match self.self_updater.state() {
                                     SelfUpdateState::Idle => {
-                                        if cfg!(target_os = "linux") {
-                                            ui.label(
-                                                "Install Linux updates through your package or source build.",
-                                            );
-                                        } else if shadcn
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            use realmhound_core::install::InstallKind;
+                                            match self.self_updater.install_kind() {
+                                                InstallKind::OfficialUser => {
+                                                    if shadcn
+                                                        .btn(
+                                                            ui,
+                                                            format!(
+                                                                "⬇ Update to v{}",
+                                                                manifest.latest_version
+                                                            ),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.self_updater.start_download(
+                                                            manifest.artifact_for_this_platform(),
+                                                        );
+                                                    }
+                                                }
+                                                other => {
+                                                    if let Some(hint) = other.update_hint() {
+                                                        ui.label(hint);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        #[cfg(not(target_os = "linux"))]
+                                        if shadcn
                                             .btn(
                                                 ui,
-                                                format!(
-                                                    "⬇ Update to v{}",
-                                                    manifest.latest_version
-                                                ),
+                                                format!("⬇ Update to v{}", manifest.latest_version),
                                             )
                                             .clicked()
                                         {
@@ -2026,10 +2091,8 @@ impl RealmHoundApp {
                                         });
                                     }
                                     SelfUpdateState::ReadyToApply => {
-                                        if shadcn.btn(ui, "✔ Restart to apply update").clicked()
-                                        {
-                                            self.pending_relaunch =
-                                                Some(RelaunchReason::Updated);
+                                        if shadcn.btn(ui, "✔ Restart to apply update").clicked() {
+                                            self.pending_relaunch = Some(RelaunchReason::Updated);
                                         }
                                     }
                                     SelfUpdateState::Failed(msg) => {
@@ -2046,12 +2109,9 @@ impl RealmHoundApp {
                             }
                             UpdateState::Error(err) => {
                                 ui.label(
-                                    RichText::new(format!(
-                                        "Update check failed: {}",
-                                        err.message
-                                    ))
-                                    .color(Color32::from_rgb(200, 150, 100))
-                                    .small(),
+                                    RichText::new(format!("Update check failed: {}", err.message))
+                                        .color(Color32::from_rgb(200, 150, 100))
+                                        .small(),
                                 );
                                 ui.add_space(4.0);
                                 if shadcn.btn(ui, "Retry").clicked() {
@@ -10501,6 +10561,14 @@ impl RealmHoundApp {
                     self.start_capture();
                 }
             }
+            if let Some(error) = self.capture_start_error.clone() {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("[!] Capture problem")
+                        .color(egui::Color32::from_rgb(255, 100, 100)),
+                )
+                .hover_tip(error);
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
@@ -10662,6 +10730,32 @@ impl eframe::App for RealmHoundApp {
             self.pending_relaunch = Some(RelaunchReason::Updated);
         }
 
+        // Capture startup failures are shown once and remain in the status bar
+        // after dismissal, so a helper problem is never silent.
+        if let Some(error) = self.capture_start_error.clone() {
+            let mut open = true;
+            egui::Window::new("Capture problem")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(error).color(Color32::from_rgb(255, 200, 100)));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Retry").clicked() {
+                            self.capture_start_error = None;
+                            self.start_capture();
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            self.capture_start_error = None;
+                        }
+                    });
+                });
+            if !open {
+                self.capture_start_error = None;
+            }
+        }
+
         // Changelog window (modal)
         if self.modals.show_changelog {
             self.render_changelog_window(ctx);
@@ -10699,6 +10793,13 @@ impl eframe::App for RealmHoundApp {
             let (glow, dye, char_dye, bytes) = self.sprite_renderer.cache_stats();
             crate::profiling::update_cache_stats(glow, dye, char_dye, bytes);
         }
+        // Only a rendered frame confirms a self-update actually started; a
+        // successful spawn alone is not enough to release the recovery copy.
+        if !self.startup_confirmed {
+            self.startup_confirmed = true;
+            realmhound_core::update::confirm_startup(self.self_updater.install_kind());
+        }
+
         crate::profiling::end_frame(ctx);
     }
 

@@ -113,6 +113,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Test installer directory guard
+        run: ./packaging/linux/tests/ensure-protected-dir.sh
+
       - name: Run core tests
         working-directory: realmhound
         # Some migration tests share process-global state and require serial execution.
